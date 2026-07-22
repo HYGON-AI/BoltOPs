@@ -1,0 +1,3 @@
+# Convenience environment for local development with every backend.
+# For a smaller install, use one of the optional-dependency commands in README.md.
+-e .[all,dev,tune]

@@ -1,0 +1,74 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bolt_ops"
+dynamic = ["version"]
+description = "Hygon DCU AI Compiler ops library (Triton & TileLang & Other DSLs)"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.9"
+authors = [{ name = "Hygon DCU AI Compiler" }]
+dependencies = [
+    "packaging",
+    "torch",
+]
+
+[project.optional-dependencies]
+triton = ["triton"]
+tilelang = ["tilelang"]
+all = ["triton", "tilelang"]
+tune = [
+    "triton",
+    "pytest",
+    "numpy",
+    "pandas",
+    "matplotlib",
+]
+dev = [
+    "pytest",
+    "numpy",
+    "pandas",
+]
+
+[project.scripts]
+bolt-moe-tune-cli = "bolt_ops.tools.triton_moe_tune.tune_moe_cli:main"
+
+[tool.setuptools]
+packages = [
+    "bolt_ops",
+    "bolt_ops.fused_moe",
+    "bolt_ops.fused_moe.triton",
+    "bolt_ops.fused_moe.triton.configs",
+    "bolt_ops.fused_moe.tilelang",
+    "bolt_ops.mamba_state_scatter",
+    "bolt_ops.mamba_state_scatter.triton",
+    "bolt_ops.mamba_state_scatter.tilelang",
+    "bolt_ops.recompute_w_u",
+    "bolt_ops.recompute_w_u.triton",
+    "bolt_ops.recompute_w_u.tilelang",
+    "bolt_ops.utility",
+    "bolt_ops.fused_moe.triton.moe_sorting_hipc",
+    "bolt_ops.tools",
+    "bolt_ops.tools.triton_moe_tune",
+]
+
+[tool.setuptools.dynamic]
+version = { attr = "bolt_ops._version.__version__" }
+
+[tool.setuptools.package-data]
+bolt_ops = [
+    "fused_moe/triton/moe_sorting_hipc/csrc/*",
+    "fused_moe/triton/configs/moe/*.json",
+    "tools/triton_moe_tune/*.sh",
+    "tools/triton_moe_tune/*.md",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["test"]
+pythonpath = ["."]
+markers = [
+    "bench: performance benchmark on real-model sizes (requires --bench/--benchmark)",
+]
