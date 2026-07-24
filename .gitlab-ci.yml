@@ -1,0 +1,97 @@
+stages:
+  - build
+  - publish
+
+variables:
+  PIP_INDEX_URL: "http://10.16.1.201:9929/nightly/dtk2604/+simple/"
+  PIP_TRUSTED_HOST: "10.16.1.201"
+  DTK_PKG: "/ArchivedFile/dtk-pkg/dtk26.04/DTK-26.04-rc4-centos8-x86_64.tar.gz"
+  DEVPI_URL: "http://10.16.1.201:9929/"
+  CISMI_TIMEOUT: "3600"
+  TORCH_VERSION: "2.10.0"
+
+.dcu-runner:
+  tags:
+    - nmz
+  before_script:
+    # Keep the DTK/AICC setup aligned with triton-staging so both projects use
+    # the same compiler and runtime on the shared runner.
+    - cp -f ${DTK_PKG} /opt/
+    - cd /opt && tar -xzf $(basename ${DTK_PKG}) && mv dtk-* dtk
+    - source /opt/dtk/env.sh && cd ${CI_PROJECT_DIR}
+    - src_dir="/ArchivedFile/ai_cc/nightly"
+    - latest_run=$(cd "$src_dir" && ls dtk_llvm_*.run 2>/dev/null | sed 's/\.run$//' | sort -t '_' -k4 -nr | head -n1)
+    - 'echo "AICC installer: ${src_dir}/${latest_run}.run"'
+    - test -n "${latest_run}"
+    - cp "${src_dir}/${latest_run}.run" ./
+    - chmod +x "${latest_run}.run"
+    - 'yes | bash "${latest_run}.run" || test "${PIPESTATUS[1]}" -eq 0'
+
+build:test-wheel:
+  extends: .dcu-runner
+  stage: build
+  timeout: 3h
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"'
+  before_script:
+    - !reference [.dcu-runner, before_script]
+    # Test the source branch together with the latest target branch, matching
+    # the integration behavior used by triton-staging.
+    - |
+      cat > /tmp/git-askpass.sh << 'SCRIPT'
+      #!/bin/sh
+      case "$1" in
+        *Username*) echo "gitlab-ci-token" ;;
+        *Password*) echo "$GIT_TOKEN" ;;
+      esac
+      SCRIPT
+    - chmod +x /tmp/git-askpass.sh
+    - export GIT_ASKPASS=/tmp/git-askpass.sh GIT_TERMINAL_PROMPT=0 GIT_TOKEN="${CI_JOB_TOKEN}"
+    - git config user.email "ci@local" && git config user.name "CI"
+    - git fetch origin "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
+    - git merge "origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME" --no-edit
+    - python -m pip install "torch==${TORCH_VERSION}" triton pytest "numpy==1.24.3" pandas build cismi ninja
+    - python -m pip show torch triton
+  script:
+    - export HIP_VISIBLE_DEVICES=$(CIsmi need 1 --timeout ${CISMI_TIMEOUT})
+    - python -m build --wheel
+    - |
+      wheel_test_dir=$(mktemp -d)
+      python -m pip install --no-deps --target "${wheel_test_dir}" dist/*.whl
+      cp -r test "${wheel_test_dir}/test"
+      (
+        cd "${wheel_test_dir}"
+        python -m pytest test -s --tb=short \
+          --junitxml="${CI_PROJECT_DIR}/bolt_ops_test.xml"
+      )
+  artifacts:
+    when: always
+    paths:
+      - dist/*.whl
+      - bolt_ops_test.xml
+    reports:
+      junit: bolt_ops_test.xml
+    expire_in: 7 days
+
+publish:
+  extends: .dcu-runner
+  stage: publish
+  timeout: 3h
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_REF_NAME == "main"'
+  before_script:
+    - !reference [.dcu-runner, before_script]
+    - python -m pip install "torch==${TORCH_VERSION}" triton build wheel ciupload
+    - test -f /opt/dtk/env.sh
+    - 'echo "DTK environment: ${DTK_PKG}"'
+  script:
+    - DTK_VER=$(echo ${DTK_PKG} | grep -oP 'dtk\K[0-9]+\.[0-9]+' | tr -d '.')
+    - TORCH_VER=$(echo ${TORCH_VERSION} | tr -d '.')
+    - LOCAL_VER="dtk${DTK_VER}.torch${TORCH_VER}.$(date +%y%m%d%H%M).g$(git rev-parse --short=6 HEAD)"
+    - python -m build --wheel
+    - CIUpload --repair --torch_version ${TORCH_VERSION} --set_local_version ${LOCAL_VER} --outputdir output -f dist/*.whl
+    - CIUpload --devpi_url ${DEVPI_URL} --devpi_user ${devpi_nightly_user} --devpi_password ${devpi_nightly_password} --dtk_pkg_name $(basename ${DTK_PKG}) -f output/*.whl
+  artifacts:
+    paths:
+      - output/*.whl
+    expire_in: 30 days
