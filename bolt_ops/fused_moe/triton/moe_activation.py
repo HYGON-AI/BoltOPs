@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Shared MoE activation helpers and Triton kernels.
+"""Shared MoE activation implementation and public Triton entry points.
 
 Terminology:
 - "gated" activation means gate-up fusion: input is interpreted as [gate, up]
@@ -447,6 +447,15 @@ def get_triton_swiglu_variant_config(M, D):
     return {"BLOCK_SIZE_D": 1024, "num_warps": 1}
 
 
+def get_triton_situ_and_mul_config(M, D):
+    # Tuned on gfx938, bf16. Decode-sized inputs are launch/latency bound,
+    # while larger inputs benefit from a wider tile without the occupancy
+    # loss measured at 1024 elements.
+    if M <= 16:
+        return {"BLOCK_SIZE_D": 128, "num_warps": 1}
+    return {"BLOCK_SIZE_D": 512, "num_warps": 1}
+
+
 def get_triton_swiglu_oai_interleaved_config(M, D):
     # BLOCK_SIZE_D >= 128 produces incorrect results due to interleaved
     # address pattern (offs_d*2) failing to generate correct buffer_load.
@@ -671,6 +680,102 @@ def triton_swiglu_oai_and_mul(out: torch.Tensor, inp: torch.Tensor, alpha: float
     )
 
 
+@triton.heuristics(
+    {
+        "D_DIV": lambda args: (args["D"] % args["BLOCK_SIZE_D"]) == 0,
+    }
+)
+@triton.jit
+def situ_and_mul_kernel(
+    out_ptr,  # [M, D]
+    in_ptr,  # [M, 2D], chunked layout [gate(0:D), up(D:2D)]
+    M,
+    D: tl.constexpr,
+    stride_in0,
+    stride_in1,
+    stride_out0,
+    stride_out1,
+    BETA: tl.constexpr,
+    LINEAR_BETA: tl.constexpr,
+    HAS_LINEAR_BETA: tl.constexpr,
+    D_DIV: tl.constexpr,
+    BLOCK_SIZE_D: tl.constexpr,
+):
+    """Kimi SituGLU: soft-clipped SiLU gate times an optional clipped up."""
+    tl.assume(M > 0)
+    tl.assume(D > 0)
+    tl.assume(stride_in0 > 0)
+    tl.assume(stride_in1 > 0)
+    tl.assume(stride_out0 > 0)
+    tl.assume(stride_out1 > 0)
+
+    pid = tl.program_id(axis=0)
+    num_pid_d = tl.cdiv(D, BLOCK_SIZE_D)
+    pid_m = pid // num_pid_d
+    pid_d = pid % num_pid_d
+    offs_d = pid_d * BLOCK_SIZE_D + tl.arange(0, BLOCK_SIZE_D)
+    mask_d = offs_d < D
+
+    row_in = in_ptr + pid_m.to(tl.int64) * stride_in0
+    gate_ptrs = row_in + offs_d * stride_in1
+    up_ptrs = row_in + (offs_d + D) * stride_in1
+    if D_DIV:
+        gate = tl.load(gate_ptrs)
+        up = tl.load(up_ptrs)
+    else:
+        gate = tl.load(gate_ptrs, mask=mask_d, other=0.0)
+        up = tl.load(up_ptrs, mask=mask_d, other=0.0)
+
+    gate_f = gate.to(tl.float32)
+    up_f = up.to(tl.float32)
+    gate_out = BETA * _tanh(gate_f / BETA) * tl.sigmoid(gate_f)
+    if HAS_LINEAR_BETA:
+        up_f = LINEAR_BETA * _tanh(up_f / LINEAR_BETA)
+    y = gate_out * up_f
+
+    out_ptrs = out_ptr + pid_m.to(tl.int64) * stride_out0 + offs_d * stride_out1
+    if D_DIV:
+        tl.store(out_ptrs, y.to(gate.dtype))
+    else:
+        tl.store(out_ptrs, y.to(gate.dtype), mask=mask_d)
+
+
+def triton_situ_and_mul(
+    out: torch.Tensor,
+    inp: torch.Tensor,
+    beta: float,
+    linear_beta: Optional[float] = None,
+) -> None:
+    """Apply Kimi SituGLU to a packed ``[gate, up]`` input."""
+    if beta <= 0:
+        raise ValueError("activation_situ_beta must be greater than 0")
+    if linear_beta is not None and linear_beta <= 0:
+        raise ValueError("activation_situ_linear_beta must be greater than 0")
+    assert inp.shape[-1] % 2 == 0
+    assert inp.is_contiguous() and out.is_contiguous()
+
+    M = inp.numel() // inp.shape[-1]
+    D = inp.shape[-1] // 2
+    inp_2d = inp.view(M, inp.shape[-1])
+    out_2d = out.view(M, D)
+    config = get_triton_situ_and_mul_config(M, D)
+    grid = (M * triton.cdiv(D, config["BLOCK_SIZE_D"]),)
+    situ_and_mul_kernel[grid](
+        out_2d,
+        inp_2d,
+        M,
+        D,
+        inp_2d.stride(0),
+        inp_2d.stride(1),
+        out_2d.stride(0),
+        out_2d.stride(1),
+        BETA=float(beta),
+        LINEAR_BETA=0.0 if linear_beta is None else float(linear_beta),
+        HAS_LINEAR_BETA=linear_beta is not None,
+        **config,
+    )
+
+
 _ACTIVATION_ALIASES = {
     "gelu_pytorch_tanh": "gelu_tanh",
     "gelu_pytorch_tanh_no_mul": "gelu_tanh_no_mul",
@@ -682,11 +787,12 @@ _NO_MUL_ACTIVATIONS = {
     "relu2_no_mul",
     "relu2",
 }
-_GATED_ONLY_ACTIVATIONS = {"swigluoai", "swiglustep"}
+_GATED_ONLY_ACTIVATIONS = {"situ", "swigluoai", "swiglustep"}
 _SUPPORTED_ACTIVATIONS = {
     "silu",
     "gelu",
     "gelu_tanh",
+    "situ",
     "swigluoai",
     "swiglustep",
     "silu_no_mul",
@@ -724,6 +830,23 @@ def adjust_N_for_activation(n: int, is_gated: bool) -> int:
     return n // 2 if is_gated else n
 
 
+def normalize_moe_activation(
+    activation: str,
+    is_gated: Optional[bool] = None,
+) -> Tuple[str, bool]:
+    """Normalize an activation name and resolve whether it is gated."""
+    return _normalize_activation_and_gate(activation, is_gated)
+
+
+def moe_activation_output_size(n: int, is_gated: bool) -> int:
+    """Return the last-dimension size produced by an MoE activation."""
+    if n <= 0:
+        raise ValueError("input last dimension must be greater than zero")
+    if is_gated and n % 2:
+        raise ValueError("gated input last dimension must be even")
+    return adjust_N_for_activation(n, is_gated)
+
+
 def _apply_activation(
     activation: str,
     is_gated: bool,
@@ -731,6 +854,8 @@ def _apply_activation(
     ffn1_out_2d: torch.Tensor,
     gemm1_alpha: Optional[float],
     gemm1_limit: Optional[float],
+    activation_situ_beta: Optional[float] = None,
+    activation_situ_linear_beta: Optional[float] = None,
 ) -> None:
     """Apply MoE expert activation.
 
@@ -775,6 +900,17 @@ def _apply_activation(
             if gemm1_alpha is not None or gemm1_limit is not None:
                 raise ValueError("gemm1_alpha/gemm1_limit are not supported for gated GELU_TANH")
             triton_gelu_tanh_and_mul(activated_out, ffn1_out_2d)
+        elif activation == "situ":
+            if gemm1_alpha is not None or gemm1_limit is not None:
+                raise ValueError("gemm1_alpha/gemm1_limit are not supported for SITU")
+            if activation_situ_beta is None:
+                raise ValueError("SITU requires activation_situ_beta")
+            triton_situ_and_mul(
+                activated_out,
+                ffn1_out_2d,
+                activation_situ_beta,
+                activation_situ_linear_beta,
+            )
         elif activation == "swigluoai":
             # OpenAI interleaved SwiGLU variant:
             # out = gate'*sigmoid(alpha*gate')*(up'+1)
@@ -806,3 +942,52 @@ def _apply_activation(
         triton_relu2(activated_out, ffn1_out_2d)
     else:
         raise ValueError(f"Unsupported non-gated activation: {activation}")
+
+
+def moe_activation(
+    activated_out: torch.Tensor,
+    ffn1_out_2d: torch.Tensor,
+    activation: str = "silu",
+    is_gated: Optional[bool] = None,
+    *,
+    gemm1_alpha: Optional[float] = None,
+    gemm1_limit: Optional[float] = None,
+    activation_situ_beta: Optional[float] = None,
+    activation_situ_linear_beta: Optional[float] = None,
+) -> None:
+    """Apply an MoE activation into a caller-owned output tensor.
+
+    This is the public integration API for aiter's ``moe_c``, ``moe_asm`` and
+    ``moe_triton`` paths.
+    """
+    activation, is_gated = _normalize_activation_and_gate(activation, is_gated)
+    if ffn1_out_2d.ndim != 2 or activated_out.ndim != 2:
+        raise ValueError("ffn1_out_2d and activated_out must both be 2D")
+    if not ffn1_out_2d.is_cuda or not activated_out.is_cuda:
+        raise ValueError("moe_activation only supports CUDA/HIP tensors")
+    if ffn1_out_2d.device != activated_out.device:
+        raise ValueError("activated_out and ffn1_out_2d must be on the same device")
+    if not ffn1_out_2d.is_floating_point() or not activated_out.is_floating_point():
+        raise TypeError("activation input and output must have floating-point dtypes")
+    if not ffn1_out_2d.is_contiguous() or not activated_out.is_contiguous():
+        raise ValueError("activation input and output must be contiguous")
+
+    rows, n = ffn1_out_2d.shape
+    output_n = moe_activation_output_size(n, is_gated)
+    if activated_out.shape != (rows, output_n):
+        raise ValueError(
+            f"activated_out shape must be {(rows, output_n)}, got {tuple(activated_out.shape)}"
+        )
+    if ffn1_out_2d.numel() == 0:
+        return
+
+    _apply_activation(
+        activation=activation,
+        is_gated=is_gated,
+        activated_out=activated_out,
+        ffn1_out_2d=ffn1_out_2d,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_limit=gemm1_limit,
+        activation_situ_beta=activation_situ_beta,
+        activation_situ_linear_beta=activation_situ_linear_beta,
+    )

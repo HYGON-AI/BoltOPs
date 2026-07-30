@@ -487,7 +487,9 @@ def inplace_fused_experts(hidden_states: torch.Tensor,
                           no_combine: bool = False,
                           routed_scaling_factor: Optional[float] = 1.0,
                           gemm1_alpha: Optional[float] = None,
-                          gemm1_limit: Optional[float] = None) -> None:
+                          gemm1_limit: Optional[float] = None,
+                          activation_situ_beta: Optional[float] = None,
+                          activation_situ_linear_beta: Optional[float] = None) -> None:
     if activation is None:
         activation = "silu"
     fused_experts_impl(
@@ -522,6 +524,8 @@ def inplace_fused_experts(hidden_states: torch.Tensor,
         routed_scaling_factor=routed_scaling_factor,
         gemm1_alpha=gemm1_alpha,
         gemm1_limit=gemm1_limit,
+        activation_situ_beta=activation_situ_beta,
+        activation_situ_linear_beta=activation_situ_linear_beta,
     )
 
 def outplace_fused_experts(
@@ -554,7 +558,9 @@ def outplace_fused_experts(
         no_combine: bool = False,
         routed_scaling_factor: Optional[float] = 1.0,
         gemm1_alpha: Optional[float] = None,
-        gemm1_limit: Optional[float] = None) -> torch.Tensor:
+        gemm1_limit: Optional[float] = None,
+        activation_situ_beta: Optional[float] = None,
+        activation_situ_linear_beta: Optional[float] = None) -> torch.Tensor:
     if activation is None:
         activation = "silu"
     return fused_experts_impl(
@@ -589,6 +595,8 @@ def outplace_fused_experts(
         routed_scaling_factor=routed_scaling_factor,
         gemm1_alpha=gemm1_alpha,
         gemm1_limit=gemm1_limit,
+        activation_situ_beta=activation_situ_beta,
+        activation_situ_linear_beta=activation_situ_linear_beta,
     )
 
 def fused_experts(hidden_states: torch.Tensor,
@@ -621,7 +629,9 @@ def fused_experts(hidden_states: torch.Tensor,
                   no_combine: bool = False,
                   routed_scaling_factor: Optional[float] = 1.0,
                   gemm1_alpha: Optional[float] = None,
-                  gemm1_limit: Optional[float] = None) -> torch.Tensor:
+                  gemm1_limit: Optional[float] = None,
+                  activation_situ_beta: Optional[float] = None,
+                  activation_situ_linear_beta: Optional[float] = None) -> torch.Tensor:
     if activation is None:
         activation = 'silu'
     return fused_experts_impl(
@@ -656,6 +666,8 @@ def fused_experts(hidden_states: torch.Tensor,
         routed_scaling_factor=routed_scaling_factor,
         gemm1_alpha=gemm1_alpha,
         gemm1_limit=gemm1_limit,
+        activation_situ_beta=activation_situ_beta,
+        activation_situ_linear_beta=activation_situ_linear_beta,
     )
 
 def fused_moe_fake(
@@ -690,6 +702,8 @@ def fused_moe_fake(
         routed_scaling_factor: Optional[float] = 1.0,
         gemm1_alpha: Optional[float] = None,
         gemm1_limit: Optional[float] = None,
+        activation_situ_beta: Optional[float] = None,
+        activation_situ_linear_beta: Optional[float] = None,
         fn_key: Optional[str] = None,
 ) -> torch.Tensor:
     device = topk_ids.device
@@ -736,7 +750,9 @@ def fused_experts_impl(hidden_states: torch.Tensor,
                        no_combine: bool = False,
                        routed_scaling_factor: Optional[float] = 1.0,
                        gemm1_alpha: Optional[float] = None,
-                       gemm1_limit: Optional[float] = None)-> torch.Tensor:
+                       gemm1_limit: Optional[float] = None,
+                       activation_situ_beta: Optional[float] = None,
+                       activation_situ_linear_beta: Optional[float] = None)-> torch.Tensor:
     if routed_scaling_factor is None:
         routed_scaling_factor = 1.0
 
@@ -1016,6 +1032,8 @@ def fused_experts_impl(hidden_states: torch.Tensor,
             ffn1_out_2d=intermediate_cache1.view(-1, N),
             gemm1_alpha=gemm1_alpha,
             gemm1_limit=gemm1_limit,
+            activation_situ_beta=activation_situ_beta,
+            activation_situ_linear_beta=activation_situ_linear_beta,
         )
         if expert_map != None:
             # for EP mode, intermediate_cache1 and intermediate_cache3 need be zeros inited

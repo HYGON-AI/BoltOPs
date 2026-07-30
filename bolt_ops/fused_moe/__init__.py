@@ -11,7 +11,6 @@ from typing import List, Optional
 
 import torch
 
-
 def fused_experts(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -44,6 +43,8 @@ def fused_experts(
     routed_scaling_factor: Optional[float] = 1.0,
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
+    activation_situ_beta: Optional[float] = None,
+    activation_situ_linear_beta: Optional[float] = None,
 ) -> torch.Tensor:
     """Run fused MoE experts."""
     from bolt_ops.fused_moe.triton import fused_experts as impl
@@ -80,7 +81,62 @@ def fused_experts(
         routed_scaling_factor=routed_scaling_factor,
         gemm1_alpha=gemm1_alpha,
         gemm1_limit=gemm1_limit,
+        activation_situ_beta=activation_situ_beta,
+        activation_situ_linear_beta=activation_situ_linear_beta,
     )
 
 
-__all__ = ["fused_experts"]
+def normalize_moe_activation(
+    activation: str,
+    is_gated: Optional[bool] = None,
+) -> tuple[str, bool]:
+    """Normalize an activation name and resolve gated mode."""
+    from bolt_ops.fused_moe.triton.moe_activation import (
+        normalize_moe_activation as impl,
+    )
+
+    return impl(activation, is_gated)
+
+
+def moe_activation_output_size(n: int, is_gated: bool) -> int:
+    """Return the output width for an input width and gated mode."""
+    from bolt_ops.fused_moe.triton.moe_activation import (
+        moe_activation_output_size as impl,
+    )
+
+    return impl(n, is_gated)
+
+def moe_activation(
+    activated_out: torch.Tensor,
+    ffn1_out_2d: torch.Tensor,
+    activation: str = "silu",
+    is_gated: Optional[bool] = None,
+    *,
+    gemm1_alpha: Optional[float] = None,
+    gemm1_limit: Optional[float] = None,
+    activation_situ_beta: Optional[float] = None,
+    activation_situ_linear_beta: Optional[float] = None,
+) -> None:
+    """Apply an MoE activation into caller-provided 2D output storage."""
+    from bolt_ops.fused_moe.triton.moe_activation import (
+        moe_activation as impl,
+    )
+
+    impl(
+        activation=activation,
+        is_gated=is_gated,
+        activated_out=activated_out,
+        ffn1_out_2d=ffn1_out_2d,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_limit=gemm1_limit,
+        activation_situ_beta=activation_situ_beta,
+        activation_situ_linear_beta=activation_situ_linear_beta,
+    )
+
+
+__all__ = [
+    "fused_experts",
+    "normalize_moe_activation",
+    "moe_activation_output_size",
+    "moe_activation",
+]

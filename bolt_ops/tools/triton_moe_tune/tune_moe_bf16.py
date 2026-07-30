@@ -26,6 +26,7 @@ try:
         build_compile_group_ids,
         build_run_group_ids,
         resolve_moe_activation_and_gate,
+        resolve_situ_parameters,
         apply_activation_ref,
         resolve_patched_environment,
         enforce_training_patch_contract,
@@ -39,6 +40,7 @@ except ImportError:
             build_compile_group_ids,
             build_run_group_ids,
             resolve_moe_activation_and_gate,
+            resolve_situ_parameters,
             apply_activation_ref,
             resolve_patched_environment,
             enforce_training_patch_contract,
@@ -51,6 +53,7 @@ except ImportError:
             build_compile_group_ids,
             build_run_group_ids,
             resolve_moe_activation_and_gate,
+            resolve_situ_parameters,
             apply_activation_ref,
             resolve_patched_environment,
             enforce_training_patch_contract,
@@ -139,6 +142,9 @@ BATCH_SIZES = FULL_BATCH_SIZES.copy()
 
 
 ACTIVATION_NAME, IS_GATED = resolve_moe_activation_and_gate()
+ACTIVATION_SITU_BETA, ACTIVATION_SITU_LINEAR_BETA = resolve_situ_parameters(
+    ACTIVATION_NAME
+)
 
 
 print(f"[test_moe_bf16.py] Running with TRAINING_MODE={training_mode}, CUR_GROUP={cur_group}!!!")
@@ -379,7 +385,9 @@ def fused_experts_impl_benchmark(hidden_states: torch.Tensor,
                        w2_zp: Optional[torch.Tensor] = None,
                        a1_scale: Optional[torch.Tensor] = None,
                        a2_scale: Optional[torch.Tensor] = None,
-                       block_shape: Optional[List[int]] = None)-> torch.Tensor:
+                       block_shape: Optional[List[int]] = None,
+                       activation_situ_beta: Optional[float] = None,
+                       activation_situ_linear_beta: Optional[float] = None)-> torch.Tensor:
 
     return fused_moe_module.fused_experts_impl(hidden_states,
                                 w1,
@@ -391,7 +399,9 @@ def fused_experts_impl_benchmark(hidden_states: torch.Tensor,
                                 expert_map=expert_map,
                                 inplace=inplace,
                                 activation=activation,
-                                is_gated=IS_GATED)
+                                is_gated=IS_GATED,
+                                activation_situ_beta=activation_situ_beta,
+                                activation_situ_linear_beta=activation_situ_linear_beta)
 
 
 @pytest.mark.parametrize("m", BATCH_SIZES)
@@ -496,6 +506,8 @@ def test_fused_moe(
                         a[mask] @ w1[i].transpose(0, 1),
                         activation_name=ACTIVATION_NAME,
                         is_gated=IS_GATED,
+                        activation_situ_beta=ACTIVATION_SITU_BETA,
+                        activation_situ_linear_beta=ACTIVATION_SITU_LINEAR_BETA,
                     ) @ w2[i].transpose(0, 1)
             return (out.view(B, -1, w2.shape[1]) *
                     topk_weight.view(B, -1, 1).to(out.dtype)).sum(dim=1)
@@ -525,7 +537,9 @@ def test_fused_moe(
                                 expert_map=e_map,
                                 inplace=inplace,
                                 activation=ACTIVATION_NAME,
-                                is_gated=IS_GATED)
+                                is_gated=IS_GATED,
+                                activation_situ_beta=ACTIVATION_SITU_BETA,
+                                activation_situ_linear_beta=ACTIVATION_SITU_LINEAR_BETA)
     if ENABLE_TORCH_REF:
         # torch.set_printoptions(profile="full")
         # print(f"triton_output: {triton_output}, {triton_output.dtype}")
@@ -654,6 +668,8 @@ def bench_fused_moe_bf16(BATCH_SIZE, HIDDEN_SIZE, FFN_HIDDEN_SIZE, NUM_EXPERTS, 
                 expert_map=e_map,
                 inplace=inplace,
                 activation=ACTIVATION_NAME,
+                activation_situ_beta=ACTIVATION_SITU_BETA,
+                activation_situ_linear_beta=ACTIVATION_SITU_LINEAR_BETA,
             )
             ms = avg_us / 1000.0
     else:
