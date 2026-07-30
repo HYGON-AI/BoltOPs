@@ -11,6 +11,7 @@ from bolt_ops.fused_moe.triton.moe_activation import (
     triton_silu_and_mul,
     triton_gelu_and_mul,
     triton_gelu_tanh_and_mul,
+    triton_situ_and_mul,
     triton_relu2,
     triton_silu_no_mul,
     triton_gelu_no_mul,
@@ -42,6 +43,18 @@ def torch_gelu_tanh_and_mul(input: torch.Tensor) -> torch.Tensor:
     d = input.shape[-1] // 2
     x, y = input.split([d, d], dim=-1)
     return F.gelu(x, approximate="tanh") * y
+
+
+def torch_situ_and_mul(
+    input: torch.Tensor,
+    beta: float,
+    linear_beta: float | None = None,
+) -> torch.Tensor:
+    gate, up = input.float().chunk(2, dim=-1)
+    gate = beta * torch.tanh(gate / beta) * torch.sigmoid(gate)
+    if linear_beta is not None:
+        up = linear_beta * torch.tanh(up / linear_beta)
+    return (gate * up).to(input.dtype)
 
 
 def torch_relu2(x: torch.Tensor) -> torch.Tensor:
@@ -260,6 +273,17 @@ def test_all_moe_activation_kernels_smoke(dtype):
     triton_gelu_tanh_and_mul(out_g, inp_g)
     assert checkAllclose(torch_gelu_tanh_and_mul(inp_g), out_g, rtol=rtol, atol=atol, printLog=False) == 0
 
+    situ_beta = 2.0
+    situ_linear_beta = 1.5
+    triton_situ_and_mul(out_g, inp_g, situ_beta, situ_linear_beta)
+    assert checkAllclose(
+        torch_situ_and_mul(inp_g, situ_beta, situ_linear_beta),
+        out_g,
+        rtol=rtol,
+        atol=atol,
+        printLog=False,
+    ) == 0
+
     triton_swiglu_silu_clamp_mul(out_g, inp_g, limit)
     assert checkAllclose(torch_swiglu_silu_clamp_mul(inp_g, limit), out_g, rtol=rtol, atol=atol, printLog=False) == 0
 
@@ -305,6 +329,9 @@ def test_all_activation_strings_covered(dtype):
             elif normalized_activation == "gelu_tanh":
                 inp = chunked_inp
                 ref = torch_gelu_tanh_and_mul(inp)
+            elif normalized_activation == "situ":
+                inp = chunked_inp
+                ref = torch_situ_and_mul(inp, beta=2.0)
             elif normalized_activation == "swigluoai":
                 inp = interleaved_inp
                 ref = torch_swiglu_oai_interleaved(inp, alpha=1.702, limit=7.0)
@@ -327,6 +354,11 @@ def test_all_activation_strings_covered(dtype):
             else:
                 raise AssertionError(f"Unexpected non-gated activation in test: {normalized_activation}")
 
+        apply_kwargs = (
+            {"activation_situ_beta": 2.0}
+            if normalized_activation == "situ"
+            else {}
+        )
         _apply_activation(
             activation=normalized_activation,
             is_gated=is_gated,
@@ -334,6 +366,7 @@ def test_all_activation_strings_covered(dtype):
             ffn1_out_2d=inp,
             gemm1_alpha=None,
             gemm1_limit=None,
+            **apply_kwargs,
         )
         assert checkAllclose(ref, out, rtol=rtol, atol=atol, printLog=False) == 0
 

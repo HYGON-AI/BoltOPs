@@ -45,6 +45,7 @@ from bolt_ops import (
     recompute_w_u_fwd,
     fused_mamba_state_scatter_with_mask,
     fused_experts,
+    moe_activation,
 )
 
 w, u = recompute_w_u_fwd(k, v, beta, g_cumsum, A, cu_seqlens)
@@ -52,6 +53,8 @@ w, u = recompute_w_u_fwd(k, v, beta, g_cumsum, A, cu_seqlens)
 fused_mamba_state_scatter_with_mask(dst, src, dst_indices_raw, step_indices_raw)
 
 out = fused_experts(hidden_states, w1, w2, topk_weights, topk_ids)
+
+moe_activation(activated, ffn1_out, activation="silu")
 ```
 
 需要做实现 A/B 时，直接 import 后端模块，不要绕公开 API：
@@ -68,6 +71,7 @@ from bolt_ops.recompute_w_u.triton.recompute_w_u import recompute_w_u_fwd as tri
 | Mixed         | `recompute_w_u_fwd`                   | Triton ✅ TileLang ❌ | Triton @zhenxin TileLang @xxx | Triton             | [docs](docs/ops/recompute_w_u.md)       |
 | Mixed         | `fused_mamba_state_scatter_with_mask` | Triton ✅ TileLang ❌ | Triton @zhenxin TileLang @xxx | Triton             | [docs](docs/ops/mamba_state_scatter.md) |
 | MoE系列       | `fused_experts`                       | Triton ✅ TileLang ❌ | Triton @zhenxin TileLang @xxx | Triton (混合+策略) | [docs](docs/ops/fused_moe.md)           |
+| MoE系列       | `moe_activation`                     | Triton ✅ TileLang ❌ | Triton @zhenxin TileLang @xxx | Triton             | [docs](docs/ops/moe_activation.md)      |
 | MHC           |                                         |                       |                               |                    |                                        |
 | Gemm系列      |                                         |                       |                               |                    |                                        |
 | AwqGemm       |                                         |                       |                               |                    |                                        |

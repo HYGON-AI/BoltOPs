@@ -67,6 +67,7 @@ VALID_MOE_ACTIVATIONS = {
     "gelu",
     "gelu_tanh",
     "gelu_pytorch_tanh",
+    "situ",
     "swigluoai",
     "swiglustep",
     "silu_no_mul",
@@ -580,7 +581,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "覆盖 MOE_ACTIVATION。支持: "
-            "silu/gelu/gelu_tanh/swigluoai/swiglustep/"
+            "silu/gelu/gelu_tanh/situ/swigluoai/swiglustep/"
             "silu_no_mul/gelu_no_mul/gelu_tanh_no_mul/relu2(_no_mul)"
         ),
     )
@@ -589,6 +590,18 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="覆盖 MOE_IS_GATED。支持 true/false (或 1/0)，默认由 activation 自动推断",
+    )
+    moe_group.add_argument(
+        "--activation-situ-beta",
+        type=float,
+        default=None,
+        help="SITU 的 beta；--activation situ 时必填且必须大于 0",
+    )
+    moe_group.add_argument(
+        "--activation-situ-linear-beta",
+        type=float,
+        default=None,
+        help="SITU 可选的 linear_beta；设置时必须大于 0",
     )
 
     runtime_group.add_argument(
@@ -761,6 +774,19 @@ def main() -> int:
             print(f"错误: {exc}", file=sys.stderr)
             return 1
 
+    if args.activation_situ_beta is not None and args.activation_situ_beta <= 0:
+        print("错误: --activation-situ-beta 必须大于 0", file=sys.stderr)
+        return 1
+    if (
+        args.activation_situ_linear_beta is not None
+        and args.activation_situ_linear_beta <= 0
+    ):
+        print("错误: --activation-situ-linear-beta 必须大于 0", file=sys.stderr)
+        return 1
+    if activation_value == "situ" and args.activation_situ_beta is None:
+        print("错误: --activation situ 时必须设置 --activation-situ-beta", file=sys.stderr)
+        return 1
+
     env = os.environ.copy()
     # develop：把仓库根加入 PYTHONPATH，便于未 editable 安装时导入 bolt_ops。
     # installed：依赖 site-packages 中的 bolt_ops，勿把 parents[2] 误加进 PYTHONPATH。
@@ -779,6 +805,8 @@ def main() -> int:
         "MOE_BLOCK_SHAPE",
         "MOE_ACTIVATION",
         "MOE_IS_GATED",
+        "MOE_ACTIVATION_SITU_BETA",
+        "MOE_ACTIVATION_SITU_LINEAR_BETA",
         "AUTOTUNE_DEVICE_START_ID",
         "AUTOTUNE_DEVICE_COUNT",
         "AUTOTUNE_NUM_GROUPS_RUN",
@@ -804,6 +832,12 @@ def main() -> int:
         env["MOE_ACTIVATION"] = activation_value
     if is_gated_value is not None:
         env["MOE_IS_GATED"] = "1" if is_gated_value else "0"
+    if args.activation_situ_beta is not None:
+        env["MOE_ACTIVATION_SITU_BETA"] = str(args.activation_situ_beta)
+    if args.activation_situ_linear_beta is not None:
+        env["MOE_ACTIVATION_SITU_LINEAR_BETA"] = str(
+            args.activation_situ_linear_beta
+        )
 
     if args.device_start_id is not None:
         env["AUTOTUNE_DEVICE_START_ID"] = str(args.device_start_id)
@@ -883,6 +917,11 @@ def main() -> int:
         ("block_shape", env.get("MOE_BLOCK_SHAPE", "<script_default_or_unused>")),
         ("activation", env.get("MOE_ACTIVATION", "<script_default>")),
         ("is_gated", env.get("MOE_IS_GATED", "<auto_by_activation>")),
+        ("activation_situ_beta", env.get("MOE_ACTIVATION_SITU_BETA", "<unset>")),
+        (
+            "activation_situ_linear_beta",
+            env.get("MOE_ACTIVATION_SITU_LINEAR_BETA", "<unset>"),
+        ),
         ("fixed_group_size", FIXED_GROUP_SIZE_BY_TEST.get(args.test_type, "<n/a>")),
         ("batch_sizes", env.get("MOE_BATCH_SIZES")),
         ("splitk_size", env.get("SPLITK_SIZE")),

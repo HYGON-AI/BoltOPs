@@ -33,6 +33,16 @@ def parse_env_optional_bool(name: str) -> bool | None:
     raise ValueError(f"{name} 仅支持 true/false (或 1/0)，当前值: {raw!r}")
 
 
+def parse_env_optional_float(name: str) -> float | None:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return None
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} 必须是浮点数，当前值: {raw!r}") from exc
+
+
 def resolve_moe_activation_and_gate(
     *,
     activation_env: str = "MOE_ACTIVATION",
@@ -47,7 +57,33 @@ def resolve_moe_activation_and_gate(
     )
 
 
-def apply_activation_ref(x, *, activation_name: str, is_gated: bool):
+def resolve_situ_parameters(
+    activation_name: str,
+    *,
+    beta_env: str = "MOE_ACTIVATION_SITU_BETA",
+    linear_beta_env: str = "MOE_ACTIVATION_SITU_LINEAR_BETA",
+) -> tuple[float | None, float | None]:
+    beta = parse_env_optional_float(beta_env)
+    linear_beta = parse_env_optional_float(linear_beta_env)
+    if activation_name != "situ":
+        return beta, linear_beta
+    if beta is None:
+        raise ValueError(f"activation='situ' 时必须设置 {beta_env}")
+    if beta <= 0:
+        raise ValueError(f"{beta_env} 必须大于 0")
+    if linear_beta is not None and linear_beta <= 0:
+        raise ValueError(f"{linear_beta_env} 必须大于 0")
+    return beta, linear_beta
+
+
+def apply_activation_ref(
+    x,
+    *,
+    activation_name: str,
+    is_gated: bool,
+    activation_situ_beta: float | None = None,
+    activation_situ_linear_beta: float | None = None,
+):
     import torch
     import torch.nn.functional as F
 
@@ -59,6 +95,18 @@ def apply_activation_ref(x, *, activation_name: str, is_gated: bool):
             act = F.gelu(gate, approximate="none")
         elif activation_name == "gelu_tanh":
             act = F.gelu(gate, approximate="tanh")
+        elif activation_name == "situ":
+            if activation_situ_beta is None:
+                raise ValueError("SITU reference requires activation_situ_beta")
+            act = (
+                activation_situ_beta
+                * torch.tanh(gate / activation_situ_beta)
+                * torch.sigmoid(gate)
+            )
+            if activation_situ_linear_beta is not None:
+                up = activation_situ_linear_beta * torch.tanh(
+                    up / activation_situ_linear_beta
+                )
         elif activation_name == "swigluoai":
             gate_clamp = torch.clamp(gate, max=7.0)
             up_clamp = torch.clamp(up, min=-7.0, max=7.0)

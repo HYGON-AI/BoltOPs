@@ -49,6 +49,7 @@ from bolt_ops import (
     recompute_w_u_fwd,
     fused_mamba_state_scatter_with_mask,
     fused_experts,
+    moe_activation,
 )
 
 w, u = recompute_w_u_fwd(k, v, beta, g_cumsum, A, cu_seqlens)
@@ -56,6 +57,8 @@ w, u = recompute_w_u_fwd(k, v, beta, g_cumsum, A, cu_seqlens)
 fused_mamba_state_scatter_with_mask(dst, src, dst_indices_raw, step_indices_raw)
 
 out = fused_experts(hidden_states, w1, w2, topk_weights, topk_ids)
+
+moe_activation(activated, ffn1_out, activation="silu")
 ```
 
 For A/B of backends, import the backend module directly — do not go around the public API:
@@ -75,6 +78,7 @@ from bolt_ops.recompute_w_u.triton.recompute_w_u import recompute_w_u_fwd as tri
 | Mixed           | `recompute_w_u_fwd`                   | Triton ✅ TileLang ❌ | Triton @zhenxin TileLang @xxx | Triton                | [docs](docs/ops/recompute_w_u.md)       |
 | Mixed           | `fused_mamba_state_scatter_with_mask` | Triton ✅ TileLang ❌ | Triton @zhenxin TileLang @xxx | Triton                | [docs](docs/ops/mamba_state_scatter.md) |
 | MoE family      | `fused_experts`                       | Triton ✅ TileLang ❌ | Triton @zhenxin TileLang @xxx | Triton (mixed+policy) | [docs](docs/ops/fused_moe.md)           |
+| MoE family      | `moe_activation`                     | Triton ✅ TileLang ❌ | Triton @zhenxin TileLang @xxx | Triton                | [docs](docs/ops/moe_activation.md)      |
 | MHC             |                                       |                     |                               |                       |                                         |
 | Gemm family     |                                       |                     |                               |                       |                                         |
 | AwqGemm         |                                       |                     |                               |                       |                                         |
@@ -137,4 +141,3 @@ pytest test --bench -s       # correctness + real model-size performance
 1. Create `bolt_ops/<op>/` with `triton/` and `tilelang/` impls; put correctness in `test/test_<op>.py` and model-size benches under `@pytest.mark.bench`, then use `--bench` to pick the winner.
 2. Prefer public signatures aligned with vLLM / SGLang (or HIPC / CUDA C); wire ship-time backend selection in `bolt_ops/<op>/__init__.py` and export.
 3. Re-export from `bolt_ops/__init__.py` and add `docs/ops/`.
-

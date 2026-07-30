@@ -20,6 +20,10 @@ out += w * y                          # 再按 topk 聚合；可选 no_combine
 
 ## 2. 接口说明
 
+第一层 GEMM 后的激活也可作为独立公开算子调用；接口、支持的激活类型以及
+aiter `moe_c` / `moe_asm` / `moe_triton` 的显式输出接入方式见
+[`moe_activation`](moe_activation.md)。
+
 ```python
 from bolt_ops import fused_experts
 
