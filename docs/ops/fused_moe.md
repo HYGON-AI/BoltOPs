@@ -127,6 +127,45 @@ def fused_experts(
 `bolt-moe-tune-cli` 的第一个参数仍是站点码（`nmz`/`bmz`/`zd`/`yy`），
 会映射到对应 `arch` 再写 JSON（见调参手册）。
 
+### 3.1 腾讯 5B FP16 接入约定
+
+该模型的 `T=56` 表示 56 组位置相关专家。每组有 7 个 routed experts（7 选 1）
+和 1 个始终执行的 shared expert：
+
+```text
+E_routed = 56 × 7 = 392
+E_shared = 56 × 1 = 56
+E_total  = 448
+```
+
+完整模型每个 token 有 `1 routed + 1 shared` 两路输出，因此模型语义上的
+`topk=2`。当前 `fused_experts` 不负责 shared 路径，正式接入必须拆分：
+
+```text
+routed_out = fused_experts(... E=392, topk=1 ...)
+shared_out = framework_shared_expert(... E=56 ...)
+output     = routed_out + shared_out
+```
+
+以 `B=234, D=1232, I=1536` 为例，Bolt routed 调用使用：
+
+- `hidden_states=[13104,1232]`
+- `w1=[392,3072,1232]`
+- `w2=[392,1232,1536]`
+- `topk_ids/topk_weights=[13104,1]`
+
+第 `t` 组的局部 routed id 需映射为 `t * 7 + local_id`。shared 的 56 份权重
+由框架独立管理；当前对接按 `use_ln=0`，不做 shared LayerNorm。
+
+来源 weight 不满足 Bolt layout 时，在模型加载/初始化阶段提前转换：来源
+`w12=[E,D,2I]` 按 gated-half 语义交换后转置成 `w1=[E,2I,D]`，来源
+`wout=[E,I,D]` 转置成 `w2=[E,D,I]`。也可以直接使用 Bolt native weight。
+该转换不计入 kernel benchmark。routed/shared 必须分别转换，不能拼成 `E=448`
+后以 `topk=2` 传给当前 Bolt MoE。
+
+因此，5B FP16 的调优配置也应按 routed 路径的 `E=392、topk=1` 生成；
+`E=448、topk=2` 只表示完整模型的两路语义，不是当前 `fused_experts` 的调用参数。
+
 ## 4. 正确性测试与性能基准
 
 线上 shape 的精度回归、autotune、以及性能测速统一走随包发布的

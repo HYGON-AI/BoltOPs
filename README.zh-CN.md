@@ -42,11 +42,25 @@ pip install -e ".[all]"             # Triton + TileLang
 
 ```python
 from bolt_ops import (
+    attn_res,
     recompute_w_u_fwd,
     fused_mamba_state_scatter_with_mask,
     fused_experts,
     moe_activation,
 )
+from bolt_ops.kda import (
+    chunk_gla_fwd_o_gk,
+    chunk_kda_fwd_intra,
+    chunk_kda_fwd_intra_token_parallel,
+    fused_kda_gate,
+    fused_kda_gate_chunk_cumsum,
+    fused_recurrent_kda,
+    fused_recurrent_kda_fwd,
+    fused_recurrent_kda_packed_decode,
+    recompute_w_u_fwd as kda_recompute_w_u_fwd,
+)
+
+mixed = attn_res(prefix, blocks, norm_weight, qk_weight, num_blocks, eps)
 
 w, u = recompute_w_u_fwd(k, v, beta, g_cumsum, A, cu_seqlens)
 
@@ -56,6 +70,9 @@ out = fused_experts(hidden_states, w1, w2, topk_weights, topk_ids)
 
 moe_activation(activated, ffn1_out, activation="silu")
 ```
+
+KDA 通过 `bolt_ops.kda` 提供直接移植的 Triton Kernel 与 launch wrapper；Prefill
+和 packed decode 的接口说明见 [KDA 算子文档](docs/ops/kda.md)。
 
 需要做实现 A/B 时，直接 import 后端模块，不要绕公开 API：
 
@@ -68,6 +85,7 @@ from bolt_ops.recompute_w_u.triton.recompute_w_u import recompute_w_u_fwd as tri
 
 | 算子类别      | 接口名                                  | DSLs                  | 维护者                        | 出厂后端           | 介绍和文档                             |
 | ------------- | --------------------------------------- | --------------------- | ----------------------------- | ------------------ | -------------------------------------- |
+| Mixed         | `attn_res`                            | Triton ✅ TileLang ❌ | Triton @zhenxin TileLang @xxx | Triton             | [docs](docs/ops/attn_res.md)            |
 | Mixed         | `recompute_w_u_fwd`                   | Triton ✅ TileLang ❌ | Triton @zhenxin TileLang @xxx | Triton             | [docs](docs/ops/recompute_w_u.md)       |
 | Mixed         | `fused_mamba_state_scatter_with_mask` | Triton ✅ TileLang ❌ | Triton @zhenxin TileLang @xxx | Triton             | [docs](docs/ops/mamba_state_scatter.md) |
 | MoE系列       | `fused_experts`                       | Triton ✅ TileLang ❌ | Triton @zhenxin TileLang @xxx | Triton (混合+策略) | [docs](docs/ops/fused_moe.md)           |
@@ -76,7 +94,15 @@ from bolt_ops.recompute_w_u.triton.recompute_w_u import recompute_w_u_fwd as tri
 | Gemm系列      |                                         |                       |                               |                    |                                        |
 | AwqGemm       |                                         |                       |                               |                    |                                        |
 | SageAttention |                                         |                       |                               |                    |                                        |
-| FLA系列       |                                         |                       |                               |                    |                                        |
+| KDA 系列      | `chunk_gla_fwd_o_gk`                  | Triton ✅ TileLang ❌ | Triton @zhenxin TileLang @xxx | Triton             | [docs](docs/ops/kda.md)                 |
+| KDA 系列      | `chunk_kda_fwd_intra`                 | Triton ✅ TileLang ❌ | Triton @zhenxin TileLang @xxx | Triton             | [docs](docs/ops/kda.md)                 |
+| KDA 系列      | `chunk_kda_fwd_intra_token_parallel`  | Triton ✅ TileLang ❌ | Triton @zhenxin TileLang @xxx | Triton             | [docs](docs/ops/kda.md)                 |
+| KDA 系列      | `fused_kda_gate`                      | Triton ✅ TileLang ❌ | Triton @zhenxin TileLang @xxx | Triton             | [docs](docs/ops/kda.md)                 |
+| KDA 系列      | `fused_kda_gate_chunk_cumsum`         | Triton ✅ TileLang ❌ | Triton @zhenxin TileLang @xxx | Triton             | [docs](docs/ops/kda.md)                 |
+| KDA 系列      | `fused_recurrent_kda`                 | Triton ✅ TileLang ❌ | Triton @zhenxin TileLang @xxx | Triton             | [docs](docs/ops/kda.md)                 |
+| KDA 系列      | `fused_recurrent_kda_fwd`             | Triton ✅ TileLang ❌ | Triton @zhenxin TileLang @xxx | Triton             | [docs](docs/ops/kda.md)                 |
+| KDA 系列      | `fused_recurrent_kda_packed_decode`   | Triton ✅ TileLang ❌ | Triton @zhenxin TileLang @xxx | Triton             | [docs](docs/ops/kda.md)                 |
+| KDA 系列      | `recompute_w_u_fwd`                   | Triton ✅ TileLang ❌ | Triton @zhenxin TileLang @xxx | Triton             | [docs](docs/ops/kda.md)                 |
 | FA系列        |                                         |                       |                               |                    |                                        |
 | DeepGemm系列  |                                         |                       |                               |                    |                                        |
 | MLA系列       |                                         |                       |                               |                    |                                        |

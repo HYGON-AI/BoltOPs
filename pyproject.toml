@@ -39,6 +39,8 @@ bolt-moe-tune-cli = "bolt_ops.tools.triton_moe_tune.tune_moe_cli:main"
 [tool.setuptools]
 packages = [
     "bolt_ops",
+    "bolt_ops.attn_res",
+    "bolt_ops.attn_res.triton",
     "bolt_ops.fused_moe",
     "bolt_ops.fused_moe.triton",
     "bolt_ops.fused_moe.triton.configs",
@@ -46,6 +48,9 @@ packages = [
     "bolt_ops.mamba_state_scatter",
     "bolt_ops.mamba_state_scatter.triton",
     "bolt_ops.mamba_state_scatter.tilelang",
+    "bolt_ops.kda",
+    "bolt_ops.kda.triton",
+    "bolt_ops.kda.triton.kda",
     "bolt_ops.recompute_w_u",
     "bolt_ops.recompute_w_u.triton",
     "bolt_ops.recompute_w_u.tilelang",
