@@ -46,11 +46,25 @@ Callers should use the public API only:
 
 ```python
 from bolt_ops import (
+    attn_res,
     recompute_w_u_fwd,
     fused_mamba_state_scatter_with_mask,
     fused_experts,
     moe_activation,
 )
+from bolt_ops.kda import (
+    chunk_gla_fwd_o_gk,
+    chunk_kda_fwd_intra,
+    chunk_kda_fwd_intra_token_parallel,
+    fused_kda_gate,
+    fused_kda_gate_chunk_cumsum,
+    fused_recurrent_kda,
+    fused_recurrent_kda_fwd,
+    fused_recurrent_kda_packed_decode,
+    recompute_w_u_fwd as kda_recompute_w_u_fwd,
+)
+
+mixed = attn_res(prefix, blocks, norm_weight, qk_weight, num_blocks, eps)
 
 w, u = recompute_w_u_fwd(k, v, beta, g_cumsum, A, cu_seqlens)
 
@@ -60,6 +74,10 @@ out = fused_experts(hidden_states, w1, w2, topk_weights, topk_ids)
 
 moe_activation(activated, ffn1_out, activation="silu")
 ```
+
+KDA exposes the directly migrated Triton kernels and launch wrappers through
+`bolt_ops.kda`; see [the KDA operator guide](docs/ops/kda.md) for prefill and
+packed-decode signatures.
 
 For A/B of backends, import the backend module directly — do not go around the public API:
 
@@ -75,6 +93,7 @@ from bolt_ops.recompute_w_u.triton.recompute_w_u import recompute_w_u_fwd as tri
 
 | Category        | API                                   | DSLs                | Maintainers                   | Default backend       | Intro & docs                            |
 | --------------- | ------------------------------------- | ------------------- | ----------------------------- | --------------------- | --------------------------------------- |
+| Mixed           | `attn_res`                            | Triton ✅ TileLang ❌ | Triton @zhenxin TileLang @xxx | Triton                | [docs](docs/ops/attn_res.md)            |
 | Mixed           | `recompute_w_u_fwd`                   | Triton ✅ TileLang ❌ | Triton @zhenxin TileLang @xxx | Triton                | [docs](docs/ops/recompute_w_u.md)       |
 | Mixed           | `fused_mamba_state_scatter_with_mask` | Triton ✅ TileLang ❌ | Triton @zhenxin TileLang @xxx | Triton                | [docs](docs/ops/mamba_state_scatter.md) |
 | MoE family      | `fused_experts`                       | Triton ✅ TileLang ❌ | Triton @zhenxin TileLang @xxx | Triton (mixed+policy) | [docs](docs/ops/fused_moe.md)           |
@@ -83,7 +102,15 @@ from bolt_ops.recompute_w_u.triton.recompute_w_u import recompute_w_u_fwd as tri
 | Gemm family     |                                       |                     |                               |                       |                                         |
 | AwqGemm         |                                       |                     |                               |                       |                                         |
 | SageAttention   |                                       |                     |                               |                       |                                         |
-| FLA family      |                                       |                     |                               |                       |                                         |
+| KDA family      | `chunk_gla_fwd_o_gk`                  | Triton ✅ TileLang ❌ | Triton @zhenxin TileLang @xxx | Triton                | [docs](docs/ops/kda.md)                 |
+| KDA family      | `chunk_kda_fwd_intra`                 | Triton ✅ TileLang ❌ | Triton @zhenxin TileLang @xxx | Triton                | [docs](docs/ops/kda.md)                 |
+| KDA family      | `chunk_kda_fwd_intra_token_parallel`  | Triton ✅ TileLang ❌ | Triton @zhenxin TileLang @xxx | Triton                | [docs](docs/ops/kda.md)                 |
+| KDA family      | `fused_kda_gate`                      | Triton ✅ TileLang ❌ | Triton @zhenxin TileLang @xxx | Triton                | [docs](docs/ops/kda.md)                 |
+| KDA family      | `fused_kda_gate_chunk_cumsum`         | Triton ✅ TileLang ❌ | Triton @zhenxin TileLang @xxx | Triton                | [docs](docs/ops/kda.md)                 |
+| KDA family      | `fused_recurrent_kda`                 | Triton ✅ TileLang ❌ | Triton @zhenxin TileLang @xxx | Triton                | [docs](docs/ops/kda.md)                 |
+| KDA family      | `fused_recurrent_kda_fwd`             | Triton ✅ TileLang ❌ | Triton @zhenxin TileLang @xxx | Triton                | [docs](docs/ops/kda.md)                 |
+| KDA family      | `fused_recurrent_kda_packed_decode`   | Triton ✅ TileLang ❌ | Triton @zhenxin TileLang @xxx | Triton                | [docs](docs/ops/kda.md)                 |
+| KDA family      | `recompute_w_u_fwd`                   | Triton ✅ TileLang ❌ | Triton @zhenxin TileLang @xxx | Triton                | [docs](docs/ops/kda.md)                 |
 | FA family       |                                       |                     |                               |                       |                                         |
 | DeepGemm family |                                       |                     |                               |                       |                                         |
 | MLA family      |                                       |                     |                               |                       |                                         |
