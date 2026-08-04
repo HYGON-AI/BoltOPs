@@ -47,6 +47,15 @@ from bolt_ops import (
     fused_mamba_state_scatter_with_mask,
     fused_experts,
     moe_activation,
+    matmul_persistent,
+    gemm_a16w16,
+    w8a8_triton_block_scaled_mm,
+    triton_scaled_mm,
+    awq_gemm_triton,
+    gemm_a8w8_blockscale,
+    gemm_afp4wfp4,
+    batched_gemm_a16wfp4,
+    w8a8_block_int8_matmul,
 )
 from bolt_ops.kda import (
     chunk_gla_fwd_o_gk,
@@ -69,6 +78,17 @@ fused_mamba_state_scatter_with_mask(dst, src, dst_indices_raw, step_indices_raw)
 out = fused_experts(hidden_states, w1, w2, topk_weights, topk_ids)
 
 moe_activation(activated, ffn1_out, activation="silu")
+
+# Gemm 系列（布局与 vLLM / aiter 调用一致）
+c = matmul_persistent(a, b, bias)         # vLLM Triton persistent；B[K,N]
+y = gemm_a16w16(x, weight, bias)          # aiter A16W16；weight 为 [N,K]
+c = w8a8_triton_block_scaled_mm(A, B, As, Bs, [128, 128])
+c = triton_scaled_mm(a, b, scale_a, scale_b, out_dtype=torch.float16)
+c = awq_gemm_triton(x, qweight, scales, qzeros, split_k_iters)
+y = gemm_a8w8_blockscale(x, w, x_scale, w_scale)
+y = gemm_afp4wfp4(x, w, x_scales, w_scales)          # 需要 FP4 GPU
+y = batched_gemm_a16wfp4(x, w, w_scales)             # 需要 FP4 GPU
+c = w8a8_block_int8_matmul(A, B, As, Bs, [128, 128]) # SGLang INT8 block
 ```
 
 KDA 通过 `bolt_ops.kda` 提供直接移植的 Triton Kernel 与 launch wrapper；Prefill
@@ -91,8 +111,15 @@ from bolt_ops.recompute_w_u.triton.recompute_w_u import recompute_w_u_fwd as tri
 | MoE系列       | `fused_experts`                       | Triton ✅ TileLang ❌ | Triton @zhenxin TileLang @xxx | Triton (混合+策略) | [docs](docs/ops/fused_moe.md)           |
 | MoE系列       | `moe_activation`                     | Triton ✅ TileLang ❌ | Triton @zhenxin TileLang @xxx | Triton             | [docs](docs/ops/moe_activation.md)      |
 | MHC           |                                         |                       |                               |                    |                                        |
-| Gemm系列      |                                         |                       |                               |                    |                                        |
-| AwqGemm       |                                         |                       |                               |                    |                                        |
+| Gemm系列      | `matmul_persistent`                 | Triton ✅ TileLang ❌ | Triton @xukang TileLang @xxx | Triton | [docs](docs/ops/gemm.md) |
+| Gemm系列      | `gemm_a16w16`                       | Triton ✅ TileLang ❌ | Triton @xukang TileLang @xxx | Triton | [docs](docs/ops/gemm.md) |
+| Gemm系列      | `w8a8_triton_block_scaled_mm`       | Triton ✅ TileLang ❌ | Triton @xukang TileLang @xxx | Triton | [docs](docs/ops/gemm.md) |
+| Gemm系列      | `triton_scaled_mm`                  | Triton ✅ TileLang ❌ | Triton @xukang TileLang @xxx | Triton | [docs](docs/ops/gemm.md) |
+| Gemm系列      | `awq_gemm_triton`                   | Triton ✅ TileLang ❌ | Triton @xukang TileLang @xxx | Triton | [docs](docs/ops/gemm.md) |
+| Gemm系列      | `gemm_a8w8_blockscale`              | Triton ✅ TileLang ❌ | Triton @xukang TileLang @xxx | Triton | [docs](docs/ops/gemm.md) |
+| Gemm系列      | `gemm_afp4wfp4`                     | Triton ✅ TileLang ❌ | Triton @xukang TileLang @xxx | Triton | [docs](docs/ops/gemm.md) |
+| Gemm系列      | `batched_gemm_a16wfp4`              | Triton ✅ TileLang ❌ | Triton @xukang TileLang @xxx | Triton | [docs](docs/ops/gemm.md) |
+| Gemm系列      | `w8a8_block_int8_matmul`            | Triton ✅ TileLang ❌ | Triton @xukang TileLang @xxx | Triton | [docs](docs/ops/gemm.md) |
 | SageAttention |                                         |                       |                               |                    |                                        |
 | KDA 系列      | `chunk_gla_fwd_o_gk`                  | Triton ✅ TileLang ❌ | Triton @zhenxin TileLang @xxx | Triton             | [docs](docs/ops/kda.md)                 |
 | KDA 系列      | `chunk_kda_fwd_intra`                 | Triton ✅ TileLang ❌ | Triton @zhenxin TileLang @xxx | Triton             | [docs](docs/ops/kda.md)                 |
