@@ -18,6 +18,72 @@ cdiv = triton.cdiv
 next_power_of_2 = triton.next_power_of_2
 
 
+# Offline-tuned on BW1100, BF16/FP32, D=128.  These candidate sets cover
+# decode (tokens, heads)={(1, 3), (4, 3), (6, 24), (8, 12), (16, 24)}.
+KDA_GATE_BETA_CONFIGS = (
+    {"BT": 2, "num_warps": 2, "num_stages": 3},  # T=1 and T=6
+    {"BT": 2, "num_warps": 8, "num_stages": 2},  # T=4 and T=8
+    {"BT": 8, "num_warps": 4, "num_stages": 3},  # T=16
+)
+
+FUSED_RECURRENT_KDA_CONFIGS = (
+    {"BV": 8, "num_warps": 1, "num_stages": 2},  # B=1
+    {"BV": 16, "num_warps": 1, "num_stages": 1},  # B>=16 or H>=24
+    {"BV": 8, "num_warps": 1, "num_stages": 1},  # B=4 or B=8
+)
+
+FUSED_RECURRENT_KDA_PACKED_DECODE_CONFIGS = (
+    {"BV": 8, "num_warps": 1, "num_stages": 2},  # B=8
+    {"BV": 8, "num_warps": 1, "num_stages": 1},  # B<=6
+    {"BV": 32, "num_warps": 2, "num_stages": 2},  # B>=16
+)
+
+
+def get_kda_gate_beta_config(T: int, H: int, _D: int) -> dict[str, int]:
+    if T >= 16:
+        return KDA_GATE_BETA_CONFIGS[2]
+    if T >= 6 and H >= 24:
+        return KDA_GATE_BETA_CONFIGS[0]
+    if T >= 4:
+        return KDA_GATE_BETA_CONFIGS[1]
+    return KDA_GATE_BETA_CONFIGS[0]
+
+
+def get_fused_recurrent_kda_config(
+    B: int,
+    _T: int,
+    H: int,
+    use_gate_in_kernel: bool,
+) -> dict[str, int]:
+    if use_gate_in_kernel:
+        if B <= 1:
+            return FUSED_RECURRENT_KDA_CONFIGS[0]
+        if H < 24:
+            return FUSED_RECURRENT_KDA_CONFIGS[2]
+        return FUSED_RECURRENT_KDA_CONFIGS[1]
+
+    if B <= 1 or B >= 8:
+        return FUSED_RECURRENT_KDA_CONFIGS[1]
+    if H >= 24:
+        return FUSED_RECURRENT_KDA_CONFIGS[0]
+    return FUSED_RECURRENT_KDA_CONFIGS[2]
+
+
+def get_fused_recurrent_kda_packed_decode_config(
+    B: int,
+    H: int,
+    K: int,
+    V: int,
+) -> dict[str, int]:
+    if K < 128 or V < 128:
+        return FUSED_RECURRENT_KDA_PACKED_DECODE_CONFIGS[1]
+    if B <= 6:
+        return FUSED_RECURRENT_KDA_PACKED_DECODE_CONFIGS[1]
+    if B < 16:
+        return FUSED_RECURRENT_KDA_PACKED_DECODE_CONFIGS[0]
+    return FUSED_RECURRENT_KDA_PACKED_DECODE_CONFIGS[2]
+
+
 @triton.heuristics(
     {
         "HAS_DT_BIAS": lambda args: args["dt_bias"] is not None,
@@ -103,8 +169,9 @@ def _fused_kda_gate_beta(
     gate = torch.empty((B, T, H, D), dtype=torch.float32, device=raw_g.device)
     beta = torch.empty((B, T, H), dtype=torch.float32, device=raw_beta.device)
 
-    BT = 16
-    _kda_gate_beta_fwd_kernel[(cdiv(T, BT), H)](
+    config = get_kda_gate_beta_config(T, H, D)
+    grid = (cdiv(T, config["BT"]), H)
+    _kda_gate_beta_fwd_kernel[grid](
         raw_g=raw_g,
         raw_beta=raw_beta,
         A_log=A_log,
@@ -119,9 +186,8 @@ def _fused_kda_gate_beta(
         stride_beta_token=raw_beta.stride(1),
         H=H,
         D=D,
-        BT=BT,
         BD=next_power_of_2(D),
-        num_warps=4,
+        **config,
     )
     return gate, beta
 
@@ -348,9 +414,10 @@ def fused_recurrent_kda_fwd(
     if scale is None:
         scale = K**-0.5
 
-    BV = 32 if use_gate_in_kernel else 8
-    num_warps = 4 if use_gate_in_kernel else 1
-    grid = (cdiv(V, BV) * N * H,)
+    config = get_fused_recurrent_kda_config(
+        N, T, H, use_gate_in_kernel
+    )
+    grid = (cdiv(V, config["BV"]) * N * H,)
     fused_recurrent_kda_fwd_kernel[grid](
         q=q,
         k=k,
@@ -372,7 +439,6 @@ def fused_recurrent_kda_fwd(
         K=K,
         V=V,
         BK=next_power_of_2(K),
-        BV=BV,
         stride_qkv_token=q.stride(1),
         stride_g_token=g.stride(1),
         stride_beta_token=beta.stride(1),
@@ -383,8 +449,7 @@ def fused_recurrent_kda_fwd(
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         USE_GATE_IN_KERNEL=use_gate_in_kernel,
         APPLY_BETA_SIGMOID=use_beta_sigmoid_in_kernel,
-        num_warps=num_warps,
-        num_stages=2,
+        **config,
     )
     return out, initial_state
 
@@ -537,6 +602,91 @@ def fused_recurrent_kda_packed_decode_kernel(
     tl.store(p_state, b_state.to(p_state.dtype.element_ty), mask=mask_state)
 
 
+@triton.jit
+def fused_recurrent_kda_packed_decode_3d_kernel(
+    mixed_qkv,
+    raw_g,
+    raw_beta,
+    A_log,
+    dt_bias,
+    out,
+    state,
+    state_indices,
+    lower_bound,
+    scale: tl.constexpr,
+    stride_mixed_token: tl.constexpr,
+    stride_g_token: tl.constexpr,
+    stride_beta_token: tl.constexpr,
+    stride_state_token: tl.constexpr,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+):
+    """Bounded-gate packed decode with direct (V tile, head, token) IDs."""
+    i_v, i_h, i_n = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    o_k = tl.arange(0, BK)
+    o_v = i_v * BV + tl.arange(0, BV)
+    mask_k = o_k < K
+    mask_v = o_v < V
+
+    state_idx = tl.load(state_indices + i_n).to(tl.int64)
+    p_out = out + (i_n * H + i_h) * V + o_v
+    if state_idx <= 0:
+        tl.store(p_out, 0.0, mask=mask_v)
+        return
+
+    p_mixed = mixed_qkv + i_n * stride_mixed_token
+    b_q = tl.load(
+        p_mixed + i_h * K + o_k, mask=mask_k, other=0.0
+    ).to(tl.float32)
+    b_k = tl.load(
+        p_mixed + H * K + i_h * K + o_k,
+        mask=mask_k,
+        other=0.0,
+    ).to(tl.float32)
+    b_q /= tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
+    b_k /= tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
+    b_q *= scale
+
+    b_g = tl.load(
+        raw_g + i_n * stride_g_token + i_h * K + o_k,
+        mask=mask_k,
+        other=0.0,
+    ).to(tl.float32)
+    b_bias = tl.load(
+        dt_bias + i_h * K + o_k, mask=mask_k, other=0.0
+    ).to(tl.float32)
+    b_a = exp(tl.load(A_log + i_h).to(tl.float32))
+    b_gate = lower_bound * tl.sigmoid(b_a * (b_g + b_bias))
+    b_beta = tl.sigmoid(
+        tl.load(raw_beta + i_n * stride_beta_token + i_h).to(tl.float32)
+    )
+
+    p_state = (
+        state
+        + state_idx * stride_state_token
+        + i_h * V * K
+        + o_v[:, None] * K
+        + o_k[None, :]
+    )
+    mask_state = mask_v[:, None] & mask_k[None, :]
+    b_state = tl.load(p_state, mask=mask_state, other=0.0).to(tl.float32)
+    b_state *= exp(b_gate)[None, :]
+    b_v = tl.load(
+        p_mixed + 2 * H * K + i_h * V + o_v,
+        mask=mask_v,
+        other=0.0,
+    ).to(tl.float32)
+    b_v = (b_v - tl.sum(b_state * b_k[None, :], axis=1)) * b_beta
+    b_state += b_v[:, None] * b_k[None, :]
+    b_out = tl.sum(b_state * b_q[None, :], axis=1)
+
+    tl.store(p_out, b_out.to(p_out.dtype.element_ty), mask=mask_v)
+    tl.store(p_state, b_state.to(p_state.dtype.element_ty), mask=mask_state)
+
+
 def fused_recurrent_kda_packed_decode(
     mixed_qkv: torch.Tensor,
     raw_g: torch.Tensor,
@@ -591,35 +741,65 @@ def fused_recurrent_kda_packed_decode(
         raise ValueError("`state_indices` must contain one entry per token.")
 
     BK = next_power_of_2(K)
-    BV = min(next_power_of_2(V), 32)
     if scale is None:
         scale = K**-0.5
 
     out = torch.empty((1, B, H, V), dtype=mixed_qkv.dtype, device=device)
-    grid = (cdiv(V, BV), B * H)
-    fused_recurrent_kda_packed_decode_kernel[grid](
-        mixed_qkv=mixed_qkv,
-        raw_g=raw_g,
-        raw_beta=raw_beta,
-        A_log=A_log,
-        dt_bias=dt_bias,
-        out=out,
-        state=initial_state,
-        state_indices=state_indices,
-        lower_bound=lower_bound or 0.0,
-        scale=scale,
-        stride_mixed_token=mixed_qkv.stride(0),
-        stride_g_token=raw_g.stride(1),
-        stride_beta_token=raw_beta.stride(1),
-        stride_state_token=initial_state.stride(0),
-        H=H,
-        K=K,
-        V=V,
-        BK=BK,
-        BV=BV,
-        SOFTPLUS_THRESHOLD=20.0,
-        USE_LOWER_BOUND=lower_bound is not None,
-        num_warps=4,
-        num_stages=2,
+    config = get_fused_recurrent_kda_packed_decode_config(B, H, K, V)
+    use_direct_3d = (
+        lower_bound is not None
+        and K == 128
+        and V == 128
+        and initial_state.dtype == torch.float32
     )
+    if use_direct_3d:
+        grid = (cdiv(V, config["BV"]), H, B)
+        fused_recurrent_kda_packed_decode_3d_kernel[grid](
+            mixed_qkv=mixed_qkv,
+            raw_g=raw_g,
+            raw_beta=raw_beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            out=out,
+            state=initial_state,
+            state_indices=state_indices,
+            lower_bound=lower_bound,
+            scale=scale,
+            stride_mixed_token=mixed_qkv.stride(0),
+            stride_g_token=raw_g.stride(1),
+            stride_beta_token=raw_beta.stride(1),
+            stride_state_token=initial_state.stride(0),
+            H=H,
+            K=K,
+            V=V,
+            BK=BK,
+            **config,
+        )
+    else:
+        # Preserve the upstream softplus and generic-shape implementation.
+        config = {"BV": 16, "num_warps": 1, "num_stages": 3}
+        grid = (cdiv(V, config["BV"]), B * H)
+        fused_recurrent_kda_packed_decode_kernel[grid](
+            mixed_qkv=mixed_qkv,
+            raw_g=raw_g,
+            raw_beta=raw_beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            out=out,
+            state=initial_state,
+            state_indices=state_indices,
+            lower_bound=lower_bound or 0.0,
+            scale=scale,
+            stride_mixed_token=mixed_qkv.stride(0),
+            stride_g_token=raw_g.stride(1),
+            stride_beta_token=raw_beta.stride(1),
+            stride_state_token=initial_state.stride(0),
+            H=H,
+            K=K,
+            V=V,
+            BK=BK,
+            SOFTPLUS_THRESHOLD=20.0,
+            USE_LOWER_BOUND=lower_bound is not None,
+            **config,
+        )
     return out, initial_state

@@ -21,6 +21,12 @@ from bolt_ops.kda import (  # noqa: E402
     fused_recurrent_kda_packed_decode,
     recompute_w_u_fwd,
 )
+from bolt_ops.kda.triton.kda import (  # noqa: E402
+    chunk as kda_chunk_kernels,
+    chunk_intra as kda_intra_kernels,
+    chunk_intra_token_parallel as kda_token_kernels,
+    fused_recurrent as kda_recurrent_kernels,
+)
 from bolt_ops.kda.triton.kda.fused_recurrent import (  # noqa: E402
     _fused_kda_gate_beta,
 )
@@ -51,6 +57,143 @@ def test_public_apis_are_defined_at_package_boundary() -> None:
             ).parameters.values()
         ]
         assert public_parameters == backend_parameters
+
+
+def test_all_kda_kernels_use_bounded_bw1100_static_configs() -> None:
+    kernels = {
+        "recompute_w_u": (
+            kda_chunk_kernels.recompute_w_u_fwd_kernel_beta_factored_head_first
+        ),
+        "chunk_output": kda_chunk_kernels.chunk_gla_fwd_kernel_o_local_first,
+        "gate_cumsum": kda_chunk_kernels.kda_gate_chunk_cumsum_vector_kernel,
+        "gate": kda_chunk_kernels.kda_gate_fwd_kernel,
+        "inter_solve": kda_intra_kernels.chunk_kda_fwd_kernel_inter_solve_fused,
+        "safe_intra": (
+            kda_intra_kernels.chunk_kda_fwd_kernel_intra_sub_chunk_poly_solve_optimized
+        ),
+        "token_intra": (
+            kda_token_kernels.chunk_kda_fwd_kernel_intra_subchunk_raw_optimized
+        ),
+        "decode_gate_beta": kda_recurrent_kernels._kda_gate_beta_fwd_kernel,
+        "recurrent": kda_recurrent_kernels.fused_recurrent_kda_fwd_kernel,
+        "packed_decode": (
+            kda_recurrent_kernels.fused_recurrent_kda_packed_decode_3d_kernel
+        ),
+    }
+    assert len(kernels) == 10
+    assert all(not hasattr(kernel, "configs") for kernel in kernels.values())
+
+    config_sets = {
+        "recompute_w_u": kda_chunk_kernels.RECOMPUTE_W_U_FWD_CONFIGS,
+        "chunk_output": kda_chunk_kernels.CHUNK_GLA_FWD_O_CONFIGS,
+        "gate_cumsum": (
+            kda_chunk_kernels.KDA_GATE_CHUNK_CUMSUM_VECTOR_CONFIGS
+        ),
+        "gate": kda_chunk_kernels.KDA_GATE_FWD_CONFIGS,
+        "inter_solve": kda_intra_kernels.CHUNK_KDA_INTER_SOLVE_CONFIGS,
+        "safe_intra": (
+            kda_intra_kernels.CHUNK_KDA_INTRA_SUB_CHUNK_CONFIGS
+        ),
+        "token_intra": (
+            kda_token_kernels.CHUNK_KDA_INTRA_TOKEN_PARALLEL_CONFIGS
+        ),
+        "decode_gate_beta": kda_recurrent_kernels.KDA_GATE_BETA_CONFIGS,
+        "recurrent": kda_recurrent_kernels.FUSED_RECURRENT_KDA_CONFIGS,
+        "packed_decode": (
+            kda_recurrent_kernels.FUSED_RECURRENT_KDA_PACKED_DECODE_CONFIGS
+        ),
+    }
+    assert config_sets.keys() == kernels.keys()
+    for name, configs in config_sets.items():
+        assert 2 <= len(configs) <= 3, (
+            f"{name} must keep exactly 2-3 BW1100-tuned configs"
+        )
+        assert all("num_warps" in config for config in configs)
+        signatures = {tuple(sorted(config.items())) for config in configs}
+        assert len(signatures) == len(configs)
+
+    selected_configs = {
+        "recompute_w_u": kda_chunk_kernels.get_recompute_w_u_fwd_config(
+            8192, 24, 128, 128, False
+        ),
+        "chunk_output": kda_chunk_kernels.get_chunk_gla_fwd_o_config(
+            8192, 24, 128, 128, False
+        ),
+        "gate_cumsum": (
+            kda_chunk_kernels.get_kda_gate_chunk_cumsum_vector_config(
+                8192, 24, 128, False
+            )
+        ),
+        "gate": kda_chunk_kernels.get_kda_gate_fwd_config(8192, 24, 128),
+        "inter_solve": kda_intra_kernels.get_chunk_kda_inter_solve_config(
+            8192, 24, 24, False, False
+        ),
+        "safe_intra": (
+            kda_intra_kernels.get_chunk_kda_intra_sub_chunk_config(
+                8192, 24, 24, False
+            )
+        ),
+        "token_intra": (
+            kda_token_kernels.get_chunk_kda_intra_token_parallel_config(
+                8192, 24, 24, False
+            )
+        ),
+        "decode_gate_beta": (
+            kda_recurrent_kernels.get_kda_gate_beta_config(6, 24, 128)
+        ),
+        "recurrent": kda_recurrent_kernels.get_fused_recurrent_kda_config(
+            6, 6, 24, True
+        ),
+        "packed_decode": (
+            kda_recurrent_kernels.get_fused_recurrent_kda_packed_decode_config(
+                6, 24, 128, 128
+            )
+        ),
+    }
+    for name, config in selected_configs.items():
+        assert config in config_sets[name]
+
+    # Exercise the shape branches used by small/common and large network cases.
+    assert (
+        kda_chunk_kernels.get_chunk_gla_fwd_o_config(128, 3, 128, 64, False)
+        == kda_chunk_kernels.CHUNK_GLA_FWD_O_CONFIGS[2]
+    )
+    assert (
+        kda_token_kernels.get_chunk_kda_intra_token_parallel_config(
+            128, 3, 3, False
+        )
+        == kda_token_kernels.CHUNK_KDA_INTRA_TOKEN_PARALLEL_CONFIGS[0]
+    )
+    assert (
+        kda_recurrent_kernels.get_fused_recurrent_kda_packed_decode_config(
+            1, 3, 128, 128
+        )
+        == kda_recurrent_kernels.FUSED_RECURRENT_KDA_PACKED_DECODE_CONFIGS[1]
+    )
+    assert (
+        kda_recurrent_kernels.get_fused_recurrent_kda_packed_decode_config(
+            4, 3, 128, 128
+        )
+        == kda_recurrent_kernels.FUSED_RECURRENT_KDA_PACKED_DECODE_CONFIGS[1]
+    )
+    assert (
+        kda_recurrent_kernels.get_fused_recurrent_kda_config(
+            8, 8, 12, True
+        )
+        == kda_recurrent_kernels.FUSED_RECURRENT_KDA_CONFIGS[2]
+    )
+    assert (
+        kda_recurrent_kernels.get_fused_recurrent_kda_packed_decode_config(
+            8, 12, 128, 128
+        )
+        == kda_recurrent_kernels.FUSED_RECURRENT_KDA_PACKED_DECODE_CONFIGS[0]
+    )
+    assert (
+        kda_recurrent_kernels.get_fused_recurrent_kda_packed_decode_config(
+            16, 24, 128, 128
+        )
+        == kda_recurrent_kernels.FUSED_RECURRENT_KDA_PACKED_DECODE_CONFIGS[2]
+    )
 
 
 def _relative_rmse(actual: torch.Tensor, expected: torch.Tensor) -> float:
@@ -191,9 +334,21 @@ def test_recompute_and_chunk_output_match_torch() -> None:
 
 
 @GPU_REQUIRED
-def test_chunk_intra_safe_and_token_parallel_agree() -> None:
+@pytest.mark.parametrize(
+    ("T", "K", "boundaries"),
+    [
+        pytest.param(31, 32, None, id="fallback-tail"),
+        pytest.param(70, 128, None, id="optimized-tail"),
+        pytest.param(70, 128, (0, 19, 70), id="optimized-varlen"),
+    ],
+)
+def test_chunk_intra_safe_and_token_parallel_agree(
+    T: int,
+    K: int,
+    boundaries: tuple[int, ...] | None,
+) -> None:
     torch.manual_seed(13)
-    B, T, H, HV, K = 1, 31, 2, 2, 32
+    B, H, HV = 1, 2, 2
     q = torch.randn(B, T, H, K, device=DEVICE, dtype=torch.bfloat16)
     k = torch.randn_like(q)
     gk = (
@@ -202,13 +357,25 @@ def test_chunk_intra_safe_and_token_parallel_agree() -> None:
     ).cumsum(1) * RCP_LN2
     beta = torch.rand(B, T, HV, device=DEVICE, dtype=torch.float32)
 
+    cu_seqlens = None
+    if boundaries is not None:
+        cu_seqlens = torch.tensor(
+            boundaries, device=DEVICE, dtype=torch.int32
+        )
     token_aqk, token_akk = chunk_kda_fwd_intra(
-        q, k, gk, beta, K**-0.5, safe_gate=False
+        q, k, gk, beta, K**-0.5, cu_seqlens=cu_seqlens,
+        safe_gate=False
     )
     safe_aqk, safe_akk = chunk_kda_fwd_intra(
-        q, k, gk, beta, K**-0.5, safe_gate=True
+        q, k, gk, beta, K**-0.5, cu_seqlens=cu_seqlens,
+        safe_gate=True
     )
-    rows = torch.arange(T, device=DEVICE) % 64
+    rows = torch.empty(T, device=DEVICE, dtype=torch.long)
+    spans = ((0, T),) if boundaries is None else zip(
+        boundaries[:-1], boundaries[1:]
+    )
+    for start, end in spans:
+        rows[start:end] = torch.arange(end - start, device=DEVICE) % 64
     columns = torch.arange(64, device=DEVICE)
     valid = (columns[None, :] <= rows[:, None])[None, :, None, :]
     token_aqk_valid = token_aqk.masked_select(valid)
@@ -252,9 +419,12 @@ def _make_decode_inputs(B: int, H: int, D: int):
 
 
 @GPU_REQUIRED
-def test_packed_decode_matches_dense_recurrent() -> None:
+@pytest.mark.parametrize("lower_bound", [None, -3.0])
+def test_packed_decode_matches_dense_recurrent(
+    lower_bound: float | None,
+) -> None:
     torch.manual_seed(14)
-    B, H, D = 3, 2, 64
+    B, H, D = 3, 2, 128
     (
         mixed_qkv,
         raw_g,
@@ -273,7 +443,7 @@ def test_packed_decode_matches_dense_recurrent() -> None:
         A_log,
         D,
         g_bias=dt_bias,
-        lower_bound=-3.0,
+        lower_bound=lower_bound,
     ).unsqueeze(0)
     beta = raw_beta.float().sigmoid()
     cu_seqlens = torch.arange(B + 1, device=DEVICE, dtype=torch.int32)
@@ -299,7 +469,7 @@ def test_packed_decode_matches_dense_recurrent() -> None:
         raw_beta,
         A_log,
         dt_bias,
-        -3.0,
+        lower_bound,
         fused_state,
         cu_seqlens,
         state_indices,
@@ -317,7 +487,7 @@ def test_packed_decode_matches_dense_recurrent() -> None:
         raw_beta,
         A_log,
         dt_bias,
-        -3.0,
+        lower_bound,
         materialized_state,
         cu_seqlens,
         state_indices,
@@ -336,7 +506,7 @@ def test_packed_decode_matches_dense_recurrent() -> None:
         raw_beta,
         A_log,
         dt_bias,
-        -3.0,
+        lower_bound,
         packed_state,
         state_indices,
     )
@@ -353,14 +523,18 @@ _PREFILL_K = 128
 _PREFILL_V = 128
 _PREFILL_BT = 64
 _PREFILL_BC = 16
+_PREFILL_VARLEN_CU_SEQLENS = (0, 3000, 8192)
 
 _DECODE_BENCH_SHAPES = [
     pytest.param(6, 24, 128, id="tokens6-h24"),
     pytest.param(1, 3, 128, id="tokens1-h3-tp8"),
+    pytest.param(4, 3, 128, id="tokens4-h3"),
+    pytest.param(8, 12, 128, id="tokens8-h12"),
+    pytest.param(16, 24, 128, id="tokens16-h24"),
 ]
 
 
-def _make_prefill_bench_inputs():
+def _make_prefill_bench_inputs(use_varlen: bool = False):
     B, T, H, K, V, BT = (
         _PREFILL_B,
         _PREFILL_T,
@@ -375,21 +549,42 @@ def _make_prefill_bench_inputs():
     gate_steps = -torch.rand(
         B, T, H, K, device=DEVICE, dtype=torch.float32
     ) * 0.01
-    gk = (
-        gate_steps.view(B, T // BT, BT, H, K)
-        .cumsum(2)
-        .view(B, T, H, K)
-        .mul_(RCP_LN2)
+    gk = torch.empty_like(gate_steps)
+    sequence_ranges = (
+        zip(
+            _PREFILL_VARLEN_CU_SEQLENS[:-1],
+            _PREFILL_VARLEN_CU_SEQLENS[1:],
+        )
+        if use_varlen
+        else ((0, T),)
     )
+    for bos, eos in sequence_ranges:
+        for start in range(bos, eos, BT):
+            end = min(start + BT, eos)
+            gk[:, start:end] = gate_steps[:, start:end].cumsum(1)
+    gk.mul_(RCP_LN2)
     beta = torch.rand(B, T, H, device=DEVICE, dtype=torch.float32)
     return q, k, v, gk, beta
 
 
-def _print_prefill_bench(name: str, elapsed: float) -> None:
+def _make_prefill_cu_seqlens(use_varlen: bool) -> torch.Tensor | None:
+    if not use_varlen:
+        return None
+    return torch.tensor(
+        _PREFILL_VARLEN_CU_SEQLENS, device=DEVICE, dtype=torch.int32
+    )
+
+
+def _print_prefill_bench(
+    name: str, elapsed: float, use_varlen: bool | None = None
+) -> None:
+    mode = ""
+    if use_varlen is not None:
+        mode = f", mode={'varlen' if use_varlen else 'fixed'}"
     print(
         f"KDA {name}: B={_PREFILL_B}, T={_PREFILL_T}, "
         f"H={_PREFILL_H}, K={_PREFILL_K}, V={_PREFILL_V}, "
-        f"{elapsed:.4f} ms"
+        f"{elapsed:.4f} ms{mode}"
     )
 
 
@@ -401,11 +596,16 @@ def _make_decode_bench_inputs(T: int, H: int, D: int):
     raw_beta = torch.randn(1, T, H, device=DEVICE, dtype=torch.bfloat16)
     A_log = torch.randn(H, device=DEVICE, dtype=torch.float32)
     dt_bias = torch.randn(H, D, device=DEVICE, dtype=torch.float32)
+    # Cache slot 0 is the invalid/sentinel entry in the recurrent kernels.
+    # Keep one extra slot so every benchmark token exercises the recurrence.
     state = (
-        torch.randn(T, H, D, D, device=DEVICE, dtype=torch.float32) * 0.01
+        torch.randn(T + 1, H, D, D, device=DEVICE, dtype=torch.float32)
+        * 0.01
     )
     cu_seqlens = torch.arange(T + 1, device=DEVICE, dtype=torch.int32)
-    state_indices = torch.arange(T, device=DEVICE, dtype=torch.int32)
+    state_indices = torch.arange(
+        1, T + 1, device=DEVICE, dtype=torch.int32
+    )
     mixed_qkv = torch.cat(
         tuple(x[0].reshape(T, H * D) for x in (q, k, v)), dim=-1
     ).contiguous()
@@ -464,7 +664,9 @@ def test_bench_kda_gate(
 
 @GPU_REQUIRED
 @pytest.mark.bench
+@pytest.mark.parametrize("use_varlen", [False, True], ids=["fixed", "varlen"])
 def test_bench_kda_gate_chunk_cumsum(
+    use_varlen: bool,
     time_ms,
     bench_warmup: int,
     bench_repeat: int,
@@ -488,28 +690,32 @@ def test_bench_kda_gate_chunk_cumsum(
     g_bias = torch.randn(
         _PREFILL_H, _PREFILL_K, device=DEVICE, dtype=torch.float32
     )
+    cu_seqlens = _make_prefill_cu_seqlens(use_varlen)
     elapsed = time_ms(
         lambda: fused_kda_gate_chunk_cumsum(
             raw_g,
             raw_beta,
             A_log,
             g_bias=g_bias,
+            cu_seqlens=cu_seqlens,
             chunk_size=_PREFILL_BT,
         ),
         bench_warmup,
         bench_repeat,
     )
-    _print_prefill_bench("gate chunk cumsum", elapsed)
+    _print_prefill_bench("gate chunk cumsum", elapsed, use_varlen)
 
 
 @GPU_REQUIRED
 @pytest.mark.bench
+@pytest.mark.parametrize("use_varlen", [False, True], ids=["fixed", "varlen"])
 def test_bench_kda_intra_token_parallel(
+    use_varlen: bool,
     time_ms,
     bench_warmup: int,
     bench_repeat: int,
 ) -> None:
-    q, k, _, gk, beta = _make_prefill_bench_inputs()
+    q, k, _, gk, beta = _make_prefill_bench_inputs(use_varlen)
     Aqk = torch.empty(
         _PREFILL_B,
         _PREFILL_T,
@@ -526,6 +732,7 @@ def test_bench_kda_intra_token_parallel(
         device=DEVICE,
         dtype=torch.float32,
     )
+    cu_seqlens = _make_prefill_cu_seqlens(use_varlen)
     elapsed = time_ms(
         lambda: chunk_kda_fwd_intra_token_parallel(
             q,
@@ -535,25 +742,29 @@ def test_bench_kda_intra_token_parallel(
             Aqk,
             Akk,
             _PREFILL_K**-0.5,
+            cu_seqlens=cu_seqlens,
             chunk_size=_PREFILL_BT,
             sub_chunk_size=_PREFILL_BC,
         ),
         bench_warmup,
         bench_repeat,
     )
-    _print_prefill_bench("intra token parallel", elapsed)
+    _print_prefill_bench("intra token parallel", elapsed, use_varlen)
 
 
 @GPU_REQUIRED
 @pytest.mark.bench
 @pytest.mark.parametrize("safe_gate", [False, True], ids=["token", "safe"])
+@pytest.mark.parametrize("use_varlen", [False, True], ids=["fixed", "varlen"])
 def test_bench_kda_prefill_intra(
     safe_gate: bool,
+    use_varlen: bool,
     time_ms,
     bench_warmup: int,
     bench_repeat: int,
 ) -> None:
-    q, k, _, gk, beta = _make_prefill_bench_inputs()
+    q, k, _, gk, beta = _make_prefill_bench_inputs(use_varlen)
+    cu_seqlens = _make_prefill_cu_seqlens(use_varlen)
     elapsed = time_ms(
         lambda: chunk_kda_fwd_intra(
             q,
@@ -561,6 +772,7 @@ def test_bench_kda_prefill_intra(
             gk,
             beta,
             _PREFILL_K**-0.5,
+            cu_seqlens=cu_seqlens,
             chunk_size=_PREFILL_BT,
             safe_gate=safe_gate,
         ),
@@ -568,17 +780,19 @@ def test_bench_kda_prefill_intra(
         bench_repeat,
     )
     path = "safe" if safe_gate else "token"
-    _print_prefill_bench(f"prefill intra ({path})", elapsed)
+    _print_prefill_bench(f"prefill intra ({path})", elapsed, use_varlen)
 
 
 @GPU_REQUIRED
 @pytest.mark.bench
+@pytest.mark.parametrize("use_varlen", [False, True], ids=["fixed", "varlen"])
 def test_bench_kda_recompute_w_u(
+    use_varlen: bool,
     time_ms,
     bench_warmup: int,
     bench_repeat: int,
 ) -> None:
-    _, k, v, gk, beta = _make_prefill_bench_inputs()
+    _, k, v, gk, beta = _make_prefill_bench_inputs(use_varlen)
     A = torch.randn(
         _PREFILL_B,
         _PREFILL_T,
@@ -587,22 +801,27 @@ def test_bench_kda_recompute_w_u(
         device=DEVICE,
         dtype=torch.bfloat16,
     )
+    cu_seqlens = _make_prefill_cu_seqlens(use_varlen)
     elapsed = time_ms(
-        lambda: recompute_w_u_fwd(k, v, beta, A, gk=gk),
+        lambda: recompute_w_u_fwd(
+            k, v, beta, A, gk=gk, cu_seqlens=cu_seqlens
+        ),
         bench_warmup,
         bench_repeat,
     )
-    _print_prefill_bench("recompute W/U", elapsed)
+    _print_prefill_bench("recompute W/U", elapsed, use_varlen)
 
 
 @GPU_REQUIRED
 @pytest.mark.bench
+@pytest.mark.parametrize("use_varlen", [False, True], ids=["fixed", "varlen"])
 def test_bench_kda_chunk_output(
+    use_varlen: bool,
     time_ms,
     bench_warmup: int,
     bench_repeat: int,
 ) -> None:
-    q, _, v, gk, _ = _make_prefill_bench_inputs()
+    q, _, v, gk, _ = _make_prefill_bench_inputs(use_varlen)
     A = torch.randn(
         _PREFILL_B,
         _PREFILL_T,
@@ -621,6 +840,7 @@ def test_bench_kda_chunk_output(
         dtype=torch.bfloat16,
     )
     output = torch.empty_like(v)
+    cu_seqlens = _make_prefill_cu_seqlens(use_varlen)
     elapsed = time_ms(
         lambda: chunk_gla_fwd_o_gk(
             q,
@@ -630,12 +850,13 @@ def test_bench_kda_chunk_output(
             h,
             output,
             _PREFILL_K**-0.5,
+            cu_seqlens=cu_seqlens,
             chunk_size=_PREFILL_BT,
         ),
         bench_warmup,
         bench_repeat,
     )
-    _print_prefill_bench("chunk output", elapsed)
+    _print_prefill_bench("chunk output", elapsed, use_varlen)
 
 
 @GPU_REQUIRED
@@ -725,7 +946,7 @@ def test_bench_kda_fused_recurrent(
     assert actual.shape == (1, T, H, D)
     assert actual.dtype == torch.bfloat16
     assert actual_state.shape == (
-        T,
+        T + 1,
         H,
         D,
         D,
@@ -777,7 +998,7 @@ def test_bench_kda_packed_decode(
     assert actual.shape == (1, T, H, D)
     assert actual.dtype == torch.bfloat16
     assert actual_state.shape == (
-        T,
+        T + 1,
         H,
         D,
         D,

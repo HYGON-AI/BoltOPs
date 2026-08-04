@@ -16,14 +16,71 @@ import triton.language as tl
 
 from .chunk_intra import chunk_kda_fwd_intra
 from .math import exp2, log
-from .utils import FLA_CHUNK_SIZE, is_amd, prepare_chunk_indices
+from .utils import FLA_CHUNK_SIZE, prepare_chunk_indices
 
 RCP_LN2 = 1.4426950408889634
 cdiv = triton.cdiv
 next_power_of_2 = triton.next_power_of_2
 
-BT_LIST_AUTOTUNE = [32, 64, 128]
-NUM_WARPS_AUTOTUNE = [2, 4, 8, 16] if is_amd else [4, 8, 16, 32]
+# Offline candidates retained on BW1100.  The new recompute/output champions
+# were selected at B=1, T=8192, H=24, K=V=128; wrappers select one config
+# directly and never run online autotuning.
+RECOMPUTE_W_U_FWD_CONFIGS = (
+    {"BK": 64, "BV": 128, "num_warps": 4, "num_stages": 2},
+    {"BK": 64, "BV": 128, "num_warps": 4, "num_stages": 1},
+    {"BK": 64, "BV": 64, "num_warps": 4, "num_stages": 2},
+)
+CHUNK_GLA_FWD_O_CONFIGS = (
+    {"BK": 128, "BV": 128, "num_warps": 4, "num_stages": 2},
+    {"BK": 128, "BV": 128, "num_warps": 8, "num_stages": 2},
+    {"BK": 64, "BV": 64, "num_warps": 8, "num_stages": 2},
+)
+KDA_GATE_CHUNK_CUMSUM_VECTOR_CONFIGS = (
+    {"BS": 32, "num_warps": 2},
+    {"BS": 32, "num_warps": 4},
+    {"BS": 64, "num_warps": 2},
+)
+KDA_GATE_FWD_CONFIGS = (
+    {"BT": 32, "num_warps": 16, "num_stages": 2},
+    {"BT": 64, "num_warps": 4, "num_stages": 2},
+    {"BT": 128, "num_warps": 4, "num_stages": 2},
+)
+
+
+def get_recompute_w_u_fwd_config(
+    _T: int, _H: int, _K: int, V: int, _is_varlen: bool
+) -> dict:
+    if V < 128:
+        return RECOMPUTE_W_U_FWD_CONFIGS[2]
+    return RECOMPUTE_W_U_FWD_CONFIGS[0]
+
+
+def get_chunk_gla_fwd_o_config(
+    T: int, H: int, K: int, V: int, is_varlen: bool
+) -> dict:
+    del T, H, is_varlen
+    if K >= 128 and V >= 128:
+        return CHUNK_GLA_FWD_O_CONFIGS[0]
+    return CHUNK_GLA_FWD_O_CONFIGS[2]
+
+
+def get_kda_gate_chunk_cumsum_vector_config(
+    T: int, H: int, _S: int, is_varlen: bool
+) -> dict:
+    work = T * H
+    if work <= 16_384:
+        return KDA_GATE_CHUNK_CUMSUM_VECTOR_CONFIGS[1]
+    if is_varlen or T >= 4096:
+        return KDA_GATE_CHUNK_CUMSUM_VECTOR_CONFIGS[2]
+    return KDA_GATE_CHUNK_CUMSUM_VECTOR_CONFIGS[0]
+
+
+def get_kda_gate_fwd_config(T: int, H: int, _D: int) -> dict:
+    if H <= 3 or T <= 512:
+        return KDA_GATE_FWD_CONFIGS[0]
+    if T <= 8192:
+        return KDA_GATE_FWD_CONFIGS[1]
+    return KDA_GATE_FWD_CONFIGS[2]
 
 
 @triton.heuristics(
@@ -32,14 +89,6 @@ NUM_WARPS_AUTOTUNE = [2, 4, 8, 16] if is_amd else [4, 8, 16, 32]
         "STORE_KG": lambda args: args["kg"] is not None,
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
-)
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ],
-    key=["H", "K", "V", "BT", "BK", "BV", "IS_VARLEN"],
 )
 @triton.jit(do_not_specialize=["T"])
 def recompute_w_u_fwd_kernel(
@@ -185,6 +234,179 @@ def recompute_w_u_fwd_kernel(
         tl.store(p_w, b_w.to(p_w.dtype.element_ty), boundary_check=(0, 1))
 
 
+@triton.heuristics(
+    {
+        "STORE_QG": lambda args: args["qg"] is not None,
+        "STORE_KG": lambda args: args["kg"] is not None,
+        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+    }
+)
+@triton.jit(do_not_specialize=["T"])
+def recompute_w_u_fwd_kernel_beta_factored_head_first(
+    q,
+    k,
+    qg,
+    kg,
+    v,
+    beta,
+    w,
+    u,
+    A,
+    gk,
+    cu_seqlens,
+    chunk_indices,
+    T,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    STORE_QG: tl.constexpr,
+    STORE_KG: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+    DOT_PRECISION: tl.constexpr,
+):
+    """Head-first sibling that factors beta into the shared A tile."""
+    i_bh, i_tc = tl.program_id(0), tl.program_id(1)
+    i_b, i_h = i_bh // H, i_bh % H
+    if IS_VARLEN:
+        i_n, i_t = (
+            tl.load(chunk_indices + i_tc * 2).to(tl.int32),
+            tl.load(chunk_indices + i_tc * 2 + 1).to(tl.int32),
+        )
+        bos, eos = (
+            tl.load(cu_seqlens + i_n).to(tl.int32),
+            tl.load(cu_seqlens + i_n + 1).to(tl.int32),
+        )
+        T = eos - bos
+    else:
+        i_t = i_tc
+        bos, eos = i_b * T, i_b * T + T
+
+    p_beta = tl.make_block_ptr(
+        beta + bos * H + i_h,
+        (T,),
+        (H,),
+        (i_t * BT,),
+        (BT,),
+        (0,),
+    )
+    p_A = tl.make_block_ptr(
+        A + (bos * H + i_h) * BT,
+        (T, BT),
+        (H * BT, 1),
+        (i_t * BT, 0),
+        (BT, BT),
+        (1, 0),
+    )
+    b_beta = tl.load(p_beta, boundary_check=(0,)).to(tl.float32)
+    b_Ab = (
+        tl.load(p_A, boundary_check=(0, 1)).to(tl.float32)
+        * b_beta[None, :]
+    ).to(tl.bfloat16)
+
+    for i_v in range(tl.cdiv(V, BV)):
+        p_v = tl.make_block_ptr(
+            v + (bos * H + i_h) * V,
+            (T, V),
+            (H * V, 1),
+            (i_t * BT, i_v * BV),
+            (BT, BV),
+            (1, 0),
+        )
+        p_u = tl.make_block_ptr(
+            u + (bos * H + i_h) * V,
+            (T, V),
+            (H * V, 1),
+            (i_t * BT, i_v * BV),
+            (BT, BV),
+            (1, 0),
+        )
+        b_v = tl.load(p_v, boundary_check=(0, 1))
+        b_u = tl.dot(b_Ab, b_v, input_precision=DOT_PRECISION)
+        tl.store(p_u, b_u.to(p_u.dtype.element_ty), boundary_check=(0, 1))
+
+    for i_k in range(tl.cdiv(K, BK)):
+        p_k = tl.make_block_ptr(
+            k + (bos * H + i_h) * K,
+            (T, K),
+            (H * K, 1),
+            (i_t * BT, i_k * BK),
+            (BT, BK),
+            (1, 0),
+        )
+        p_gk = tl.make_block_ptr(
+            gk + (bos * H + i_h) * K,
+            (T, K),
+            (H * K, 1),
+            (i_t * BT, i_k * BK),
+            (BT, BK),
+            (1, 0),
+        )
+        b_k = tl.load(p_k, boundary_check=(0, 1))
+        b_gk = tl.load(p_gk, boundary_check=(0, 1)).to(tl.float32)
+        b_kgate = (b_k * exp2(b_gk)).to(b_k.dtype)
+        p_w = tl.make_block_ptr(
+            w + (bos * H + i_h) * K,
+            (T, K),
+            (H * K, 1),
+            (i_t * BT, i_k * BK),
+            (BT, BK),
+            (1, 0),
+        )
+        b_w = tl.dot(b_Ab, b_kgate, input_precision=DOT_PRECISION)
+        tl.store(p_w, b_w.to(p_w.dtype.element_ty), boundary_check=(0, 1))
+
+        if STORE_QG:
+            p_q = tl.make_block_ptr(
+                q + (bos * H + i_h) * K,
+                (T, K),
+                (H * K, 1),
+                (i_t * BT, i_k * BK),
+                (BT, BK),
+                (1, 0),
+            )
+            p_qg = tl.make_block_ptr(
+                qg + (bos * H + i_h) * K,
+                (T, K),
+                (H * K, 1),
+                (i_t * BT, i_k * BK),
+                (BT, BK),
+                (1, 0),
+            )
+            b_q = tl.load(p_q, boundary_check=(0, 1))
+            tl.store(
+                p_qg,
+                (b_q * exp2(b_gk)).to(p_qg.dtype.element_ty),
+                boundary_check=(0, 1),
+            )
+
+        if STORE_KG:
+            last_idx = min(i_t * BT + BT, T) - 1
+            o_k = i_k * BK + tl.arange(0, BK)
+            m_k = o_k < K
+            b_gn = tl.load(
+                gk + ((bos + last_idx) * H + i_h) * K + o_k,
+                mask=m_k,
+                other=0.0,
+            ).to(tl.float32)
+            p_kg = tl.make_block_ptr(
+                kg + (bos * H + i_h) * K,
+                (T, K),
+                (H * K, 1),
+                (i_t * BT, i_k * BK),
+                (BT, BK),
+                (1, 0),
+            )
+            b_kg = b_k * exp2(b_gn[None, :] - b_gk)
+            tl.store(
+                p_kg,
+                b_kg.to(p_kg.dtype.element_ty),
+                boundary_check=(0, 1),
+            )
+
+
 def recompute_w_u_fwd(
     k: torch.Tensor,
     v: torch.Tensor,
@@ -197,9 +419,6 @@ def recompute_w_u_fwd(
 ) -> tuple[torch.Tensor, torch.Tensor, None, torch.Tensor | None]:
     B, T, H, K, V = *k.shape, v.shape[-1]
     BT = A.shape[-1]
-    BK = 64
-    BV = 64
-
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
@@ -207,7 +426,26 @@ def recompute_w_u_fwd(
     w = torch.empty_like(k)
     u = torch.empty_like(v)
     kg = torch.empty_like(k) if gk is not None else None
-    recompute_w_u_fwd_kernel[(NT, B * H)](
+    config = get_recompute_w_u_fwd_config(
+        T, H, K, V, cu_seqlens is not None
+    )
+    use_beta_factored_head_first = (
+        k.dtype == torch.bfloat16
+        and v.dtype == torch.bfloat16
+        and A.dtype == torch.bfloat16
+        and gk is not None
+        and BT == 64
+        and K <= 128
+        and V <= 128
+        and (cu_seqlens is None or B == 1)
+    )
+    kernel = (
+        recompute_w_u_fwd_kernel_beta_factored_head_first
+        if use_beta_factored_head_first
+        else recompute_w_u_fwd_kernel
+    )
+    grid = (B * H, NT) if use_beta_factored_head_first else (NT, B * H)
+    kernel[grid](
         q=q,
         k=k,
         qg=None,
@@ -225,24 +463,13 @@ def recompute_w_u_fwd(
         K=K,
         V=V,
         BT=BT,
-        BK=BK,
-        BV=BV,
         DOT_PRECISION="ieee",
+        **config,
     )
     return w, u, None, kg
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
-@triton.autotune(
-    configs=[
-        triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for BK in [32, 64]
-        for BV in [64, 128]
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ],
-    key=["BT"],
-)
 @triton.jit(do_not_specialize=["T"])
 def chunk_gla_fwd_kernel_o(
     q,
@@ -351,6 +578,111 @@ def chunk_gla_fwd_kernel_o(
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
 
+@triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
+@triton.jit(do_not_specialize=["T"])
+def chunk_gla_fwd_kernel_o_local_first(
+    q,
+    v,
+    g,
+    h,
+    o,
+    A,
+    cu_seqlens,
+    chunk_indices,
+    scale,
+    T,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+):
+    """Chunk output with the causal local term scheduled before state."""
+    i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    i_b, i_h = i_bh // H, i_bh % H
+    if IS_VARLEN:
+        i_tg = i_t
+        i_n, i_t = (
+            tl.load(chunk_indices + i_t * 2).to(tl.int32),
+            tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32),
+        )
+        bos, eos = (
+            tl.load(cu_seqlens + i_n).to(tl.int32),
+            tl.load(cu_seqlens + i_n + 1).to(tl.int32),
+        )
+        T = eos - bos
+    else:
+        i_tg = i_b * tl.cdiv(T, BT) + i_t
+        bos, eos = i_b * T, i_b * T + T
+
+    rows = tl.arange(0, BT)
+    causal = rows[:, None] >= rows[None, :]
+    p_v = tl.make_block_ptr(
+        v + (bos * H + i_h) * V,
+        (T, V),
+        (H * V, 1),
+        (i_t * BT, i_v * BV),
+        (BT, BV),
+        (1, 0),
+    )
+    p_A = tl.make_block_ptr(
+        A + (bos * H + i_h) * BT,
+        (T, BT),
+        (H * BT, 1),
+        (i_t * BT, 0),
+        (BT, BT),
+        (1, 0),
+    )
+    b_v = tl.load(p_v, boundary_check=(0, 1))
+    b_A = tl.load(p_A, boundary_check=(0, 1))
+    b_A = tl.where(causal, b_A, 0.0).to(b_v.dtype)
+    b_o = tl.dot(b_A, b_v, allow_tf32=False)
+
+    for i_k in range(tl.cdiv(K, BK)):
+        p_q = tl.make_block_ptr(
+            q + (bos * H + i_h) * K,
+            (T, K),
+            (H * K, 1),
+            (i_t * BT, i_k * BK),
+            (BT, BK),
+            (1, 0),
+        )
+        p_g = tl.make_block_ptr(
+            g + (bos * H + i_h) * K,
+            (T, K),
+            (H * K, 1),
+            (i_t * BT, i_k * BK),
+            (BT, BK),
+            (1, 0),
+        )
+        p_h = tl.make_block_ptr(
+            h + (i_tg * H + i_h) * K * V,
+            (V, K),
+            (K, 1),
+            (i_v * BV, i_k * BK),
+            (BV, BK),
+            (1, 0),
+        )
+        b_q = tl.load(p_q, boundary_check=(0, 1))
+        b_q = (b_q * scale).to(b_q.dtype)
+        b_g = tl.load(p_g, boundary_check=(0, 1))
+        b_qg = (b_q * exp2(b_g)).to(b_q.dtype)
+        b_h = tl.load(p_h, boundary_check=(0, 1))
+        b_o += tl.dot(b_qg, tl.trans(b_h).to(b_qg.dtype))
+
+    p_o = tl.make_block_ptr(
+        o + (bos * H + i_h) * V,
+        (T, V),
+        (H * V, 1),
+        (i_t * BT, i_v * BV),
+        (BT, BV),
+        (1, 0),
+    )
+    tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
+
+
 def chunk_gla_fwd_o_gk(
     q: torch.Tensor,
     v: torch.Tensor,
@@ -369,11 +701,17 @@ def chunk_gla_fwd_o_gk(
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
     NT = cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
+    config = get_chunk_gla_fwd_o_config(
+        T, H, K, V, cu_seqlens is not None
+    )
+    grid = (cdiv(V, config["BV"]), NT, B * H)
 
-    def grid(meta):
-        return (cdiv(V, meta["BV"]), NT, B * H)
-
-    chunk_gla_fwd_kernel_o[grid](
+    kernel = (
+        chunk_gla_fwd_kernel_o_local_first
+        if K >= 128 and V >= 128 and BT == 64
+        else chunk_gla_fwd_kernel_o
+    )
+    kernel[grid](
         q=q,
         v=v,
         g=g,
@@ -388,6 +726,7 @@ def chunk_gla_fwd_o_gk(
         K=K,
         V=V,
         BT=BT,
+        **config,
     )
     return o
 
@@ -397,14 +736,6 @@ def chunk_gla_fwd_o_gk(
         "HAS_BIAS": lambda args: args["g_bias"] is not None,
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
-)
-@triton.autotune(
-    configs=[
-        triton.Config({"BS": BS}, num_warps=num_warps)
-        for BS in [32, 64]
-        for num_warps in [2, 4, 8]
-    ],
-    key=["H", "S", "BT", "IS_VARLEN"],
 )
 @triton.jit(do_not_specialize=["T"])
 def kda_gate_chunk_cumsum_vector_kernel(
@@ -547,11 +878,12 @@ def fused_kda_gate_chunk_cumsum(
         g_bias = g_bias.reshape(-1)
     y = torch.empty_like(raw_g, dtype=output_dtype or raw_g.dtype)
     beta_out = torch.empty(raw_beta.shape, device=raw_beta.device, dtype=torch.float32)
-
-    def grid(meta):
-        # For each (chunk, head), program 0 computes beta without extending a
-        # gate tile's critical path. The remaining programs cover the gate dim.
-        return (cdiv(meta["S"], meta["BS"]) + 1, NT, B * H)
+    config = get_kda_gate_chunk_cumsum_vector_config(
+        T, H, D, cu_seqlens is not None
+    )
+    # For each (chunk, head), program 0 computes beta without extending a gate
+    # tile's critical path. The remaining programs cover the gate dimension.
+    grid = (cdiv(D, config["BS"]) + 1, NT, B * H)
 
     kda_gate_chunk_cumsum_vector_kernel[grid](
         s=raw_g,
@@ -577,19 +909,11 @@ def fused_kda_gate_chunk_cumsum(
         S=D,
         BT=chunk_size,
         USE_LOWER_BOUND=lower_bound is not None,
+        **config,
     )
     return y, beta_out
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BT": bt}, num_warps=nw, num_stages=ns)
-        for bt in BT_LIST_AUTOTUNE
-        for nw in NUM_WARPS_AUTOTUNE
-        for ns in [2, 3]
-    ],
-    key=["H", "D"],
-)
 @triton.jit
 def kda_gate_fwd_kernel(
     g,
@@ -680,9 +1004,8 @@ def fused_kda_gate(
     assert H * head_k_dim == HD
 
     y = torch.empty_like(g, dtype=torch.float32)
-
-    def grid(meta):
-        return (cdiv(T, meta["BT"]), H)
+    config = get_kda_gate_fwd_config(T, H, head_k_dim)
+    grid = (cdiv(T, config["BT"]), H)
 
     kda_gate_fwd_kernel[grid](
         g,
@@ -698,6 +1021,7 @@ def fused_kda_gate(
         BD=next_power_of_2(head_k_dim),
         HAS_BIAS=g_bias is not None,
         USE_LOWER_BOUND=lower_bound is not None,
+        **config,
     )
 
     y = y.view(*orig_shape, H, head_k_dim)
