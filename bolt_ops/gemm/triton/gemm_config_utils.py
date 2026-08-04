@@ -1,0 +1,390 @@
+import copy
+import functools
+import itertools
+import json
+import os
+
+import triton
+
+import bolt_ops.utility.arch_info as arch_info
+from bolt_ops.gemm.triton.builtin_gemm_configs import BUILTIN_GEMM_CONFIGS
+
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+AITER_TRITON_CONFIGS_PATH = os.path.abspath(os.path.join(_THIS_DIR, "configs"))
+
+# Per-kernel config folders under ``configs/``. Longest prefix wins.
+_CONFIG_NAME_TO_DIR = (
+    ("BATCHED_GEMM-A16WFP4", "batched_gemm_a16wfp4"),
+    ("GEMM-A8W8_BLOCKSCALE", "gemm_a8w8_blockscale"),
+    ("GEMM-AFP4WFP4", "gemm_afp4wfp4"),
+    ("GEMM-A16W16", "gemm_a16w16"),
+)
+
+# Standard bounds for M_LEQ_x keys (tuple for hashability with LRU cache)
+STANDARD_M_BOUNDS = (4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
+
+
+def _kernel_config_dir(config_name: str) -> str:
+    for prefix, dirname in _CONFIG_NAME_TO_DIR:
+        if config_name == prefix or config_name.startswith(prefix):
+            return dirname
+    return config_name.lower().replace("_", "-")
+
+# This flag should be set to True, unless it is being used for debugging
+USE_LRU_CACHE = True
+"""
+Cold start: 290.8928 ms
+LRU Cache: ENABLED
+Avg per call: 0.110 us
+vs
+LRU Cache: DISABLED
+Avg per call: 2.503 us
+"""
+
+
+def _load_config_file(
+    cache_dict: dict,
+    cache_key: str,
+    fpath: str,
+    config_key: str,
+    fpath_should_exist: bool = False,
+) -> bool:
+    """
+    Helper function to load a config file and cache it.
+    """
+    if os.path.exists(fpath):
+        with open(fpath, "r") as file:
+            config = json.load(file)
+        cache_dict[cache_key][config_key] = config
+        return True
+    elif fpath_should_exist:
+        raise AssertionError(f"Required config file doesn't exist: {fpath}")
+    return False
+
+
+@functools.lru_cache(maxsize=1024 if USE_LRU_CACHE else 0)
+def _get_gemm_config_cached(
+    config_name: str,
+    M: int,
+    N: int | None = None,
+    K: int | None = None,
+    bounds: tuple[int, ...] | None = None,
+    specialized_filename: str | None = None,
+    backend: str | None = None,
+    B: int | None = None,
+) -> tuple[dict, bool]:
+    """
+    Internal cached implementation. Do NOT use this directly — use
+    ``get_gemm_config()`` instead, which returns a defensive deep-copy so
+    callers can freely mutate the returned dict without polluting the cache.
+
+    Layout (per kernel)::
+
+        configs/<kernel>/{arch-}{config_name}.json
+        configs/<kernel>/{config_name}.json          # unprefixed fallback
+
+    Prefer ``{arch}-{config_name}.json`` when present, else unprefixed default.
+    ``backend`` is accepted for API compatibility but ignored (Triton-only).
+    """
+    del backend  # Triton-only; no per-backend subdirs
+    # Input validation
+    assert M >= 0, "M must be positive."
+    assert N is None or N > 0, "N must be positive when provided."
+    assert K is None or K > 0, "K must be positive when provided."
+    assert bounds is None or (
+        len(bounds) > 0
+        and all(x > 0 for x in bounds)
+        and all(x < y for x, y in itertools.pairwise(bounds))
+    ), "When provided, bounds must be a non-empty tuple of strictly increasing positive numbers."
+
+    if not hasattr(_get_gemm_config_cached, "_config_cache"):
+        _get_gemm_config_cached._config_cache = {}
+
+    dev = arch_info.get_arch()
+    cache_key = f"{dev}_{config_name}"
+    kernel_dir = os.path.join(AITER_TRITON_CONFIGS_PATH, _kernel_config_dir(config_name))
+
+    # Prefer arch-prefixed file when present; else unprefixed default.
+    candidate_dirs = []
+    if dev:
+        candidate_dirs.append((kernel_dir, f"{dev}-"))
+    candidate_dirs.append((kernel_dir, ""))
+
+    cfg_dir, name_prefix = candidate_dirs[-1]
+    for _dir, _prefix in candidate_dirs:
+        if os.path.exists(f"{_dir}/{_prefix}{config_name}.json"):
+            cfg_dir, name_prefix = _dir, _prefix
+            break
+
+    if cache_key not in _get_gemm_config_cached._config_cache:
+        _get_gemm_config_cached._config_cache[cache_key] = {}
+
+        fpath = f"{cfg_dir}/{name_prefix}{config_name}.json"
+        loaded = _load_config_file(
+            _get_gemm_config_cached._config_cache,
+            cache_key,
+            fpath,
+            "default",
+            fpath_should_exist=False,
+        )
+        if not loaded and name_prefix:
+            # Retry unprefixed in the same kernel folder.
+            alt = f"{kernel_dir}/{config_name}.json"
+            if _load_config_file(
+                _get_gemm_config_cached._config_cache,
+                cache_key,
+                alt,
+                "default",
+                fpath_should_exist=False,
+            ):
+                cfg_dir, name_prefix = kernel_dir, ""
+                loaded = True
+        if not loaded:
+            # No shipped JSON (only AWQ HCU tables are kept on disk).
+            builtin = BUILTIN_GEMM_CONFIGS.get(config_name)
+            if builtin is not None:
+                _get_gemm_config_cached._config_cache[cache_key]["default"] = (
+                    copy.deepcopy(builtin)
+                )
+                cfg_dir, name_prefix = kernel_dir, ""
+                loaded = True
+        if not loaded:
+            raise AssertionError(
+                f"Required config file doesn't exist for {config_name} "
+                f"(arch={dev}, dir={kernel_dir})"
+            )
+
+    config_dict_key = "default"
+
+    # Handle custom specialized filename (for fused kernels with multiple N dims)
+    if specialized_filename is not None:
+        spec_key = specialized_filename
+        if spec_key not in _get_gemm_config_cached._config_cache[cache_key]:
+            fpath = f"{cfg_dir}/{name_prefix}{config_name}-{specialized_filename}.json"
+            if _load_config_file(
+                _get_gemm_config_cached._config_cache, cache_key, fpath, spec_key
+            ):
+                config_dict_key = spec_key
+        else:
+            config_dict_key = spec_key
+
+    elif N is not None and K is not None:
+        # Try B-specialized config first: {dev}-{config_name}-B={B}-N={N}-K={K}.json
+        if B is not None:
+            bnk_key = f"{B}_{N}_{K}"
+            if bnk_key not in _get_gemm_config_cached._config_cache[cache_key]:
+                fpath = f"{cfg_dir}/{name_prefix}{config_name}-B={B}-N={N}-K={K}.json"
+                if _load_config_file(
+                    _get_gemm_config_cached._config_cache,
+                    cache_key,
+                    fpath,
+                    bnk_key,
+                ):
+                    config_dict_key = bnk_key
+            else:
+                config_dict_key = bnk_key
+
+        # Fall back to N/K-specialized config
+        if config_dict_key == "default":
+            nk_key = f"{N}_{K}"
+            if nk_key not in _get_gemm_config_cached._config_cache[cache_key]:
+                fpath = f"{cfg_dir}/{name_prefix}{config_name}-N={N}-K={K}.json"
+                if _load_config_file(
+                    _get_gemm_config_cached._config_cache,
+                    cache_key,
+                    fpath,
+                    nk_key,
+                ):
+                    config_dict_key = nk_key
+            else:
+                config_dict_key = nk_key
+
+    config_dict = _get_gemm_config_cached._config_cache[cache_key][config_dict_key]
+
+    # use standard bounds unless custom bounds are passed
+    search_bounds = bounds if bounds is not None else STANDARD_M_BOUNDS
+
+    # Search for M_LEQ_x keys
+    for bound in search_bounds:
+        key = f"M_LEQ_{bound}"
+        if M <= bound and key in config_dict:
+            return dict(config_dict[key]), config_dict_key != "default"
+
+    # Search for M_GEQ_x keys
+    for bound in reversed(search_bounds):
+        key = f"M_GEQ_{bound}"
+        if M >= bound and key in config_dict:
+            return dict(config_dict[key]), config_dict_key != "default"
+
+    if "any" in config_dict:
+        return dict(config_dict["any"]), False
+
+    raise KeyError(
+        f"No matching configuration found for M={M}, N={N}, K={K} in config '{config_name}'."
+    )
+
+
+def get_gemm_config(
+    config_name: str,
+    M: int,
+    N: int | None = None,
+    K: int | None = None,
+    bounds: tuple[int, ...] | None = None,
+    specialized_filename: str | None = None,
+    backend: str | None = None,
+    B: int | None = None,
+) -> tuple[dict, bool]:
+    """
+    Load a GEMM configuration using the standardized M_LEQ_x/M_GEQ_y/any format.
+
+    This function provides a unified way to load GEMM configs across all kernels.
+    It uses the following logic under ``configs/<kernel>/``:
+    1. Load default: ``{hcu_arch-}{config_name}.json`` (unprefixed fallback)
+    2. If B, N and K are provided, try ``...-B={B}-N={N}-K={K}.json``
+    3. If N and K are provided, try ``...-N={N}-K={K}.json``
+       Or if specialized_filename is provided, use that suffix
+    4. Search for M_LEQ_x keys in order of bounds (default: STANDARD_M_BOUNDS)
+    5. If no M_LEQ_x matches, search for M_GEQ_x keys in reverse order
+    6. Fall back to "any" if no bounds match
+
+    Args:
+        config_name: Name of the config (example - "GEMM-A16W16")
+        M: M dimension of the GEMM
+        N: N dimension of the GEMM (optional)
+        K: K dimension of the GEMM (optional)
+        bounds: Custom bounds to use instead of STANDARD_M_BOUNDS (optional)
+        specialized_filename: Custom specialized filename suffix (optional)
+        backend: Accepted for API compatibility; ignored (Triton-only)
+        B: Batch dimension for batched GEMM (optional)
+
+    Returns:
+        Dictionary with the config params (a fresh deep-copy safe to mutate),
+        bool indicating if the config is tuned.(True if tuned, False otherwise)
+    """
+    config, is_tuned = _get_gemm_config_cached(
+        config_name, M, N, K, bounds, specialized_filename, backend, B
+    )
+    return copy.deepcopy(config), is_tuned
+
+
+def add_default_gemm_config_params(config: dict) -> dict:
+    """
+    this fn ensures that all configs have required default values.
+
+    Args:
+        config: Dictionary containing GEMM configuration parameters.
+
+    Returns:
+        same object as input
+    """
+    if "NUM_KSPLIT" not in config:
+        config["NUM_KSPLIT"] = 1
+
+    # adding default cache_modifier if not present as some kernels need this
+    if "cache_modifier" not in config and "BLOCK_SIZE_K" in config:
+        config["cache_modifier"] = None
+
+    return config
+
+
+def compute_splitk_params(config: dict, K: int) -> dict:
+    """
+    this fn calculates the SPLITK_BLOCK_SIZE and adjusts BLOCK_SIZE_K
+    if necessary based on the NUM_KSPLIT value in the config.
+
+    Args:
+        config: Dictionary containing GEMM configuration parameters.
+        K: K dimension of the GEMM operation (must be positive)
+
+    Returns:
+        same object as input
+    """
+    assert K > 0, "K must be positive"
+
+    add_default_gemm_config_params(config)
+
+    config["SPLITK_BLOCK_SIZE"] = triton.cdiv(K, config["NUM_KSPLIT"])
+
+    if "BLOCK_SIZE_K" in config:
+        # If NUM_KSPLIT makes K too small, then BLOCK_K will decrease to be smaller than
+        # GROUP_K.
+        while (
+            config["NUM_KSPLIT"] > 1
+            and config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]
+        ):
+            config["NUM_KSPLIT"] = max(config["NUM_KSPLIT"] // 2, 1)
+            config["SPLITK_BLOCK_SIZE"] = triton.cdiv(K, config["NUM_KSPLIT"])
+
+        # If BLOCK_SIZE_K is still too large with NUM_KSPLIT=1, fix it to equal K dim.
+        if config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]:
+            config["BLOCK_SIZE_K"] = triton.next_power_of_2(config["SPLITK_BLOCK_SIZE"])
+
+            if config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]:
+                config["BLOCK_SIZE_K"] = config["BLOCK_SIZE_K"] // 2
+
+        config["BLOCK_SIZE_K"] = max(config["BLOCK_SIZE_K"], 16)
+
+        # Round the SPLITK_BLOCK_SIZE to multiple of BLOCK_SIZE_K and update NUM_KSPLIT to again.
+        if config["NUM_KSPLIT"] > 1 and (
+            config["SPLITK_BLOCK_SIZE"] % config["BLOCK_SIZE_K"] != 0
+        ):
+            config["SPLITK_BLOCK_SIZE"] = (
+                triton.cdiv(config["SPLITK_BLOCK_SIZE"], config["BLOCK_SIZE_K"])
+                * config["BLOCK_SIZE_K"]
+            )
+            config["NUM_KSPLIT"] = triton.cdiv(K, config["SPLITK_BLOCK_SIZE"])
+
+    return config
+
+
+def _padded_size_32_4(n):
+    pad = (n >> 5) << 2
+    if (n & 31) == 0 and pad >= 4:
+        pad -= 4
+    return n + pad
+
+
+def _padded_size_pow2(n, interval, padding):
+    log2_i = (interval - 1).bit_length()
+    log2_p = (padding - 1).bit_length() if padding else 0
+    pad = (n >> log2_i) << log2_p
+    if n % interval == 0 and pad >= padding:
+        pad -= padding
+    return n + pad
+
+
+def _gemm_lds_bytes(
+    block_m, block_n, block_k, bits_a, bits_b, num_stages, use_async_padding
+):
+    elem_a = block_m * block_k
+    elem_b = block_k * block_n
+    if use_async_padding:
+        # Padded shared encoding + N buffers (matches TensorAtlas
+        # _estimate_triton_lds_async_copy / tritonBLAS origami).
+        pa = _padded_size_32_4(elem_a)
+        pb = _padded_size_32_4(elem_b)
+        if block_k & (block_k - 1) == 0:
+            pa = max(pa, _padded_size_pow2(elem_a, block_k, 8))
+        if block_n & (block_n - 1) == 0:
+            pb = max(pb, _padded_size_pow2(elem_b, block_n, 8))
+        return num_stages * (pa * bits_a + pb * bits_b) // 8
+    # Non-async: (N-1) extra buffer pairs beyond the active stage.
+    LDSA = elem_a * bits_a
+    LDSB = elem_b * bits_b
+    if num_stages <= 1:
+        return max(LDSA, LDSB) // 8
+    return (LDSA + LDSB) * (num_stages - 1) // 8
+
+
+def pick_gemm_num_stages(
+    arch, block_m, block_n, block_k, bits_a, bits_b, use_async_padding=False
+):
+    assert min(block_m, block_n, block_k, bits_a, bits_b) > 0
+    # bits_a / bits_b: element bit-widths (8 for fp8, 4 for mxfp4).
+    # use_async_padding: True when the kernel lowers to async direct-to-LDS
+    # with padded shared encoding (e.g. a4w4 on gfx950).
+    cap = arch_info.get_lds_capacity_bytes(arch)
+    lds = _gemm_lds_bytes(
+        block_m, block_n, block_k, bits_a, bits_b, 2, use_async_padding
+    )
+    return 2 if lds <= cap else 1
