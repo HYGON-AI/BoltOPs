@@ -22,6 +22,44 @@ from .utils import (
     prepare_chunk_indices,
 )
 
+
+# BW1100 candidates retained for the KDA Prefill model shape.  Optimized
+# siblings also passed fixed/varlen multi-sequence tail smoke tests.
+CHUNK_KDA_INTER_SOLVE_CONFIGS: tuple[dict[str, int], ...] = (
+    {"BK": 64, "num_warps": 1, "num_stages": 2},
+    {"BK": 64, "num_warps": 1, "num_stages": 1},
+    {"BK": 32, "num_warps": 1, "num_stages": 1},
+)
+
+CHUNK_KDA_INTRA_SUB_CHUNK_CONFIGS: tuple[dict[str, int | bool], ...] = (
+    {"BK": 128, "EARLY_AQK_STORE": False, "num_warps": 1, "num_stages": 1},
+    {"BK": 128, "EARLY_AQK_STORE": True, "num_warps": 1, "num_stages": 1},
+    {"BK": 128, "EARLY_AQK_STORE": True, "num_warps": 1, "num_stages": 2},
+)
+
+
+def get_chunk_kda_inter_solve_config(
+    T: int,
+    H: int,
+    HV: int,
+    is_varlen: bool,
+    safe_gate: bool,
+) -> dict[str, int]:
+    """Select one of three offline configs for the inter/solve kernel."""
+    del H, HV, is_varlen, safe_gate
+    if T <= 128:
+        return CHUNK_KDA_INTER_SOLVE_CONFIGS[1]
+    return CHUNK_KDA_INTER_SOLVE_CONFIGS[0]
+
+
+def get_chunk_kda_intra_sub_chunk_config(
+    T: int, H: int, HV: int, is_varlen: bool
+) -> dict[str, int | bool]:
+    """Select one of three offline configs for the polynomial sibling."""
+    del T, H, HV, is_varlen
+    return CHUNK_KDA_INTRA_SUB_CHUNK_CONFIGS[0]
+
+
 ################################################################################
 # Fused inter + solve_tril kernel: compute off-diagonal Akk and solve in one pass
 ################################################################################
@@ -31,14 +69,6 @@ from .utils import (
     {
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
-)
-@triton.autotune(
-    configs=[
-        triton.Config({"BK": BK}, num_warps=num_warps)
-        for BK in [32, 64]
-        for num_warps in [1, 2, 4]
-    ],
-    key=["H", "HV", "K", "BC"],
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_kda_fwd_kernel_inter_solve_fused(
@@ -450,14 +480,6 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
 )
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [1, 2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ],
-    key=["BK", "NC", "BT", "HV"],
-)
 @triton.jit(do_not_specialize=["B", "T"])
 def chunk_kda_fwd_kernel_intra_sub_chunk(
     q,
@@ -574,6 +596,135 @@ def chunk_kda_fwd_kernel_intra_sub_chunk(
     tl.store(p_Akk, b_Ai.to(Akk.dtype.element_ty), boundary_check=(0, 1))
 
 
+@triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
+@triton.jit(do_not_specialize=["T"])
+def chunk_kda_fwd_kernel_intra_sub_chunk_poly_solve_optimized(
+    q,
+    k,
+    g,
+    beta,
+    Aqk,
+    Akk,
+    scale,
+    cu_seqlens,
+    chunk_indices,
+    T,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    BT: tl.constexpr,
+    BC: tl.constexpr,
+    BK: tl.constexpr,
+    EARLY_AQK_STORE: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+):
+    """Invert a strict-lower 16x16 block with its nilpotent polynomial."""
+    i_t, i_i, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    if IS_VARLEN:
+        i_n, i_t = (
+            tl.load(chunk_indices + i_t * 2).to(tl.int32),
+            tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32),
+        )
+        bos = tl.load(cu_seqlens + i_n).to(tl.int32)
+        eos = tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        T = eos - bos
+        i_hv = i_bh
+    else:
+        i_b, i_hv = i_bh // HV, i_bh % HV
+        bos = i_b * T
+    i_h = i_hv // (HV // H)
+    i_ti = i_t * BT + i_i * BC
+    if i_ti >= T:
+        return
+
+    o_c = i_ti + tl.arange(0, BC)
+    m_c = o_c < T
+    q += (bos * H + i_h) * K
+    k += (bos * H + i_h) * K
+    g += (bos * HV + i_hv) * K
+    beta += bos * HV + i_hv
+    Aqk += (bos * HV + i_hv) * BT
+    Akk += (bos * HV + i_hv) * BC
+    p_q = tl.make_block_ptr(q, (T, K), (H * K, 1), (i_ti, 0), (BC, BK), (1, 0))
+    p_k = tl.make_block_ptr(k, (T, K), (H * K, 1), (i_ti, 0), (BC, BK), (1, 0))
+    p_g = tl.make_block_ptr(g, (T, K), (HV * K, 1), (i_ti, 0), (BC, BK), (1, 0))
+    p_beta = tl.make_block_ptr(beta, (T,), (HV,), (i_ti,), (BC,), (0,))
+    b_q = tl.load(p_q, boundary_check=(0, 1))
+    b_k = tl.load(p_k, boundary_check=(0, 1))
+    b_g = tl.load(p_g, boundary_check=(0, 1))
+    b_beta = tl.load(p_beta, boundary_check=(0,)).to(tl.float32)
+    o_k = tl.arange(0, BK)
+    center = min(BC // 2, T - i_ti - 1)
+    b_gn = tl.load(
+        g + (i_ti + center) * HV * K + o_k, mask=o_k < K, other=0.0
+    )[None, :]
+    b_gm = (b_g - b_gn).to(tl.float32)
+    b_gq = tl.where(m_c[:, None], exp2(b_gm), 0.0)
+    b_gk = tl.where(m_c[:, None], exp2(-b_gm), 0.0)
+    b_right = tl.trans(b_k * b_gk)
+    b_Aqk = tl.dot(b_q * b_gq, b_right, input_precision="ieee") * scale
+    b_Akk = tl.dot(b_k * b_gq, b_right, input_precision="ieee") * b_beta[:, None]
+    o_i = tl.arange(0, BC)
+    lower_equal = o_i[:, None] >= o_i[None, :]
+    lower_strict = o_i[:, None] > o_i[None, :]
+    identity = (o_i[:, None] == o_i[None, :]).to(tl.float32)
+    b_Aqk = tl.where(lower_equal, b_Aqk, 0.0)
+    A = tl.where(lower_strict, b_Akk, 0.0)
+
+    p_Aqk = tl.make_block_ptr(
+        Aqk, (T, BT), (HV * BT, 1), (i_ti, i_i * BC), (BC, BC), (1, 0)
+    )
+    if EARLY_AQK_STORE:
+        tl.store(p_Aqk, b_Aqk.to(Aqk.dtype.element_ty), boundary_check=(0, 1))
+
+    # Keep every polynomial input and intermediate in FP32.  Although the
+    # public inverse output is BF16, narrowing between products compounds the
+    # error across the A2/A4/A8 chain.
+    A2 = tl.dot(
+        A,
+        A,
+        input_precision="ieee",
+        out_dtype=tl.float32,
+    )
+    X = tl.dot(
+        identity - A,
+        identity + A2,
+        input_precision="ieee",
+        out_dtype=tl.float32,
+    )
+    A4 = tl.dot(
+        A2,
+        A2,
+        input_precision="ieee",
+        out_dtype=tl.float32,
+    )
+    X = tl.dot(
+        X,
+        identity + A4,
+        input_precision="ieee",
+        out_dtype=tl.float32,
+    )
+    A8 = tl.dot(
+        A4,
+        A4,
+        input_precision="ieee",
+        out_dtype=tl.float32,
+    )
+    X = tl.dot(
+        X,
+        identity + A8,
+        input_precision="ieee",
+        out_dtype=tl.float32,
+    )
+
+    p_Akk = tl.make_block_ptr(
+        Akk, (T, BC), (HV * BC, 1), (i_ti, 0), (BC, BC), (1, 0)
+    )
+    if not EARLY_AQK_STORE:
+        tl.store(p_Aqk, b_Aqk.to(Aqk.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(p_Akk, X.to(Akk.dtype.element_ty), boundary_check=(0, 1))
+
+
 def chunk_kda_fwd_intra(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -599,10 +750,41 @@ def chunk_kda_fwd_intra(
     # Separate fp32 buffer for diagonal 16x16 blocks (for precision in solve_tril)
     Akkd = torch.empty(B, T, HV, BC, device=k.device, dtype=torch.float32)
 
-    # Compute diagonal blocks into Akkd in fp32.
-    if safe_gate:
+    # Compute diagonal blocks into Akkd in fp32.  For the model-shape class the
+    # polynomial sibling writes the already-inverted 16x16 diagonal blocks, so
+    # the inter kernel can skip four serial forward-substitution loops.  The
+    # public token-parallel wrapper still retains its raw-Akkd contract.
+    use_poly_solve = K == 128 and BT == 64 and BC == 16
+    if use_poly_solve:
+        grid = (NT, NC, B * HV if cu_seqlens is None else HV)
+        config = get_chunk_kda_intra_sub_chunk_config(
+            T=T,
+            H=H,
+            HV=HV,
+            is_varlen=cu_seqlens is not None,
+        )
+        chunk_kda_fwd_kernel_intra_sub_chunk_poly_solve_optimized[grid](
+            q=q,
+            k=k,
+            g=gk,
+            beta=beta,
+            Aqk=Aqk,
+            Akk=Akkd,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            T=T,
+            H=H,
+            HV=HV,
+            K=K,
+            BT=BT,
+            BC=BC,
+            **config,
+        )
+    elif safe_gate:
         grid = (NT, NC, B * HV)
         BK = triton.next_power_of_2(K)
+        fallback_config = {"num_warps": 1, "num_stages": 2}
         chunk_kda_fwd_kernel_intra_sub_chunk[grid](
             q=q,
             k=k,
@@ -621,6 +803,7 @@ def chunk_kda_fwd_intra(
             BC=BC,
             BK=BK,
             USE_GATHER=is_gather_supported,
+            **fallback_config,
         )
     else:
         Aqk, Akkd = chunk_kda_fwd_intra_token_parallel(
@@ -643,6 +826,14 @@ def chunk_kda_fwd_intra(
         else "ieee"
     )
     grid = (NT, B * HV)
+    diagonal_is_presolved = safe_gate or use_poly_solve
+    config = get_chunk_kda_inter_solve_config(
+        T=T,
+        H=H,
+        HV=HV,
+        is_varlen=cu_seqlens is not None,
+        safe_gate=diagonal_is_presolved,
+    )
     chunk_kda_fwd_kernel_inter_solve_fused[grid](
         q=q,
         k=k,
@@ -660,7 +851,8 @@ def chunk_kda_fwd_intra(
         K=K,
         BT=BT,
         BC=BC,
-        USE_SAFE_GATE=safe_gate,
+        USE_SAFE_GATE=diagonal_is_presolved,
         SOLVE_TRIL_DOT_PRECISION=solve_tril_dot_precision,
+        **config,
     )
     return Aqk, Akk
