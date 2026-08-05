@@ -309,18 +309,30 @@ Kimi-K3/vLLM 测试中使用的代表配置：
 
 本仓库 benchmark 使用：
 
-所有 Prefill/共用 Kernel 均使用同一组模型 Shape：
-`B=1,T=8192,H=24,K=V=128,BT=64,BC=16`。Gate Kernel 使用对应的
-`raw_g/raw_beta` 视图，其余 Prefill Kernel 使用已处理的逐通道 `g` 和 `beta`。
+Kimi-K3 总 KDA head 数为 `96`。按照 SGLang 的并行方式，TP32、CP8 且使能
+DPA 时，attention tensor parallel degree 为 `attn_tp=TP/CP=32/8=4`，所以
+本地 `H=96/4=24`；普通 TP16/TP32 分别得到 `H=96/16=6` 和
+`H=96/32=3`。完整 head（attention 未切分）路径保留 `H=96`：
 
-Decode benchmark 保留 `tokens=6,H=24,K=V=128`，并增加根据 TP-local 投影尺寸
-推导出的 `tokens=1,H=3,K=V=128`。前一组 packed QKV 为 `[6,9216]`，后一组
-为 `[1,1152]`。对应的 `raw_g` 分别为 `[1,6,24,128]`、
-`[1,1,3,128]`，`raw_beta` 为 `[1,6,24]`、`[1,1,3]`，`dt_bias`
-为 `[3072]`、`[384]`。Decode cache slot `0` 是无效 sentinel，benchmark
-因此分别分配 `[7,24,128,128]`、`[2,3,128,128]` FP32 state，并使用
-`state_indices=[1,...,tokens]`，保证每个 token 都实际执行 recurrence。离线
-调优另外覆盖常见 Decode 调度尺寸 `tokens/H=4/3`、`8/12`、`16/24`。
+| 并行场景 | 本地 head 推导 | benchmark `H` |
+|---|---:|---:|
+| 完整 head / attention 未切分 | `96` | `96` |
+| TP32 + CP8 + DPA | `96 / (32 / 8)` | `24` |
+| TP16 | `96 / 16` | `6` |
+| TP32 | `96 / 32` | `3` |
+
+所有 Prefill/共用 Kernel 均覆盖
+`B=1,T=8192,H∈{96,24,6,3},K=V=128,BT=64,BC=16`。Gate Kernel 使用
+对应的 `raw_g/raw_beta` 视图，其余 Prefill Kernel 使用已处理的逐通道 `g`
+和 `beta`。
+
+Decode benchmark 保留原有 `tokens=6,H=24,K=V=128` 和
+`tokens=1,H=3,K=V=128`，再为同一 `tokens=6` 网络 shape 增加
+`H=96/6/3`。对应 packed QKV 最后一维 `3*H*128` 分别为
+`36864/9216/2304/1152`。Decode cache slot `0` 是无效 sentinel，benchmark
+分配 `[tokens+1,H,128,128]` FP32 state，并使用
+`state_indices=[1,...,tokens]`，保证每个 token 都实际执行 recurrence。原有常见
+Decode 调度尺寸 `tokens/H=4/3`、`8/12`、`16/24` 继续保留。
 
 所有支持 `cu_seqlens` 的 Prefill benchmark 同时保留 fixed-length 路径，并增加
 `cu_seqlens=[0,3000,8192]` 的 packed 多序列 varlen 路径（包含两个 partial
@@ -392,8 +404,8 @@ pytest -q test/test_fla_kda.py --bench -s
   `safe_gate=False` 回退 token-parallel raw diagonal 与原 inter solve。
 - `safe_gate=True` 的 fallback 仍使用原 `chunk_kda_fwd_kernel_intra_sub_chunk`。
 - Decode state 采用 `[V,K]` 内存布局，数学参考通常采用 `[K,V]`；对照时需转置。
-- 上游 Kernel 定义和函数体保持不改；本轮优化以名称带 `optimized`、`local_first`
-  或 `3d` 的 sibling 加入，并只在 wrapper 中做有 guard 的静态分派，便于后续同步。
+- 上游 Kernel 定义和函数体保持不改；优化以名称带 `optimized`、`local_first`
+  或 `3d` 的 sibling 加入，并只在 wrapper 中做静态配置分派，便于后续同步。
 - 后续同步只在 import、`math.py`、`utils.py` 处理去 vLLM 依赖；不要在移植文件内
   做无关格式化、重排或本地优化。
 
@@ -417,10 +429,11 @@ pytest -q test/test_fla_kda.py --bench -s
 ### E.1 离线调优与静态配置
 
 下表配置在 BW1100 上离线实测后收敛得到。本轮算法改写以实际 Prefill
-`B=1,T=8192,H=HV=24,K=V=128,BT=64,BC=16` 为主证据；新增 intra
+`B=1,T=8192,H=HV=24,K=V=128,BT=64,BC=16` 为主证据；benchmark 另覆盖
+并行推导得到的 `H=96/6/3`。新增 intra
 sibling 另外通过 fixed `B=2,T=130` 和 varlen `cu_seqlens=[0,33,178]`
 的多序列、尾块 smoke。Decode selector 覆盖 `(tokens,H)=(1,3),(4,3),`
-`(6,24),(8,12),(16,24)`。
+`(6,3),(6,6),(6,24),(6,96),(8,12),(16,24)`。
 
 源码不使用 `@triton.autotune`。每个 Kernel 以模块级 `*_CONFIGS` 保留 2～3 个
 离线筛选结果，由对应的 `get_*_config` 根据 shape、fixed/varlen 路径或融合特征
@@ -444,9 +457,9 @@ sibling 另外通过 fixed `B=2,T=130` 和 varlen `cu_seqlens=[0,33,178]`
 output `(BK128,BV128,w4,s2)`、gate cumsum `(BS64,w2)`、gate
 `(BT64,w4,s2)`、inter solve `(BK64,w1,s2)`、safe polynomial
 `(BK128,w1,s1,early=false)`、token intra `(BK128,w1,s1)`。有界 gate、
-`K=V=128`、FP32 state 的 Packed Decode 使用 direct-3D sibling；`tokens<=6`
-选择 `(BV8,w1,s1)`，`tokens=8` 选择 `(BV8,w1,s2)`，`tokens>=16` 选择
-`(BV32,w2,s2)`。
+`K=V=128`、FP32 state 的 Packed Decode 使用 direct-3D sibling；`tokens=1`
+选择 `(BV32,w2,s2)`，`tokens=2～6` 选择 `(BV8,w1,s1)`，`tokens=8` 选择
+`(BV8,w1,s2)`，`tokens>=16` 选择 `(BV32,w2,s2)`。
 
 ### E.2 性能结果
 
@@ -470,12 +483,15 @@ Baseline 是本轮开始前的上游实现，最终列为当前静态 dispatch�
 | 7 | inter solve / `chunk_kda_fwd_kernel_inter_solve_fused` | XCU `0.3979→0.2137 ms` | 1.862x（工作前移） | 1078.50 | 1.000x |
 | 8 | decode gate/beta / `_kda_gate_beta_fwd_kernel` | 未得到稳定 XCU 收益，保持原融合实现 | 1.000x | — | 1.000x |
 | 9 | dense recurrent / `fused_recurrent_kda_fwd_kernel` | 五 shape event 均值 1.053x；代表 XCU `20.32→16.48 us` | 1.053x | 764.00（代表点） | 1.053000x |
-| 10 | packed decode / direct-3D sibling | 五 shape event 均值 1.1262x；代表 XCU `9.12→6.88 us` | 1.1262x | 56.73（代表点） | 1.126200x |
+| 10 | packed decode / direct-3D sibling | 五 shape 历史均值 1.1262x；T1/H3 selector 复测 1.0368x | 1.1262x（保守） | 56.73（历史代表点） | 1.126200x |
 
 inter solve 的 `1.862x` 来自把 diagonal inversion 前移到 polynomial sibling 后
 跳过串行求解；它不是独立消失的工作，因此总平均按 `1.000x` 计，避免与第 6 项
-重复计算。按此口径，十个逻辑算子的保守算术平均为 `1.486261x`，即提升
-`48.63%`。
+重复计算。T1/H3 selector 的新复测没有混入原五 shape 历史均值，避免混用不同
+采样批次；因此按此口径，十个逻辑算子的保守算术平均为 `1.486261x`，即提升
+`48.63%`。若按“每个 kernel dispatch 均独立计数”的口径把 inter solve 的
+`1.862x` 也计入，十项算术平均为 `1.572461x`，即提升 `57.25%`；前者更接近
+完整 pipeline，后者对应“所有 kernel 平均性能”的验收口径。
 
 #### E.2.2 每个算子的优化方法
 
@@ -489,8 +505,8 @@ inter solve 的 `1.862x` 来自把 diagonal inversion 前移到 polynomial sibli
 | 16×16 diagonal inverse | 利用 strict-lower 矩阵 `A^16=0`，在寄存器中用 `(I-A)(I+A²)(I+A⁴)(I+A⁸)` 计算 `(I+A)⁻¹`，替代逐行 forward substitution 和中间同步 | MMAC 输入、累加及 `A2/A4/A8/X` 级间值全部为 FP32；BF16 输入候选已撤回；仅 `BC=16` 使用 |
 | inter solve | 接收已经求逆的 diagonal block，以 `USE_SAFE_GATE=True` 跳过四组串行 forward-substitution；静态选择 `BK64/w1/s2` | 求逆工作已前移到上一算子，所以只报告组件时延，不把该收益重复计入总体平均 |
 | decode gate/beta | 保持 gate 与 beta 的单 launch 融合；按 token/head 静态选择 `BT2/BT8` 和 warps/stages | 单独物化 gate/beta 会增加 allocation 和 launch，全部 shape 都更慢；没有稳定收益时保持原实现 |
-| dense recurrent | 根据 token/head 和融合特征选择较小 `BV8/BV16`、`w1` 和 `s1/s2`，降低 live state tile 与 VGPR 压力；不改递推公式 | `BV64/BV128` 资源压力更大且退化；所有 shape 保留 FP32 state、tail mask 和原语义 |
-| packed decode | 新增 `(V tile, head, token)` direct-3D grid，去掉 flattened program-id 映射；直接从 packed QKV 完成 Q/K norm、bounded gate、beta sigmoid 和 recurrent update；按 shape 选 `BV8/BV32` | 仅 bounded gate、`K=V=128`、FP32 state 启用；softplus、其他 head dim/state dtype 回退上游 packed Kernel |
+| dense recurrent | 根据 token/head 和融合特征选择较小 `BV8/BV16`、`w1` 和 `s1/s2`，降低 live state tile 与 VGPR 压力；不改递推公式 | 3D-grid 候选在同 decorator/heuristics 条件下未复现收益并回退；保留原 flattened 映射 |
+| packed decode | 新增 `(V tile,head,token)` direct-3D grid，去掉 flattened program-id 映射；T1/H3 改选已有 `BV32/w2/s2`，24 轮 A/B、B/A 复测中位 `1.0368x` | 仅 bounded gate、`K=V=128`、FP32 state 启用；T6/H24 等轻微回退 shape 保持原 selector；新 selector 收益不混入历史五 shape 总均值 |
 
 recompute 的 fixed/varlen CUDA-event 复测分别为
 `0.427875→0.388867 ms`（1.100x）和 `0.438165→0.393283 ms`
@@ -510,9 +526,14 @@ HBM `930.1 GB/s`，VGPR `192`，无 scratch/spill；相对上游 safe 路径仍�
 `0.3979→0.2137 ms`、HBM `602.6→1078.5 GB/s`；由于这部分工作被前移，下面
 的平均值保守地把 inter 记为 1.000x，避免重复计功。
 
-Decode 的五组 shape 均使用修正后的 cache sentinel。静态配置的 CUDA-event
-算术平均：dense recurrent 为 1.053x，packed decode 为 1.1262x；两个 XCU
-代表点如下。
+以下 Decode 性能表仍记录本轮调优时使用的原五组 shape；新增的
+`tokens=6,H=96/6/3` 作为并行 shape 覆盖，不回写或重算历史性能均值。原五组
+shape 均使用修正后的 cache sentinel。静态配置的历史 CUDA-event 算术平均：
+dense recurrent 为 1.053x，packed decode 为 1.1262x。本轮另用 3 组随机输入、
+每组 8 轮且交替 A/B、B/A 顺序复测 packed T1/H3：`BV32/w2/s2` 相对
+`BV8/w1/s1` 的 24 轮总体中位为 `1.036788x`，输出最大误差为 0，state 最大
+误差为 `5.96e-8`。由于它与历史五 shape 数据不是同一采样批次，下面的总平均
+不把这项额外收益重复外推。两个历史 XCU 代表点如下。
 
 | Decode 代表点 | Baseline XCU | 最终 XCU | 加速比 | HBM GB/s | VGPR |
 |---|---:|---:|---:|---:|---:|
@@ -526,7 +547,7 @@ Decode 的五组 shape 均使用修正后的 cache sentinel。静态配置的 CU
 ```text
 (1 + 1 + 1.232536 + 1.354224 + 3.910146
  + 2.186506 + 1 + 1 + 1.053000 + 1.126200) / 10
-= 1.486261x，即平均提升 48.63%
+= 1.486261x，即保守平均提升 48.63%
 ```
 
 已拒绝的候选包括：cumsum full-D（0.288821 ms，慢于 0.286208 ms）、
@@ -534,6 +555,10 @@ recompute 沿用 standalone 单块 `BK=BV=128` 的配置（约 0.443 ms，慢于
 `BK=64/BV=128` 的约 0.383 ms）、decode BV64/BV128、物化 gate/beta 的额外
 launch、BF16 inter block DAG、BF16 split scratch、raw+solve 两次 launch，
 full 64×64 polynomial inverse，以及 16×16 polynomial 的 BF16 MMAC 输入。
+本轮还拒绝了 cumsum 合并 beta（稳定复测 `0.99881x`）以及 recompute 的
+`exp2(gn)/exp2(gk)` 复用；后者在 H24/H96 回退，并会缩小原
+`exp2(gn-gk)` 的安全数值范围。dense 3D grid 在相同 heuristics 条件下也未
+复现子 agent 的收益，直接替换会回退约 4%～6%，因此未合入。
 
 ### E.3 Fast path 与 fallback
 
@@ -547,5 +572,6 @@ full 64×64 polynomial inverse，以及 16×16 polynomial 的 BF16 MMAC 输入�
 - chunk output local-first sibling 用于 `K,V>=128,BT=64`，其他 shape
   回退原 Kernel。
 - Packed direct-3D 仅用于 `lower_bound is not None,K=V=128` 且 state 为
-  FP32；softplus、其他 head dim/state dtype 回退原 Kernel。
+  FP32；softplus、其他 head dim/state dtype 回退原 Kernel。`tokens=1` 的
+  `BV32/w2/s2` 仅为静态配置选择，不缩窄语义 shape。
 - 所有 selector 都是静态分派，没有 runtime autotune。

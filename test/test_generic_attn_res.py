@@ -11,11 +11,39 @@ import torch.nn.functional as F
 pytest.importorskip("triton")
 
 from bolt_ops.generic import attn_res  # noqa: E402
+from bolt_ops.generic.triton.attn_res import (  # noqa: E402
+    _ATTN_RES_CONFIGS,
+    _get_attn_res_config,
+    _use_attn_res_lazy_prefix,
+)
 
 DEVICE = "cuda"
 GPU_REQUIRED = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA/HIP device is required"
 )
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "num_blocks", "config_index"),
+    [
+        pytest.param(1, 8, 0, id="decode"),
+        pytest.param(256, 5, 0, id="small-token"),
+        pytest.param(4096, 2, 1, id="two-residual-blocks"),
+        pytest.param(4096, 3, 1, id="three-residual-blocks"),
+        pytest.param(320, 8, 2, id="prefill"),
+        pytest.param(8192, 5, 2, id="network-shape"),
+    ],
+)
+def test_attn_res_uses_offline_tuned_static_configs(
+    num_tokens: int, num_blocks: int, config_index: int
+) -> None:
+    assert len(_ATTN_RES_CONFIGS) == 3
+    assert _get_attn_res_config(num_tokens, num_blocks) == _ATTN_RES_CONFIGS[
+        config_index
+    ]
+    assert _use_attn_res_lazy_prefix(num_tokens, num_blocks) == (
+        num_tokens >= 320 and num_blocks >= 4
+    )
 
 
 def _reference(
@@ -103,6 +131,21 @@ _BENCH_SHAPES = {
     "decode": _BenchShape(tokens=1, blocks=8, hidden=7168),
     "small-batch": _BenchShape(tokens=17, blocks=8, hidden=7168),
     "prefill": _BenchShape(tokens=320, blocks=8, hidden=7168),
+    # Token sweep at the observed network block count.
+    **{
+        f"tokens-{tokens}-blocks-5": _BenchShape(
+            tokens=tokens, blocks=5, hidden=7168
+        )
+        for tokens in (1, 16, 64, 256, 1024, 4096, 8192)
+    },
+    # Full residual-block sweep at the observed 4096-token network shape.
+    **{
+        f"tokens-4096-blocks-{blocks}": _BenchShape(
+            tokens=4096, blocks=blocks, hidden=7168
+        )
+        for blocks in range(1, 9)
+        if blocks != 5
+    },
 }
 
 
