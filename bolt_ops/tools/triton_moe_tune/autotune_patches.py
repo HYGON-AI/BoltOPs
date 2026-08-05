@@ -550,7 +550,7 @@ def fused_moe(
             block_shape is not None and block_shape[1] > 0:
         assert B_scale is not None and B_scale.ndim == 3
         assert B_zp is None or B_zp.ndim == 3
-        offset_max = 2**31 - 1
+        offset_max = 2**32 - 1
         use_addr_offset_int64_a = A.numel() * A.element_size() >= offset_max
         use_addr_offset_int64_b = B.numel() * B.element_size() >= offset_max
         use_addr_offset_int64_c = C.numel() * C.element_size() >= offset_max
@@ -652,7 +652,7 @@ def fused_moe(
             **config,
         )
     else:
-        offset_max = 2**31 - 1
+        offset_max = 2**32 - 1
         use_addr_offset_int64_a = A.numel() * A.element_size() >= offset_max
         use_addr_offset_int64_c = C.numel() * C.element_size() >= offset_max
         use_addr_offset_int64_b = B.numel() * B.element_size() >= offset_max
