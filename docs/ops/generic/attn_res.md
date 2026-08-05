@@ -25,7 +25,7 @@ output = sum_i(weight_i * values_i)
 ## 2. 接口说明
 
 ```python
-from bolt_ops import attn_res
+from bolt_ops.generic import attn_res
 
 output = attn_res(
     prefix=prefix,
@@ -91,10 +91,10 @@ Kimi-K3 attention residual 的典型 hidden size 为 `7168`，最多使用 8 路
 
 ```bash
 # 正确性测试
-pytest -q test/test_attn_res.py
+pytest -q test/test_generic_attn_res.py
 
 # Decode / small-batch / prefill 性能
-pytest -q test/test_attn_res.py --bench -s
+pytest -q test/test_generic_attn_res.py --bench -s
 ```
 
 PyTorch reference 等价于：
@@ -110,9 +110,9 @@ expected = torch.matmul(probs.unsqueeze(1), values).squeeze(1)
 
 | 用途 | 文件 |
 |---|---|
-| 公开接口 | `bolt_ops/attn_res/__init__.py` |
-| Triton 实现 | `bolt_ops/attn_res/triton/attn_res.py` |
-| 测试 / 性能 | `test/test_attn_res.py`（`--bench`） |
+| 公开接口 | `bolt_ops/generic/__init__.py` |
+| Triton 实现 | `bolt_ops/generic/triton/attn_res.py` |
+| 测试 / 性能 | `test/test_generic_attn_res.py`（`--bench`） |
 
 范围：`attn_res` / `_attn_res_kernel`；不含 NVIDIA CUDA 实现，不含 backward。
 

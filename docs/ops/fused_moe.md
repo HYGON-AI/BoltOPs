@@ -20,12 +20,10 @@ out += w * y                          # 再按 topk 聚合；可选 no_combine
 
 ## 2. 接口说明
 
-第一层 GEMM 后的激活也可作为独立公开算子调用；接口、支持的激活类型以及
-aiter `moe_c` / `moe_asm` / `moe_triton` 的显式输出接入方式见
-[`moe_activation`](moe_activation.md)。
+第一层 GEMM 后的激活也可通过 `bolt_ops.fused_moe.moe_activation` 独立调用。
 
 ```python
-from bolt_ops import fused_experts
+from bolt_ops.fused_moe import fused_experts
 
 out = fused_experts(
     hidden_states,
@@ -101,7 +99,16 @@ def fused_experts(
 | `routed_scaling_factor`                              | float                                       | 路由缩放                                   |
 | `gemm1_alpha` / `gemm1_limit`                      | optional                                    | 部分激活路径参数                           |
 
-### 2.2 前置条件
+### 2.2 支持的 activation
+
+| 类型 | `activation` |
+| --- | --- |
+| Gated / non-gated | `silu`、`gelu`、`gelu_tanh` |
+| 仅 gated | `situ`、`swigluoai`、`swiglustep` |
+| 仅 non-gated | `silu_no_mul`、`gelu_no_mul`、`gelu_tanh_no_mul`、`relu2`、`relu2_no_mul` |
+| 别名 | `gelu_pytorch_tanh`、`gelu_pytorch_tanh_no_mul` |
+
+### 2.3 前置条件
 
 - 张量在 GPU 上；`hidden_states` contiguous；`w1`/`w2` 最后一维 stride 为 1
 - `topk_weights.shape == topk_ids.shape`

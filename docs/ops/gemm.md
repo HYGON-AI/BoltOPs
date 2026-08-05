@@ -20,7 +20,7 @@
 未公开：`gemm_fp16`（内部 HCU WASP/WDRA 实验）。
 
 ```python
-from bolt_ops import (
+from bolt_ops.gemm import (
     matmul_persistent,
     gemm_a16w16,
     w8a8_triton_block_scaled_mm,

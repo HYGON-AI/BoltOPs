@@ -13,8 +13,8 @@ import torch
 
 pytest.importorskip("triton")
 
-from bolt_ops.recompute_w_u import recompute_w_u_fwd  # noqa: E402
-from bolt_ops.recompute_w_u.triton.recompute_w_u import (  # noqa: E402
+from bolt_ops.generic import recompute_w_u_fwd  # noqa: E402
+from bolt_ops.generic.triton.recompute_w_u import (  # noqa: E402
     _RECOMPUTE_W_U_CONFIGS,
     _select_recompute_w_u_config,
     prepare_chunk_indices,
