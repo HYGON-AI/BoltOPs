@@ -19,7 +19,7 @@ next_power_of_2 = triton.next_power_of_2
 
 
 # Offline-tuned on BW1100, BF16/FP32, D=128.  These candidate sets cover
-# decode (tokens, heads)={(1, 3), (4, 3), (6, 24), (8, 12), (16, 24)}.
+# decode (tokens, heads)={(1,3),(4,3),(6,3/6/24/96),(8,12),(16,24)}.
 KDA_GATE_BETA_CONFIGS = (
     {"BT": 2, "num_warps": 2, "num_stages": 3},  # T=1 and T=6
     {"BT": 2, "num_warps": 8, "num_stages": 2},  # T=4 and T=8
@@ -35,7 +35,7 @@ FUSED_RECURRENT_KDA_CONFIGS = (
 FUSED_RECURRENT_KDA_PACKED_DECODE_CONFIGS = (
     {"BV": 8, "num_warps": 1, "num_stages": 2},  # B=8
     {"BV": 8, "num_warps": 1, "num_stages": 1},  # B<=6
-    {"BV": 32, "num_warps": 2, "num_stages": 2},  # B>=16
+    {"BV": 32, "num_warps": 2, "num_stages": 2},  # B=1 or B>=16
 )
 
 
@@ -77,6 +77,8 @@ def get_fused_recurrent_kda_packed_decode_config(
 ) -> dict[str, int]:
     if K < 128 or V < 128:
         return FUSED_RECURRENT_KDA_PACKED_DECODE_CONFIGS[1]
+    if B <= 1:
+        return FUSED_RECURRENT_KDA_PACKED_DECODE_CONFIGS[2]
     if B <= 6:
         return FUSED_RECURRENT_KDA_PACKED_DECODE_CONFIGS[1]
     if B < 16:

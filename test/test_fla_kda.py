@@ -168,7 +168,7 @@ def test_all_kda_kernels_use_bounded_bw1100_static_configs() -> None:
         kda_recurrent_kernels.get_fused_recurrent_kda_packed_decode_config(
             1, 3, 128, 128
         )
-        == kda_recurrent_kernels.FUSED_RECURRENT_KDA_PACKED_DECODE_CONFIGS[1]
+        == kda_recurrent_kernels.FUSED_RECURRENT_KDA_PACKED_DECODE_CONFIGS[2]
     )
     assert (
         kda_recurrent_kernels.get_fused_recurrent_kda_packed_decode_config(
@@ -420,11 +420,20 @@ def _make_decode_inputs(B: int, H: int, D: int):
 
 @GPU_REQUIRED
 @pytest.mark.parametrize("lower_bound", [None, -3.0])
+@pytest.mark.parametrize(
+    ("B", "H"),
+    [
+        pytest.param(1, 3, id="tokens1-h3"),
+        pytest.param(3, 2, id="tokens3-h2"),
+    ],
+)
 def test_packed_decode_matches_dense_recurrent(
+    B: int,
+    H: int,
     lower_bound: float | None,
 ) -> None:
     torch.manual_seed(14)
-    B, H, D = 3, 2, 128
+    D = 128
     (
         mixed_qkv,
         raw_g,
@@ -518,27 +527,39 @@ def test_packed_decode_matches_dense_recurrent(
 
 _PREFILL_B = 1
 _PREFILL_T = 8192
-_PREFILL_H = 24
 _PREFILL_K = 128
 _PREFILL_V = 128
 _PREFILL_BT = 64
 _PREFILL_BC = 16
 _PREFILL_VARLEN_CU_SEQLENS = (0, 3000, 8192)
 
+# Kimi-K3 has 96 total KDA heads.  SGLang DPA with TP32+CP8 uses
+# attn_tp=TP/CP=4 (H=24); regular TP16/TP32 use H=6/H=3.  Keep H=96 for
+# the full-head/unsharded-attention path.
+_PARALLEL_HEAD_BENCH_CASES = [
+    pytest.param(96, id="h96-full-heads"),
+    pytest.param(24, id="h24-tp32-cp8-dpa"),
+    pytest.param(6, id="h6-tp16"),
+    pytest.param(3, id="h3-tp32"),
+]
+
 _DECODE_BENCH_SHAPES = [
-    pytest.param(6, 24, 128, id="tokens6-h24"),
-    pytest.param(1, 3, 128, id="tokens1-h3-tp8"),
+    pytest.param(6, 96, 128, id="tokens6-h96-full-heads"),
+    pytest.param(6, 24, 128, id="tokens6-h24-tp32-cp8-dpa"),
+    pytest.param(6, 6, 128, id="tokens6-h6-tp16"),
+    pytest.param(6, 3, 128, id="tokens6-h3-tp32"),
+    pytest.param(1, 3, 128, id="tokens1-h3-tp32"),
     pytest.param(4, 3, 128, id="tokens4-h3"),
     pytest.param(8, 12, 128, id="tokens8-h12"),
     pytest.param(16, 24, 128, id="tokens16-h24"),
 ]
 
 
-def _make_prefill_bench_inputs(use_varlen: bool = False):
+def _make_prefill_bench_inputs(H: int, use_varlen: bool = False):
     B, T, H, K, V, BT = (
         _PREFILL_B,
         _PREFILL_T,
-        _PREFILL_H,
+        H,
         _PREFILL_K,
         _PREFILL_V,
         _PREFILL_BT,
@@ -575,15 +596,35 @@ def _make_prefill_cu_seqlens(use_varlen: bool) -> torch.Tensor | None:
     )
 
 
+def _prefill_num_chunks(use_varlen: bool) -> int:
+    if not use_varlen:
+        return (_PREFILL_T + _PREFILL_BT - 1) // _PREFILL_BT
+    return sum(
+        (eos - bos + _PREFILL_BT - 1) // _PREFILL_BT
+        for bos, eos in zip(
+            _PREFILL_VARLEN_CU_SEQLENS[:-1],
+            _PREFILL_VARLEN_CU_SEQLENS[1:],
+        )
+    )
+
+
+def test_prefill_bench_chunk_count_matches_varlen_layout() -> None:
+    assert _prefill_num_chunks(False) == 128
+    assert _prefill_num_chunks(True) == 129
+
+
 def _print_prefill_bench(
-    name: str, elapsed: float, use_varlen: bool | None = None
+    name: str,
+    elapsed: float,
+    H: int,
+    use_varlen: bool | None = None,
 ) -> None:
     mode = ""
     if use_varlen is not None:
         mode = f", mode={'varlen' if use_varlen else 'fixed'}"
     print(
         f"KDA {name}: B={_PREFILL_B}, T={_PREFILL_T}, "
-        f"H={_PREFILL_H}, K={_PREFILL_K}, V={_PREFILL_V}, "
+        f"H={H}, K={_PREFILL_K}, V={_PREFILL_V}, "
         f"{elapsed:.4f} ms{mode}"
     )
 
@@ -634,20 +675,22 @@ def _print_decode_bench(
 
 @GPU_REQUIRED
 @pytest.mark.bench
+@pytest.mark.parametrize("H", _PARALLEL_HEAD_BENCH_CASES)
 def test_bench_kda_gate(
+    H: int,
     time_ms,
     bench_warmup: int,
     bench_repeat: int,
 ) -> None:
     raw_g = torch.randn(
         _PREFILL_B * _PREFILL_T,
-        _PREFILL_H * _PREFILL_K,
+        H * _PREFILL_K,
         device=DEVICE,
         dtype=torch.bfloat16,
     )
-    A_log = torch.randn(_PREFILL_H, device=DEVICE, dtype=torch.float32)
+    A_log = torch.randn(H, device=DEVICE, dtype=torch.float32)
     g_bias = torch.randn(
-        _PREFILL_H, _PREFILL_K, device=DEVICE, dtype=torch.float32
+        H, _PREFILL_K, device=DEVICE, dtype=torch.float32
     )
     elapsed = time_ms(
         lambda: fused_kda_gate(
@@ -659,13 +702,15 @@ def test_bench_kda_gate(
         bench_warmup,
         bench_repeat,
     )
-    _print_prefill_bench("gate", elapsed)
+    _print_prefill_bench("gate", elapsed, H)
 
 
 @GPU_REQUIRED
 @pytest.mark.bench
+@pytest.mark.parametrize("H", _PARALLEL_HEAD_BENCH_CASES)
 @pytest.mark.parametrize("use_varlen", [False, True], ids=["fixed", "varlen"])
 def test_bench_kda_gate_chunk_cumsum(
+    H: int,
     use_varlen: bool,
     time_ms,
     bench_warmup: int,
@@ -674,7 +719,7 @@ def test_bench_kda_gate_chunk_cumsum(
     raw_g = torch.randn(
         _PREFILL_B,
         _PREFILL_T,
-        _PREFILL_H,
+        H,
         _PREFILL_K,
         device=DEVICE,
         dtype=torch.bfloat16,
@@ -682,13 +727,13 @@ def test_bench_kda_gate_chunk_cumsum(
     raw_beta = torch.randn(
         _PREFILL_B,
         _PREFILL_T,
-        _PREFILL_H,
+        H,
         device=DEVICE,
         dtype=torch.bfloat16,
     )
-    A_log = torch.randn(_PREFILL_H, device=DEVICE, dtype=torch.float32)
+    A_log = torch.randn(H, device=DEVICE, dtype=torch.float32)
     g_bias = torch.randn(
-        _PREFILL_H, _PREFILL_K, device=DEVICE, dtype=torch.float32
+        H, _PREFILL_K, device=DEVICE, dtype=torch.float32
     )
     cu_seqlens = _make_prefill_cu_seqlens(use_varlen)
     elapsed = time_ms(
@@ -703,23 +748,25 @@ def test_bench_kda_gate_chunk_cumsum(
         bench_warmup,
         bench_repeat,
     )
-    _print_prefill_bench("gate chunk cumsum", elapsed, use_varlen)
+    _print_prefill_bench("gate chunk cumsum", elapsed, H, use_varlen)
 
 
 @GPU_REQUIRED
 @pytest.mark.bench
+@pytest.mark.parametrize("H", _PARALLEL_HEAD_BENCH_CASES)
 @pytest.mark.parametrize("use_varlen", [False, True], ids=["fixed", "varlen"])
 def test_bench_kda_intra_token_parallel(
+    H: int,
     use_varlen: bool,
     time_ms,
     bench_warmup: int,
     bench_repeat: int,
 ) -> None:
-    q, k, _, gk, beta = _make_prefill_bench_inputs(use_varlen)
+    q, k, _, gk, beta = _make_prefill_bench_inputs(H, use_varlen)
     Aqk = torch.empty(
         _PREFILL_B,
         _PREFILL_T,
-        _PREFILL_H,
+        H,
         _PREFILL_BT,
         device=DEVICE,
         dtype=torch.bfloat16,
@@ -727,7 +774,7 @@ def test_bench_kda_intra_token_parallel(
     Akk = torch.empty(
         _PREFILL_B,
         _PREFILL_T,
-        _PREFILL_H,
+        H,
         _PREFILL_BC,
         device=DEVICE,
         dtype=torch.float32,
@@ -749,21 +796,23 @@ def test_bench_kda_intra_token_parallel(
         bench_warmup,
         bench_repeat,
     )
-    _print_prefill_bench("intra token parallel", elapsed, use_varlen)
+    _print_prefill_bench("intra token parallel", elapsed, H, use_varlen)
 
 
 @GPU_REQUIRED
 @pytest.mark.bench
+@pytest.mark.parametrize("H", _PARALLEL_HEAD_BENCH_CASES)
 @pytest.mark.parametrize("safe_gate", [False, True], ids=["token", "safe"])
 @pytest.mark.parametrize("use_varlen", [False, True], ids=["fixed", "varlen"])
 def test_bench_kda_prefill_intra(
+    H: int,
     safe_gate: bool,
     use_varlen: bool,
     time_ms,
     bench_warmup: int,
     bench_repeat: int,
 ) -> None:
-    q, k, _, gk, beta = _make_prefill_bench_inputs(use_varlen)
+    q, k, _, gk, beta = _make_prefill_bench_inputs(H, use_varlen)
     cu_seqlens = _make_prefill_cu_seqlens(use_varlen)
     elapsed = time_ms(
         lambda: chunk_kda_fwd_intra(
@@ -780,23 +829,25 @@ def test_bench_kda_prefill_intra(
         bench_repeat,
     )
     path = "safe" if safe_gate else "token"
-    _print_prefill_bench(f"prefill intra ({path})", elapsed, use_varlen)
+    _print_prefill_bench(f"prefill intra ({path})", elapsed, H, use_varlen)
 
 
 @GPU_REQUIRED
 @pytest.mark.bench
+@pytest.mark.parametrize("H", _PARALLEL_HEAD_BENCH_CASES)
 @pytest.mark.parametrize("use_varlen", [False, True], ids=["fixed", "varlen"])
 def test_bench_kda_recompute_w_u(
+    H: int,
     use_varlen: bool,
     time_ms,
     bench_warmup: int,
     bench_repeat: int,
 ) -> None:
-    _, k, v, gk, beta = _make_prefill_bench_inputs(use_varlen)
+    _, k, v, gk, beta = _make_prefill_bench_inputs(H, use_varlen)
     A = torch.randn(
         _PREFILL_B,
         _PREFILL_T,
-        _PREFILL_H,
+        H,
         _PREFILL_BT,
         device=DEVICE,
         dtype=torch.bfloat16,
@@ -809,31 +860,33 @@ def test_bench_kda_recompute_w_u(
         bench_warmup,
         bench_repeat,
     )
-    _print_prefill_bench("recompute W/U", elapsed, use_varlen)
+    _print_prefill_bench("recompute W/U", elapsed, H, use_varlen)
 
 
 @GPU_REQUIRED
 @pytest.mark.bench
+@pytest.mark.parametrize("H", _PARALLEL_HEAD_BENCH_CASES)
 @pytest.mark.parametrize("use_varlen", [False, True], ids=["fixed", "varlen"])
 def test_bench_kda_chunk_output(
+    H: int,
     use_varlen: bool,
     time_ms,
     bench_warmup: int,
     bench_repeat: int,
 ) -> None:
-    q, _, v, gk, _ = _make_prefill_bench_inputs(use_varlen)
+    q, _, v, gk, _ = _make_prefill_bench_inputs(H, use_varlen)
     A = torch.randn(
         _PREFILL_B,
         _PREFILL_T,
-        _PREFILL_H,
+        H,
         _PREFILL_BT,
         device=DEVICE,
         dtype=torch.bfloat16,
     )
     h = torch.randn(
         _PREFILL_B,
-        _PREFILL_T // _PREFILL_BT,
-        _PREFILL_H,
+        _prefill_num_chunks(use_varlen),
+        H,
         _PREFILL_V,
         _PREFILL_K,
         device=DEVICE,
@@ -856,7 +909,7 @@ def test_bench_kda_chunk_output(
         bench_warmup,
         bench_repeat,
     )
-    _print_prefill_bench("chunk output", elapsed, use_varlen)
+    _print_prefill_bench("chunk output", elapsed, H, use_varlen)
 
 
 @GPU_REQUIRED

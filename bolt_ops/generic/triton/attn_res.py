@@ -13,6 +13,28 @@ import triton
 import triton.language as tl
 
 
+# Three static configs selected by an offline sweep on gfx938 (BW1100), using
+# the benchmark shapes in ``test/test_generic_attn_res.py``.  Keep this list
+# explicit: production calls must not pay Triton's runtime autotune cost.
+_ATTN_RES_CONFIGS = (
+    {"BLOCK_L": 4, "num_warps": 8, "num_stages": 2},
+    {"BLOCK_L": 4, "num_warps": 4, "num_stages": 2},
+    {"BLOCK_L": 2, "num_warps": 4, "num_stages": 2},
+)
+
+
+def _get_attn_res_config(num_tokens: int, num_blocks: int) -> dict[str, int]:
+    if num_tokens < 320:
+        return _ATTN_RES_CONFIGS[0]
+    if 2 <= num_blocks <= 3:
+        return _ATTN_RES_CONFIGS[1]
+    return _ATTN_RES_CONFIGS[2]
+
+
+def _use_attn_res_lazy_prefix(num_tokens: int, num_blocks: int) -> bool:
+    return num_tokens >= 320 and num_blocks >= 4
+
+
 @triton.jit
 def _attn_res_kernel(
     prefix_ptr,
@@ -86,6 +108,89 @@ def _attn_res_kernel(
     )
 
 
+@triton.jit
+def _attn_res_kernel_lazy_prefix(
+    prefix_ptr,
+    blocks_ptr,
+    norm_weight_ptr,
+    qk_weight_ptr,
+    output_ptr,
+    stride_prefix_m: tl.constexpr,
+    stride_block_m: tl.constexpr,
+    stride_block_r: tl.constexpr,
+    stride_output_m: tl.constexpr,
+    num_blocks: tl.constexpr,
+    hidden_size: tl.constexpr,
+    eps: tl.constexpr,
+    BLOCK_L: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Keep the upstream kernel intact while shortening prefix live ranges."""
+    row_idx = tl.program_id(0).to(tl.int64)
+    d_offsets = tl.max_contiguous(tl.arange(0, BLOCK_D), BLOCK_D)
+    d_mask = d_offsets < hidden_size
+    input_qk_weight = tl.load(
+        norm_weight_ptr + d_offsets, mask=d_mask, other=0.0
+    ).to(tl.float32) * tl.load(
+        qk_weight_ptr + d_offsets, mask=d_mask, other=0.0
+    ).to(tl.float32)
+
+    max_logit = tl.full((), -float("inf"), tl.float32)
+    denominator = tl.zeros((), tl.float32)
+    mixed = tl.zeros((BLOCK_D,), tl.float32)
+    num_sources: tl.constexpr = num_blocks + 1
+    num_tiles: tl.constexpr = tl.cdiv(num_sources, BLOCK_L)
+
+    for source_tile in range(num_tiles):
+        source_offsets = source_tile * BLOCK_L + tl.arange(0, BLOCK_L)
+        source_mask = source_offsets < num_sources
+        block_ptrs = (
+            blocks_ptr
+            + row_idx * stride_block_m
+            + source_offsets[:, None] * stride_block_r
+            + d_offsets[None, :]
+        )
+        if source_tile + 1 == num_tiles:
+            is_prefix = source_offsets == num_blocks
+            block_values = tl.load(
+                block_ptrs,
+                mask=(source_mask[:, None] & ~is_prefix[:, None] & d_mask[None, :]),
+                other=0.0,
+                eviction_policy="evict_first",
+            ).to(tl.float32)
+            prefix = tl.load(
+                prefix_ptr + row_idx * stride_prefix_m + d_offsets,
+                mask=d_mask,
+                other=0.0,
+            ).to(tl.float32)
+            values = tl.where(is_prefix[:, None], prefix[None, :], block_values)
+        else:
+            values = tl.load(
+                block_ptrs,
+                mask=(source_mask[:, None] & d_mask[None, :]),
+                other=0.0,
+                eviction_policy="evict_first",
+            ).to(tl.float32)
+
+        reciprocal_std = tl.rsqrt(
+            tl.sum(values * values, axis=1) * (1.0 / hidden_size) + eps
+        )
+        logits = tl.sum(values * input_qk_weight[None, :], axis=1) * reciprocal_std
+        scores = tl.where(source_mask, logits, -float("inf"))
+        new_max_logit = tl.maximum(max_logit, tl.max(scores, axis=0))
+        old_scale = tl.exp(max_logit - new_max_logit)
+        block_scales = tl.exp(scores - new_max_logit)
+        denominator = denominator * old_scale + tl.sum(block_scales, axis=0)
+        mixed = mixed * old_scale + tl.sum(block_scales[:, None] * values, axis=0)
+        max_logit = new_max_logit
+
+    tl.store(
+        output_ptr + row_idx * stride_output_m + d_offsets,
+        mixed / denominator,
+        mask=d_mask,
+    )
+
+
 def attn_res(
     prefix: torch.Tensor,
     blocks: torch.Tensor,
@@ -108,11 +213,13 @@ def attn_res(
     if num_tokens == 0:
         return output
 
-    if num_tokens >= 256 or num_blocks <= 1:
-        block_l, num_warps = 1, 4
-    else:
-        block_l, num_warps = 4, 8
-    _attn_res_kernel[(num_tokens,)](
+    config = _get_attn_res_config(num_tokens, num_blocks)
+    kernel = (
+        _attn_res_kernel_lazy_prefix
+        if _use_attn_res_lazy_prefix(num_tokens, num_blocks)
+        else _attn_res_kernel
+    )
+    kernel[(num_tokens,)](
         prefix,
         blocks,
         norm_weight,
@@ -125,9 +232,7 @@ def attn_res(
         num_blocks,
         hidden_size,
         eps,
-        BLOCK_L=block_l,
         BLOCK_D=triton.next_power_of_2(hidden_size),
-        num_warps=num_warps,
-        num_stages=2,
+        **config,
     )
     return output
