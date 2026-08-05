@@ -1,4 +1,4 @@
-# `KDA Triton Kernel 使用说明`
+# `FLA/KDA Triton Kernel 使用说明`
 
 Kimi-K3 Kernelized Delta Attention（KDA）的 Prefill/Chunk 与
 Decode/Recurrent Triton Kernel 集合。当前包提供 KDA 目录内直接定义的 Kernel
@@ -96,10 +96,10 @@ flowchart LR
 
 ## 2. 接口说明
 
-公开接口从 `bolt_ops.kda` 导入：
+公开接口从 `bolt_ops.fla_kda` 导入：
 
 ```python
-from bolt_ops.kda import (
+from bolt_ops.fla_kda import (
     chunk_gla_fwd_o_gk,
     chunk_kda_fwd_intra,
     chunk_kda_fwd_intra_token_parallel,
@@ -346,10 +346,10 @@ Decode-only recurrent Kernel 不复用 Prefill Shape，分别使用上述实际 
 
 ```bash
 # 正确性测试
-pytest -q test/test_kda.py
+pytest -q test/test_fla_kda.py
 
 # 全部 Prefill、共用及 Decode KDA Kernel 性能
-pytest -q test/test_kda.py --bench -s
+pytest -q test/test_fla_kda.py --bench -s
 ```
 
 正确性测试覆盖：
@@ -366,14 +366,14 @@ pytest -q test/test_kda.py --bench -s
 
 | 用途 | 文件 |
 |---|---|
-| 公开接口 | `bolt_ops/kda/__init__.py` |
-| Triton 导出 | `bolt_ops/kda/triton/__init__.py` |
-| Chunk Kernel | `bolt_ops/kda/triton/kda/chunk.py` |
-| Intra Kernel | `bolt_ops/kda/triton/kda/chunk_intra.py` |
-| Token-parallel Kernel | `bolt_ops/kda/triton/kda/chunk_intra_token_parallel.py` |
-| Recurrent Kernel | `bolt_ops/kda/triton/kda/fused_recurrent.py` |
-| 去 vLLM 兼容 helper | `bolt_ops/kda/triton/kda/math.py`、`utils.py` |
-| 测试 / 性能 | `test/test_kda.py`（`--bench`） |
+| 公开接口 | `bolt_ops/fla_kda/__init__.py` |
+| Triton 导出 | `bolt_ops/fla_kda/triton/__init__.py` |
+| Chunk Kernel | `bolt_ops/fla_kda/triton/chunk.py` |
+| Intra Kernel | `bolt_ops/fla_kda/triton/chunk_intra.py` |
+| Token-parallel Kernel | `bolt_ops/fla_kda/triton/chunk_intra_token_parallel.py` |
+| Recurrent Kernel | `bolt_ops/fla_kda/triton/fused_recurrent.py` |
+| 去 vLLM 兼容 helper | `bolt_ops/fla_kda/triton/math.py`、`utils.py` |
+| 测试 / 性能 | `test/test_fla_kda.py`（`--bench`） |
 
 范围：KDA 目录直接定义的 Triton Kernel 与直接 launch wrapper；不含依赖 vLLM
 公共 FLA Kernel 的完整 `chunk_kda` orchestration，不含 backward。

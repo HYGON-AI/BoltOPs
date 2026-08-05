@@ -27,7 +27,7 @@ w_c = A_c @ (
 ## 2. 接口说明
 
 ```python
-from bolt_ops import recompute_w_u_fwd
+from bolt_ops.generic import recompute_w_u_fwd
 
 w, u = recompute_w_u_fwd(
     k=k,
@@ -101,19 +101,19 @@ def recompute_w_u_fwd(
 
 ```bash
 # 正确性测试
-pytest -q test/test_recompute_w_u.py
+pytest -q test/test_generic_recompute_w_u.py
 
 # 性能（真实模型尺寸；与正确性 case 集不同）
-pytest -q test/test_recompute_w_u.py --bench -s
+pytest -q test/test_generic_recompute_w_u.py --bench -s
 ```
 
 ## 附录 A. 仓库文件
 
 | 用途        | 文件                                      |
 | ----------- | ----------------------------------------- |
-| 公开接口    | `bolt_ops/recompute_w_u/__init__.py`           |
-| Triton 实现 | `bolt_ops/recompute_w_u/triton/recompute_w_u.py` |
-| 测试 / 性能 | `test/test_recompute_w_u.py`（`--bench`） |
+| 公开接口    | `bolt_ops/generic/__init__.py`                    |
+| Triton 实现 | `bolt_ops/generic/triton/recompute_w_u.py`         |
+| 测试 / 性能 | `test/test_generic_recompute_w_u.py`（`--bench`） |
 
 范围：`recompute_w_u_fwd` / `recompute_w_u_fwd_kernel` 及 chunk-index helper；
 不含 backward。

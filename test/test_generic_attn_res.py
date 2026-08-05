@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 pytest.importorskip("triton")
 
-from bolt_ops.attn_res import attn_res  # noqa: E402
+from bolt_ops.generic import attn_res  # noqa: E402
 
 DEVICE = "cuda"
 GPU_REQUIRED = pytest.mark.skipif(

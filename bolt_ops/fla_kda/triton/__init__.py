@@ -1,9 +1,9 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-#
-# Standalone vendor of the directly callable Kimi-K3 KDA Triton kernels from
-# vLLM's AMD implementation. vLLM imports are replaced by local compatibility
-# helpers; orchestration that depends on vLLM's shared FLA modules is excluded.
+"""Triton backend for Kernelized Delta Attention.
+
+Standalone vendor of the directly callable Kimi-K3 KDA Triton kernels from
+vLLM's AMD implementation. vLLM imports are replaced by local compatibility
+helpers; orchestration that depends on vLLM's shared FLA modules is excluded.
+"""
 
 from .chunk import (
     chunk_gla_fwd_o_gk,

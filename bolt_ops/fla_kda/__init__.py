@@ -20,7 +20,7 @@ def recompute_w_u_fwd(
     chunk_indices: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, None, torch.Tensor | None]:
     """Recompute the KDA ``w`` and ``u`` chunk intermediates."""
-    from bolt_ops.kda.triton.kda import recompute_w_u_fwd as impl
+    from bolt_ops.fla_kda.triton import recompute_w_u_fwd as impl
 
     return impl(
         k,
@@ -47,7 +47,7 @@ def chunk_gla_fwd_o_gk(
     chunk_size: int = 64,
 ) -> torch.Tensor:
     """Compute the chunk KDA output from cumulative gates and state."""
-    from bolt_ops.kda.triton.kda import chunk_gla_fwd_o_gk as impl
+    from bolt_ops.fla_kda.triton import chunk_gla_fwd_o_gk as impl
 
     return impl(
         q,
@@ -77,7 +77,7 @@ def fused_kda_gate_chunk_cumsum(
     output_dtype: torch.dtype | None = torch.float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply the KDA gate and produce its chunk-wise cumulative sum."""
-    from bolt_ops.kda.triton.kda import fused_kda_gate_chunk_cumsum as impl
+    from bolt_ops.fla_kda.triton import fused_kda_gate_chunk_cumsum as impl
 
     return impl(
         raw_g,
@@ -104,7 +104,7 @@ def fused_kda_gate(
     lower_bound: float | None = None,
 ) -> torch.Tensor:
     """Apply the KDA gate transformation."""
-    from bolt_ops.kda.triton.kda import fused_kda_gate as impl
+    from bolt_ops.fla_kda.triton import fused_kda_gate as impl
 
     return impl(
         g,
@@ -129,7 +129,7 @@ def chunk_kda_fwd_intra(
     safe_gate: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute the intra-chunk KDA coefficient matrices."""
-    from bolt_ops.kda.triton.kda import chunk_kda_fwd_intra as impl
+    from bolt_ops.fla_kda.triton import chunk_kda_fwd_intra as impl
 
     return impl(
         q,
@@ -157,7 +157,7 @@ def chunk_kda_fwd_intra_token_parallel(
     sub_chunk_size: int = 16,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute intra-chunk coefficients with token parallelism."""
-    from bolt_ops.kda.triton.kda import (
+    from bolt_ops.fla_kda.triton import (
         chunk_kda_fwd_intra_token_parallel as impl,
     )
 
@@ -196,7 +196,7 @@ def fused_recurrent_kda_fwd(
     out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run recurrent KDA with preprocessed gate and beta tensors."""
-    from bolt_ops.kda.triton.kda import fused_recurrent_kda_fwd as impl
+    from bolt_ops.fla_kda.triton import fused_recurrent_kda_fwd as impl
 
     return impl(
         q,
@@ -237,7 +237,7 @@ def fused_recurrent_kda(
     fuse_gate: bool | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run recurrent KDA from raw gate and beta tensors."""
-    from bolt_ops.kda.triton.kda import fused_recurrent_kda as impl
+    from bolt_ops.fla_kda.triton import fused_recurrent_kda as impl
 
     return impl(
         q,
@@ -269,7 +269,7 @@ def fused_recurrent_kda_packed_decode(
     scale: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run one-token KDA decode from packed post-convolution QKV."""
-    from bolt_ops.kda.triton.kda import fused_recurrent_kda_packed_decode as impl
+    from bolt_ops.fla_kda.triton import fused_recurrent_kda_packed_decode as impl
 
     return impl(
         mixed_qkv,
