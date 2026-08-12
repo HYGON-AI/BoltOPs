@@ -1,9 +1,12 @@
-"""Hygon / Triton architecture queries."""
+"""Cached accelerator architecture and capability queries."""
 
 from __future__ import annotations
 
+import re
+from dataclasses import dataclass
+from functools import lru_cache
+
 import torch
-import triton
 
 # Per-arch LDS / shared-memory capacity (bytes). Unknown arch -> 64KiB.
 _LDS_CAP_BYTES = {
@@ -20,14 +23,72 @@ _LDS_CAP_BYTES = {
 }
 
 
-def get_arch():
-    return triton.runtime.driver.active.get_current_target().arch
+@dataclass(frozen=True)
+class DeviceInfo:
+    index: int
+    arch: str
+    cu_count: int
 
 
-def get_num_sms():
-    current_device_index = torch.cuda.current_device()
-    current_device = torch.cuda.get_device_properties(current_device_index)
-    return current_device.multi_processor_count
+def _normalize_arch(value: str) -> str | None:
+    match = re.search(r"gfx[0-9a-f]+", value.lower())
+    return match.group(0) if match else None
+
+
+def _device_index(device: torch.device | str | int | None) -> int:
+    if device is None:
+        return torch.cuda.current_device()
+    if isinstance(device, int):
+        return device
+
+    resolved = torch.device(device)
+    if resolved.type != "cuda":
+        raise RuntimeError(
+            f"Accelerator metadata requires a CUDA/HCU device, got {resolved}"
+        )
+    return (
+        torch.cuda.current_device()
+        if resolved.index is None
+        else resolved.index
+    )
+
+
+@lru_cache(maxsize=None)
+def _get_device_info(index: int) -> DeviceInfo:
+    props = torch.cuda.get_device_properties(index)
+    candidates = (
+        getattr(props, "gcnArchName", ""),
+        getattr(props, "arch_name", ""),
+        getattr(props, "name", ""),
+    )
+    arch = next(
+        (arch for value in candidates if (arch := _normalize_arch(str(value)))),
+        None,
+    )
+    if arch is None:
+        raise RuntimeError(
+            f"Unable to determine gfx architecture for device {index}: {props!r}"
+        )
+    return DeviceInfo(
+        index=index,
+        arch=arch,
+        cu_count=props.multi_processor_count,
+    )
+
+
+def get_device_info(
+    device: torch.device | str | int | None = None,
+) -> DeviceInfo:
+    """Return cached metadata for an explicit or current accelerator."""
+    return _get_device_info(_device_index(device))
+
+
+def get_arch(device: torch.device | str | int | None = None):
+    return get_device_info(device).arch
+
+
+def get_num_sms(device: torch.device | str | int | None = None):
+    return get_device_info(device).cu_count
 
 
 def get_lds_capacity_bytes(arch: str | None = None) -> int:
@@ -53,5 +114,3 @@ def get_fp8_dtypes():
 
 def get_fp8_e4m3_dtype():
     return torch.float8_e4m3fn
-
-
