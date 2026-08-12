@@ -114,6 +114,20 @@ build:test-wheel:
       echo "Integrated commit: $(git rev-parse HEAD)"
     - python -m pip install "torch==${TORCH_VERSION}" triton pytest "numpy==1.24.3" pandas build wheel ciupload cismi ninja
     - python -m pip show torch triton
+    # tilelang 0.1.12 wheels on nightly are torch==2.10.0 only (Requires-Dist pin).
+    # Match tilelang CI: apache-tvm-ffi comes from Aliyun, not dtk2604 nightly.
+    - |
+      if [ "${TORCH_VERSION}" = "2.10.0" ]; then
+        python -m pip install "apache-tvm-ffi==0.1.11" \
+          -i https://mirrors.aliyun.com/pypi/simple/ \
+          --trusted-host mirrors.aliyun.com
+        python -m pip install "tilelang==0.1.12" \
+          --extra-index-url https://mirrors.aliyun.com/pypi/simple/ \
+          --trusted-host mirrors.aliyun.com
+        python -m pip show tilelang apache-tvm-ffi
+      else
+        echo "Skip tilelang install on torch ${TORCH_VERSION}"
+      fi
   script:
     - |
       HIP_VISIBLE_DEVICES=$(CIsmi need 1 --timeout "${CISMI_TIMEOUT}")

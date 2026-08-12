@@ -27,6 +27,13 @@ from boltops.gemm import (
     w8a8_block_int8_matmul,
     w8a8_triton_block_scaled_mm,
 )
+from boltops.mhc import (
+    hc_split_sinkhorn,
+    mhc_fused_tilelang,
+    mhc_post_fwd,
+    mhc_pre_big_fuse,
+    pre_big_fuse_tilelang,
+)
 from boltops.tools.fused_moe_triton_tune.tune_moe_cli import main as moe_tune_main
 
 
@@ -53,6 +60,11 @@ def test_operator_package_exports():
     assert callable(moe_activation)
     assert callable(moe_activation_output_size)
     assert callable(normalize_moe_activation)
+    assert callable(hc_split_sinkhorn)
+    assert callable(mhc_fused_tilelang)
+    assert callable(mhc_post_fwd)
+    assert callable(mhc_pre_big_fuse)
+    assert callable(pre_big_fuse_tilelang)
 
 
 def test_root_package_does_not_reexport_operators():
