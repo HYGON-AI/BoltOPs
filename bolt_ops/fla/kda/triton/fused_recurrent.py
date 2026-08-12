@@ -12,7 +12,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .math import exp, log
+from ...common.triton.math import exp, log
 
 cdiv = triton.cdiv
 next_power_of_2 = triton.next_power_of_2

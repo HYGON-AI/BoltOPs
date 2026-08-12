@@ -69,7 +69,7 @@ from bolt_ops.mla import (
     decode_attention_fwd,
     compute_num_kv_splits,
 )
-from bolt_ops.fla_kda import (
+from bolt_ops.fla.kda import (
     chunk_gla_fwd_o_gk,
     chunk_kda_fwd_intra,
     chunk_kda_fwd_intra_token_parallel,
@@ -125,7 +125,7 @@ from bolt_ops.generic.triton.recompute_w_u import recompute_w_u_fwd as triton_im
 | Category                                                                             | API                                                                                                                                                                                                                                    | DSLs                | Maintainers                                  | Default backend                       | Intro & docs                                                                                               |
 | ------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------- | -------------------------------------------- | ------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
 | Generic                                                                              | `attn_res` `recompute_w_u_fwd` `fused_mamba_state_scatter_with_mask`                                                                                                                                                                   | Triton ✅ TileLang ❌ | Triton @all                                  | Triton                                | [docs](docs/ops/generic/generic.md)                                                                        |
-| FLA/KDA family                                                                       | `chunk_gla_fwd_o_gk` `chunk_kda_fwd_intra` `chunk_kda_fwd_intra_token_parallel` `fused_kda_gate` `fused_kda_gate_chunk_cumsum` `fused_recurrent_kda` `fused_recurrent_kda_fwd` `fused_recurrent_kda_packed_decode` `recompute_w_u_fwd` | Triton ✅ TileLang ❌ | Triton @liji                                 | Triton                                | [docs](docs/ops/fla_kda.md)                                                                                |
+| FLA/KDA family                                                                       | `chunk_gla_fwd_o_gk` `chunk_kda_fwd_intra` `chunk_kda_fwd_intra_token_parallel` `fused_kda_gate` `fused_kda_gate_chunk_cumsum` `fused_recurrent_kda` `fused_recurrent_kda_fwd` `fused_recurrent_kda_packed_decode` `recompute_w_u_fwd` | Triton ✅ TileLang ❌ | Triton @liji                                 | Triton                                | [docs](docs/ops/fla/kda.md)                                                                                |
 | FLA/GDN family                                                                       |                                                                                                                                                                                                                                        |                     | Triton @huangteng                            |                                       |                                                                                                            |
 | MoE family                                                                           | `fused_experts` `moe_activation`                                                                                                                                                                                                       | Triton ✅ TileLang ❌ | Triton @zhenxin TileLang @xxx                | Triton (`fused_experts` mixed+policy) | [docs](docs/ops/fused_moe.md) [tuning guide](bolt_ops/tools/triton_moe_tune/tune_moe_triton_user_guide.md) |
 | FA family (UnifiedAttention / PagedAttention / ExtendAttention / SagedAttention/...) |                                                                                                                                                                                                                                        |                     | Triton @huangshuang @sunchunhao @fangzx |                                       |                                                                                                            |
@@ -142,6 +142,10 @@ from bolt_ops.generic.triton.recompute_w_u import recompute_w_u_fwd as triton_im
 
 ```text
 bolt_ops/
+  fla/               # Flash Linear Attention umbrella
+    kda/             # FLA/KDA family (Triton @liji)
+    gdn/             # FLA/GDN family (Triton @huangteng)
+    common/          # helpers shared by FLA sub-families
   <op>/              # one directory per op
     __init__.py      # public signature + ship-time backend (lazy-import)
     triton/          # Triton impl (incl. configs)
@@ -189,4 +193,3 @@ pytest test --bench -s       # correctness + real model-size performance
 1. Create `bolt_ops/<op>/` with `triton/` and `tilelang/` impls; put correctness in `test/test_<op>.py` and model-size benches under `@pytest.mark.bench`, then use `--bench` to pick the winner.
 2. Prefer public signatures aligned with vLLM / SGLang (or HIPC / CUDA C); wire ship-time backend selection in `bolt_ops/<op>/__init__.py` and export.
 3. Re-export from `bolt_ops/__init__.py` and add `docs/ops/`.
-
