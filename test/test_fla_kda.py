@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 pytest.importorskip("triton")
 
-from bolt_ops.fla_kda import (  # noqa: E402
+from bolt_ops.fla.kda import (  # noqa: E402
     chunk_gla_fwd_o_gk,
     chunk_kda_fwd_intra,
     chunk_kda_fwd_intra_token_parallel,
@@ -21,13 +21,13 @@ from bolt_ops.fla_kda import (  # noqa: E402
     fused_recurrent_kda_packed_decode,
     recompute_w_u_fwd,
 )
-from bolt_ops.fla_kda.triton import (  # noqa: E402
+from bolt_ops.fla.kda.triton import (  # noqa: E402
     chunk as kda_chunk_kernels,
     chunk_intra as kda_intra_kernels,
     chunk_intra_token_parallel as kda_token_kernels,
     fused_recurrent as kda_recurrent_kernels,
 )
-from bolt_ops.fla_kda.triton.fused_recurrent import (  # noqa: E402
+from bolt_ops.fla.kda.triton.fused_recurrent import (  # noqa: E402
     _fused_kda_gate_beta,
 )
 
@@ -39,13 +39,13 @@ GPU_REQUIRED = pytest.mark.skipif(
 
 
 def test_public_apis_are_defined_at_package_boundary() -> None:
-    import bolt_ops.fla_kda as kda
-    import bolt_ops.fla_kda.triton as backend
+    import bolt_ops.fla.kda as kda
+    import bolt_ops.fla.kda.triton as backend
 
     for name in kda.__all__:
         op = vars(kda).get(name)
         assert inspect.isfunction(op), f"{name} must be an explicit package API"
-        assert op.__module__ == "bolt_ops.fla_kda"
+        assert op.__module__ == "bolt_ops.fla.kda"
         public_parameters = [
             (parameter.name, parameter.kind, parameter.default)
             for parameter in inspect.signature(op).parameters.values()

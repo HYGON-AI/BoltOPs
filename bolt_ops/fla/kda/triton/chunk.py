@@ -15,8 +15,8 @@ import triton
 import triton.language as tl
 
 from .chunk_intra import chunk_kda_fwd_intra
-from .math import exp2, log
-from .utils import FLA_CHUNK_SIZE, prepare_chunk_indices
+from ...common.triton.math import exp2, log
+from ...common.triton.utils import FLA_CHUNK_SIZE, prepare_chunk_indices
 
 RCP_LN2 = 1.4426950408889634
 cdiv = triton.cdiv

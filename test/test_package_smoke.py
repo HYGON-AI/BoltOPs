@@ -75,3 +75,4 @@ def test_gemm_fp16_not_public():
 
 def test_moe_tune_cli_is_packaged():
     assert callable(moe_tune_main)
+

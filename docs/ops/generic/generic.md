@@ -29,7 +29,7 @@ from bolt_ops.generic import (
   直接依赖 `triton/` 下的实现文件。
 - Generic 中的三个算子彼此独立，没有共享的融合入口或统一函数签名。
 - `recompute_w_u_fwd` 是独立的 Gated Delta Net WY 重计算实现，与
-  `bolt_ops.fla_kda.recompute_w_u_fwd` 的逐通道 gate 语义和返回值不同，不能互换。
+  `bolt_ops.fla.kda.recompute_w_u_fwd` 的逐通道 gate 语义和返回值不同，不能互换。
 
 ## 测试与性能基准
 

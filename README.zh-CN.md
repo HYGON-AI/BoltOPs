@@ -68,7 +68,7 @@ from bolt_ops.mla import (
     decode_attention_fwd,
     compute_num_kv_splits,
 )
-from bolt_ops.fla_kda import (
+from bolt_ops.fla.kda import (
     chunk_gla_fwd_o_gk,
     chunk_kda_fwd_intra,
     chunk_kda_fwd_intra_token_parallel,
@@ -124,7 +124,7 @@ from bolt_ops.generic.triton.recompute_w_u import recompute_w_u_fwd as triton_im
 | 算子类别                                                                            | 接口名                                                                                                                                                                                                                                    | DSLs                | 维护者                                           | 出厂后端                         | 介绍和文档                                                                                              |
 | ------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------- | --------------------------------------------- | ---------------------------- | -------------------------------------------------------------------------------------------------- |
 | Generic                                                                         | `attn_res` `recompute_w_u_fwd` `fused_mamba_state_scatter_with_mask`                                                                                                                                                                   | Triton ✅ TileLang ❌ | Triton @all                                   | Triton                       | [docs](docs/ops/generic/generic.md)                                                                |
-| FLA/KDA 系列                                                                      | `chunk_gla_fwd_o_gk` `chunk_kda_fwd_intra` `chunk_kda_fwd_intra_token_parallel` `fused_kda_gate` `fused_kda_gate_chunk_cumsum` `fused_recurrent_kda` `fused_recurrent_kda_fwd` `fused_recurrent_kda_packed_decode` `recompute_w_u_fwd` | Triton ✅ TileLang ❌ | Triton @liji                                  | Triton                       | [docs](docs/ops/fla_kda.md)                                                                        |
+| FLA/KDA 系列                                                                      | `chunk_gla_fwd_o_gk` `chunk_kda_fwd_intra` `chunk_kda_fwd_intra_token_parallel` `fused_kda_gate` `fused_kda_gate_chunk_cumsum` `fused_recurrent_kda` `fused_recurrent_kda_fwd` `fused_recurrent_kda_packed_decode` `recompute_w_u_fwd` | Triton ✅ TileLang ❌ | Triton @liji                                  | Triton                       | [docs](docs/ops/fla/kda.md)                                                                        |
 | FLA/GDN 系列                                                                      |                                                                                                                                                                                                                                        |                     | Trtion @huangteng                             |                              |                                                                                                    |
 | MoE 系列                                                                          | `fused_experts` `moe_activation`                                                                                                                                                                                                       | Triton ✅ TileLang ❌ | Triton @zhenxin TileLang @xxx                 | Triton（`fused_experts` 混合策略） | [docs](docs/ops/fused_moe.md) [调参指南](bolt_ops/tools/triton_moe_tune/tune_moe_triton_user_guide.md) |
 | FA 系列（UnifiedAttention / PagedAttention / ExtendAttention / SagedAttention/...） |                                                                                                                                                                                                                                        |                     | Triton @huangshuang @sunchunhao @fangzx |                              |                                                                                                    |
@@ -141,6 +141,10 @@ from bolt_ops.generic.triton.recompute_w_u import recompute_w_u_fwd as triton_im
 
 ```text
 bolt_ops/
+  fla/               # Flash Linear Attention 总目录
+    kda/             # FLA/KDA 系列（Triton @liji）
+    gdn/             # FLA/GDN 系列（Triton @huangteng）
+    common/          # FLA 各子系列共用 helper
   <op>/              # 每个算子一个目录
     __init__.py      # 公开接口 + 出厂后端分流（lazy-import）
     triton/          # Triton 实现（含 configs）
@@ -188,4 +192,3 @@ pytest test --bench -s       # 正确性 + 真实模型尺寸性能
 1. 新建 `bolt_ops/<op>/`，在 `triton/` 与 `tilelang/` 实现；`test/test_<op>.py` 写正确性，`@pytest.mark.bench` 写模型尺寸测速，用 `--bench` 比出最优。
 2. 公开签名优先对齐 vLLM / SGLang（或 HIPC / CUDA C）；在 `bolt_ops/<op>/__init__.py` 写出厂后端分流并导出。
 3. 在 `bolt_ops/__init__.py` 再导出，并补 `docs/ops/`。
-

@@ -14,8 +14,8 @@ import triton
 import triton.language as tl
 
 from .chunk_intra_token_parallel import chunk_kda_fwd_intra_token_parallel
-from .math import exp2
-from .utils import (
+from ...common.triton.math import exp2
+from ...common.triton.utils import (
     current_platform,
     gather,
     is_gather_supported,

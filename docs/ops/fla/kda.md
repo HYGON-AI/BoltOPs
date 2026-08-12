@@ -96,10 +96,10 @@ flowchart LR
 
 ## 2. 接口说明
 
-公开接口从 `bolt_ops.fla_kda` 导入：
+公开接口从 `bolt_ops.fla.kda` 导入：
 
 ```python
-from bolt_ops.fla_kda import (
+from bolt_ops.fla.kda import (
     chunk_gla_fwd_o_gk,
     chunk_kda_fwd_intra,
     chunk_kda_fwd_intra_token_parallel,
@@ -378,13 +378,13 @@ pytest -q test/test_fla_kda.py --bench -s
 
 | 用途 | 文件 |
 |---|---|
-| 公开接口 | `bolt_ops/fla_kda/__init__.py` |
-| Triton 导出 | `bolt_ops/fla_kda/triton/__init__.py` |
-| Chunk Kernel | `bolt_ops/fla_kda/triton/chunk.py` |
-| Intra Kernel | `bolt_ops/fla_kda/triton/chunk_intra.py` |
-| Token-parallel Kernel | `bolt_ops/fla_kda/triton/chunk_intra_token_parallel.py` |
-| Recurrent Kernel | `bolt_ops/fla_kda/triton/fused_recurrent.py` |
-| 去 vLLM 兼容 helper | `bolt_ops/fla_kda/triton/math.py`、`utils.py` |
+| 公开接口 | `bolt_ops/fla/kda/__init__.py` |
+| Triton 导出 | `bolt_ops/fla/kda/triton/__init__.py` |
+| Chunk Kernel | `bolt_ops/fla/kda/triton/chunk.py` |
+| Intra Kernel | `bolt_ops/fla/kda/triton/chunk_intra.py` |
+| Token-parallel Kernel | `bolt_ops/fla/kda/triton/chunk_intra_token_parallel.py` |
+| Recurrent Kernel | `bolt_ops/fla/kda/triton/fused_recurrent.py` |
+| 去 vLLM 兼容 helper | `bolt_ops/fla/common/triton/math.py`、`utils.py` |
 | 测试 / 性能 | `test/test_fla_kda.py`（`--bench`） |
 
 范围：KDA 目录直接定义的 Triton Kernel 与直接 launch wrapper；不含依赖 vLLM

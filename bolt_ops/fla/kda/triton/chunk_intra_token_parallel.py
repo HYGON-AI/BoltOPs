@@ -15,8 +15,8 @@ import torch
 import triton
 import triton.language as tl
 
-from .math import exp2
-from .utils import prepare_chunk_indices
+from ...common.triton.math import exp2
+from ...common.triton.utils import prepare_chunk_indices
 
 
 CHUNK_KDA_INTRA_TOKEN_PARALLEL_CONFIGS: tuple[dict[str, int], ...] = (
