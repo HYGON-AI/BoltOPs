@@ -2,6 +2,7 @@
 
 import os
 
+import triton
 import triton.language as tl
 import triton.language.extra.libdevice as tldevice
 
@@ -13,3 +14,13 @@ else:
     exp = tl.exp
     exp2 = tl.exp2
     log = tl.log
+
+
+@triton.jit
+def safe_exp(x):
+    return tl.exp(tl.where(x <= 0, x, float("-inf")))
+
+
+@triton.jit
+def safe_exp2(x):
+    return tl.math.exp2(tl.where(x <= 0, x, float("-inf")))
