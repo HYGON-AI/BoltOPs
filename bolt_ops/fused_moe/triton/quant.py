@@ -1,8 +1,21 @@
 # SPDX-License-Identifier: MIT
- 
+
+import functools
+
 import triton
 import triton.language as tl
 import torch
+
+
+_PER_TOKEN_QUANT_4ROW_PROGRAMS_PER_CU = 16
+_PER_TOKEN_QUANT_4ROW_N2048_PROGRAMS_PER_CU = 80
+
+
+@functools.lru_cache(maxsize=None)
+def _per_token_quant_num_cus(device: torch.device) -> int:
+    """Return the CU count for the tensor's device, cached per device."""
+    num_cus = torch.cuda.get_device_properties(device).multi_processor_count
+    return num_cus
 
 
 @triton.jit
@@ -117,27 +130,71 @@ def dynamic_per_tensor_quant_fp8_i8(
     return qx, scale_out
 
 
-# Heuristic: BLOCK_N is the power-of-two tile covering ``cols``; EVEN_N tells the
-# kernel whether the column mask can be dropped entirely (``cols`` is already a
-# power of two, the common MoE case: per-block cols=128 and per-token cols=K).
-# This is the "mask read/write" optimisation: the masked load/store path is only
-# emitted when the columns are not naturally aligned to BLOCK_N.
-@triton.heuristics(
-    {
-        "BLOCK_N": lambda args: triton.next_power_of_2(args["cols"]),
-        "EVEN_N": lambda args: args["cols"] == triton.next_power_of_2(args["cols"]),
-    }
-)
-# Autotune the row-tile (BLOCK_M) against the MoE batch size (rows). The two
-# configs below are selected to cover the whole tested M range (small: BLOCK_M=1,
-# large: BLOCK_M=32); autotune picks the faster one per (rows, cols) shape.
-@triton.autotune(
-    key=["rows", "cols"],
-    configs=[
-        triton.Config({"BLOCK_M": 1}, num_warps=1, num_stages=1),
-        triton.Config({"BLOCK_M": 32}, num_warps=8, num_stages=2),
-    ],
-)
+@triton.jit
+def _dynamic_per_token_quant_fp8_i8_1d_kernel(
+    qx_ptr,
+    scale_out_ptr,
+    x_in_ptr,
+    cols,
+    x_in_stride_r,
+    BLOCK_N: tl.constexpr,
+    DTYPE_MAX: tl.constexpr,
+):
+    """One row per program with a 1-D register tile."""
+    row = tl.program_id(axis=0)
+    col = tl.arange(0, BLOCK_N)
+    mask = col < cols
+    offs = row * x_in_stride_r + col
+
+    x = tl.load(x_in_ptr + offs, mask=mask, other=0.0, cache_modifier=".cg")
+    m = tl.max(tl.abs(x))
+    scale_out = m.to(tl.float32) / DTYPE_MAX
+    qx = (x * (1.0 / scale_out)).to(qx_ptr.dtype.element_ty)
+
+    tl.store(scale_out_ptr + row, scale_out)
+    tl.store(qx_ptr + offs, qx, mask=mask, cache_modifier=".cs")
+
+
+@triton.jit
+def _dynamic_per_token_quant_fp8_i8_n128_kernel(
+    qx_ptr,
+    scale_out_ptr,
+    x_in_ptr,
+    rows,
+    x_in_stride_r,
+    BLOCK_M: tl.constexpr,
+    EVEN_M: tl.constexpr,
+    DTYPE_MAX: tl.constexpr,
+):
+    """Specialized path for a fixed row width of 128 elements."""
+    pid = tl.program_id(axis=0)
+    row_offs = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    col_offs = tl.arange(0, 128)
+    offs = row_offs[:, None] * x_in_stride_r + col_offs[None, :]
+
+    if EVEN_M:
+        x = tl.load(x_in_ptr + offs, cache_modifier=".cg")
+    else:
+        row_mask = row_offs < rows
+        x = tl.load(
+            x_in_ptr + offs,
+            mask=row_mask[:, None],
+            other=0.0,
+            cache_modifier=".cg",
+        )
+
+    scale_out = tl.max(tl.abs(x), axis=-1).to(tl.float32) / DTYPE_MAX
+    qx = (x * (1.0 / scale_out)[:, None]).to(qx_ptr.dtype.element_ty)
+
+    if EVEN_M:
+        tl.store(scale_out_ptr + row_offs, scale_out)
+        tl.store(qx_ptr + offs, qx, cache_modifier=".cs")
+    else:
+        row_mask = row_offs < rows
+        tl.store(scale_out_ptr + row_offs, scale_out, mask=row_mask)
+        tl.store(qx_ptr + offs, qx, mask=row_mask[:, None], cache_modifier=".cs")
+
+
 @triton.jit
 def _dynamic_per_token_quant_fp8_i8_kernel(
     qx_ptr,
@@ -212,20 +269,82 @@ def dynamic_per_token_quant_fp8_i8(
     """
     rows = x_in.shape[0]
     cols = x_in.shape[1]
-    grid = lambda meta: (triton.cdiv(rows, meta["BLOCK_M"]),)  # noqa: E731
-    _dynamic_per_token_quant_fp8_i8_kernel[grid](
-        qx,
-        scale_out,
-        x_in,
-        rows,
-        cols,
-        x_in.stride(0),
-        DTYPE_MAX=(
-            torch.finfo(qx.dtype).max
-            if torch.is_floating_point(qx)
-            else torch.iinfo(qx.dtype).max
-        ),
+    block_n = triton.next_power_of_2(cols)
+    dtype_max = (
+        torch.finfo(qx.dtype).max
+        if torch.is_floating_point(qx)
+        else torch.iinfo(qx.dtype).max
     )
+
+    if cols == 128 and rows >= 256:
+        block_m = 16
+        _dynamic_per_token_quant_fp8_i8_n128_kernel[(triton.cdiv(rows, block_m),)](
+            qx,
+            scale_out,
+            x_in,
+            rows,
+            x_in.stride(0),
+            BLOCK_M=block_m,
+            EVEN_M=rows % block_m == 0,
+            DTYPE_MAX=dtype_max,
+            num_warps=1,
+            num_stages=1,
+        )
+        return qx, scale_out
+
+    # Row tiling pays off early for widths below 2048. At exactly 2048 the
+    # crossover is later because each program uses more registers; wider rows
+    # remain on the 1-D path. Scale both thresholds with the device CU count.
+    num_cus = _per_token_quant_num_cus(x_in.device)
+    if cols < 2048:
+        four_row_limit = _PER_TOKEN_QUANT_4ROW_PROGRAMS_PER_CU * num_cus
+    elif cols == 2048:
+        four_row_limit = (
+            _PER_TOKEN_QUANT_4ROW_N2048_PROGRAMS_PER_CU * num_cus
+        )
+    else:
+        four_row_limit = None
+    use_four_row_kernel = four_row_limit is not None and rows >= four_row_limit
+    if rows <= 1024:
+        _dynamic_per_token_quant_fp8_i8_1d_kernel[(rows,)](
+            qx,
+            scale_out,
+            x_in,
+            cols,
+            x_in.stride(0),
+            BLOCK_N=block_n,
+            DTYPE_MAX=dtype_max,
+            num_warps=4,
+            num_stages=1,
+        )
+    elif not use_four_row_kernel:
+        _dynamic_per_token_quant_fp8_i8_1d_kernel[(rows,)](
+            qx,
+            scale_out,
+            x_in,
+            cols,
+            x_in.stride(0),
+            BLOCK_N=block_n,
+            DTYPE_MAX=dtype_max,
+            num_warps=2,
+            num_stages=1,
+        )
+    else:
+        block_m = 4
+        _dynamic_per_token_quant_fp8_i8_kernel[(triton.cdiv(rows, block_m),)](
+            qx,
+            scale_out,
+            x_in,
+            rows,
+            cols,
+            x_in.stride(0),
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            EVEN_N=cols == block_n,
+            DTYPE_MAX=dtype_max,
+            num_warps=4,
+            num_stages=1,
+        )
 
     return qx, scale_out
 
