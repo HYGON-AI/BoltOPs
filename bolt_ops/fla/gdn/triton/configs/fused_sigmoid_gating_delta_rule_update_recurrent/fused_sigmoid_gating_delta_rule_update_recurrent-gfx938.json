@@ -1,0 +1,56 @@
+{
+  "config": {
+    "default": {
+      "BV": 32,
+      "num_warps": 1
+    },
+    "T=4,H=4,HV=16": {
+      "BV": 32,
+      "num_warps": 4
+    },
+    "T=16,H=4,HV=16": {
+      "BV": 16,
+      "num_warps": 1
+    },
+    "T=32,H=4,HV=16": {
+      "BV": 32,
+      "num_warps": 1
+    },
+    "T=64,H=4,HV=16": {
+      "BV": 32,
+      "num_warps": 1
+    },
+    "T=128,H=4,HV=16": {
+      "BV": 32,
+      "num_warps": 1
+    },
+    "T=192,H=4,HV=16": {
+      "BV": 32,
+      "num_warps": 1
+    },
+    "T=4,H=2,HV=8": {
+      "BV": 16,
+      "num_warps": 4
+    },
+    "T=16,H=2,HV=8": {
+      "BV": 32,
+      "num_warps": 4
+    },
+    "T=32,H=2,HV=8": {
+      "BV": 16,
+      "num_warps": 1
+    },
+    "T=64,H=2,HV=8": {
+      "BV": 16,
+      "num_warps": 1
+    },
+    "T=128,H=2,HV=8": {
+      "BV": 16,
+      "num_warps": 1
+    },
+    "T=192,H=2,HV=8": {
+      "BV": 16,
+      "num_warps": 1
+    }
+  }
+}

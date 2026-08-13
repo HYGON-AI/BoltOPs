@@ -1,0 +1,34 @@
+{
+  "config": {
+    "default": {
+      "BV": 32,
+      "num_warps": 8,
+      "num_stages": 2
+    },
+    "K=128,V=128,BT=32,H=8": {
+      "BV": 32,
+      "num_warps": 8,
+      "num_stages": 2
+    },
+    "K=128,V=128,BT=32,H=16": {
+      "BV": 32,
+      "num_warps": 4,
+      "num_stages": 2
+    },
+    "K=128,V=128,BT=64,H=8": {
+      "BV": 16,
+      "num_warps": 4,
+      "num_stages": 2
+    },
+    "K=128,V=128,BT=64,H=16": {
+      "BV": 32,
+      "num_warps": 4,
+      "num_stages": 2
+    },
+    "K=128,V=128,BT=64,H=16,IS_VARLEN=True": {
+      "BV": 32,
+      "num_warps": 4,
+      "num_stages": 1
+    }
+  }
+}
