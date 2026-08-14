@@ -1,8 +1,8 @@
 # `FLA/KDA Triton Kernel 使用说明`
 
-Kimi-K3 Kernelized Delta Attention（KDA）的 Prefill/Chunk 与
-Decode/Recurrent Triton Kernel 集合。当前包提供 KDA 目录内直接定义的 Kernel
-及其 launch wrapper，不包含依赖 vLLM 公共 FLA Kernel 的完整 `chunk_kda` 编排。
+Kimi-K3 Kernelized Delta Attention（KDA）的完整 forward Prefill/Chunk 与
+Decode/Recurrent Triton Kernel 集合。当前包已包含上游 vLLM AMD KDA 的四个
+Prefill orchestration 入口，以及底层 kernel/wrapper。
 
 ## 1. 算子用途与数学语义
 
@@ -38,7 +38,7 @@ raw gate / raw beta
 ```
 
 下面的数据流图给出各算子的输入、输出和先后关系。虚线节点是完整 Prefill
-编排中需要、但不属于本次 BoltOps KDA 移植范围的 vLLM/FLA state propagation。
+编排中包含本仓库新增的 state propagation 实现。
 
 ```mermaid
 flowchart LR
@@ -47,7 +47,7 @@ flowchart LR
         P1[fused_kda_gate_chunk_cumsum<br/>gate、beta 与 chunk-local cumsum]
         P2[chunk_kda_fwd_intra<br/>生成 Aqk 与三角求解后的 A]
         P3[recompute_w_u_fwd<br/>生成 w、u、kg]
-        PX[[vLLM / FLA state propagation<br/>生成 chunk state h 与 v_new]]
+        PX[[chunk state propagation<br/>生成 chunk state h 与 v_new]]
         P4[chunk_gla_fwd_o_gk<br/>state 项 + tril(Aqk) @ v_new]
         PO[Prefill output / final state]
 
@@ -91,8 +91,8 @@ flowchart LR
     class PX external;
 ```
 
-当前移植提供上述直接 Triton 计算组件；state propagation 等来自 vLLM 公共 FLA
-目录的步骤不在本次范围内。
+当前移植提供上述直接 Triton 计算组件，包括本地 `chunk_state.py` 中的 state
+propagation；上游依赖的公共 cumsum/l2norm helper 也已在本仓库补齐。
 
 ## 2. 接口说明
 
@@ -297,6 +297,30 @@ def fused_recurrent_kda_packed_decode(
   `1/ln(2)`
 - 本移植为 forward-only，不包含 backward
 
+### 2.6 KDA kernel family
+
+当前实现新增并导出的 KDA kernel/wrapper 如下：
+
+| 类别 | Kernel / wrapper | 用途 |
+|---|---|---|
+| Prefill orchestration | `chunk_kda`, `chunk_kda_fwd` | materialized gate 的完整 prefill 编排 |
+| Fused-gate orchestration | `chunk_kda_with_fused_gate`, `chunk_kda_with_fused_gate_fwd` | raw gate/beta 到 output 的完整路径 |
+| Q/K normalization | `l2norm_fwd_kernel`, `l2norm_fwd` | q/k L2 归一化 |
+| Gate cumsum | `kda_gate_chunk_cumsum_vector_kernel`, `fused_kda_gate_chunk_cumsum` | gate、beta 和 chunk-local cumsum |
+| Intra polynomial | `chunk_kda_fwd_kernel_intra_sub_chunk_poly_solve_optimized` | FP32 diagonal polynomial solve |
+| Intra/inter solve | `chunk_kda_fwd_kernel_inter_solve_fused` | Aqk/Akk inter solve |
+| Token-parallel fallback | `chunk_kda_fwd_kernel_intra_token_parallel`, `chunk_kda_fwd_kernel_intra_subchunk_raw_optimized` | 通用 intra 路径 |
+| WY reconstruction | `recompute_w_u_fwd_kernel_beta_factored_head_first` | 重建 w/u/kg |
+| State propagation | `chunk_gated_delta_rule_fwd_kernel_h_blockdim64` | 更新 chunk recurrent state |
+| Chunk output | `chunk_gla_fwd_kernel_o_local_first` | 合并 local 项和 state 项 |
+| Dense recurrent decode | `fused_recurrent_kda_fwd_kernel` | dense/spec decode |
+| Packed decode | `fused_recurrent_kda_packed_decode_3d_kernel` | packed bounded-gate decode |
+
+其中新增的 `chunk_state.py`、`common/triton/cumsum.py` 和
+`common/triton/l2norm.py` 分别提供 state propagation、chunk-local cumsum 和
+q/k normalization；完整 dispatch 耗时及采集命令见
+[kda_performance.md](./kda_performance.md)。
+
 ## 3. 典型 Shape
 
 Kimi-K3/vLLM 测试中使用的代表配置：
@@ -384,11 +408,14 @@ pytest -q test/test_fla_kda.py --bench -s
 | Intra Kernel | `bolt_ops/fla/kda/triton/chunk_intra.py` |
 | Token-parallel Kernel | `bolt_ops/fla/kda/triton/chunk_intra_token_parallel.py` |
 | Recurrent Kernel | `bolt_ops/fla/kda/triton/fused_recurrent.py` |
+| Chunk state Kernel | `bolt_ops/fla/kda/triton/chunk_state.py` |
+| Common cumsum helper | `bolt_ops/fla/common/triton/cumsum.py` |
+| Common l2norm helper | `bolt_ops/fla/common/triton/l2norm.py` |
 | 去 vLLM 兼容 helper | `bolt_ops/fla/common/triton/math.py`、`utils.py` |
 | 测试 / 性能 | `test/test_fla_kda.py`（`--bench`） |
 
-范围：KDA 目录直接定义的 Triton Kernel 与直接 launch wrapper；不含依赖 vLLM
-公共 FLA Kernel 的完整 `chunk_kda` orchestration，不含 backward。
+范围：KDA forward 目录直接定义的 Triton Kernel、state propagation 和完整
+`chunk_kda` orchestration；不含 backward。
 
 ## 附录 B. 溯源
 
@@ -449,6 +476,7 @@ sibling 另外通过 fixed `B=2,T=130` 和 varlen `cu_seqlens=[0,33,178]`
 | `chunk_kda_fwd_kernel_inter_solve_fused` | `(BK64,w1,s2)`, `(BK64,w1,s1)`, `(BK32,w1,s1)` |
 | `chunk_kda_fwd_kernel_intra_sub_chunk_poly_solve_optimized` | `(BK128,w1,s1,early=false)`, `(BK128,w1,s1,early=true)`, `(BK128,w1,s2,early=true)` |
 | `chunk_kda_fwd_kernel_intra_subchunk_raw_optimized` | `(BK128,w1,s1)`, `(BK128,w1,s2)`, `(BK128,w1,s3)` |
+| `chunk_gated_delta_rule_fwd_kernel_h_blockdim64` | `(BV64,w4,s2)` baseline；|
 | `_kda_gate_beta_fwd_kernel` | `(BT2,w2,s3)`, `(BT2,w8,s2)`, `(BT8,w4,s3)` |
 | `fused_recurrent_kda_fwd_kernel` | `(BV8,w1,s2)`, `(BV16,w1,s1)`, `(BV8,w1,s1)` |
 | `fused_recurrent_kda_packed_decode_3d_kernel` | `(BV8,w1,s2)`, `(BV8,w1,s1)`, `(BV32,w2,s2)` |

@@ -6,6 +6,10 @@ helpers; orchestration that depends on vLLM's shared FLA modules is excluded.
 """
 
 from .chunk import (
+    chunk_kda,
+    chunk_kda_fwd,
+    chunk_kda_with_fused_gate,
+    chunk_kda_with_fused_gate_fwd,
     chunk_gla_fwd_o_gk,
     fused_kda_gate,
     fused_kda_gate_chunk_cumsum,
@@ -21,6 +25,10 @@ from .fused_recurrent import (
 
 __all__ = [
     "chunk_gla_fwd_o_gk",
+    "chunk_kda",
+    "chunk_kda_fwd",
+    "chunk_kda_with_fused_gate",
+    "chunk_kda_with_fused_gate_fwd",
     "chunk_kda_fwd_intra",
     "chunk_kda_fwd_intra_token_parallel",
     "fused_kda_gate",
