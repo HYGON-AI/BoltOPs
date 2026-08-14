@@ -382,21 +382,21 @@ Decode-only recurrent Kernel 不复用 Prefill Shape，分别使用上述实际 
 
 ```bash
 # 正确性测试
-pytest -q test/test_fla_kda.py
-
-# 全部 Prefill、共用及 Decode KDA Kernel 性能
-pytest -q test/test_fla_kda.py --bench -s
+pytest -q test/fla/test_kda_*.py
 ```
 
-正确性测试覆盖：
+各测试文件职责如下：
 
-- gate、beta 与 chunk-local cumsum 对照 PyTorch
-- `w/u/kg` 重建与 chunk output 对照 PyTorch
-- token-parallel 和 safe-gate 两条 intra 路径在 fallback、fixed tail、
-  多序列 varlen tail 上交叉校验
-- materialized gate/beta、融合 gate/beta 两条 recurrent 路径交叉校验
-- packed decode 的 softplus fallback 与 bounded direct-3D fast path均与
-  dense recurrent Kernel 交叉校验
+| 测试文件 | 测试内容 |
+|---|---|
+| `test_kda_gate.py` | q/k l2norm、KDA gate、beta sigmoid、fixed/varlen chunk-local cumsum，以及 bounded/softplus gate 路径 |
+| `test_kda_chunk.py` | WY `w/u/kg` 重建、完整 fused-gate Prefill 链路，以及 chunk output |
+| `test_kda_state.py` | chunk state 更新、`h`、`v_new` 和 final state 与 Torch reference 的一致性 |
+| `test_kda_decode.py` | dense recurrent、融合 gate、materialized gate 和 packed decode 的 output/state 一致性 |
+| `_kda_reference.py` | 提供 gate、recurrent、WY 和 state 的 PyTorch reference，不执行 Triton kernel |
+
+测试重点包括：Prefill 各阶段的 tensor 依赖、bounded/softplus 两种 gate 语义、
+fixed/varlen cumsum 边界，以及 packed decode 与 dense recurrent 的结果一致性。
 
 ## 附录 A. 仓库文件
 
@@ -412,7 +412,8 @@ pytest -q test/test_fla_kda.py --bench -s
 | Common cumsum helper | `bolt_ops/fla/common/triton/cumsum.py` |
 | Common l2norm helper | `bolt_ops/fla/common/triton/l2norm.py` |
 | 去 vLLM 兼容 helper | `bolt_ops/fla/common/triton/math.py`、`utils.py` |
-| 测试 / 性能 | `test/test_fla_kda.py`（`--bench`） |
+| 正确性测试 | `test/fla/test_kda_*.py`、`test/fla/_kda_reference.py` |
+| 性能测试 | `test/fla/benchmark_kda_baseline.py`、`test/fla/xcu_kda_stage.py` |
 
 范围：KDA forward 目录直接定义的 Triton Kernel、state propagation 和完整
 `chunk_kda` orchestration；不含 backward。
