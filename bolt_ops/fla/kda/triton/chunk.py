@@ -15,6 +15,9 @@ import triton
 import triton.language as tl
 
 from .chunk_intra import chunk_kda_fwd_intra
+from .chunk_state import chunk_gated_delta_rule_fwd_h
+from ...common.triton.cumsum import chunk_local_cumsum
+from ...common.triton.l2norm import l2norm_fwd
 from ...common.triton.math import exp2, log
 from ...common.triton.utils import FLA_CHUNK_SIZE, prepare_chunk_indices
 
@@ -60,7 +63,12 @@ def get_chunk_gla_fwd_o_config(
 ) -> dict:
     del T, H, is_varlen
     if K >= 128 and V >= 128:
-        return CHUNK_GLA_FWD_O_CONFIGS[0]
+        # On BW200, the output kernel is large enough at the model shape to
+        # benefit from twice the wavefront-level parallelism.  The BK=128 /
+        # BV=128 tile is unchanged; only the launch width moves from 4 to 8
+        # warps.  The smaller-tile candidate is slower because it increases
+        # the number of programs and repeats the h-tile loads.
+        return CHUNK_GLA_FWD_O_CONFIGS[1]
     return CHUNK_GLA_FWD_O_CONFIGS[2]
 
 
@@ -912,6 +920,160 @@ def fused_kda_gate_chunk_cumsum(
         **config,
     )
     return y, beta_out
+
+
+def _chunk_kda_fwd_with_cumulative_g(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    scale: float,
+    initial_state: torch.Tensor | None,
+    output_final_state: bool,
+    cu_seqlens: torch.Tensor | None = None,
+    chunk_indices: torch.Tensor | None = None,
+    chunk_size: int = FLA_CHUNK_SIZE,
+    safe_gate: bool = False,
+):
+    Aqk, A = chunk_kda_fwd_intra(
+        q=q, k=k, gk=g, beta=beta, scale=scale,
+        cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
+        chunk_size=chunk_size, safe_gate=safe_gate,
+    )
+    w, u, _, kg = recompute_w_u_fwd(
+        k=k, v=v, beta=beta, A=A, gk=g,
+        cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
+    )
+    h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
+        k=kg, w=w, u=u, gk=g, initial_state=initial_state,
+        output_final_state=output_final_state, cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices, use_exp2=True,
+    )
+    o = chunk_gla_fwd_o_gk(
+        q=q, v=v_new, g=g, A=Aqk, h=h, o=v, scale=scale,
+        cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
+        chunk_size=chunk_size,
+    )
+    return o, final_state
+
+
+def chunk_kda_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    scale: float,
+    initial_state: torch.Tensor | None,
+    output_final_state: bool,
+    cu_seqlens: torch.Tensor | None = None,
+):
+    chunk_size = FLA_CHUNK_SIZE
+    chunk_indices = (
+        prepare_chunk_indices(cu_seqlens, chunk_size)
+        if cu_seqlens is not None else None
+    )
+    g = chunk_local_cumsum(
+        g, chunk_size=chunk_size, cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+    ) * RCP_LN2
+    return _chunk_kda_fwd_with_cumulative_g(
+        q=q, k=k, v=v, g=g, beta=beta, scale=scale,
+        initial_state=initial_state, output_final_state=output_final_state,
+        cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
+        chunk_size=chunk_size,
+    )
+
+
+def chunk_kda_with_fused_gate_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    raw_g: torch.Tensor,
+    raw_beta: torch.Tensor,
+    A_log: torch.Tensor,
+    g_bias: torch.Tensor | None,
+    scale: float,
+    initial_state: torch.Tensor | None,
+    output_final_state: bool,
+    lower_bound: float | None = None,
+    cu_seqlens: torch.Tensor | None = None,
+):
+    chunk_size = FLA_CHUNK_SIZE
+    chunk_indices = (
+        prepare_chunk_indices(cu_seqlens, chunk_size)
+        if cu_seqlens is not None else None
+    )
+    g, beta = fused_kda_gate_chunk_cumsum(
+        raw_g, raw_beta=raw_beta, A_log=A_log, g_bias=g_bias,
+        cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
+        chunk_size=chunk_size, lower_bound=lower_bound,
+    )
+    return _chunk_kda_fwd_with_cumulative_g(
+        q=q, k=k, v=v, g=g, beta=beta, scale=scale,
+        initial_state=initial_state, output_final_state=output_final_state,
+        cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
+        chunk_size=chunk_size, safe_gate=lower_bound is not None,
+    )
+
+
+def chunk_kda(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    scale: float | None = None,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    use_qk_l2norm_in_kernel: bool = False,
+    cu_seqlens: torch.Tensor | None = None,
+    **kwargs,
+):
+    del kwargs
+    if scale is None:
+        scale = k.shape[-1] ** -0.5
+    if use_qk_l2norm_in_kernel:
+        q = l2norm_fwd(q.contiguous())
+        k = l2norm_fwd(k.contiguous())
+    return chunk_kda_fwd(
+        q=q, k=k, v=v.contiguous(), g=g.contiguous(), beta=beta.contiguous(),
+        scale=scale,
+        initial_state=initial_state.contiguous() if initial_state is not None else None,
+        output_final_state=output_final_state, cu_seqlens=cu_seqlens,
+    )
+
+
+def chunk_kda_with_fused_gate(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    raw_g: torch.Tensor,
+    raw_beta: torch.Tensor,
+    A_log: torch.Tensor,
+    g_bias: torch.Tensor | None,
+    scale: float | None = None,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    lower_bound: float | None = None,
+    use_qk_l2norm_in_kernel: bool = False,
+    cu_seqlens: torch.Tensor | None = None,
+    **kwargs,
+):
+    del kwargs
+    if scale is None:
+        scale = k.shape[-1] ** -0.5
+    if use_qk_l2norm_in_kernel:
+        q = l2norm_fwd(q.contiguous())
+        k = l2norm_fwd(k.contiguous())
+    return chunk_kda_with_fused_gate_fwd(
+        q=q, k=k, v=v.contiguous(), raw_g=raw_g.contiguous(),
+        raw_beta=raw_beta, A_log=A_log, g_bias=g_bias, scale=scale,
+        initial_state=initial_state.contiguous() if initial_state is not None else None,
+        output_final_state=output_final_state, lower_bound=lower_bound,
+        cu_seqlens=cu_seqlens,
+    )
 
 
 @triton.jit

@@ -9,6 +9,53 @@ from __future__ import annotations
 import torch
 
 
+def chunk_kda(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor,
+    beta: torch.Tensor, scale: float | None = None,
+    initial_state: torch.Tensor | None = None, output_final_state: bool = False,
+    use_qk_l2norm_in_kernel: bool = False,
+    cu_seqlens: torch.Tensor | None = None, **kwargs,
+):
+    from bolt_ops.fla.kda.triton import chunk_kda as impl
+    return impl(q, k, v, g, beta, scale, initial_state, output_final_state,
+                use_qk_l2norm_in_kernel, cu_seqlens, **kwargs)
+
+
+def chunk_kda_fwd(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor,
+    beta: torch.Tensor, scale: float, initial_state: torch.Tensor | None,
+    output_final_state: bool, cu_seqlens: torch.Tensor | None = None,
+):
+    from bolt_ops.fla.kda.triton import chunk_kda_fwd as impl
+    return impl(q, k, v, g, beta, scale, initial_state, output_final_state,
+                cu_seqlens)
+
+
+def chunk_kda_with_fused_gate(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, raw_g: torch.Tensor,
+    raw_beta: torch.Tensor, A_log: torch.Tensor, g_bias: torch.Tensor | None,
+    scale: float | None = None, initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False, lower_bound: float | None = None,
+    use_qk_l2norm_in_kernel: bool = False,
+    cu_seqlens: torch.Tensor | None = None, **kwargs,
+):
+    from bolt_ops.fla.kda.triton import chunk_kda_with_fused_gate as impl
+    return impl(q, k, v, raw_g, raw_beta, A_log, g_bias, scale,
+                initial_state, output_final_state, lower_bound,
+                use_qk_l2norm_in_kernel, cu_seqlens, **kwargs)
+
+
+def chunk_kda_with_fused_gate_fwd(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, raw_g: torch.Tensor,
+    raw_beta: torch.Tensor, A_log: torch.Tensor, g_bias: torch.Tensor | None,
+    scale: float, initial_state: torch.Tensor | None, output_final_state: bool,
+    lower_bound: float | None = None, cu_seqlens: torch.Tensor | None = None,
+):
+    from bolt_ops.fla.kda.triton import chunk_kda_with_fused_gate_fwd as impl
+    return impl(q, k, v, raw_g, raw_beta, A_log, g_bias, scale,
+                initial_state, output_final_state, lower_bound, cu_seqlens)
+
+
 def recompute_w_u_fwd(
     k: torch.Tensor,
     v: torch.Tensor,
@@ -285,6 +332,10 @@ def fused_recurrent_kda_packed_decode(
 
 
 __all__ = [
+    "chunk_kda",
+    "chunk_kda_fwd",
+    "chunk_kda_with_fused_gate",
+    "chunk_kda_with_fused_gate_fwd",
     "chunk_gla_fwd_o_gk",
     "chunk_kda_fwd_intra",
     "chunk_kda_fwd_intra_token_parallel",
