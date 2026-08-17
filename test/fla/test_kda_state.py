@@ -7,7 +7,7 @@ import torch
 
 pytest.importorskip("triton")
 
-from bolt_ops.fla.kda.triton.chunk_state import chunk_gated_delta_rule_fwd_h
+from boltops.fla.kda.triton.chunk_state import chunk_gated_delta_rule_fwd_h
 from ._kda_reference import naive_chunk_state
 
 DEVICE = "cuda"

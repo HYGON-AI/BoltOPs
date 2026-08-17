@@ -9,7 +9,7 @@ import torch
 
 triton = pytest.importorskip("triton")
 
-from bolt_ops.fla.gdn import fused_recurrent_gated_delta_rule_packed_decode
+from boltops.fla.gdn import fused_recurrent_gated_delta_rule_packed_decode
 from ._gdn_reference import (
     naive_gdn_gate,
     naive_recurrent_gated_delta_rule,
@@ -22,7 +22,7 @@ GPU_REQUIRED = pytest.mark.skipif(
 
 
 def test_public_packed_decode_signature_matches_backend() -> None:
-    from bolt_ops.fla.gdn.triton.fused_recurrent import (
+    from boltops.fla.gdn.triton.fused_recurrent import (
         fused_recurrent_gated_delta_rule_packed_decode as backend,
     )
 

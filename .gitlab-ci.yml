@@ -65,15 +65,15 @@ build:test-wheel:
       (
         cd "${wheel_test_dir}"
         python -m pytest test -s --tb=short \
-          --junitxml="${CI_PROJECT_DIR}/bolt_ops_test.xml"
+          --junitxml="${CI_PROJECT_DIR}/boltops_test.xml"
       )
   artifacts:
     when: always
     paths:
       - dist/*.whl
-      - bolt_ops_test.xml
+      - boltops_test.xml
     reports:
-      junit: bolt_ops_test.xml
+      junit: boltops_test.xml
     expire_in: 7 days
 
 publish:

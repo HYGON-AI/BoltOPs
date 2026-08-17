@@ -10,7 +10,7 @@ import torch
 
 triton = pytest.importorskip("triton")
 
-from bolt_ops.fla.gdn import chunk_fwd_o, chunk_gated_delta_rule_fwd_h
+from boltops.fla.gdn import chunk_fwd_o, chunk_gated_delta_rule_fwd_h
 from ._gdn_reference import naive_chunk_h, naive_chunk_o
 
 DEVICE = "cuda"
@@ -20,10 +20,10 @@ GPU_REQUIRED = pytest.mark.skipif(
 
 
 def test_public_chunk_signatures_match_backends() -> None:
-    from bolt_ops.fla.gdn.triton.chunk_delta_h import (
+    from boltops.fla.gdn.triton.chunk_delta_h import (
         chunk_gated_delta_rule_fwd_h as h_backend,
     )
-    from bolt_ops.fla.gdn.triton.chunk_o import chunk_fwd_o as o_backend
+    from boltops.fla.gdn.triton.chunk_o import chunk_fwd_o as o_backend
 
     def parameters(fn):
         return [

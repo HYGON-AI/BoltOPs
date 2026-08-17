@@ -20,10 +20,10 @@ out += w * y                          # 再按 topk 聚合；可选 no_combine
 
 ## 2. 接口说明
 
-第一层 GEMM 后的激活也可通过 `bolt_ops.fused_moe.moe_activation` 独立调用。
+第一层 GEMM 后的激活也可通过 `boltops.fused_moe.moe_activation` 独立调用。
 
 ```python
-from bolt_ops.fused_moe import fused_experts
+from boltops.fused_moe import fused_experts
 
 out = fused_experts(
     hidden_states,
@@ -129,9 +129,9 @@ def fused_experts(
 | topk         | 2                               |
 | dtype        | BF16                            |
 
-线上 MoE 的 `E` / `N` / dtype / quant 组合由 `bolt_ops/fused_moe/triton/configs/moe/*.json`
+线上 MoE 的 `E` / `N` / dtype / quant 组合由 `boltops/fused_moe/triton/configs/moe/*.json`
 按 GPU ISA `arch`（如 `gfx938`）选择；缺配置时回退默认并打日志。
-`bolt-moe-tune-cli` 的第一个参数仍是站点码（`nmz`/`bmz`/`zd`/`yy`），
+`boltops-fused-moe-tune-cli` 的第一个参数仍是站点码（`nmz`/`bmz`/`zd`/`yy`），
 会映射到对应 `arch` 再写 JSON（见调参手册）。
 
 ### 3.1 腾讯 5B FP16 接入约定
@@ -176,21 +176,21 @@ output     = routed_out + shared_out
 ## 4. 正确性测试与性能基准
 
 线上 shape 的精度回归、autotune、以及性能测速统一走随包发布的
-**`bolt-moe-tune-cli`**（封装 `bolt_ops/tools/triton_moe_tune/tune_moe_cli.py`）。
+**`boltops-fused-moe-tune-cli`**（封装 `boltops/tools/triton_moe_tune/tune_moe_cli.py`）。
 
 安装后（推荐 `pip install -e ".[tune]"` 或安装带 `tune` extra 的 wheel）可在任意目录执行：
 
 ```bash
 # 训练 + 生成 configs/moe JSON + Step4 正确性/性能（默认全流程）
-bolt-moe-tune-cli <device_name> <test_type>
-# 例：bolt-moe-tune-cli nmz bf16
-#     bolt-moe-tune-cli nmz int8_channel --num-experts 256 --top-k 8
+boltops-fused-moe-tune-cli <device_name> <test_type>
+# 例：boltops-fused-moe-tune-cli nmz bf16
+#     boltops-fused-moe-tune-cli nmz int8_channel --num-experts 256 --top-k 8
 
 # 仅测速 / 复核（复用已有 JSON，不重新 autotune）
-bolt-moe-tune-cli <device_name> <test_type> --benchmark
+boltops-fused-moe-tune-cli <device_name> <test_type> --benchmark
 
 # 只看参数计划
-bolt-moe-tune-cli nmz bf16 --dry-run
+boltops-fused-moe-tune-cli nmz bf16 --dry-run
 ```
 
 wheel、普通安装和 editable 安装均可在任意目录执行，日志写到当前工作目录。
@@ -198,16 +198,16 @@ wheel、普通安装和 editable 安装均可在任意目录执行，日志写�
 `test_type` 含 `bf16` / `fp8` / `fp8_channel` / `int8` / `int8_channel` /
 `int4` / `int4int8` 等。参数、TP 循环、选卡与排障见一线手册：
 
-[`tune_moe_triton_user_guide.md`](../../bolt_ops/tools/triton_moe_tune/tune_moe_triton_user_guide.md)
+[`tune_moe_triton_user_guide.md`](../../boltops/tools/triton_moe_tune/tune_moe_triton_user_guide.md)
 
 ## 附录 A. 仓库文件
 
 | 用途              | 文件                                                                                               |
 | ----------------- | -------------------------------------------------------------------------------------------------- |
-| 公开接口          | `bolt_ops/fused_moe/__init__.py`                                                                  |
-| MoE JSON 配置     | `bolt_ops/fused_moe/triton/configs/moe/`                                                          |
-| 正确性 / 调参 / 测速 | `bolt-moe-tune-cli` → `bolt_ops.tools.triton_moe_tune.tune_moe_cli:main` |
-| Autotune 使用手册 | [`tune_moe_triton_user_guide.md`](../../bolt_ops/tools/triton_moe_tune/tune_moe_triton_user_guide.md) |
+| 公开接口          | `boltops/fused_moe/__init__.py`                                                                  |
+| MoE JSON 配置     | `boltops/fused_moe/triton/configs/moe/`                                                          |
+| 正确性 / 调参 / 测速 | `boltops-fused-moe-tune-cli` → `boltops.tools.triton_moe_tune.tune_moe_cli:main` |
+| Autotune 使用手册 | [`tune_moe_triton_user_guide.md`](../../boltops/tools/triton_moe_tune/tune_moe_triton_user_guide.md) |
 
 ## 附录 B. 溯源
 

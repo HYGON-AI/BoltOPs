@@ -10,8 +10,8 @@ import torch.nn.functional as F
 
 pytest.importorskip("triton")
 
-from bolt_ops.generic import attn_res  # noqa: E402
-from bolt_ops.generic.triton.attn_res import (  # noqa: E402
+from boltops.generic import attn_res  # noqa: E402
+from boltops.generic.triton.attn_res import (  # noqa: E402
     _ATTN_RES_CONFIGS,
     _get_attn_res_config,
     _use_attn_res_lazy_prefix,

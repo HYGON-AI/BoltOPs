@@ -30,7 +30,7 @@ s < src.shape[2]
 ## 2. 接口说明
 
 ```python
-from bolt_ops.generic import fused_mamba_state_scatter_with_mask
+from boltops.generic import fused_mamba_state_scatter_with_mask
 
 fused_mamba_state_scatter_with_mask(
     dst, src, dst_indices_raw, step_indices_raw
@@ -93,8 +93,8 @@ pytest -q test/test_generic_mamba_state_scatter.py --bench -s
 
 | 用途 | 文件 |
 |---|---|
-| 公开接口 | `bolt_ops/generic/__init__.py` |
-| Triton 实现 | `bolt_ops/generic/triton/mamba_state_scatter.py` |
+| 公开接口 | `boltops/generic/__init__.py` |
+| Triton 实现 | `boltops/generic/triton/mamba_state_scatter.py` |
 | 测试 / 性能 | `test/test_generic_mamba_state_scatter.py`（`--bench`） |
 
 范围：公开入口与 `_fused_mamba_state_scatter_with_mask_kernel`；不含同文件内

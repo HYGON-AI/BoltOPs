@@ -7,7 +7,7 @@ import torch
 
 pytest.importorskip("triton")
 
-from bolt_ops.fla.kda import (
+from boltops.fla.kda import (
     fused_kda_gate,
     fused_recurrent_kda,
     fused_recurrent_kda_fwd,

@@ -15,7 +15,7 @@ import torch
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
-    group = parser.getgroup("bolt_ops")
+    group = parser.getgroup("boltops")
     group.addoption(
         "--bench",
         "--benchmark",

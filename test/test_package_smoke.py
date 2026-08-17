@@ -2,19 +2,19 @@
 
 from __future__ import annotations
 
-from bolt_ops import __version__
-from bolt_ops.fused_moe import (
+from boltops import __version__
+from boltops.fused_moe import (
     fused_experts,
     moe_activation,
     moe_activation_output_size,
     normalize_moe_activation,
 )
-from bolt_ops.generic import (
+from boltops.generic import (
     attn_res,
     fused_mamba_state_scatter_with_mask,
     recompute_w_u_fwd,
 )
-from bolt_ops.gemm import (
+from boltops.gemm import (
     awq_gemm_triton,
     batched_gemm_a16wfp4,
     gemm_a16w16,
@@ -25,7 +25,7 @@ from bolt_ops.gemm import (
     w8a8_block_int8_matmul,
     w8a8_triton_block_scaled_mm,
 )
-from bolt_ops.tools.triton_moe_tune.tune_moe_cli import main as moe_tune_main
+from boltops.tools.triton_moe_tune.tune_moe_cli import main as moe_tune_main
 
 
 def test_version():
@@ -52,9 +52,9 @@ def test_operator_package_exports():
 
 
 def test_root_package_does_not_reexport_operators():
-    import bolt_ops
+    import boltops
 
-    assert bolt_ops.__all__ == ["__version__"]
+    assert boltops.__all__ == ["__version__"]
     for name in (
         "attn_res",
         "recompute_w_u_fwd",
@@ -64,11 +64,11 @@ def test_root_package_does_not_reexport_operators():
         "matmul_persistent",
         "gemm_a16w16",
     ):
-        assert not hasattr(bolt_ops, name)
+        assert not hasattr(boltops, name)
 
 
 def test_gemm_fp16_not_public():
-    import bolt_ops.gemm as gemm
+    import boltops.gemm as gemm
 
     assert not hasattr(gemm, "gemm_fp16")
 

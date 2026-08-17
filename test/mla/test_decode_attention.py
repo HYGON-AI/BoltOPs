@@ -9,7 +9,7 @@ import torch
 
 pytest.importorskip("triton")
 
-from bolt_ops.mla import (  # noqa: E402
+from boltops.mla import (  # noqa: E402
     compute_num_kv_splits,
     decode_attention_fwd,
 )

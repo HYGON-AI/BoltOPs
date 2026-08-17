@@ -96,10 +96,10 @@ propagation；上游依赖的公共 cumsum/l2norm helper 也已在本仓库补�
 
 ## 2. 接口说明
 
-公开接口从 `bolt_ops.fla.kda` 导入：
+公开接口从 `boltops.fla.kda` 导入：
 
 ```python
-from bolt_ops.fla.kda import (
+from boltops.fla.kda import (
     chunk_gla_fwd_o_gk,
     chunk_kda_fwd_intra,
     chunk_kda_fwd_intra_token_parallel,
@@ -402,16 +402,16 @@ fixed/varlen cumsum 边界，以及 packed decode 与 dense recurrent 的结果�
 
 | 用途 | 文件 |
 |---|---|
-| 公开接口 | `bolt_ops/fla/kda/__init__.py` |
-| Triton 导出 | `bolt_ops/fla/kda/triton/__init__.py` |
-| Chunk Kernel | `bolt_ops/fla/kda/triton/chunk.py` |
-| Intra Kernel | `bolt_ops/fla/kda/triton/chunk_intra.py` |
-| Token-parallel Kernel | `bolt_ops/fla/kda/triton/chunk_intra_token_parallel.py` |
-| Recurrent Kernel | `bolt_ops/fla/kda/triton/fused_recurrent.py` |
-| Chunk state Kernel | `bolt_ops/fla/kda/triton/chunk_state.py` |
-| Common cumsum helper | `bolt_ops/fla/common/triton/cumsum.py` |
-| Common l2norm helper | `bolt_ops/fla/common/triton/l2norm.py` |
-| 去 vLLM 兼容 helper | `bolt_ops/fla/common/triton/math.py`、`utils.py` |
+| 公开接口 | `boltops/fla/kda/__init__.py` |
+| Triton 导出 | `boltops/fla/kda/triton/__init__.py` |
+| Chunk Kernel | `boltops/fla/kda/triton/chunk.py` |
+| Intra Kernel | `boltops/fla/kda/triton/chunk_intra.py` |
+| Token-parallel Kernel | `boltops/fla/kda/triton/chunk_intra_token_parallel.py` |
+| Recurrent Kernel | `boltops/fla/kda/triton/fused_recurrent.py` |
+| Chunk state Kernel | `boltops/fla/kda/triton/chunk_state.py` |
+| Common cumsum helper | `boltops/fla/common/triton/cumsum.py` |
+| Common l2norm helper | `boltops/fla/common/triton/l2norm.py` |
+| 去 vLLM 兼容 helper | `boltops/fla/common/triton/math.py`、`utils.py` |
 | 正确性测试 | `test/fla/test_kda_*.py`、`test/fla/_kda_reference.py` |
 | 性能测试 | `test/fla/benchmark_kda_baseline.py`、`test/fla/xcu_kda_stage.py` |
 

@@ -1,7 +1,7 @@
 # MLA 系列算子说明
 
-`bolt_ops.mla` 公开 Triton **dense MLA / GQA decode** 注意力（布局对齐 vLLM
-`TRITON_MLA`）。实现位于 `bolt_ops/mla/triton/`；维护人 Triton @xukang。
+`boltops.mla` 公开 Triton **dense MLA / GQA decode** 注意力（布局对齐 vLLM
+`TRITON_MLA`）。实现位于 `boltops/mla/triton/`；维护人 Triton @xukang。
 
 FlashMLA / Sparse MLA 尚未迁入本包。
 
@@ -15,7 +15,7 @@ FlashMLA / Sparse MLA 尚未迁入本包。
 | `compute_num_kv_splits` | split-KV 数量启发式 | vLLM `triton_mla` | 与 workspace 预留一致 |
 
 ```python
-from bolt_ops.mla import (
+from boltops.mla import (
     decode_attention_fwd,
     compute_num_kv_splits,
 )
@@ -28,7 +28,7 @@ pytest -q test/mla/
 pytest -q test/mla/ --bench -s
 ```
 
-溯源见 `bolt_ops/mla/triton/SOURCE.md`。
+溯源见 `boltops/mla/triton/SOURCE.md`。
 
 ---
 
