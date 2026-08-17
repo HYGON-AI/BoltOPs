@@ -1,4 +1,4 @@
-# BoltOps
+# BoltOPs
 
 Backend Optimized Low-latency Triton/TileLang Operators
 
@@ -6,19 +6,20 @@ Backend Optimized Low-latency Triton/TileLang Operators
 
 ## 介绍
 
-**BoltOps**（*Backend Optimized Low-latency Triton/TileLang Operators*）是 AI Compiler 团队面向海光 DCU 的高性能算子库。命名同时取自 **lightning bolt（闪电）**：以低时延为目标，追求闪电般的执行速度。它以 Triton、TileLang 等 DSL 实现可量产的、由 benchmark 驱动的 kernel，并通过清晰的 Python API 对外提供，让推理框架与模型侧调用方无需后端胶水即可获得调优后的 DCU 吞吐。
+**BoltOPs**（*Backend Optimized Low-latency Triton/TileLang Operators*）是 AI Compiler 团队面向海光 DCU 的高性能算子库。命名同时取自 **lightning bolt（闪电）**：以低时延为目标，追求闪电般的执行速度。它以 Triton、TileLang 等 DSL 实现可量产的、由 benchmark 驱动的 kernel，并通过清晰的 Python API 对外提供，让推理框架与模型侧调用方无需后端胶水即可获得调优后的 DCU 吞吐。
 
 库聚焦时延敏感的融合算子、正确性优先的验证，以及便于部署的打包方式：该走快路径的地方走快路径，该降低接入成本的地方尽量少摩擦。
 
 ![BoltOp is Fastest](docs/boltop_is_fastest.jpg)
 
 
-|            | 名称               |
-| ---------- | ---------------- |
-| DAS        | `bolt_ops`       |
-| PyPI / pip | `bolt_ops`       |
-| Wheel      | `bolt_ops-*.whl` |
-| Import     | `bolt_ops`       |
+|            | 名称              |
+| ---------- | ----------------- |
+| 仓库       | `BoltOPs`         |
+| DAS        | `boltops`         |
+| PyPI / pip | `boltops`         |
+| Wheel      | `boltops-*.whl`   |
+| Import     | `boltops`         |
 
 
 
@@ -32,28 +33,28 @@ pip install -e ".[tune]"            # MoE autotune / 测速工具
 pip install -e ".[all]"             # Triton + TileLang
 ./build_wheel.sh                    # 打纯 Python wheel → dist/
 # MoE autotune / 测速入口（随包发布）
-# bolt-moe-tune-cli <device_name> <test_type> [--benchmark]
+# boltops-fused-moe-tune-cli <device_name> <test_type> [--benchmark]
 ```
 
 依赖：`torch`；跑 Triton 算子还需本机可用的 Triton（Hygon 版）。MoE 调参见
 `[docs/ops/fused_moe.md](docs/ops/fused_moe.md)` 与
-`[tune_moe_triton_user_guide.md](bolt_ops/tools/triton_moe_tune/tune_moe_triton_user_guide.md)`。
+`[tune_moe_triton_user_guide.md](boltops/tools/triton_moe_tune/tune_moe_triton_user_guide.md)`。
 
 ## 用法
 
-业务侧从对应算子包导入公开 API；根包 `bolt_ops` 只暴露版本信息：
+业务侧从对应算子包导入公开 API；根包 `boltops` 只暴露版本信息：
 
 ```python
-from bolt_ops.generic import (
+from boltops.generic import (
     attn_res,
     recompute_w_u_fwd,
     fused_mamba_state_scatter_with_mask,
 )
-from bolt_ops.fused_moe import (
+from boltops.fused_moe import (
     fused_experts,
     moe_activation,
 )
-from bolt_ops.gemm import (
+from boltops.gemm import (
     matmul_persistent,
     gemm_a16w16,
     w8a8_triton_block_scaled_mm,
@@ -64,11 +65,11 @@ from bolt_ops.gemm import (
     batched_gemm_a16wfp4,
     w8a8_block_int8_matmul,
 )
-from bolt_ops.mla import (
+from boltops.mla import (
     decode_attention_fwd,
     compute_num_kv_splits,
 )
-from bolt_ops.fla.kda import (
+from boltops.fla.kda import (
     chunk_gla_fwd_o_gk,
     chunk_kda_fwd_intra,
     chunk_kda_fwd_intra_token_parallel,
@@ -113,7 +114,7 @@ decode_attention_fwd(
 需要做实现 A/B 时，直接 import 后端模块，不要绕公开 API：
 
 ```python
-from bolt_ops.generic.triton.recompute_w_u import recompute_w_u_fwd as triton_impl
+from boltops.generic.triton.recompute_w_u import recompute_w_u_fwd as triton_impl
 ```
 
 
@@ -126,7 +127,7 @@ from bolt_ops.generic.triton.recompute_w_u import recompute_w_u_fwd as triton_im
 | Generic                                                                         | `attn_res` `recompute_w_u_fwd` `fused_mamba_state_scatter_with_mask`                                                                                                                                                                   | Triton ✅ TileLang ❌ | Triton @all                                   | Triton                       | [docs](docs/ops/generic/generic.md)                                                                |
 | FLA/KDA 系列                                                                      | `chunk_gla_fwd_o_gk` `chunk_kda_fwd_intra` `chunk_kda_fwd_intra_token_parallel` `fused_kda_gate` `fused_kda_gate_chunk_cumsum` `fused_recurrent_kda` `fused_recurrent_kda_fwd` `fused_recurrent_kda_packed_decode` `recompute_w_u_fwd` | Triton ✅ TileLang ❌ | Triton @liji                                  | Triton                       | [docs](docs/ops/fla/kda.md)                                                                        |
 | FLA/GDN 系列                                                                      |                                                                                                                                                                                                                                        |                     | Trtion @huangteng                             |                              |                                                                                                    |
-| MoE 系列                                                                          | `fused_experts` `moe_activation`                                                                                                                                                                                                       | Triton ✅ TileLang ❌ | Triton @zhenxin TileLang @xxx                 | Triton（`fused_experts` 混合策略） | [docs](docs/ops/fused_moe.md) [调参指南](bolt_ops/tools/triton_moe_tune/tune_moe_triton_user_guide.md) |
+| MoE 系列                                                                          | `fused_experts` `moe_activation`                                                                                                                                                                                                       | Triton ✅ TileLang ❌ | Triton @zhenxin TileLang @xxx                 | Triton（`fused_experts` 混合策略） | [docs](docs/ops/fused_moe.md) [调参指南](boltops/tools/triton_moe_tune/tune_moe_triton_user_guide.md) |
 | FA 系列（UnifiedAttention / PagedAttention / ExtendAttention / SagedAttention/...） |                                                                                                                                                                                                                                        |                     | Triton @huangshuang @sunchunhao @fangzx |                              |                                                                                                    |
 | MLA / FlashMLA / Sparse MLA                                                     | `decode_attention_fwd` `decode_attention_fwd_grouped` `decode_attention_fwd_normal` `compute_num_kv_splits`                                                                                                                              | Triton ✅ TileLang ❌ | Triton @xukang                                | Triton                       | [docs](docs/ops/mla.md)（目前 dense MLA decode；FlashMLA / Sparse 待迁）                              |
 | MQA Logits（paged）                                                               |                                                                                                                                                                                                                                        |                     | Triton @fangzx                            |                              |                                                                                                    |
@@ -140,7 +141,7 @@ from bolt_ops.generic.triton.recompute_w_u import recompute_w_u_fwd as triton_im
 ## 目录
 
 ```text
-bolt_ops/
+boltops/
   fla/               # Flash Linear Attention 总目录
     kda/             # FLA/KDA 系列（Triton @liji）
     gdn/             # FLA/GDN 系列（Triton @huangteng）
@@ -160,10 +161,10 @@ build_wheel.sh       # 打 wheel
 
 ## 开发
 
-1. **关于 BoltOps 算子的定位**
+1. **关于 BoltOPs 算子的定位**
   由于是 DSL 语言开发的算子库，我们一定是在保证通用性的基础上去追求特定 size 下的性能，这是开发初衷。当然，具体到某一个算子，针对特定 size 或场景，可以由不同 kernel + DSL语言 混合实现以追求极致性能优化。
 2. **关于 Triton 和 TileLang**
-  二者都是类 Python DSL，目前看是相互补充、相互协作的关系，在 BoltOps 里也应有所体现：
+  二者都是类 Python DSL，目前看是相互补充、相互协作的关系，在 BoltOPs 里也应有所体现：
 
 
 |     | Triton                                          | TileLang                                                  |
@@ -189,6 +190,6 @@ pytest test --bench -s       # 正确性 + 真实模型尺寸性能
 
 **新算子：**
 
-1. 新建 `bolt_ops/<op>/`，在 `triton/` 与 `tilelang/` 实现；`test/test_<op>.py` 写正确性，`@pytest.mark.bench` 写模型尺寸测速，用 `--bench` 比出最优。
-2. 公开签名优先对齐 vLLM / SGLang（或 HIPC / CUDA C）；在 `bolt_ops/<op>/__init__.py` 写出厂后端分流并导出。
-3. 在 `bolt_ops/__init__.py` 再导出，并补 `docs/ops/`。
+1. 新建 `boltops/<op>/`，在 `triton/` 与 `tilelang/` 实现；`test/test_<op>.py` 写正确性，`@pytest.mark.bench` 写模型尺寸测速，用 `--bench` 比出最优。
+2. 公开签名优先对齐 vLLM / SGLang（或 HIPC / CUDA C）；在 `boltops/<op>/__init__.py` 写出厂后端分流并导出。
+3. 在 `boltops/__init__.py` 再导出，并补 `docs/ops/`。

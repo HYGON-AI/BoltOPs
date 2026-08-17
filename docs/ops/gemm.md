@@ -1,7 +1,7 @@
 # Gemm 系列算子说明
 
-`bolt_ops.gemm` 公开 Triton GEMM 族（布局对齐 vLLM / aiter / SGLang 调用侧）。
-实现位于 `bolt_ops/gemm/triton/`；维护人 Triton @xukang。
+`boltops.gemm` 公开 Triton GEMM 族（布局对齐 vLLM / aiter / SGLang 调用侧）。
+实现位于 `boltops/gemm/triton/`；维护人 Triton @xukang。
 
 ## 当前支持一览
 
@@ -20,7 +20,7 @@
 未公开：`gemm_fp16`（内部 HCU WASP/WDRA 实验）。
 
 ```python
-from bolt_ops.gemm import (
+from boltops.gemm import (
     matmul_persistent,
     gemm_a16w16,
     w8a8_triton_block_scaled_mm,
@@ -31,7 +31,7 @@ from bolt_ops.gemm import (
     batched_gemm_a16wfp4,
     w8a8_block_int8_matmul,
 )
-# 或 from bolt_ops.gemm import ...
+# 或 from boltops.gemm import ...
 ```
 
 测试统一目录：
@@ -41,7 +41,7 @@ pytest -q test/gemm/
 pytest -q test/gemm/ --bench -s   # 含 bench 的用例
 ```
 
-溯源总表见 `bolt_ops/gemm/triton/SOURCE.md`。
+溯源总表见 `boltops/gemm/triton/SOURCE.md`。
 
 ---
 

@@ -7,8 +7,8 @@ import torch
 
 pytest.importorskip("triton")
 
-from bolt_ops.fla.kda import fused_kda_gate, fused_kda_gate_chunk_cumsum
-from bolt_ops.fla.common.triton.l2norm import l2norm_fwd
+from boltops.fla.kda import fused_kda_gate, fused_kda_gate_chunk_cumsum
+from boltops.fla.common.triton.l2norm import l2norm_fwd
 from ._kda_reference import _normalize, naive_gate_chunk_cumsum, naive_kda_gate
 
 DEVICE = "cuda"

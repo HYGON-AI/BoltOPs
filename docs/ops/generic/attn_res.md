@@ -25,7 +25,7 @@ output = sum_i(weight_i * values_i)
 ## 2. 接口说明
 
 ```python
-from bolt_ops.generic import attn_res
+from boltops.generic import attn_res
 
 output = attn_res(
     prefix=prefix,
@@ -112,8 +112,8 @@ expected = torch.matmul(probs.unsqueeze(1), values).squeeze(1)
 
 | 用途 | 文件 |
 |---|---|
-| 公开接口 | `bolt_ops/generic/__init__.py` |
-| Triton 实现 | `bolt_ops/generic/triton/attn_res.py` |
+| 公开接口 | `boltops/generic/__init__.py` |
+| Triton 实现 | `boltops/generic/triton/attn_res.py` |
 | 测试 / 性能 | `test/test_generic_attn_res.py`（`--bench`） |
 
 范围：`attn_res`、上游 `_attn_res_kernel` 与本地

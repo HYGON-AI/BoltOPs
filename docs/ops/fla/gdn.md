@@ -4,10 +4,10 @@ Gated DeltaNet（GDN）提供 Decode/Recurrent 与 Chunk 前向接口。
 
 ## 1. 支持范围
 
-公开接口统一从 `bolt_ops.fla.gdn` 延迟导入：
+公开接口统一从 `boltops.fla.gdn` 延迟导入：
 
 ```python
-from bolt_ops.fla.gdn import (
+from boltops.fla.gdn import (
     chunk_fwd_o,
     chunk_gated_delta_rule_fwd_h,
     fused_recurrent_gated_delta_rule_packed_decode,
@@ -380,7 +380,7 @@ sequence在自己的 chunk边界重新累计 gate。
 测试位于 `test/fla`，正确性和性能 case保存在相同文件中。默认运行会跳过标记为
 `bench` 的性能 case；传入 `--bench` 后同时执行性能测试。
 
-在 BoltOps 仓库根目录执行：
+在 BoltOPs 仓库根目录执行：
 
 ```bash
 # 全部 GDN 正确性测试

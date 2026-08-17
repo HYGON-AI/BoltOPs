@@ -7,8 +7,8 @@ import torch
 
 pytest.importorskip("triton")
 
-from bolt_ops.gemm import gemm_afp4wfp4  # noqa: E402
-from bolt_ops.utility import arch_info  # noqa: E402
+from boltops.gemm import gemm_afp4wfp4  # noqa: E402
+from boltops.utility import arch_info  # noqa: E402
 
 DEVICE = "cuda"
 GPU_REQUIRED = pytest.mark.skipif(

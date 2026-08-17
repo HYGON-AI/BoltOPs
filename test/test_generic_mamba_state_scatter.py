@@ -14,10 +14,10 @@ import torch
 
 pytest.importorskip("triton")
 
-from bolt_ops.generic import (  # noqa: E402
+from boltops.generic import (  # noqa: E402
     fused_mamba_state_scatter_with_mask,
 )
-from bolt_ops.generic.triton.mamba_state_scatter import (  # noqa: E402
+from boltops.generic.triton.mamba_state_scatter import (  # noqa: E402
     _select_mamba_state_scatter_config,
 )
 

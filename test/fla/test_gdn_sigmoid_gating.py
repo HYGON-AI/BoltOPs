@@ -9,7 +9,7 @@ import torch
 
 triton = pytest.importorskip("triton")
 
-from bolt_ops.fla.gdn import (
+from boltops.fla.gdn import (
     fused_sigmoid_gating_delta_rule_update,
     fused_sigmoid_gating_delta_rule_update_recurrent,
 )
@@ -26,10 +26,10 @@ GPU_REQUIRED = pytest.mark.skipif(
 
 
 def test_public_sigmoid_signatures_match_backends() -> None:
-    from bolt_ops.fla.gdn.triton.fused_sigmoid_gating import (
+    from boltops.fla.gdn.triton.fused_sigmoid_gating import (
         fused_sigmoid_gating_delta_rule_update as ordinary_backend,
     )
-    from bolt_ops.fla.gdn.triton.fused_sigmoid_gating_recurrent import (
+    from boltops.fla.gdn.triton.fused_sigmoid_gating_recurrent import (
         fused_sigmoid_gating_delta_rule_update_recurrent as recurrent_backend,
     )
 

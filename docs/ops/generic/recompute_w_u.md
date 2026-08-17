@@ -27,7 +27,7 @@ w_c = A_c @ (
 ## 2. 接口说明
 
 ```python
-from bolt_ops.generic import recompute_w_u_fwd
+from boltops.generic import recompute_w_u_fwd
 
 w, u = recompute_w_u_fwd(
     k=k,
@@ -111,8 +111,8 @@ pytest -q test/test_generic_recompute_w_u.py --bench -s
 
 | 用途        | 文件                                      |
 | ----------- | ----------------------------------------- |
-| 公开接口    | `bolt_ops/generic/__init__.py`                    |
-| Triton 实现 | `bolt_ops/generic/triton/recompute_w_u.py`         |
+| 公开接口    | `boltops/generic/__init__.py`                    |
+| Triton 实现 | `boltops/generic/triton/recompute_w_u.py`         |
 | 测试 / 性能 | `test/test_generic_recompute_w_u.py`（`--bench`） |
 
 范围：`recompute_w_u_fwd` / `recompute_w_u_fwd_kernel` 及 chunk-index helper；

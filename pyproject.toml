@@ -3,7 +3,7 @@ requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "bolt_ops"
+name = "boltops"
 dynamic = ["version"]
 description = "Hygon DCU AI Compiler ops library (Triton & TileLang & Other DSLs)"
 readme = "README.md"
@@ -34,44 +34,44 @@ dev = [
 ]
 
 [project.scripts]
-bolt-moe-tune-cli = "bolt_ops.tools.triton_moe_tune.tune_moe_cli:main"
+boltops-fused-moe-tune-cli = "boltops.tools.triton_moe_tune.tune_moe_cli:main"
 
 [tool.setuptools]
 packages = [
-    "bolt_ops",
-    "bolt_ops.generic",
-    "bolt_ops.generic.triton",
-    "bolt_ops.fused_moe",
-    "bolt_ops.fused_moe.triton",
-    "bolt_ops.fused_moe.triton.configs",
-    "bolt_ops.fused_moe.tilelang",
-    "bolt_ops.gemm",
-    "bolt_ops.gemm.triton",
-    "bolt_ops.gemm.triton._quant",
-    "bolt_ops.gemm.triton.configs",
-    "bolt_ops.gemm.tilelang",
-    "bolt_ops.mla",
-    "bolt_ops.mla.triton",
-    "bolt_ops.mla.tilelang",
-    "bolt_ops.fla",
-    "bolt_ops.fla.common",
-    "bolt_ops.fla.common.triton",
-    "bolt_ops.fla.kda",
-    "bolt_ops.fla.kda.triton",
-    "bolt_ops.fla.gdn",
-    "bolt_ops.fla.gdn.triton",
-    "bolt_ops.fla.gdn.triton.configs",
-    "bolt_ops.utility",
-    "bolt_ops.fused_moe.triton.moe_sorting_hipc",
-    "bolt_ops.tools",
-    "bolt_ops.tools.triton_moe_tune",
+    "boltops",
+    "boltops.generic",
+    "boltops.generic.triton",
+    "boltops.fused_moe",
+    "boltops.fused_moe.triton",
+    "boltops.fused_moe.triton.configs",
+    "boltops.fused_moe.tilelang",
+    "boltops.gemm",
+    "boltops.gemm.triton",
+    "boltops.gemm.triton._quant",
+    "boltops.gemm.triton.configs",
+    "boltops.gemm.tilelang",
+    "boltops.mla",
+    "boltops.mla.triton",
+    "boltops.mla.tilelang",
+    "boltops.fla",
+    "boltops.fla.common",
+    "boltops.fla.common.triton",
+    "boltops.fla.kda",
+    "boltops.fla.kda.triton",
+    "boltops.fla.gdn",
+    "boltops.fla.gdn.triton",
+    "boltops.fla.gdn.triton.configs",
+    "boltops.utility",
+    "boltops.fused_moe.triton.moe_sorting_hipc",
+    "boltops.tools",
+    "boltops.tools.triton_moe_tune",
 ]
 
 [tool.setuptools.dynamic]
-version = { attr = "bolt_ops._version.__version__" }
+version = { attr = "boltops._version.__version__" }
 
 [tool.setuptools.package-data]
-bolt_ops = [
+boltops = [
     "fused_moe/triton/moe_sorting_hipc/csrc/*",
     "fused_moe/triton/configs/moe/*.json",
     "gemm/triton/configs/awq_gemm_triton/*.json",

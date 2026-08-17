@@ -1,4 +1,4 @@
-# BoltOps
+# BoltOPs
 
 Backend Optimized Low-latency Triton/TileLang Operators
 
@@ -6,7 +6,7 @@ Backend Optimized Low-latency Triton/TileLang Operators
 
 ## Introduction
 
-**BoltOps** (*Backend Optimized Low-latency Triton/TileLang Operators*) is the AI Compiler team's high-performance operator library for Hygon DCU. The name also nods to the **lightning bolt** — low latency and lightning-fast execution by design. It delivers production-ready, benchmark-driven kernels written in Triton, TileLang, and other DSLs behind clean Python APIs, giving inference frameworks and model-side callers tuned DCU throughput without backend-specific glue.
+**BoltOPs** (*Backend Optimized Low-latency Triton/TileLang Operators*) is the AI Compiler team's high-performance operator library for Hygon DCU. The name also nods to the **lightning bolt** — low latency and lightning-fast execution by design. It delivers production-ready, benchmark-driven kernels written in Triton, TileLang, and other DSLs behind clean Python APIs, giving inference frameworks and model-side callers tuned DCU throughput without backend-specific glue.
 
 The library focuses on latency-critical fused operators, correctness-first validation, and deployment-friendly packaging: fast paths where they matter, minimal friction where callers integrate.
 
@@ -15,10 +15,11 @@ The library focuses on latency-critical fused operators, correctness-first valid
 
 |            | Name             |
 | ---------- | ---------------- |
-| DAS        | `bolt_ops`       |
-| PyPI / pip | `bolt_ops`       |
-| Wheel      | `bolt_ops-*.whl` |
-| Import     | `bolt_ops`       |
+| Repository | `BoltOPs`        |
+| DAS        | `boltops`        |
+| PyPI / pip | `boltops`        |
+| Wheel      | `boltops-*.whl`  |
+| Import     | `boltops`        |
 
 
 
@@ -32,29 +33,29 @@ pip install -e ".[tune]"            # MoE autotune / benchmark tools
 pip install -e ".[all]"             # Triton + TileLang
 ./build_wheel.sh                    # pure-Python wheel → dist/
 # MoE autotune / benchmark entry (shipped with the package)
-# bolt-moe-tune-cli <device_name> <test_type> [--benchmark]
+# boltops-fused-moe-tune-cli <device_name> <test_type> [--benchmark]
 ```
 
 Dependencies: `torch`; Triton ops also need a working Triton install (Hygon build). For MoE tuning see
 `[docs/ops/fused_moe.md](docs/ops/fused_moe.md)` and
-`[tune_moe_triton_user_guide.md](bolt_ops/tools/triton_moe_tune/tune_moe_triton_user_guide.md)`.
+`[tune_moe_triton_user_guide.md](boltops/tools/triton_moe_tune/tune_moe_triton_user_guide.md)`.
 
 ## Usage
 
 Callers should import public APIs from the corresponding operator package.
-The root `bolt_ops` package exposes version metadata only:
+The root `boltops` package exposes version metadata only:
 
 ```python
-from bolt_ops.generic import (
+from boltops.generic import (
     attn_res,
     recompute_w_u_fwd,
     fused_mamba_state_scatter_with_mask,
 )
-from bolt_ops.fused_moe import (
+from boltops.fused_moe import (
     fused_experts,
     moe_activation,
 )
-from bolt_ops.gemm import (
+from boltops.gemm import (
     matmul_persistent,
     gemm_a16w16,
     w8a8_triton_block_scaled_mm,
@@ -65,11 +66,11 @@ from bolt_ops.gemm import (
     batched_gemm_a16wfp4,
     w8a8_block_int8_matmul,
 )
-from bolt_ops.mla import (
+from boltops.mla import (
     decode_attention_fwd,
     compute_num_kv_splits,
 )
-from bolt_ops.fla.kda import (
+from boltops.fla.kda import (
     chunk_gla_fwd_o_gk,
     chunk_kda_fwd_intra,
     chunk_kda_fwd_intra_token_parallel,
@@ -114,7 +115,7 @@ decode_attention_fwd(
 For A/B of backends, import the backend module directly — do not go around the public API:
 
 ```python
-from bolt_ops.generic.triton.recompute_w_u import recompute_w_u_fwd as triton_impl
+from boltops.generic.triton.recompute_w_u import recompute_w_u_fwd as triton_impl
 ```
 
 
@@ -127,7 +128,7 @@ from bolt_ops.generic.triton.recompute_w_u import recompute_w_u_fwd as triton_im
 | Generic                                                                              | `attn_res` `recompute_w_u_fwd` `fused_mamba_state_scatter_with_mask`                                                                                                                                                                   | Triton ✅ TileLang ❌ | Triton @all                                  | Triton                                | [docs](docs/ops/generic/generic.md)                                                                        |
 | FLA/KDA family                                                                       | `chunk_gla_fwd_o_gk` `chunk_kda_fwd_intra` `chunk_kda_fwd_intra_token_parallel` `fused_kda_gate` `fused_kda_gate_chunk_cumsum` `fused_recurrent_kda` `fused_recurrent_kda_fwd` `fused_recurrent_kda_packed_decode` `recompute_w_u_fwd` | Triton ✅ TileLang ❌ | Triton @liji                                 | Triton                                | [docs](docs/ops/fla/kda.md)                                                                                |
 | FLA/GDN family                                                                       |                                                                                                                                                                                                                                        |                     | Triton @huangteng                            |                                       |                                                                                                            |
-| MoE family                                                                           | `fused_experts` `moe_activation`                                                                                                                                                                                                       | Triton ✅ TileLang ❌ | Triton @zhenxin TileLang @xxx                | Triton (`fused_experts` mixed+policy) | [docs](docs/ops/fused_moe.md) [tuning guide](bolt_ops/tools/triton_moe_tune/tune_moe_triton_user_guide.md) |
+| MoE family                                                                           | `fused_experts` `moe_activation`                                                                                                                                                                                                       | Triton ✅ TileLang ❌ | Triton @zhenxin TileLang @xxx                | Triton (`fused_experts` mixed+policy) | [docs](docs/ops/fused_moe.md) [tuning guide](boltops/tools/triton_moe_tune/tune_moe_triton_user_guide.md) |
 | FA family (UnifiedAttention / PagedAttention / ExtendAttention / SagedAttention/...) |                                                                                                                                                                                                                                        |                     | Triton @huangshuang @sunchunhao @fangzx |                                       |                                                                                                            |
 | MLA / FlashMLA / Sparse MLA                                                          | `decode_attention_fwd` `decode_attention_fwd_grouped` `decode_attention_fwd_normal` `compute_num_kv_splits`                                                                                                                              | Triton ✅ TileLang ❌ | Triton @xukang                               | Triton                                | [docs](docs/ops/mla.md) (dense MLA decode now; FlashMLA / Sparse TBD)                                      |
 | MQA Logits (paged)                                                                   |                                                                                                                                                                                                                                        |                     | Triton @fangzx                           |                                       |                                                                                                            |
@@ -141,7 +142,7 @@ from bolt_ops.generic.triton.recompute_w_u import recompute_w_u_fwd as triton_im
 ## Layout
 
 ```text
-bolt_ops/
+boltops/
   fla/               # Flash Linear Attention umbrella
     kda/             # FLA/KDA family (Triton @liji)
     gdn/             # FLA/GDN family (Triton @huangteng)
@@ -161,10 +162,10 @@ build_wheel.sh       # build wheel
 
 ## Development
 
-1. **Positioning of BoltOps operators**
+1. **Positioning of BoltOPs operators**
   As a DSL-built operator library, we pursue performance on specific sizes **on top of generality** — that is the design intent. For a given op, different kernels + DSLs(mix) may target specific sizes or scenarios when chasing peak performance.
 2. **Triton and TileLang**
-  Both are Python-like DSLs and, today, complementary / collaborative — BoltOps should reflect that:
+  Both are Python-like DSLs and, today, complementary / collaborative — BoltOPs should reflect that:
 
 
 |           | Triton                                                                                                            | TileLang                                                                                                                       |
@@ -190,6 +191,6 @@ pytest test --bench -s       # correctness + real model-size performance
 
 **Adding a new op:**
 
-1. Create `bolt_ops/<op>/` with `triton/` and `tilelang/` impls; put correctness in `test/test_<op>.py` and model-size benches under `@pytest.mark.bench`, then use `--bench` to pick the winner.
-2. Prefer public signatures aligned with vLLM / SGLang (or HIPC / CUDA C); wire ship-time backend selection in `bolt_ops/<op>/__init__.py` and export.
-3. Re-export from `bolt_ops/__init__.py` and add `docs/ops/`.
+1. Create `boltops/<op>/` with `triton/` and `tilelang/` impls; put correctness in `test/test_<op>.py` and model-size benches under `@pytest.mark.bench`, then use `--bench` to pick the winner.
+2. Prefer public signatures aligned with vLLM / SGLang (or HIPC / CUDA C); wire ship-time backend selection in `boltops/<op>/__init__.py` and export.
+3. Re-export from `boltops/__init__.py` and add `docs/ops/`.

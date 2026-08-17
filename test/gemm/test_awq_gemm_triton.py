@@ -7,8 +7,8 @@ import torch
 
 pytest.importorskip("triton")
 
-from bolt_ops.gemm import awq_gemm_triton  # noqa: E402
-from bolt_ops.gemm.triton.awq_gemm_triton import awq_dequantize_triton  # noqa: E402
+from boltops.gemm import awq_gemm_triton  # noqa: E402
+from boltops.gemm.triton.awq_gemm_triton import awq_dequantize_triton  # noqa: E402
 
 DEVICE = "cuda"
 GPU_REQUIRED = pytest.mark.skipif(
