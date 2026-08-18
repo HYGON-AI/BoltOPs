@@ -465,6 +465,73 @@ def get_triton_swiglu_oai_interleaved_config(M, D):
     return {"BLOCK_SIZE_D": 64, "num_warps": 4}
 
 
+_SWIGLU_GPT_OSS_FLAT_BLOCK_SIZE = 1024
+_SWIGLU_GPT_OSS_FLAT_MIN_ELEMENTS = 256 * 1024
+
+
+def _use_swiglu_gpt_oss_flat_kernel(M: int, D: int) -> bool:
+    """Select flat mapping when it removes enough row-tile launch overhead."""
+    total = M * D
+    if total < _SWIGLU_GPT_OSS_FLAT_MIN_ELEMENTS or total >= 2**31:
+        return False
+
+    row_block = get_triton_swiglu_variant_config(M, D)["BLOCK_SIZE_D"]
+    row_programs = M * triton.cdiv(D, row_block)
+    flat_programs = triton.cdiv(total, _SWIGLU_GPT_OSS_FLAT_BLOCK_SIZE)
+
+    # Require at least a 25% program-count reduction. Below this point the
+    # flat mapping's per-element row/column calculation offsets its benefit.
+    return flat_programs * 4 <= row_programs * 3
+
+
+@triton.heuristics(
+    {
+        "EVEN_TOTAL": lambda args: (
+            (args["M"] * args["D"]) % args["BLOCK_SIZE"]
+        )
+        == 0,
+    }
+)
+@triton.jit
+def swiglu_gpt_oss_flat_kernel(
+    out_ptr,  # contiguous [M, D]
+    in_ptr,  # contiguous [M, 2*D]
+    M,
+    D: tl.constexpr,
+    ALPHA,
+    LIMIT,
+    BLOCK_SIZE: tl.constexpr,
+    EVEN_TOTAL: tl.constexpr,
+):
+    """Process the logical output as one flat array with only one tail tile."""
+    offs = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    row = offs // D
+    col = offs - row * D
+    gate_ptrs = in_ptr + row.to(tl.int64) * (2 * D) + col
+    up_ptrs = gate_ptrs + D
+
+    if EVEN_TOTAL:
+        gate = tl.load(gate_ptrs)
+        up = tl.load(up_ptrs)
+    else:
+        mask = offs < M * D
+        gate = tl.load(gate_ptrs, mask=mask, other=0.0)
+        up = tl.load(up_ptrs, mask=mask, other=0.0)
+
+    gate_f = tl.minimum(gate.to(tl.float32), LIMIT)
+    up_f = tl.minimum(tl.maximum(up.to(tl.float32), -LIMIT), LIMIT)
+    y = (
+        gate_f
+        * (1.0 / (1.0 + tl.exp(-(gate_f * ALPHA))))
+        * (up_f + 1.0)
+    )
+
+    if EVEN_TOTAL:
+        tl.store(out_ptr + offs, y.to(gate.dtype))
+    else:
+        tl.store(out_ptr + offs, y.to(gate.dtype), mask=mask)
+
+
 @triton.heuristics(
     {
         "D_DIV": lambda args: (args["D"] % args["BLOCK_SIZE_D"]) == 0,
@@ -583,7 +650,29 @@ def triton_swiglu_gpt_oss_sigmoid_alpha(
     out: torch.Tensor, inp: torch.Tensor, alpha: float, limit: float
 ) -> None:
     # out = gate' * sigmoid(alpha * gate') * (up' + 1), chunked layout
-    _triton_chunked_swiglu_variant(out, inp, alpha=alpha, limit=limit, mode=0)
+    assert inp.shape[-1] % 2 == 0
+    assert inp.is_contiguous() and out.is_contiguous()
+    M = inp.numel() // inp.shape[-1]
+    D = inp.shape[-1] // 2
+
+    if not _use_swiglu_gpt_oss_flat_kernel(M, D):
+        _triton_chunked_swiglu_variant(
+            out, inp, alpha=alpha, limit=limit, mode=0
+        )
+        return
+
+    block_size = _SWIGLU_GPT_OSS_FLAT_BLOCK_SIZE
+    grid = (triton.cdiv(M * D, block_size),)
+    swiglu_gpt_oss_flat_kernel[grid](
+        out,
+        inp,
+        M,
+        D,
+        alpha,
+        limit,
+        BLOCK_SIZE=block_size,
+        num_warps=1,
+    )
 
 
 def triton_swiglu_step_and_mul(out: torch.Tensor, inp: torch.Tensor, limit: float) -> None:
