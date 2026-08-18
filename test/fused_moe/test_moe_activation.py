@@ -144,6 +144,36 @@ def test_situ_matches_torch():
 
 
 @GPU_REQUIRED
+@pytest.mark.parametrize(
+    ("rows", "width"),
+    [(16, 66), (256, 2560), (257, 2562)],
+)
+def test_gpt_oss_swiglu_matches_torch(rows, width):
+    """Cover the small-M path, flat path, and a non-divisible flat tail."""
+    torch.manual_seed(42)
+    alpha, limit = 1.702, 7.0
+    input = torch.empty(
+        (rows, width), device=DEVICE, dtype=torch.bfloat16
+    ).uniform_(-9.0, 9.0)
+    out = torch.empty((rows, width // 2), device=DEVICE, dtype=input.dtype)
+
+    moe_activation(
+        out,
+        input,
+        activation="silu",
+        is_gated=True,
+        gemm1_alpha=alpha,
+        gemm1_limit=limit,
+    )
+
+    gate, up = _chunked(input)
+    gate = torch.minimum(gate, torch.tensor(limit, device=DEVICE))
+    up = torch.clamp(up, min=-limit, max=limit)
+    expected = gate * torch.sigmoid(alpha * gate) * (up + 1.0)
+    torch.testing.assert_close(out, expected.to(input.dtype), rtol=2e-2, atol=2e-2)
+
+
+@GPU_REQUIRED
 def test_situ_validation():
     input = torch.randn((2, 16), dtype=torch.bfloat16, device=DEVICE)
     out = torch.empty((2, 8), dtype=torch.bfloat16, device=DEVICE)
