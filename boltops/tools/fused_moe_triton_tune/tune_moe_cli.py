@@ -9,6 +9,8 @@ import sys
 import time
 from pathlib import Path
 
+from boltops.utility.triton_capability import get_triton_capabilities
+
 
 VALID_DEVICE_NAMES = {"zd", "bmz", "nmz", "yy"}
 # Site code → GPU ISA used in MoE JSON filenames (arch=...).
@@ -849,6 +851,12 @@ def main() -> int:
     env["HY_SMI_MAX_VRAM_PCT"] = str(args.hy_smi_max_vram_pct)
 
     try:
+        triton_capabilities = get_triton_capabilities()
+    except Exception as exc:
+        print(f"错误: 无法检测 Triton capability: {exc}", file=sys.stderr)
+        return 1
+
+    try:
         resolved_env = resolve_launcher_env(script_dir, env)
     except Exception as exc:
         print(f"错误: {exc}", file=sys.stderr)
@@ -883,7 +891,7 @@ def main() -> int:
             "错误: autotune patch 环境检查失败。可尝试：\n"
             "  1) 使用统一入口命令: boltops-fused-moe-tune-cli <device_name> <test_type>\n"
             "  2) 检查 boltops 包可导入: python -c \"import boltops; print(boltops.__file__)\"\n"
-            "  3) 检查 patch: python -c \"import boltops.tools.triton_moe_tune.autotune_patches\"",
+            "  3) 检查 patch: python -c \"import boltops.tools.fused_moe_triton_tune.autotune_patches\"",
             file=sys.stderr,
         )
         return 1
@@ -904,6 +912,14 @@ def main() -> int:
         ("runtime_layout", runtime_layout),
         ("script_dir", script_dir),
         ("log_root_dir", log_root_dir),
+        ("triton_package_version", triton_capabilities.package_version),
+        ("triton_capability", triton_capabilities.version),
+        ("triton_backend", triton_capabilities.backend),
+        ("triton_config_dir", triton_capabilities.config_dir_name),
+        (
+            "use_block_pingpong",
+            triton_capabilities.supports("use_block_pingpong"),
+        ),
         ("device_name", args.device_name),
         ("test_type", args.test_type),
         ("test_script_name", test_script_name),

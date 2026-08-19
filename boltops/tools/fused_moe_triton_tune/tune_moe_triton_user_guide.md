@@ -32,7 +32,7 @@
 适用于以下任务：
 
 1. 执行 fused_moe autotune（compile-only + run + parse）
-2. 生成并拷贝 MoE 配置 JSON 到 `boltops/fused_moe/triton/configs/moe`
+2. 生成并拷贝 MoE 配置 JSON 到 `boltops/fused_moe/triton/configs/moe/triton_<capability>`
 3. 只跑 benchmark（复用现有配置，不再训练）
 4. 快速排障（选卡、日志、参数一致性）
 
@@ -47,11 +47,11 @@
 
 核心文件：
 
-- 统一入口：`boltops-fused-moe-tune-cli`（`boltops.tools.triton_moe_tune.tune_moe_cli:main`）
-- 调参代码：`boltops/tools/triton_moe_tune/`
-- 公共逻辑：`boltops/tools/triton_moe_tune/common.py`
-- patch 逻辑：`boltops/tools/triton_moe_tune/autotune_patches.py`
-- 日志解析：`boltops/tools/triton_moe_tune/moe_log_parser.py`
+- 统一入口：`boltops-fused-moe-tune-cli`（`boltops.tools.fused_moe_triton_tune.tune_moe_cli:main`）
+- 调参代码：`boltops/tools/fused_moe_triton_tune/`
+- 公共逻辑：`boltops/tools/fused_moe_triton_tune/common.py`
+- patch 逻辑：`boltops/tools/fused_moe_triton_tune/autotune_patches.py`
+- 日志解析：`boltops/tools/fused_moe_triton_tune/moe_log_parser.py`
 
 安装形态统一约定（推荐）：
 
@@ -71,6 +71,16 @@
 >
 > 例：`boltops-fused-moe-tune-cli nmz bf16` → 生成/期望
 > `E=...,N=...,arch=gfx938.json`；日志目录仍为 `logs_nmz_bf16_tp*`。
+
+### 2.1 Triton capability
+
+调参工具会读取当前 Triton 的 capability 和 HCU/AMD `HIPOptions`：
+
+- Triton 3.2 能力的搜索空间不传 `use_block_pingpong`；
+- backend 实际支持该 option 时，搜索空间增加
+  `use_block_pingpong=False/True`，`True` 只用于 8-warp、2-stage 配置；
+- 新结果写入 `configs/moe/triton_3_2|triton_3_6|triton_3_8`；
+- 运行时先读当前能力目录，高版本可逐级回退到低版本。
 
 ---
 
@@ -114,7 +124,7 @@
 补充：
 
 - `tune_moe_sum.py` 是辅助测试脚本，不是 `boltops-fused-moe-tune-cli` 的 `test_type` 目标。
-- `boltops/tools/triton_moe_tune/autotune_patches.py` 不是独立算子实现，而是对 `fused_moe.py` 的外挂 patch 层，主要用于 autotune 辅助与测试路径接管。
+- `boltops/tools/fused_moe_triton_tune/autotune_patches.py` 不是独立算子实现，而是对 `fused_moe.py` 的外挂 patch 层，主要用于 autotune 辅助与测试路径接管。
 - 对 `int4int8/int4int8_channel`，建议先用小 batch 做 weight 格式与量化参数一致性校验，再进入大规模 autotune。
 - `int4/int4int8` 的 `group_size` 当前固定为 `64`，不通过 CLI 导出。
 - `int4` 的 `has_zp` 当前固定为 `True`，不通过 CLI 导出。
@@ -134,9 +144,9 @@ boltops-fused-moe-tune-cli nmz int8_channel
 在框架运行日志中，先检查是否命中已存在的 MoE config：
 
 ```text
-[boltops] Using default MoE config. Performance might be sub-optimal! Config file not found at /usr/local/lib/python3.10/dist-packages/boltops/fused_moe/triton/configs/moe/E=512,N=168,arch=gfx936.json
-[2026-04-20 17:44:46 TP7] Using default MoE config. Performance might be sub-optimal! Config file not found at /usr/local/lib/python3.10/dist-packages/boltops/fused_moe/triton/configs/moe/E=512,N=168,arch=gfx936.json
-[boltops] Using configuration from /usr/local/lib/python3.10/dist-packages/boltops/fused_moe/triton/configs/moe/E=512,N=336,arch=gfx936,is_bottom=True.json for MoE layer.
+[boltops] Using default MoE config. Performance might be sub-optimal! Config file not found at /usr/local/lib/python3.10/dist-packages/boltops/fused_moe/triton/configs/moe/triton_3_6/E=512,N=168,arch=gfx936.json
+[2026-04-20 17:44:46 TP7] Using default MoE config. Performance might be sub-optimal! Config file not found at /usr/local/lib/python3.10/dist-packages/boltops/fused_moe/triton/configs/moe/triton_3_6/E=512,N=168,arch=gfx936.json
+[boltops] Using configuration from /usr/local/lib/python3.10/dist-packages/boltops/fused_moe/triton/configs/moe/triton_3_2/E=512,N=336,arch=gfx936,is_bottom=True.json for MoE layer.
 ```
 
 判断规则：
@@ -198,10 +208,11 @@ boltops-fused-moe-tune-cli nmz int8_channel \
 
 ### 阶段C（建议）：确认是否提交配置到 boltops 仓库
 
-训练后生成的配置会拷贝到本机安装目录（如 `/usr/local/lib/python3.10/dist-packages/boltops/fused_moe/triton/configs/moe`）。
+训练后生成的配置会拷贝到当前 Triton 能力目录（如
+`/usr/local/lib/python3.10/dist-packages/boltops/fused_moe/triton/configs/moe/triton_3_6`）。
 建议再做一步判断：这些配置是否需要回传到 boltops 仓库长期保存。
 
-目标仓库路径：`boltops/fused_moe/triton/configs/moe`
+目标仓库路径：`boltops/fused_moe/triton/configs/moe/triton_<capability>`
 
 建议提交的场景：
 

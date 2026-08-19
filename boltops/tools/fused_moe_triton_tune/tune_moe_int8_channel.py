@@ -1,25 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 
-# Adapted from https://github.com/sgl-project/sglang/pull/2575
+# Adapted from https://github.com/sgl-project/sglang/pull/3730
 import itertools
-import os
-import sys
 
 import pytest
 import torch
 import triton
-import triton.language as tl
+import triton.testing
 
-import torch.nn.functional as F
-from boltops.tools.triton_moe_tune.routing import fused_topk
-from boltops.fused_moe.triton.moe_compat import per_token_quant_hip, pertoken_quant
+from boltops.tools.fused_moe_triton_tune.routing import fused_topk
+from boltops.fused_moe.triton.moe_compat import per_token_quant_hip
+from boltops.utility import dtypes
 import boltops.fused_moe.triton as fused_moe_module
 
-from boltops.utility import dtypes
 from boltops.utility.perf_utils import checkAllclose, perftest
 from typing import List, Dict, Optional
 try:
-    from boltops.tools.triton_moe_tune.common import (
+    from boltops.tools.fused_moe_triton_tune.common import (
         get_env_int,
         parse_batch_sizes_from_env,
         resolve_device_settings,
@@ -32,7 +29,7 @@ try:
     )
 except ImportError:
     try:
-        from boltops.tools.triton_moe_tune.common import (
+        from boltops.tools.fused_moe_triton_tune.common import (
             get_env_int,
             parse_batch_sizes_from_env,
             resolve_device_settings,
@@ -44,7 +41,7 @@ except ImportError:
             enforce_training_patch_contract,
         )
     except ImportError:
-        from boltops.tools.triton_moe_tune.common import (
+        from boltops.tools.fused_moe_triton_tune.common import (
             get_env_int,
             parse_batch_sizes_from_env,
             resolve_device_settings,
@@ -56,10 +53,10 @@ except ImportError:
             enforce_training_patch_contract,
         )
 
+import os
 os.environ["AMDGCN_USE_BUFFER_OPS"] = "1"
 
-# 从环境变量获取配置
-compile_only = int(os.environ.get("TRITON_COMPILE_ONLY", "0"))
+compile_only  = int(os.environ.get("TRITON_COMPILE_ONLY", "0"))
 num_groups_compile = int(os.environ.get("NUM_GROUPS_COMPILE", "1"))
 ep_size = int(os.environ.get("EP_SIZE", "1"))
 training_mode = int(os.environ.get("TRAINING_MODE", "0"))
@@ -73,10 +70,10 @@ enforce_training_patch_contract(
     patch_source=patch_source,
     import_errors=patch_import_errors,
 )
-print(f"[fp8_channel patch] source={patch_source}, noop={patch_is_noop}")
+print(f"[int8_channel patch] source={patch_source}, noop={patch_is_noop}")
 total_cuda_devices = torch.cuda.device_count()
 device_start_id, device_count, num_groups_run = resolve_device_settings(total_cuda_devices)
-DEFAULT_FULL_RUN_BATCH_SIZES = [1,2,4,8,16,24,32,64,128,256,512,1024,2048,4096,8192,16384,32768]
+DEFAULT_FULL_RUN_BATCH_SIZES = [1, 2, 4, 8, 16, 24, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
 FULL_RUN_BATCH_SIZES = parse_batch_sizes_from_env(DEFAULT_FULL_RUN_BATCH_SIZES)
 
 if compile_only == 1:
@@ -96,7 +93,7 @@ else:
         full_batches=FULL_RUN_BATCH_SIZES,
     )
     print(
-        f"[fp8_channel group config] start={device_start_id}, count={device_count}, run_groups={num_groups_run}"
+        f"[int8_channel group config] start={device_start_id}, count={device_count}, run_groups={num_groups_run}"
     )
     print(f"{group_ids=}")
 
@@ -108,19 +105,7 @@ training_config = {
     "group_id"          : group_ids,
 }
 
-
-NUM_SHARED_EXPERTS = [get_env_int("MOE_NUM_SHARED_EXPERTS", 0)]
-
-#deepseek model tp8
-NUM_EXPERTS = [get_env_int("MOE_NUM_EXPERTS", 256)]
-HIDDEN_SIZES = [get_env_int("MOE_HIDDEN_SIZE", 2048 if ep_size > 1 else 128)]
-FFN_HIDDEN_SIZES = [get_env_int("MOE_FFN_HIDDEN_SIZE", 7168)]
-EP_SIZE = [ep_size]
-TOP_KS = [get_env_int("MOE_TOP_K", 8)]
-DTYPES = [torch.float16]
-INPLACE = [True]
-
-print(f"[tune_moe_fp8_channel.py] Running with TRAINING_MODE={training_mode}, CUR_GROUP={cur_group}, EP_SIZE={ep_size}")
+print(f"[tune_moe_int8_channel.py] Running with TRAINING_MODE={training_mode}, CUR_GROUP={cur_group}")
 
 # 根据训练模式选择不同的批次大小参数
 if training_config["training_mode"] == 0:
@@ -136,7 +121,7 @@ else:
 
 
 ACTIVATION_NAME, IS_GATED = resolve_moe_activation_and_gate()
-print(f"[tune_moe_fp8_channel.py] activation={ACTIVATION_NAME}, is_gated={IS_GATED}")
+print(f"[tune_moe_int8_channel.py] activation={ACTIVATION_NAME}, is_gated={IS_GATED}")
 
 
 def setup_device_from_training_config() -> int:
@@ -151,24 +136,28 @@ def setup_device_from_training_config() -> int:
 
 
 def native_w8a8_per_token_matmul(A, B, As, Bs, output_dtype=torch.float16):
-    """Per-token input quantization + per-channel weight quantization matmul."""
+    """Matrix multiplication function that supports per-token input quantization and per-column weight quantization"""
     A = A.to(torch.float32)
     B = B.to(torch.float32)
+
     assert A.shape[-1] == B.shape[-1], "Dimension mismatch"
     assert B.ndim == 2 and B.is_contiguous(), "B must be a 2D contiguous tensor"
 
+    # Reshape input
     M = A.numel() // A.shape[-1]
-    B = B.t()
+    B = B.t()  # Transpose weight matrix
     N, K = B.shape
     origin_C_shape = A.shape[:-1] + (K,)
     A = A.reshape(M, N)
 
-    C = torch.matmul(A, B)
-    C = As * C * Bs.view(1, -1)
+    # As is per-token [M, 1], Bs is per-column [1, K]
+    C = torch.matmul(A, B)  # [M, K]
+    C = As * C * Bs.view(1, -1)  # Broadcast per-column scale
+
     return C.reshape(origin_C_shape).to(output_dtype)
 
 
-def torch_w8a8_per_channel_fp8_moe_expert_mask(
+def torch_w8a8_per_column_moe_expert_mask(
     a,
     w1,
     w2,
@@ -178,14 +167,16 @@ def torch_w8a8_per_channel_fp8_moe_expert_mask(
     topk_ids,
     expert_map=None,
 ):
-    """FP8 per-channel MoE torch reference with scale-aware dequant path."""
+    """This function performs fused moe with per-column int8 quantization using native torch."""
     B, D = a.shape
     topk = topk_weight.shape[1]
+    # Perform per-token quantization
+    a_q, a_s = per_token_quant_hip(a)
+    # Repeat tokens to match topk
+    a_q = a_q.view(B, -1, D).repeat(1, topk, 1).reshape(-1, D)
+    # Also repeat the scale
+    a_s = a_s.view(B, -1, 1).repeat(1, topk, 1).reshape(-1, 1)  # [B*topk, 1]
 
-    # Match triton path: quantize activations per token before each GEMM.
-    a_q, a_s = per_token_quant_hip(a, quant_dtype=dtypes.fp8)
-    a_q = a_q.view(B, -1, D).repeat(1, topk, 1).reshape(-1, D).to(torch.float32)
-    a_s = a_s.view(B, -1, 1).repeat(1, topk, 1).reshape(-1, 1)
     out = torch.zeros(B * topk, w2.shape[1], dtype=a.dtype, device=a.device)
 
     topk_weight = topk_weight.view(-1)
@@ -193,22 +184,31 @@ def torch_w8a8_per_channel_fp8_moe_expert_mask(
     if expert_map is not None:
         topk_ids = expert_map[topk_ids]
 
+    # Process each expert
     for i in range(w1.shape[0]):
         mask = topk_ids == i
         if mask.sum():
+            # First MLP layer: note that a_s is now per-token
             inter_out = native_w8a8_per_token_matmul(
                 a_q[mask], w1[i], a_s[mask], w1_s[i], output_dtype=a.dtype
             )
+            # Activation function
             act_out = apply_activation_ref(
                 inter_out,
                 activation_name=ACTIVATION_NAME,
                 is_gated=IS_GATED,
             )
-            act_q, act_s = per_token_quant_hip(act_out, quant_dtype=dtypes.fp8)
+            # Quantize activation output with per-token
+            act_out_q, act_out_s = per_token_quant_hip(act_out)
+
+            # Second MLP layer
             out[mask] = native_w8a8_per_token_matmul(
-                act_q, w2[i], act_s, w2_s[i], output_dtype=a.dtype
+                act_out_q, w2[i], act_out_s, w2_s[i], output_dtype=a.dtype
             )
-    return (out.view(B, -1, w2.shape[1]) * topk_weight.view(B, -1, 1).to(out.dtype)).sum(dim=1)
+    # Apply routing weights and sum
+    return (
+        out.view(B, -1, w2.shape[1]) * topk_weight.view(B, -1, 1).to(out.dtype)
+    ).sum(dim=1)
 
 
 def input_helper(
@@ -224,10 +224,13 @@ def input_helper(
     seed: int = 0,
     ep_id: Optional[int] = None,
 ):
-    """Helper function to generate input data for FP8 per-channel quantization MoE tests."""
+    """Helper function to generate input data for INT8 per-channel quantization MoE tests."""
     assert e % ep_size == 0, f"num_experts({e}) must be divisible by ep_size({ep_size})"
 
     torch.manual_seed(seed)
+    factor_for_scale = 1e-2
+    int8_max = 127
+    int8_min = -128
     e_sum = e + num_shared_experts
     inter_dim = 2 * n if IS_GATED else n
     final_topk = topk + num_shared_experts
@@ -235,16 +238,22 @@ def input_helper(
     a = torch.randn((m, k), dtype=dtype, device=device) / 10
     e_per_rank = e // ep_size
 
-    # 生成全局权重（bf16 格式，后续量化为 fp8）
-    w1_global = torch.randn((e_sum, inter_dim, k), dtype=dtype, device=device) / 10
-    w2_global = torch.randn((e_sum, k, n), dtype=dtype, device=device) / 10
+    # 生成全局权重（bf16 格式，后续量化为 int8）
+    w1_global_fp32 = (torch.rand((e_sum, inter_dim, k), dtype=torch.float32, device=device) - 0.5) * 2
+    w2_global_fp32 = (torch.rand((e_sum, k, n), dtype=torch.float32, device=device) - 0.5) * 2
+    w1_global = (w1_global_fp32 * int8_max).clamp(min=int8_min, max=int8_max).to(torch.int8)
+    w2_global = (w2_global_fp32 * int8_max).clamp(min=int8_min, max=int8_max).to(torch.int8)
+
+    # Per-channel scale
+    w1_s_global = torch.rand(e_sum, inter_dim, device=device) * factor_for_scale
+    w2_s_global = torch.rand(e_sum, k, device=device) * factor_for_scale
 
     # 情况1: ep_size == 1, 无共享专家
     if ep_size == 1 and num_shared_experts == 0:
         score_all = torch.randn((m, e), dtype=dtype, device=device)
         topk_weights, topk_ids = fused_topk(a, score_all, topk, renormalize=False)
         e_map = None
-        w1, w2 = w1_global[:e], w2_global[:e]
+        w1, w2, w1_s, w2_s = w1_global[:e], w2_global[:e], w1_s_global[:e], w2_s_global[:e]
 
     # 情况2: ep_size > 1, 无共享专家
     elif ep_size > 1 and num_shared_experts == 0:
@@ -265,10 +274,12 @@ def input_helper(
         )
         w1 = w1_global[start:end]
         w2 = w2_global[start:end]
+        w1_s = w1_s_global[start:end]
+        w2_s = w2_s_global[start:end]
 
     # 情况3: ep_size == 1, 有共享专家
     elif ep_size == 1 and num_shared_experts != 0:
-        from boltops.tools.triton_moe_tune import compat
+        from boltops.tools.fused_moe_triton_tune import compat
 
         score_all = torch.randn((m, e_sum), dtype=dtype, device=device)
         score = score_all[:, :e]
@@ -295,11 +306,11 @@ def input_helper(
         topk_weights = topk_weights.gather(1, sorted_idx)
 
         e_map = None
-        w1, w2 = w1_global, w2_global
+        w1, w2, w1_s, w2_s = w1_global, w2_global, w1_s_global, w2_s_global
 
     # 情况4: ep_size > 1, 有共享专家
     elif ep_size > 1 and num_shared_experts != 0:
-        from boltops.tools.triton_moe_tune import compat
+        from boltops.tools.fused_moe_triton_tune import compat
 
         if ep_id is None:
             ep_id = ep_size - 1
@@ -322,10 +333,16 @@ def input_helper(
         # 本地非共享专家 + 全局共享专家
         w1_local = w1_global[start:end]
         w2_local = w2_global[start:end]
+        w1_s_local = w1_s_global[start:end]
+        w2_s_local = w2_s_global[start:end]
         w1_shared = w1_global[e:e_sum]
         w2_shared = w2_global[e:e_sum]
+        w1_s_shared = w1_s_global[e:e_sum]
+        w2_s_shared = w2_s_global[e:e_sum]
         w1 = torch.cat([w1_local, w1_shared], dim=0)
         w2 = torch.cat([w2_local, w2_shared], dim=0)
+        w1_s = torch.cat([w1_s_local, w1_s_shared], dim=0)
+        w2_s = torch.cat([w2_s_local, w2_s_shared], dim=0)
 
         score = torch.randn((m, e), dtype=dtype, device=device)
         score_all = torch.randn((m, e_sum), dtype=dtype, device=device)
@@ -354,14 +371,7 @@ def input_helper(
     else:
         raise AssertionError("Invalid input combination")
 
-    # Per-channel quantization for weights
-    w1_q, w1_s = pertoken_quant(w1, quant_dtype=dtypes.fp8)
-    w2_q, w2_s = pertoken_quant(w2, quant_dtype=dtypes.fp8)
-
-    return a, w1_q, w2_q, w1_s, w2_s, score_all, e_map, topk_weights, topk_ids
-
-
-case_counter_x = 1
+    return a, w1, w2, w1_s, w2_s, score_all, e_map, topk_weights, topk_ids
 
 
 @perftest(num_warmup=1, num_iters=11, testGraph=True)
@@ -372,7 +382,7 @@ def fused_experts_impl_benchmark(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     output_dtype: torch.dtype,
-    use_fp8_w8a8: bool = False,
+    use_int8_w8a8: bool = False,
     per_channel_quant: bool = False,
     global_num_experts: int = -1,
     expert_map: Optional[torch.Tensor] = None,
@@ -387,7 +397,7 @@ def fused_experts_impl_benchmark(
         topk_weights,
         topk_ids,
         output_dtype=output_dtype,
-        use_fp8_w8a8=use_fp8_w8a8,
+        use_int8_w8a8=use_int8_w8a8,
         per_channel_quant=per_channel_quant,
         global_num_experts=global_num_experts,
         expert_map=expert_map,
@@ -396,6 +406,17 @@ def fused_experts_impl_benchmark(
         activation=activation,
         is_gated=IS_GATED,
     )
+
+# minimax m2.5 defaults; run_test_moe_training.sh can override these via MOE_* env vars.
+NUM_SHARED_EXPERTS = [get_env_int("MOE_NUM_SHARED_EXPERTS", 0)]
+NUM_EXPERTS = [get_env_int("MOE_NUM_EXPERTS", 256)]
+HIDDEN_SIZES = [get_env_int("MOE_HIDDEN_SIZE", 384)]  # N1/2 = K2 = HIDDEN_SIZES, N1 = 2 * HIDDEN_SIZES
+FFN_HIDDEN_SIZES = [get_env_int("MOE_FFN_HIDDEN_SIZE", 3072)]  # K1, N2
+EP_SIZE = [ep_size]
+TOP_KS = [get_env_int("MOE_TOP_K", 8)]
+DTYPES = [torch.half]
+
+case_counter_x = 1
 
 @pytest.mark.parametrize("m", BATCH_SIZES)
 @pytest.mark.parametrize("n", HIDDEN_SIZES)
@@ -406,7 +427,7 @@ def fused_experts_impl_benchmark(
 @pytest.mark.parametrize("num_shared_experts", NUM_SHARED_EXPERTS)
 @pytest.mark.parametrize("dtype", DTYPES)
 @torch.inference_mode()
-def test_w8a8_channel_fp8_fused_moe(m, n, k, e, topk, ep_size, num_shared_experts, dtype):
+def test_w8a8_int8_channel_fused_moe(m, n, k, e, topk, ep_size, num_shared_experts, dtype):
     # 设置CUDA设备
     if not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
@@ -416,8 +437,7 @@ def test_w8a8_channel_fp8_fused_moe(m, n, k, e, topk, ep_size, num_shared_expert
     # 获取当前设备
     device = "cuda"
 
-    # torch results for ep_size != 1 may be incorrect.
-    ENABLE_TORCH_REF = False if m > 256 or (training_config["training_mode"] == 1 or ep_size != 1) else True
+    ENABLE_TORCH_REF = False if m > 256 or training_config["training_mode"] == 1 else True
 
     final_e = e // ep_size + num_shared_experts if ep_size > 1 else e + num_shared_experts
     global_e = e + num_shared_experts
@@ -433,7 +453,7 @@ def test_w8a8_channel_fp8_fused_moe(m, n, k, e, topk, ep_size, num_shared_expert
     case_counter_x += 1
 
     M, N, K, E = m, n, k, e
-    a, w1_q, w2_q, w1_s, w2_s, _score_all, e_map, topk_weights, topk_ids = input_helper(
+    a, w1, w2, w1_s, w2_s, _score_all, e_map, topk_weights, topk_ids = input_helper(
         m=M,
         n=N,
         k=K,
@@ -449,12 +469,12 @@ def test_w8a8_channel_fp8_fused_moe(m, n, k, e, topk, ep_size, num_shared_expert
     with patched_environment():
         out = fused_moe_module.fused_experts_impl(
             a,
-            w1_q,
-            w2_q,
+            w1,
+            w2,
             topk_weights,
             topk_ids,
             output_dtype=a.dtype,
-            use_fp8_w8a8=True,
+            use_int8_w8a8=True,
             per_channel_quant=True,
             global_num_experts=E + num_shared_experts,
             expert_map=e_map,
@@ -465,13 +485,18 @@ def test_w8a8_channel_fp8_fused_moe(m, n, k, e, topk, ep_size, num_shared_expert
         )
 
     if ENABLE_TORCH_REF:
-        ref_out = torch_w8a8_per_channel_fp8_moe_expert_mask(
-                        a, w1_q, w2_q, w1_s, w2_s, topk_weights, topk_ids, expert_map=e_map)
-        msg = (
-            f"[TRITON_check] {M=}, {K=}, {N=}, {E=}, {topk=}, "
-            f"{num_shared_experts=}, {ep_size=}, dtype={dtype}"
+        ref_out = torch_w8a8_per_column_moe_expert_mask(
+                        a, w1, w2, w1_s, w2_s, topk_weights, topk_ids,
+                        expert_map=e_map
+                    )
+        rel_diff = (
+            torch.mean(torch.abs(out.to(torch.float32) - ref_out.to(torch.float32)))
+            / torch.mean(torch.abs(ref_out.to(torch.float32)))
         )
-        checkAllclose(ref_out, out, rtol=0.01, atol=100, msg=msg)
+        assert rel_diff < 0.05, (
+            f"[TRITON_check] {M=}, {K=}, {N=}, {E=}, {topk=}, "
+            f"{num_shared_experts=}, {ep_size=}, dtype={dtype}, rel_diff={rel_diff}"
+        )
 
 
 # 定义MoE测试用例列表
@@ -498,9 +523,9 @@ moe_configs = [
 
         ylabel='Time(ms)',
         xlabel='Batch Size',
-        plot_name='MoE FP8 Channel Performance (Times ms)',  # 图表标题
+        plot_name='MoE INT8 Channel Performance (Times ms)',  # 图表标题
         args={
-            'dtype': torch.float16,
+            'dtype': torch.half,
             'device': 'cuda',
         }
     )
@@ -511,8 +536,8 @@ case_counter = 1
 perf_profling = False
 
 @triton.testing.perf_report(moe_configs)
-def bench_fused_moe_fp8(BATCH_SIZE, HIDDEN_SIZE, FFN_HIDDEN_SIZE, NUM_EXPERTS, TOP_K, NUM_SHARED_EXPERTS,
-                   provider, dtype=torch.float16, device="cuda"):
+def bench_fused_moe_int8_channel(BATCH_SIZE, HIDDEN_SIZE, FFN_HIDDEN_SIZE, NUM_EXPERTS, TOP_K, NUM_SHARED_EXPERTS,
+                   provider, dtype=torch.half, device="cuda"):
     """
     BATCH_SIZE: 批次大小 (m)
     HIDDEN_SIZE: 隐藏层大小 (n)
@@ -549,7 +574,7 @@ def bench_fused_moe_fp8(BATCH_SIZE, HIDDEN_SIZE, FFN_HIDDEN_SIZE, NUM_EXPERTS, T
     k = FFN_HIDDEN_SIZE
 
     M, N, K, E = m, n, k, e
-    a, w1_q, w2_q, w1_s, w2_s, _score_all, e_map, topk_weights, topk_ids = input_helper(
+    a, w1, w2, w1_s, w2_s, _score_all, e_map, topk_weights, topk_ids = input_helper(
         m=M,
         n=N,
         k=K,
@@ -567,12 +592,12 @@ def bench_fused_moe_fp8(BATCH_SIZE, HIDDEN_SIZE, FFN_HIDDEN_SIZE, NUM_EXPERTS, T
         with patched_environment():
             _, avg_us = fused_experts_impl_benchmark(
                 a,
-                w1_q,
-                w2_q,
+                w1,
+                w2,
                 topk_weights,
                 topk_ids,
                 a.dtype,
-                use_fp8_w8a8=True,
+                use_int8_w8a8=True,
                 per_channel_quant=True,
                 global_num_experts=E + NUM_SHARED_EXPERTS,
                 expert_map=e_map,
@@ -588,7 +613,7 @@ def bench_fused_moe_fp8(BATCH_SIZE, HIDDEN_SIZE, FFN_HIDDEN_SIZE, NUM_EXPERTS, T
 
 # 运行基准测试
 if benchmark_mode == 1:
-    bench_fused_moe_fp8.run(print_data=True)
+    bench_fused_moe_int8_channel.run(print_data=True)
 
 if __name__ == "__main__":
     pytest.main([__file__, "-s"])

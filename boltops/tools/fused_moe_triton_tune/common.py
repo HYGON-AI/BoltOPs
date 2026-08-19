@@ -267,7 +267,7 @@ def resolve_patched_environment():
     The local migrated patch module is preferred; noop is the fallback.
     """
     candidates = [
-        "boltops.tools.triton_moe_tune.autotune_patches",
+        "boltops.tools.fused_moe_triton_tune.autotune_patches",
     ]
     errors: list[str] = []
     for module_name in candidates:
@@ -298,7 +298,7 @@ def enforce_training_patch_contract(
         raise RuntimeError(
             "TRAINING_MODE=1 但未加载到 autotune_patches（当前为 noop）。\n"
             f"patch_source={patch_source}\n"
-            "请确认 boltops.tools.triton_moe_tune.autotune_patches 可导入\n"
+            "请确认 boltops.tools.fused_moe_triton_tune.autotune_patches 可导入\n"
             + (f"\n导入错误详情:\n{details}" if details else "")
         )
     if benchmark_mode == 1 and patch_is_noop:

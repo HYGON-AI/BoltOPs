@@ -1,4 +1,5 @@
 import re
+import ast
 from decimal import Decimal
 from textwrap import shorten
 import json
@@ -6,6 +7,11 @@ import sys
 import os
 import shutil
 from pathlib import Path
+
+from boltops.utility.triton_capability import (
+    get_triton_capabilities,
+    get_triton_config_dir,
+)
 
 # 定义特殊键值映射表
 SPECIAL_KEY_MAP = {
@@ -18,6 +24,39 @@ SPECIAL_KEY_MAP = {
     7: 32,   # 第7个是32
     8: 64    # 第8个是64
 }
+
+_SAVED_CONFIG_KEYS = (
+    "BLOCK_SIZE_N",
+    "BLOCK_SIZE_K",
+    "GROUP_SIZE_M",
+    "COMBINE_SCALE_LOAD",
+    "USE_MLS_LOAD",
+    "waves_per_eu",
+    "instruction_sched_variant",
+    "schedule_hint",
+    "sched_latency",
+    "kpack",
+    "use_block_pingpong",
+    "num_warps",
+    "num_stages",
+)
+
+
+def _parse_config_value(raw_value):
+    raw_value = raw_value.strip()
+    try:
+        return ast.literal_eval(raw_value)
+    except (SyntaxError, ValueError):
+        return raw_value
+
+
+def _parse_autotune_config(config_text):
+    return {
+        key: _parse_config_value(value)
+        for key, value in re.findall(
+            r"([A-Za-z_][A-Za-z0-9_]*)\s*:\s*([^,\n]+)", config_text
+        )
+    }
 
 
 def parse_log_file(log_content):
@@ -61,33 +100,32 @@ def parse_log_file(log_content):
                 block_params = {}
                 best_autotune_id = None
 
-                # for m in re.finditer(
-                #       r'^\s*(\*?)\s*(\d+)\s*:\s*BLOCK_SIZE_N:\s*(\d+),\s*BLOCK_SIZE_K:\s*(\d+),\s*GROUP_SIZE_M:\s*(\d+)[\s\S]*?COMBINE_SCALE_LOAD:\s*([a-zA-Z0-9-]+)[\s\S]*?instruction_sched_variant:\s*([a-zA-Z0-9-]+)[\s\S]*?num_warps:\s*(\d+)[\s\S]*?num_stages:\s*(\d+)[\s\S]*?times\([^)]+\):\s*([\d.eE+-]+)\s*ms',
-                #       block,
-                #       re.MULTILINE
-                # ):
                 for m in re.finditer(
-                      r'^\s*(\*?)\s*(\d+)\s*:\s*BLOCK_SIZE_N:\s*(\d+),\s*BLOCK_SIZE_K:\s*(\d+),\s*GROUP_SIZE_M:\s*(\d+)[\s\S]*?COMBINE_SCALE_LOAD:\s*([a-zA-Z0-9-]+)[\s\S]*?USE_MLS_LOAD:\s*([a-zA-Z0-9-]+)[\s\S]*?instruction_sched_variant:\s*([a-zA-Z0-9-]+)[\s\S]*?sched_latency:\s*([a-zA-Z0-9-]+)[\s\S]*?kpack:\s*(\d+)[\s\S]*?num_warps:\s*(\d+)[\s\S]*?num_stages:\s*(\d+)[\s\S]*?times\([^)]+\):\s*([\d.eE+-]+)\s*ms',
-                      block,
-                      re.MULTILINE
+                    r'^\s*(\*?)\s*(\d+)\s*:\s*(.*?)\n\s*:\s*times\([^)]+\):\s*([\d.eE+-]+)\s*ms',
+                    block,
+                    re.MULTILINE,
                 ):
                     is_best = m.group(1) == '*'
                     autotune_id = int(m.group(2))
-                    block_n = int(m.group(3))  # BLOCK_SIZE_N
-                    block_k = int(m.group(4))  # BLOCK_SIZE_K
-                    group_m = int(m.group(5))  # GROUP_SIZE_M
-                    combine_scale_load = True if str(m.group(6)) == "True" else False
-                    use_mls_load = True if str(m.group(7)) == "True" else False
-                    instruction_sched_variant = str(m.group(8))  # instruction_sched_variant
-                    sched_latency = str(m.group(9))
-                    kpack = int(m.group(10))
-                    num_warps = int(m.group(11))
-                    num_stages = int(m.group(12))
-                    time_val = float(m.group(13))
+                    config_values = _parse_autotune_config(m.group(3))
+                    time_val = float(m.group(4))
+
+                    required = {
+                        "BLOCK_SIZE_N",
+                        "BLOCK_SIZE_K",
+                        "GROUP_SIZE_M",
+                        "num_warps",
+                        "num_stages",
+                    }
+                    if not required.issubset(config_values):
+                        continue
 
                     block_times[autotune_id] = time_val
-                    # 保存所有参数到元组中
-                    block_params[autotune_id] = (block_n, block_k, group_m, combine_scale_load, use_mls_load, instruction_sched_variant, sched_latency, kpack, num_warps, num_stages)
+                    block_params[autotune_id] = {
+                        key: config_values[key]
+                        for key in _SAVED_CONFIG_KEYS
+                        if key in config_values
+                    }
 
                     if is_best:
                         best_autotune_id = autotune_id
@@ -141,15 +179,11 @@ def print_results(results):
         # 生成特殊键名
         special_key = get_special_key(idx)
 
-        # 解包参数
-        k1_block_n, k1_block_k, k1_group_m, k1_combine_scale_load, k1_use_mls_load, k1_instruction_sched_variant, k1_sched_latency, k1_kpack, k1_warps, k1_stages = k1_params
-        k2_block_n, k2_block_k, k2_group_m, k2_combine_scale_load, k2_use_mls_load, k2_instruction_sched_variant, k2_sched_latency, k2_kpack, k2_warps, k2_stages = k2_params
-
         # 构建参数字符串
         full_params = (
             f"{params}, "
-            f"K1(BLOCK_SIZE_N:{k1_block_n}, BLOCK_SIZE_K:{k1_block_k}, GROUP_SIZE_M:{k1_group_m}, COMBINE_SCALE_LOAD:{k1_combine_scale_load}, USE_MLS_LOAD:{k1_use_mls_load}, instruction_sched_variant:{k1_instruction_sched_variant}, sched_latency:{k1_sched_latency}, kpack:{k1_kpack}, num_warps:{k1_warps}, num_stages:{k1_stages}), "
-            f"K2(BLOCK_SIZE_N:{k2_block_n}, BLOCK_SIZE_K:{k2_block_k}, GROUP_SIZE_M:{k2_group_m}, COMBINE_SCALE_LOAD:{k2_combine_scale_load}, USE_MLS_LOAD:{k2_use_mls_load}, instruction_sched_variant:{k2_instruction_sched_variant}, sched_latency:{k2_sched_latency}, kpack:{k2_kpack}, num_warps:{k2_warps}, num_stages:{k2_stages})"
+            f"K1({k1_params}), "
+            f"K2({k2_params})"
         )
         shortened_params = shorten(full_params, width=160, placeholder="...")
         print(f"│ {special_key:12d} │ {cfg_num:10d} │ {k1_id:12d} │ {k2_id:12d} │ {total:12.4f} │ {shortened_params:160} │")
@@ -160,42 +194,11 @@ def save_results_to_json(results, k1_filename, k2_filename):
     json_data_k2 = {}
 
     for idx, (cfg_num, params, k1_id, k2_id, total, k1_params, k2_params) in enumerate(results, 1):
-        config_dict = eval(params)  # 注意：实际使用中建议用更安全的方式解析
-
-        # 解析两个kernel的参数
-        k1_block_n, k1_block_k, k1_group_m, k1_combine_scale_load, k1_use_mls_load, k1_instruction_sched_variant, k1_sched_latency, k1_kpack, k1_warps, k1_stages = k1_params
-        k2_block_n, k2_block_k, k2_group_m, k2_combine_scale_load, k2_use_mls_load, k2_instruction_sched_variant, k2_sched_latency, k2_kpack, k2_warps, k2_stages = k2_params
+        config_dict = ast.literal_eval(params)
         block_size_m = config_dict["BLOCK_SIZE_M"]
 
-        # 构建Kernel1条目
-        entry_k1 = {
-            "BLOCK_SIZE_M": block_size_m,
-            "BLOCK_SIZE_N": k1_block_n,
-            "BLOCK_SIZE_K": k1_block_k,
-            "GROUP_SIZE_M": k1_group_m,
-            "COMBINE_SCALE_LOAD": k1_combine_scale_load,
-            "USE_MLS_LOAD": k1_use_mls_load,
-            "instruction_sched_variant": k1_instruction_sched_variant,
-            "sched_latency": k1_sched_latency,
-            "kpack": k1_kpack,
-            "num_warps": k1_warps,
-            "num_stages": k1_stages
-        }
-
-        # 构建Kernel2条目
-        entry_k2 = {
-            "BLOCK_SIZE_M": block_size_m,
-            "BLOCK_SIZE_N": k2_block_n,
-            "BLOCK_SIZE_K": k2_block_k,
-            "GROUP_SIZE_M": k2_group_m,
-            "COMBINE_SCALE_LOAD": k2_combine_scale_load,
-            "USE_MLS_LOAD": k2_use_mls_load,
-            "instruction_sched_variant": k2_instruction_sched_variant,
-            "sched_latency": k2_sched_latency,
-            "kpack": k2_kpack,
-            "num_warps": k2_warps,
-            "num_stages": k2_stages
-        }
+        entry_k1 = {"BLOCK_SIZE_M": block_size_m, **k1_params}
+        entry_k2 = {"BLOCK_SIZE_M": block_size_m, **k2_params}
 
         # 生成特殊键名
         special_key = get_special_key(idx)
@@ -212,33 +215,14 @@ def save_results_to_json(results, k1_filename, k2_filename):
 
 
 def resolve_boltops_moe_config_dir() -> Path:
-    # Prefer the active boltops installation, with a source-tree fallback.
-    try:
-        import boltops
-
-        return (
-            Path(boltops.__file__).resolve().parent
-            / "fused_moe"
-            / "triton"
-            / "configs"
-            / "moe"
-        )
-    except Exception:
-        script_dir = Path(__file__).resolve().parent
-        fallback_candidates = [
-            (
-                script_dir.parents[2]
-                / "boltops"
-                / "fused_moe"
-                / "triton"
-                / "configs"
-                / "moe"
-            ).resolve(),
-        ]
-        for candidate in fallback_candidates:
-            if candidate.exists():
-                return candidate
-        return fallback_candidates[0]
+    config_root = (
+        Path(__file__).resolve().parents[2]
+        / "fused_moe"
+        / "triton"
+        / "configs"
+        / "moe"
+    )
+    return get_triton_config_dir(config_root, get_triton_capabilities())
 
 def main():
     # 默认使用autotune_v5.log作为日志文件和默认输出JSON文件名
