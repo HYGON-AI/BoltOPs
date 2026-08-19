@@ -10,6 +10,9 @@ variables:
   DTK_PKG: "/ArchivedFile/dtk-pkg/dtk26.04/DTK-26.04-rc4-centos8-x86_64.tar.gz"
   DEVPI_URL: "http://10.16.1.201:9929/"
   CISMI_TIMEOUT: "3600"
+  # These two must be set as protected CI/CD secret variables in GitLab project settings.
+  devpi_nightly_user: ""
+  devpi_nightly_password: ""
 
 
 .dcu-runner:
@@ -27,7 +30,15 @@ variables:
     - test -n "${latest_run}"
     - cp "${src_dir}/${latest_run}.run" ./
     - chmod +x "${latest_run}.run"
-    - 'yes | bash "${latest_run}.run" || test "${PIPESTATUS[1]}" -eq 0'
+    - |
+      yes | bash "${latest_run}.run" || {
+        exit_code=$?
+        # 1: installer "already installed"; 141: SIGPIPE from yes (expected on normal exit)
+        if [ "${exit_code}" -ne 1 ] && [ "${exit_code}" -ne 141 ]; then
+          echo "AICC installer failed with exit code ${exit_code}" >&2
+          exit "${exit_code}"
+        fi
+      }
 
 .git-auth:
   before_script:
@@ -117,6 +128,7 @@ build:test-wheel:
       wheel_test_dir=$(mktemp -d)
       python -m pip install --no-deps --target "${wheel_test_dir}" output/*.whl
       cp -r test "${wheel_test_dir}/test"
+      cp pyproject.toml "${wheel_test_dir}/pyproject.toml"
       (
         cd "${wheel_test_dir}"
         python -m pytest test -s --tb=short \
