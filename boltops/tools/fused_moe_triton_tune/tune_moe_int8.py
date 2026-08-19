@@ -8,7 +8,7 @@ import torch
 import triton
 import triton.testing
 
-from boltops.tools.triton_moe_tune.routing import fused_topk
+from boltops.tools.fused_moe_triton_tune.routing import fused_topk
 from boltops.fused_moe.triton.moe_compat import per_token_quant_hip, per_block_quant_wrapper
 from boltops.utility import dtypes
 import boltops.fused_moe.triton as fused_moe_module
@@ -16,7 +16,7 @@ import boltops.fused_moe.triton as fused_moe_module
 from boltops.utility.perf_utils import checkAllclose, perftest
 from typing import List, Dict, Optional
 try:
-    from boltops.tools.triton_moe_tune.common import (
+    from boltops.tools.fused_moe_triton_tune.common import (
         get_env_int,
         parse_batch_sizes_from_env,
         resolve_device_settings,
@@ -29,7 +29,7 @@ try:
     )
 except ImportError:
     try:
-        from boltops.tools.triton_moe_tune.common import (
+        from boltops.tools.fused_moe_triton_tune.common import (
             get_env_int,
             parse_batch_sizes_from_env,
             resolve_device_settings,
@@ -41,7 +41,7 @@ except ImportError:
             enforce_training_patch_contract,
         )
     except ImportError:
-        from boltops.tools.triton_moe_tune.common import (
+        from boltops.tools.fused_moe_triton_tune.common import (
             get_env_int,
             parse_batch_sizes_from_env,
             resolve_device_settings,
@@ -323,7 +323,7 @@ def input_helper(
 
     # 情况3: ep_size == 1, 有共享专家
     elif ep_size == 1 and num_shared_experts != 0:
-        from boltops.tools.triton_moe_tune import compat
+        from boltops.tools.fused_moe_triton_tune import compat
 
         score_all = torch.randn((m, e_sum), dtype=dtype, device=device)
         score = score_all[:, :e]
@@ -354,7 +354,7 @@ def input_helper(
 
     # 情况4: ep_size > 1, 有共享专家
     elif ep_size > 1 and num_shared_experts != 0:
-        from boltops.tools.triton_moe_tune import compat
+        from boltops.tools.fused_moe_triton_tune import compat
 
         if ep_id is None:
             ep_id = ep_size - 1

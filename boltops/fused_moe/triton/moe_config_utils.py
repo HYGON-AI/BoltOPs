@@ -2,14 +2,18 @@
  
 import torch
 from typing import Any, Dict, Optional, List
-import os
 import json
 import functools
 from pathlib import Path
 import boltops.utility.arch_info as arch_info
 from boltops.utility import logger
+from boltops.utility.triton_capability import (
+    get_compatible_triton_config_dirs,
+    get_triton_capabilities,
+)
 
-# Launch JSON configs shipped beside this module: triton/configs/moe/*.json
+# Launch JSON configs shipped beside this module:
+# triton/configs/moe/triton_<capability>/*.json
 _TRITON_CONFIGS_DIR = Path(__file__).resolve().parent / "configs"
 
 M_THRESHOLD_SMALL = 256
@@ -169,14 +173,16 @@ def get_moe_configs(
     be picked and the associated configuration chosen to invoke the kernel.
     """
 
-    # First look up if an optimized configuration is available in the configs
-    # directory
+    # First look up if an optimized configuration is available in the current
+    # Triton capability directory, then fall back to lower capabilities.
     block_shape = [block_n, block_k] if block_n and block_k else None
     json_file_name = get_config_file_name(E, N, dtype, block_shape, is_bottom)
+    config_dirs = get_compatible_triton_config_dirs(
+        _TRITON_CONFIGS_DIR / "moe", get_triton_capabilities()
+    )
+    config_file_path = config_dirs[0] / json_file_name
 
-    config_file_path = os.path.join(
-        str(_TRITON_CONFIGS_DIR), "moe", json_file_name)
-    def _load_config(config_path: str) -> Optional[dict[int, Any]]:
+    def _load_config(config_path: Path) -> Optional[dict[int, Any]]:
         try:
             with open(config_path) as f:
                 config_data = json.load(f)
@@ -196,38 +202,30 @@ def get_moe_configs(
             return None
         return {int(key): val for key, val in config_data.items()}
 
-    if os.path.exists(config_file_path):
-        logger.info("Using configuration from %s for MoE layer.",
-                    config_file_path)
-        loaded_cfg = _load_config(config_file_path)
-        if loaded_cfg is not None:
-            # If a configuration has been found, return it
-            return loaded_cfg
-    elif is_bottom:
-        # if config with is_bottom json file not found, try to fallback use config without bottom json.
-        fallback_json_file_name = get_config_file_name(E, N, dtype, block_shape)
-        fallback_config_file_path = os.path.join(
-            str(_TRITON_CONFIGS_DIR), "moe", fallback_json_file_name)
+    candidate_names = [json_file_name]
+    if is_bottom:
+        # Preserve the existing bottom -> top config fallback within each
+        # capability directory.
+        candidate_names.append(get_config_file_name(E, N, dtype, block_shape))
 
-        if os.path.exists(fallback_config_file_path):
-            logger.info("Using fallback configuration from %s for MoE layer.",
-                        fallback_config_file_path)
-            loaded_cfg = _load_config(fallback_config_file_path)
+    # For EP mode, local experts may not match a config file. Try the nearest
+    # supported power-of-two expert count within each capability directory.
+    nearestE = closest_power_of_two(E, dtype)
+    if nearestE != E:
+        candidate_names.append(
+            get_config_file_name(nearestE, N, dtype, block_shape, is_bottom)
+        )
+
+    for config_dir in config_dirs:
+        for candidate_name in candidate_names:
+            candidate_path = config_dir / candidate_name
+            if not candidate_path.exists():
+                continue
+            logger.info("Using configuration from %s for MoE layer.", candidate_path)
+            loaded_cfg = _load_config(candidate_path)
             if loaded_cfg is not None:
                 return loaded_cfg
 
-    # for EP mode, local experts num may not match any config file, try to find nearest E which is power of two
-    nearestE = closest_power_of_two(E, dtype)
-    fallback_json_file_name = get_config_file_name(nearestE, N, dtype, block_shape, is_bottom)
-    fallback_config_file_path = os.path.join(
-        str(_TRITON_CONFIGS_DIR), "moe", fallback_json_file_name)
-
-    if os.path.exists(fallback_config_file_path):
-        logger.info("Using fallback configuration from %s for MoE layer.",
-                    fallback_config_file_path)
-        loaded_cfg = _load_config(fallback_config_file_path)
-        if loaded_cfg is not None:
-            return loaded_cfg
     # If no optimized configuration is available, we will use the default
     # configuration
     logger.warning(

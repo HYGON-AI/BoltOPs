@@ -15,11 +15,11 @@ import sys
 
 from typing import Optional, List  # Add this import at the top
 
-from boltops.tools.triton_moe_tune.routing import fused_topk
+from boltops.tools.fused_moe_triton_tune.routing import fused_topk
 from boltops.utility import dtypes
 import boltops.fused_moe.triton as fused_moe_module
 try:
-    from boltops.tools.triton_moe_tune.common import (
+    from boltops.tools.fused_moe_triton_tune.common import (
         get_env_int,
         parse_batch_sizes_from_env,
         resolve_device_settings,
@@ -33,7 +33,7 @@ try:
     )
 except ImportError:
     try:
-        from boltops.tools.triton_moe_tune.common import (
+        from boltops.tools.fused_moe_triton_tune.common import (
             get_env_int,
             parse_batch_sizes_from_env,
             resolve_device_settings,
@@ -46,7 +46,7 @@ except ImportError:
             enforce_training_patch_contract,
         )
     except ImportError:
-        from boltops.tools.triton_moe_tune.common import (
+        from boltops.tools.fused_moe_triton_tune.common import (
             get_env_int,
             parse_batch_sizes_from_env,
             resolve_device_settings,
@@ -270,7 +270,7 @@ def input_helper(
         scale_factor = 1.2
         num_expert_group = 8
         topk_group = 4
-        from boltops.tools.triton_moe_tune import compat
+        from boltops.tools.fused_moe_triton_tune import compat
         # final_topk 参数包含了共享专家的数量（final_topk = topk + num_shared_experts）
         _ = compat.moe_fused_gate(score, correction_bias, w_sglang, id_sglang, num_expert_group, topk_group,
                                  final_topk, num_shared_experts, scale_factor,)
@@ -345,7 +345,7 @@ def input_helper(
         scale_factor = 1.2
         num_expert_group = 8
         topk_group = 4
-        from boltops.tools.triton_moe_tune import compat
+        from boltops.tools.fused_moe_triton_tune import compat
         # moe_fused_gate 的 input 应该是非共享专家的门控输出
         # final_topk 参数包含了共享专家的数量（final_topk = topk + num_shared_experts）
         _ = compat.moe_fused_gate(score, correction_bias, w_sglang, id_sglang, num_expert_group, topk_group,

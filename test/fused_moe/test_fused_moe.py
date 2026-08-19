@@ -9,7 +9,7 @@ import torch.nn.functional as F
 pytest.importorskip("triton")
 
 from boltops.fused_moe import fused_experts  # noqa: E402
-from boltops.tools.triton_moe_tune.common import (  # noqa: E402
+from boltops.tools.fused_moe_triton_tune.common import (  # noqa: E402
     quantize_weights,
     scalar_types,
 )

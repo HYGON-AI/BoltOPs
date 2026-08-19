@@ -25,7 +25,7 @@ from boltops.gemm import (
     w8a8_block_int8_matmul,
     w8a8_triton_block_scaled_mm,
 )
-from boltops.tools.triton_moe_tune.tune_moe_cli import main as moe_tune_main
+from boltops.tools.fused_moe_triton_tune.tune_moe_cli import main as moe_tune_main
 
 
 def test_version():

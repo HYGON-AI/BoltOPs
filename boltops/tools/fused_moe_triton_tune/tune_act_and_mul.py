@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 import pytest
 
-from boltops.tools.triton_moe_tune import compat
+from boltops.tools.fused_moe_triton_tune import compat
 from boltops.utility.perf_utils import run_perftest, checkAllclose
 from boltops.fused_moe.triton.moe_activation import (
     triton_silu_and_mul,

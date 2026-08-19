@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 
 from boltops.utility import logger
-from boltops.tools.triton_moe_tune.routing import moe_fused_gate
+from boltops.tools.fused_moe_triton_tune.routing import moe_fused_gate
 
 
 def silu_and_mul(output: torch.Tensor, input: torch.Tensor):

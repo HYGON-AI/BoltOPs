@@ -1,9 +1,13 @@
 import os
-import torch
+from contextlib import contextmanager
+from itertools import product
 from typing import Optional, List, Dict, Any
 from unittest.mock import patch
+
+import torch
 import triton
 import triton.language as tl
+
 import boltops.fused_moe.triton.moe_op as moe_op
 import boltops.utility.arch_info as arch_info
 from boltops.fused_moe.triton.moe_compat import per_token_quant_hip, per_block_quant_wrapper
@@ -16,11 +20,11 @@ from boltops.fused_moe.triton.moe_activation import (
     adjust_N_for_activation,
     _apply_activation,
 )
-from contextlib import contextmanager
+from boltops.utility.triton_capability import get_triton_capabilities
 
 
 capMLS = arch_info.get_arch() in ("gfx938", "gfx92a")
-support_sched_latency = arch_info.get_arch() in ("gfx928", "gfx936", "gfx92a")
+triton_capabilities = get_triton_capabilities()
 
 training_mode = int(os.environ.get("TRAINING_MODE", "0"))
 test_type= str(os.environ.get("AUTOTUNE_TEST_TYPE", "int4"))
@@ -35,6 +39,141 @@ print(f"{mode_autotune=} {test_type=}")
 mode_best_config_tune = False
 
 _ALLOWED_OUTPUT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+_SCHEDULE_OPTION_NAMES = ("instruction_sched_variant", "schedule_hint")
+_LARGE_MOE_TOKEN_THRESHOLD = 2048
+
+
+def _compiler_option_values(name, values):
+    """Return search values, or one omission marker for unsupported options."""
+
+    return values if triton_capabilities.supports(name) else (None,)
+
+
+def _add_compiler_options(config, **options):
+    """Add capability-filtered compiler options, omitting unsupported ones."""
+
+    for name, value in options.items():
+        if value is not None:
+            config[name] = value
+
+
+def _schedule_option_name():
+    """Return the schedule option spelling accepted by the active Triton."""
+
+    for name in _SCHEDULE_OPTION_NAMES:
+        if triton_capabilities.supports(name):
+            return name
+    return None
+
+
+def _add_schedule_option(config, option_name, value):
+    """Add the version-specific schedule option when Triton exposes one."""
+
+    if option_name is not None:
+        config[option_name] = value
+
+
+def _keep_autotune_config(
+    config,
+    *,
+    block_m,
+    n,
+    k,
+    is_gemm1,
+    per_channel_quant,
+    num_stages,
+    num_warps,
+    schedule,
+):
+    """Apply shape, kernel and compiler-option pruning in one place."""
+
+    block_n = config["BLOCK_SIZE_N"]
+    block_k = config["BLOCK_SIZE_K"]
+    group_m = config["GROUP_SIZE_M"]
+    combine_scale_load = config["COMBINE_SCALE_LOAD"]
+    use_mls_load = config["USE_MLS_LOAD"]
+    bottom_a_use_mls_load = config["bottom_a_use_mls_load"]
+    kpack = config.get("kpack")
+
+    if use_mls_load or bottom_a_use_mls_load:
+        if num_stages >= 3 or n % block_n != 0 or k % block_k != 0:
+            return False
+
+    if per_channel_quant:
+        if combine_scale_load:
+            return False
+        if test_type in ("int4", "int4int8_channel") and block_k < 32:
+            return False
+
+    if kpack == 2 and block_k <= 32:
+        return False
+    if test_type in ("int4", "int4int8_channel") and block_k < 32:
+        return False
+    if block_k > k or block_n > n or group_m > block_m:
+        return False
+
+    if combine_scale_load:
+        if k % (block_k * 2) != 0:
+            return False
+        if block_k != mode_autotune_max_block_size_k or not is_gemm1:
+            return False
+        if bottom_a_use_mls_load:
+            return False
+
+    # A one-stage pipeline ignores non-default scheduling hints, so those
+    # candidates would only duplicate the default schedule.
+    if num_stages == 1 and schedule not in (None, "none"):
+        return False
+
+    byte_per_elem = (
+        1
+        if test_type
+        in (
+            "int8",
+            "int8_channel",
+            "int4int8",
+            "int4int8_channel",
+            "fp8",
+            "fp8_channel",
+        )
+        else 2
+    )
+    if config.get("use_block_pingpong", False):
+        # BlockPingpong materializes two A/B buffer generations regardless of
+        # the source-level pipeline stage count.
+        shared_mem_size = 2 * block_k * (block_m + block_n) * byte_per_elem
+    elif num_stages == 1:
+        shared_mem_size = max(
+            block_m * block_k * byte_per_elem,
+            block_k * block_n * byte_per_elem,
+        )
+    else:
+        stage_factor = 1 + (num_stages - 2)
+        shared_mem_size = (
+            block_m * block_k * byte_per_elem * stage_factor
+            + block_k * block_n * byte_per_elem * stage_factor
+        )
+    if shared_mem_size > 64 * 1024:
+        return False
+
+    if block_m * block_n / (16 * 16) <= num_warps / 8:
+        return False
+    if block_n == 16 and num_warps > 4:
+        return False
+    tile_per_wave = max(1, block_m * block_n / (16 * 16) / num_warps)
+    if tile_per_wave > 32:
+        return False
+
+    if config.get("use_block_pingpong", False):
+        return (
+            num_warps == 8
+            and block_m >= 128
+            and block_n >= 128
+            # GEMM2 with a short total reduction cannot amortize PP setup.
+            # This is the runtime GEMM K, not BLOCK_SIZE_K.
+            and (is_gemm1 or k > 256)
+        )
+    return True
 
 
 def _default_output_dtype(hidden_dtype: torch.dtype) -> torch.dtype:
@@ -84,7 +223,7 @@ elif test_type == "int8_channel" or test_type == "fp8_channel":
     mode_autotune_min_block_size_k2 = 32
     mode_autotune_max_block_size_k2 = 128
     mode_autotune_min_block_size_n1 = 16
-    mode_autotune_max_block_size_n1 = 128
+    mode_autotune_max_block_size_n1 = 256
     mode_autotune_min_block_size_n2 = 16
     mode_autotune_max_block_size_n2 = 512
 elif test_type == "int8" or test_type == "fp8":
@@ -102,7 +241,16 @@ elif  test_type == "bf16":
     mode_autotune_min_block_size_n2 = 16
     mode_autotune_max_block_size_n2 = 512
 
-def generate_config2_lists(BLOCK_SIZE_M=16, N=16, K=16, MUL_ROUTED_WEIGHT=False, per_channel_quant=False, bottom_a_use_mls_load=False):
+def generate_config2_lists(
+    BLOCK_SIZE_M=16,
+    N=16,
+    K=16,
+    MUL_ROUTED_WEIGHT=False,
+    per_channel_quant=False,
+    bottom_a_use_mls_load=False,
+    num_valid_tokens=None,
+    top_k=1,
+):
     is_gemm1 = MUL_ROUTED_WEIGHT == False
 
     # BLOCK_SIZE_M :
@@ -130,7 +278,17 @@ def generate_config2_lists(BLOCK_SIZE_M=16, N=16, K=16, MUL_ROUTED_WEIGHT=False,
         block_size_k_options = [2**i for i in range(mode_autotune_min_block_size_k.bit_length() - 1,
                                                 min(mode_autotune_max_block_size_k.bit_length(), (K.bit_length())))]
 
-    group_size_m_options = [1]
+    if torch.is_tensor(num_valid_tokens):
+        num_valid_tokens = int(num_valid_tokens.item())
+    if torch.is_tensor(top_k):
+        top_k = int(top_k.item())
+    top_k = max(int(top_k), 1)
+    num_tokens = (
+        int(num_valid_tokens) // top_k if num_valid_tokens is not None else 0
+    )
+    group_size_m_options = (
+        [1, 4, 8] if num_tokens >= _LARGE_MOE_TOKEN_THRESHOLD else [1]
+    )
     num_stage_options = [1, 2]
     combine_scale_load_options = [False, True] if test_type in ["int8", "int4int8", "fp8"] else [False]
 
@@ -139,12 +297,26 @@ def generate_config2_lists(BLOCK_SIZE_M=16, N=16, K=16, MUL_ROUTED_WEIGHT=False,
 
     # warp 1 no selected, so no need to tune
     num_warp_options = [2, 4, 8, 16]
-    waves_per_eu = 1
+    waves_per_eu = 1 if triton_capabilities.supports("waves_per_eu") else None
 
-    instruction_sched_variant_options = ["none", "local-prefetch"]
-    sched_latency_options = ["none", "mmac5-ds10"] if support_sched_latency else ["none"]
+    schedule_option_name = _schedule_option_name()
+    schedule_options = ("none", "local-prefetch") if schedule_option_name else (None,)
+    sched_latency = "none" if triton_capabilities.supports("sched_latency") else None
 
-    kpack_options = [1, 2] if test_type == "bf16" else [1]
+    kpack_options = _compiler_option_values(
+        "kpack", (1, 2) if test_type == "bf16" else (1,)
+    )
+    use_block_pingpong_options = _compiler_option_values(
+        "use_block_pingpong", (False, True)
+    )
+    # PrepareBlockPingpong owns the actual three-stage/two-buffer pipeline.
+    # Keep one canonical frontend stage value for PP to avoid tuning duplicate
+    # configurations; do not make PP legality depend on this external value.
+    pipeline_options = tuple(
+        (num_stage, use_block_pingpong)
+        for use_block_pingpong in use_block_pingpong_options
+        for num_stage in ([1] if use_block_pingpong else num_stage_options)
+    )
 
     print(f"BLOCK_SIZE_M: {BLOCK_SIZE_M} is_gemm1: {is_gemm1} Autotune Config limit range: \
                 block_size_n_options: {block_size_n_options}, \
@@ -156,146 +328,125 @@ def generate_config2_lists(BLOCK_SIZE_M=16, N=16, K=16, MUL_ROUTED_WEIGHT=False,
                 bottom_a_use_mls_load_options: {bottom_a_use_mls_load_options}, \
                 num_warp_options: {num_warp_options},   \
                 waves_per_eu: {waves_per_eu}, \
-                instruction_sched_variant_options: {instruction_sched_variant_options}, \
-                sched_latency_options: {sched_latency_options}, \
-                kpack_options: {kpack_options}")
+                schedule_option_name: {schedule_option_name}, \
+                schedule_options: {schedule_options}, \
+                sched_latency: {sched_latency}, \
+                kpack_options: {kpack_options}, \
+                use_block_pingpong_options: {use_block_pingpong_options}")
 
     configs = []
     config_count = 0
     cur_group_config_count=0
     if mode_best_config_tune == False:
+        option_combinations = product(
+            block_size_n_options,
+            block_size_k_options,
+            group_size_m_options,
+            combine_scale_load_options,
+            pipeline_options,
+            num_warp_options,
+            schedule_options,
+            kpack_options,
+            use_mls_load_options,
+            bottom_a_use_mls_load_options,
+        )
+        for (
+            block_n,
+            block_k,
+            group_m,
+            combine_scale_load,
+            (num_stage, use_block_pingpong),
+            num_warp,
+            schedule,
+            kpack,
+            use_mls_load,
+            bottom_a_use_mls_load,
+        ) in option_combinations:
+            config = {
+                "BLOCK_SIZE_N": block_n,
+                "BLOCK_SIZE_K": block_k,
+                "GROUP_SIZE_M": group_m,
+                "COMBINE_SCALE_LOAD": combine_scale_load,
+                "USE_MLS_LOAD": use_mls_load,
+                "bottom_a_use_mls_load": bottom_a_use_mls_load,
+            }
+            _add_compiler_options(
+                config,
+                waves_per_eu=waves_per_eu,
+                sched_latency=sched_latency,
+                kpack=kpack,
+                use_block_pingpong=use_block_pingpong,
+            )
+            _add_schedule_option(config, schedule_option_name, schedule)
 
-        for block_n in block_size_n_options:
-            for block_k in block_size_k_options:
-                for group_m in group_size_m_options:
-                    for combine_scale_load in combine_scale_load_options:
-                        for num_stage in num_stage_options:
-                            for num_warp in num_warp_options:
-                                for instruction_sched_variant in instruction_sched_variant_options:
-                                    for sched_latency in sched_latency_options:
-                                        for kpack in kpack_options:
-                                            for use_mls_load in use_mls_load_options:
-                                                for bottom_a_use_mls_load in bottom_a_use_mls_load_options:
-                                                    if use_mls_load == True or bottom_a_use_mls_load == True:
-                                                        if (num_stage >= 3):
-                                                            continue
-                                                        if N % block_n != 0 or K % block_k != 0:
-                                                            continue
+            if not _keep_autotune_config(
+                config,
+                block_m=block_m,
+                n=N,
+                k=K,
+                is_gemm1=is_gemm1,
+                per_channel_quant=per_channel_quant,
+                num_stages=num_stage,
+                num_warps=num_warp,
+                schedule=schedule,
+            ):
+                continue
 
-                                                    if per_channel_quant == True:
-                                                        if combine_scale_load == True:
-                                                            continue
-                                                        if test_type in ["int4", "int4int8_channel"] and block_k < 32:
-                                                            continue
-                                                    if kpack == 2 and block_k <= 32:  # minBlockSizeK = waveSize/(waveSize/16) * kpack
-                                                        continue
-                                                    if test_type in ["int4", "int4int8_channel"] and block_k < 32:
-                                                        continue
-                                                    if block_k > K or block_n > N:
-                                                        continue
-
-                                                    if group_m > block_m:
-                                                        continue
-
-                                                    if combine_scale_load == True:
-                                                        if K % (block_k * 2) != 0:
-                                                            continue
-                                                        if block_k != mode_autotune_max_block_size_k:
-                                                            continue
-                                                        if is_gemm1 == False:
-                                                            continue
-
-                                                        # not write the code support.
-                                                        if bottom_a_use_mls_load == True:
-                                                            continue
-
-                                                    if num_stage == 1:
-                                                        if instruction_sched_variant != "none":
-                                                            # 1 stage时，instruction_sched_variant 在 lower_instruction_sched_hints pass 都不会被处理
-                                                            # 会 被直接设置为 none，所以 这里不用添加这个 options，没有意义。
-                                                            continue
-
-                                                    # occupy 限制
-                                                    byte_per_elem = 1 if test_type in ["int8", "int8_channel", "int4int8", "int4int8_channel", "fp8"] else 2
-                                                    if num_stage == 1:
-                                                        share_mem_size =  max(block_m * block_k * byte_per_elem, block_k * block_n * byte_per_elem)
-                                                    else:
-                                                        share_mem_size =  block_m * block_k * byte_per_elem * (1 + (num_stage-2)) + block_k * block_n * byte_per_elem * (1 + (num_stage-2))
-                                                    if share_mem_size > 64 * 1024:
-                                                        continue
-
-                                                    # wave 重复工作限制
-                                                    if block_m * block_n / (16 * 16) <=  num_warp/8:
-                                                        continue
-                                                    if block_n == 16 and num_warp > 4:
-                                                        continue
-                                                    # reg spill 限制
-                                                    tile_per_wave = max(1, block_m * block_n / (16 * 16) / num_warp)
-                                                    if (tile_per_wave > 32):
-                                                        continue
-
-                                                    config = {
-                                                        "BLOCK_SIZE_N": block_n,
-                                                        "BLOCK_SIZE_K": block_k,
-                                                        "GROUP_SIZE_M": group_m,
-                                                        "COMBINE_SCALE_LOAD": combine_scale_load,
-                                                        "USE_MLS_LOAD": use_mls_load,
-                                                        "bottom_a_use_mls_load": bottom_a_use_mls_load,
-                                                        "waves_per_eu": waves_per_eu,
-                                                        "instruction_sched_variant": instruction_sched_variant,
-                                                        "sched_latency": sched_latency,
-                                                        "kpack": kpack,
-                                                    }
-                                                    config_count += 1
-                                                    if compile_only:
-                                                        # groups in each batch need cover all configs
-                                                        if (config_count - 1) % num_groups_compile != cur_group:
-                                                            continue
-                                                    cur_group_config_count += 1
-                                                    print(f"Autotune Config for compile_group={cur_group} config_idx:{config_count}: BLOCK_SIZE_M:{BLOCK_SIZE_M} {config} {num_stage} {num_warp}")
-                                                    triton_cfg = triton.Config(config, num_stages=num_stage, num_warps=num_warp)
-                                                    configs.append(triton_cfg)
+            config_count += 1
+            if compile_only and (config_count - 1) % num_groups_compile != cur_group:
+                continue
+            cur_group_config_count += 1
+            print(
+                f"Autotune Config for compile_group={cur_group} "
+                f"config_idx:{config_count}: BLOCK_SIZE_M:{BLOCK_SIZE_M} "
+                f"{config} {num_stage} {num_warp}"
+            )
+            configs.append(
+                triton.Config(config, num_stages=num_stage, num_warps=num_warp)
+            )
     else:
         # # # tune best config for gemm1 & bs=32
         if test_type == "fp8":
             if is_gemm1:
-                triton_cfg = triton.Config({"BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1, "COMBINE_SCALE_LOAD": False,
-                                            "USE_MLS_LOAD": True,
-                                            "instruction_sched_variant": "none"
-                                           }, num_stages=2, num_warps=8)
+                config = {"BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1, "COMBINE_SCALE_LOAD": False,
+                          "USE_MLS_LOAD": True}
+                _add_schedule_option(config, schedule_option_name, "none")
+                triton_cfg = triton.Config(config, num_stages=2, num_warps=8)
                 config_count += 1
                 cur_group_config_count += 1
                 configs.append(triton_cfg)
 
             else:
                 # # tune best config for gemm2 & bs=32:
-                triton_cfg = triton.Config({"BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1, "COMBINE_SCALE_LOAD": False,
-                                            "USE_MLS_LOAD": True,
-                                            "instruction_sched_variant": "none"
-                                           }, num_stages=2, num_warps=8)
+                config = {"BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1, "COMBINE_SCALE_LOAD": False,
+                          "USE_MLS_LOAD": True}
+                _add_schedule_option(config, schedule_option_name, "none")
+                triton_cfg = triton.Config(config, num_stages=2, num_warps=8)
                 config_count += 1
                 cur_group_config_count += 1
                 configs.append(triton_cfg)
 
-                triton_cfg = triton.Config({"BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1, "COMBINE_SCALE_LOAD": False,
-                                            "USE_MLS_LOAD": True,
-                                            "instruction_sched_variant": "none"
-                                           }, num_stages=2, num_warps=8)
+                config = {"BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1, "COMBINE_SCALE_LOAD": False,
+                          "USE_MLS_LOAD": True}
+                _add_schedule_option(config, schedule_option_name, "none")
+                triton_cfg = triton.Config(config, num_stages=2, num_warps=8)
                 config_count += 1
                 cur_group_config_count += 1
                 configs.append(triton_cfg)
         else:
-            triton_cfg = triton.Config({"BLOCK_SIZE_N": 16, "BLOCK_SIZE_K": 256, "GROUP_SIZE_M": 1, "COMBINE_SCALE_LOAD": False,
-                                        "USE_MLS_LOAD": True,
-                                        "instruction_sched_variant": "local-prefetch"}, num_stages=2, num_warps=4)
+            config = {"BLOCK_SIZE_N": 16, "BLOCK_SIZE_K": 256, "GROUP_SIZE_M": 1, "COMBINE_SCALE_LOAD": False,
+                      "USE_MLS_LOAD": True}
+            _add_schedule_option(config, schedule_option_name, "local-prefetch")
+            triton_cfg = triton.Config(config, num_stages=2, num_warps=4)
             config_count += 1
             cur_group_config_count += 1
             configs.append(triton_cfg)
 
             # # # tune best config for gemm2 & bs=32:
-            triton_cfg = triton.Config({"BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1, "COMBINE_SCALE_LOAD": False,
-                                        "USE_MLS_LOAD": True,
-                                        "instruction_sched_variant": "local-prefetch"}, num_stages=2, num_warps=4)
+            config = {"BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1, "COMBINE_SCALE_LOAD": False,
+                      "USE_MLS_LOAD": True}
+            _add_schedule_option(config, schedule_option_name, "local-prefetch")
+            triton_cfg = triton.Config(config, num_stages=2, num_warps=4)
             config_count += 1
             cur_group_config_count += 1
             configs.append(triton_cfg)
@@ -380,12 +531,18 @@ def dynamic_autotune(fn):
                 K = 16 if K is None else K
 
                 # 动态生成配置列表
-                dynamic_configs = generate_config2_lists(BLOCK_SIZE_M=BLOCK_SIZE_M,
-                                                            N=N,
-                                                            K=K,
-                                                            MUL_ROUTED_WEIGHT=MUL_ROUTED_WEIGHT,
-                                                            per_channel_quant=per_channel_quant,
-                                                            bottom_a_use_mls_load=bottom_a_use_mls_load)
+                dynamic_configs = generate_config2_lists(
+                    BLOCK_SIZE_M=BLOCK_SIZE_M,
+                    N=N,
+                    K=K,
+                    MUL_ROUTED_WEIGHT=MUL_ROUTED_WEIGHT,
+                    per_channel_quant=per_channel_quant,
+                    bottom_a_use_mls_load=bottom_a_use_mls_load,
+                    num_valid_tokens=kwargs.get(
+                        "num_valid_tokens", named_args.get("num_valid_tokens")
+                    ),
+                    top_k=kwargs.get("top_k", named_args.get("top_k", 1)),
+                )
                 if "int4" in test_type:
                     for cfg in dynamic_configs:
                         cfg.kwargs.pop("bottom_a_use_mls_load", None)
@@ -1227,10 +1384,6 @@ def patched_environment():
     patchers = []
     try:
         if mode_autotune:
-            patchers.append(patch(
-                'boltops.fused_moe.triton.moe_op.fused_moe_kernel_gptq_awq',
-                new=dynamic_autotune(moe_op.fused_moe_kernel_gptq_awq)
-            ))
             patchers.append(patch(
                 'boltops.fused_moe.triton.moe_op.fused_moe_kernel_gptq_awq',
                 new=dynamic_autotune(moe_op.fused_moe_kernel_gptq_awq)

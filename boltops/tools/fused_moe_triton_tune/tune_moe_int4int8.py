@@ -14,11 +14,11 @@ import os
 import sys
 
 import boltops.fused_moe.triton as fused_moe_module
-from boltops.tools.triton_moe_tune.routing import fused_topk
+from boltops.tools.fused_moe_triton_tune.routing import fused_topk
 from boltops.fused_moe.triton.moe_compat import per_token_quant_hip, per_block_quant_wrapper
 from boltops.utility.perf_utils import perftest
 try:
-    from boltops.tools.triton_moe_tune.common import (
+    from boltops.tools.fused_moe_triton_tune.common import (
         get_env_int,
         parse_batch_sizes_from_env,
         resolve_device_settings,
@@ -33,7 +33,7 @@ try:
     )
 except ImportError:
     try:
-        from boltops.tools.triton_moe_tune.common import (
+        from boltops.tools.fused_moe_triton_tune.common import (
             get_env_int,
             parse_batch_sizes_from_env,
             resolve_device_settings,
@@ -47,7 +47,7 @@ except ImportError:
             enforce_training_patch_contract,
         )
     except ImportError:
-        from boltops.tools.triton_moe_tune.common import (
+        from boltops.tools.fused_moe_triton_tune.common import (
             get_env_int,
             parse_batch_sizes_from_env,
             resolve_device_settings,
