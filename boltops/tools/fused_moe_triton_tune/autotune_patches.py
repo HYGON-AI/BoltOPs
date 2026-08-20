@@ -1148,11 +1148,27 @@ def fused_experts_impl(hidden_states: torch.Tensor,
                 # 4096: 4096*8*2/256 = 256
                 # 8192: 8192*8*2/256 = 512
                 # 16384: 16384*8*2/256 = 1024
-                tune_block_size_m_max = max(num_tokens_aligned * top_k_num * 2 / E, 32)
+                # For top_k=1 with many experts, keep both the small M tiles
+                # needed by sparse per-expert routing and BLOCK_SIZE_M=128,
+                # the smallest PP-capable M tile.  The route-density estimate
+                # alone can otherwise remove every PP candidate.
+                min_block_m_ceiling = (
+                    128
+                    if top_k_num == 1 and num_tokens >= 2048
+                    else 32
+                )
+                tune_block_size_m_max = max(
+                    num_tokens_aligned * top_k_num * 2 / E,
+                    min_block_m_ceiling,
+                )
                 if (config['BLOCK_SIZE_M'] > tune_block_size_m_max):
                     print(f"{config} skiped, {tune_block_size_m_max=}")
                     continue
-                if num_tokens >= 2048 and config['BLOCK_SIZE_M'] <= 32:
+                if (
+                    num_tokens >= 2048
+                    and top_k_num > 1
+                    and config['BLOCK_SIZE_M'] <= 32
+                ):
                     print(f"{config} skiped, {num_tokens=}")
                     continue
 
