@@ -83,6 +83,47 @@ def _torch_moe(
     ).sum(dim=1).to(hidden_states.dtype)
 
 
+@GPU_REQUIRED
+@torch.inference_mode()
+def test_fused_experts_topk1_matches_torch():
+    torch.manual_seed(4)
+    num_tokens = 32
+    hidden_size = 336
+    intermediate_size = 512
+    num_experts = 4
+
+    hidden_states = torch.randn(
+        (num_tokens, hidden_size), device=DEVICE, dtype=torch.bfloat16
+    ) / 10
+    w1 = torch.randn(
+        (num_experts, 2 * intermediate_size, hidden_size),
+        device=DEVICE,
+        dtype=torch.bfloat16,
+    ) / 10
+    w2 = torch.randn(
+        (num_experts, hidden_size, intermediate_size),
+        device=DEVICE,
+        dtype=torch.bfloat16,
+    ) / 10
+    topk_weights, topk_ids = _routing(num_tokens, num_experts, 1)
+    actual = fused_experts(
+        hidden_states,
+        w1,
+        w2,
+        topk_weights,
+        topk_ids,
+        activation="silu",
+        is_gated=True,
+        global_num_experts=num_experts,
+    )
+    expected = _torch_moe(
+        hidden_states, w1, w2, topk_weights, topk_ids
+    )
+
+    assert actual.shape == hidden_states.shape
+    torch.testing.assert_close(actual, expected, rtol=3e-2, atol=2e-2)
+
+
 def _pack_w4a16_weight(
     weight: torch.Tensor,
     group_size: int,

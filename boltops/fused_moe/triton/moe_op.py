@@ -257,6 +257,35 @@ def remap_xcd(pid, GRID_MN, NUM_XCDS: tl.constexpr = 4):
     return pid
 
 
+@triton.jit
+def decode_sorted_token_id(
+    encoded_token_id,
+    ck_sorting: tl.constexpr,
+    ck_topk: tl.constexpr,
+):
+    """Return the flattened route id encoded by the selected sorter.
+
+    CK sorting stores the token id in the low 24 bits and the route id in
+    the high 8 bits.  For topK=1 the route id is necessarily zero, so avoid
+    extracting and combining a value that cannot affect the result.
+    """
+    if ck_sorting:
+        token_id = encoded_token_id & 0x00FFFFFF
+        if ck_topk == 1:
+            return token_id
+        route_id = (encoded_token_id >> 24) & 0xFF
+        return token_id * ck_topk + route_id
+    return encoded_token_id
+
+
+@triton.jit
+def source_token_id(flattened_route_id, top_k: tl.constexpr):
+    """Map a flattened route id to its source activation row."""
+    if top_k == 1:
+        return flattened_route_id
+    return flattened_route_id // top_k
+
+
 def _fused_moe_kernel_gptq_awq_repr(specialization):
     if distinguish_moe_kernel_name():
         constants = specialization.constants
@@ -398,10 +427,8 @@ def fused_moe_kernel_gptq_awq(
     offs_token_id = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)).to(tl.int32)
     offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
 
-    if ck_sorting:
-        token_id = (offs_token & 0x00FFFFFF)
-        topk_id  = (offs_token >> 24) & 0xFF
-        offs_token = token_id * ck_topk + topk_id
+    offs_token = decode_sorted_token_id(offs_token, ck_sorting, ck_topk)
+    source_token = source_token_id(offs_token, top_k)
 
     token_mask = offs_token < num_valid_tokens
 
@@ -425,10 +452,10 @@ def fused_moe_kernel_gptq_awq(
 
 
     if USE_ADDR_OFFSET_INT64_A:
-        a_ptrs = a_ptr + (offs_token[:, None].to(tl.int64) // top_k * stride_am +
+        a_ptrs = a_ptr + (source_token[:, None].to(tl.int64) * stride_am +
                         offs_k[None, :].to(tl.int64) * stride_ak)
     else:
-        a_ptrs = a_ptr + (offs_token[:, None] // top_k * stride_am +
+        a_ptrs = a_ptr + (source_token[:, None] * stride_am +
                         offs_k[None, :] * stride_ak).to(tl.int32)
 
     if use_int4_w4a16:
@@ -816,10 +843,8 @@ def fused_moe_kernel_gptq_awq_w4a8(
     offs_token_id = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)).to(tl.int32)
     offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
 
-    if ck_sorting:
-        token_id = (offs_token & 0x00FFFFFF)
-        topk_id  = (offs_token >> 24) & 0xFF
-        offs_token = token_id * ck_topk + topk_id
+    offs_token = decode_sorted_token_id(offs_token, ck_sorting, ck_topk)
+    source_token = source_token_id(offs_token, top_k)
 
     token_mask = offs_token < num_valid_tokens
 
@@ -842,10 +867,10 @@ def fused_moe_kernel_gptq_awq_w4a8(
 
 
     if USE_ADDR_OFFSET_INT64_A:
-        a_ptrs = a_ptr + (offs_token[:, None].to(tl.int64) // top_k * stride_am +
+        a_ptrs = a_ptr + (source_token[:, None].to(tl.int64) * stride_am +
                         offs_k[None, :].to(tl.int64) * stride_ak)
     else:
-        a_ptrs = a_ptr + (offs_token[:, None] // top_k * stride_am +
+        a_ptrs = a_ptr + (source_token[:, None] * stride_am +
                         offs_k[None, :] * stride_ak).to(tl.int32)
 
     offs_k_continue = tl.arange(0, BLOCK_SIZE_K // 2).to(tl.int32)
@@ -857,9 +882,9 @@ def fused_moe_kernel_gptq_awq_w4a8(
     b_zp_shifter = (offs_bn[None, :] % 2) * 4
 
     if COMBINE_SCALE_LOAD:
-        a_scale_ptrs = a_scale_ptr + (offs_token[:, None] // top_k) * stride_asm
+        a_scale_ptrs = a_scale_ptr + source_token[:, None] * stride_asm
     else:
-        a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
+        a_scale_ptrs = a_scale_ptr + source_token * stride_asm
 
     # w4a8 deepseek case
 
@@ -1107,10 +1132,8 @@ def fused_moe_kernel_gptq_awq_w4a8_channelwise(
     offs_token_id = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)).to(tl.int32)
     offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
 
-    if ck_sorting:
-        token_id = (offs_token & 0x00FFFFFF)
-        topk_id  = (offs_token >> 24) & 0xFF
-        offs_token = token_id * ck_topk + topk_id
+    offs_token = decode_sorted_token_id(offs_token, ck_sorting, ck_topk)
+    source_token = source_token_id(offs_token, top_k)
 
     token_mask = offs_token < num_valid_tokens
 
@@ -1124,12 +1147,12 @@ def fused_moe_kernel_gptq_awq_w4a8_channelwise(
 
     if USE_ADDR_OFFSET_INT64_A:
         a_ptrs = a_ptr + (
-            offs_token[:, None].to(tl.int64) // top_k * stride_am
+            source_token[:, None].to(tl.int64) * stride_am
             + offs_k[None, :].to(tl.int64) * stride_ak
         )
     else:
         a_ptrs = a_ptr + (
-            offs_token[:, None] // top_k * stride_am
+            source_token[:, None] * stride_am
             + offs_k[None, :] * stride_ak
         ).to(tl.int32)
 
@@ -1149,7 +1172,7 @@ def fused_moe_kernel_gptq_awq_w4a8_channelwise(
     # even -> shift 4, odd -> shift 0.
     b_shifter = ((offs_k[:, None] + 1) % 2) * 4
 
-    a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
+    a_scale_ptrs = a_scale_ptr + source_token * stride_asm
     b_scale_ptrs = b_scale_ptr + (off_experts * stride_bse + offs_bn[None, :] * stride_bsn).to(tl.int32)
     b_scale = tl.load(b_scale_ptrs).to(tl.float32)
 
@@ -1382,10 +1405,8 @@ def fused_moe_kernel(
         tl.int32)
     offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
 
-    if ck_sorting:
-        token_id = (offs_token & 0x00FFFFFF)
-        topk_id  = (offs_token >> 24) & 0xFF
-        offs_token = token_id * ck_topk + topk_id
+    offs_token = decode_sorted_token_id(offs_token, ck_sorting, ck_topk)
+    source_token = source_token_id(offs_token, top_k)
 
     token_mask = offs_token < num_valid_tokens
 
@@ -1394,10 +1415,10 @@ def fused_moe_kernel(
 
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     if USE_ADDR_OFFSET_INT64_A:
-        a_ptrs = a_ptr + (offs_token[:, None].to(tl.int64) // top_k * stride_am +
+        a_ptrs = a_ptr + (source_token[:, None].to(tl.int64) * stride_am +
                  offs_k[None, :].to(tl.int64) * stride_ak)
     else:
-        a_ptrs = a_ptr + (offs_token[:, None] // top_k * stride_am +
+        a_ptrs = a_ptr + (source_token[:, None] * stride_am +
                  offs_k[None, :] * stride_ak).to(tl.int32)
 
     if USE_ADDR_OFFSET_INT64_B:
@@ -1425,7 +1446,7 @@ def fused_moe_kernel(
         # block-wise
         if group_k > 0 and group_n > 0:
             if COMBINE_SCALE_LOAD:
-                a_scale_ptrs = a_scale_ptr + (offs_token[:, None] // top_k) * stride_asm
+                a_scale_ptrs = a_scale_ptr + source_token[:, None] * stride_asm
                 offs_bsn = offs_bn // group_n
                 b_scale_ptrs = (b_scale_ptr + off_experts * stride_bse +
                                 offs_bsn[:, None] * stride_bsn)
@@ -1433,7 +1454,7 @@ def fused_moe_kernel(
                 if bottom_a_use_mls_load: # top_k is 1
                     a_scale_ptrs = a_scale_ptr + offs_token_id * stride_asm
                 else:
-                    a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
+                    a_scale_ptrs = a_scale_ptr + source_token * stride_asm
 
                 offs_bsn = offs_bn // group_n
                 b_scale_ptrs = (b_scale_ptr + off_experts * stride_bse +
@@ -1447,7 +1468,7 @@ def fused_moe_kernel(
             if bottom_a_use_mls_load:  # top_k is 1 and A is laid out in sorted MLS order
                 a_scale_ptrs = a_scale_ptr + offs_token_id * stride_asm
             else:
-                a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
+                a_scale_ptrs = a_scale_ptr + source_token * stride_asm
             a_scale = tl.load(a_scale_ptrs, mask=token_mask, other=0.0)[:,
                                                                         None]
         # tensor-wise
@@ -1854,10 +1875,8 @@ def fused_moe_splitk_kernel(
         tl.int32)
     offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
 
-    if ck_sorting:
-        token_id = (offs_token & 0x00FFFFFF)
-        topk_id  = (offs_token >> 24) & 0xFF
-        offs_token = token_id * ck_topk + topk_id
+    offs_token = decode_sorted_token_id(offs_token, ck_sorting, ck_topk)
+    source_token = source_token_id(offs_token, top_k)
 
     token_mask = offs_token < num_valid_tokens
 
@@ -1866,10 +1885,10 @@ def fused_moe_splitk_kernel(
 
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     if USE_ADDR_OFFSET_INT64_A:
-        a_ptrs = a_ptr + (offs_token[:, None].to(tl.int64) // top_k * stride_am +
+        a_ptrs = a_ptr + (source_token[:, None].to(tl.int64) * stride_am +
                  (offs_k[None, :] + k_start).to(tl.int64) * stride_ak)
     else:
-        a_ptrs = a_ptr + (offs_token[:, None] // top_k * stride_am +
+        a_ptrs = a_ptr + (source_token[:, None] * stride_am +
                  (offs_k[None, :] + k_start) * stride_ak).to(tl.int32)
 
     if USE_ADDR_OFFSET_INT64_B:
@@ -1897,7 +1916,7 @@ def fused_moe_splitk_kernel(
         # block-wise
         if group_k > 0 and group_n > 0:
             if COMBINE_SCALE_LOAD:
-                a_scale_ptrs = a_scale_ptr + (offs_token[:, None] // top_k) * stride_asm
+                a_scale_ptrs = a_scale_ptr + source_token[:, None] * stride_asm
                 offs_bsn = offs_bn // group_n
                 b_scale_ptrs = (b_scale_ptr + off_experts * stride_bse +
                                 offs_bsn[:, None] * stride_bsn)
@@ -1905,7 +1924,7 @@ def fused_moe_splitk_kernel(
                 if bottom_a_use_mls_load: # top_k is 1
                     a_scale_ptrs = a_scale_ptr + offs_token_id * stride_asm
                 else:
-                    a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
+                    a_scale_ptrs = a_scale_ptr + source_token * stride_asm
 
                 offs_bsn = offs_bn // group_n
                 b_scale_ptrs = (b_scale_ptr + off_experts * stride_bse +
@@ -1919,7 +1938,7 @@ def fused_moe_splitk_kernel(
             if bottom_a_use_mls_load:  # top_k is 1 and A is laid out in sorted MLS order
                 a_scale_ptrs = a_scale_ptr + offs_token_id * stride_asm
             else:
-                a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
+                a_scale_ptrs = a_scale_ptr + source_token * stride_asm
             a_scale = tl.load(a_scale_ptrs, mask=token_mask, other=0.0)[:,
                                                                         None]
         # tensor-wise
@@ -2297,10 +2316,8 @@ def fused_moe_persistent_kernel(
                 tl.int32)
             offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
 
-            if ck_sorting:
-                token_id = (offs_token & 0x00FFFFFF)
-                topk_id  = (offs_token >> 24) & 0xFF
-                offs_token = token_id * ck_topk + topk_id
+            offs_token = decode_sorted_token_id(offs_token, ck_sorting, ck_topk)
+            source_token = source_token_id(offs_token, top_k)
 
             token_mask = offs_token < num_valid_tokens
 
@@ -2310,10 +2327,10 @@ def fused_moe_persistent_kernel(
 
             offs_k = tl.arange(0, BLOCK_SIZE_K)
             if USE_ADDR_OFFSET_INT64_A:
-                a_ptrs = a_ptr + (offs_token[:, None].to(tl.int64) // top_k * stride_am +
+                a_ptrs = a_ptr + (source_token[:, None].to(tl.int64) * stride_am +
                         offs_k[None, :].to(tl.int64) * stride_ak)
             else:
-                a_ptrs = a_ptr + (offs_token[:, None] // top_k * stride_am +
+                a_ptrs = a_ptr + (source_token[:, None] * stride_am +
                         offs_k[None, :] * stride_ak).to(tl.int32)
 
             if USE_ADDR_OFFSET_INT64_B:
@@ -2341,7 +2358,7 @@ def fused_moe_persistent_kernel(
                 # block-wise
                 if group_k > 0 and group_n > 0:
                     if COMBINE_SCALE_LOAD:
-                        a_scale_ptrs = a_scale_ptr + (offs_token[:, None] // top_k) * stride_asm
+                        a_scale_ptrs = a_scale_ptr + source_token[:, None] * stride_asm
                         offs_bsn = offs_bn // group_n
                         b_scale_ptrs = (b_scale_ptr + off_experts * stride_bse +
                                         offs_bsn[:, None] * stride_bsn)
@@ -2349,7 +2366,7 @@ def fused_moe_persistent_kernel(
                         if bottom_a_use_mls_load: # top_k is 1
                             a_scale_ptrs = a_scale_ptr + offs_token_id * stride_asm
                         else:
-                            a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
+                            a_scale_ptrs = a_scale_ptr + source_token * stride_asm
 
                         offs_bsn = offs_bn // group_n
                         b_scale_ptrs = (b_scale_ptr + off_experts * stride_bse +
@@ -2363,7 +2380,7 @@ def fused_moe_persistent_kernel(
                     if bottom_a_use_mls_load:  # top_k is 1 and A is laid out in sorted MLS order
                         a_scale_ptrs = a_scale_ptr + offs_token_id * stride_asm
                     else:
-                        a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
+                        a_scale_ptrs = a_scale_ptr + source_token * stride_asm
                     a_scale = tl.load(a_scale_ptrs, mask=token_mask, other=0.0)[:,
                                                                                 None]
                 # tensor-wise
