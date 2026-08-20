@@ -13,7 +13,7 @@ from boltops.utility.triton_capability import (
 )
 
 # Launch JSON configs shipped beside this module:
-# triton/configs/moe/triton_<capability>/*.json
+# triton/configs/triton_<capability>/*.json
 _TRITON_CONFIGS_DIR = Path(__file__).resolve().parent / "configs"
 
 M_THRESHOLD_SMALL = 256
@@ -178,7 +178,7 @@ def get_moe_configs(
     block_shape = [block_n, block_k] if block_n and block_k else None
     json_file_name = get_config_file_name(E, N, dtype, block_shape, is_bottom)
     config_dirs = get_compatible_triton_config_dirs(
-        _TRITON_CONFIGS_DIR / "moe", get_triton_capabilities()
+        _TRITON_CONFIGS_DIR, get_triton_capabilities()
     )
     config_file_path = config_dirs[0] / json_file_name
 

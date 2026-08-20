@@ -32,7 +32,7 @@
 适用于以下任务：
 
 1. 执行 fused_moe autotune（compile-only + run + parse）
-2. 生成并拷贝 MoE 配置 JSON 到 `boltops/fused_moe/triton/configs/moe/triton_<capability>`
+2. 生成并拷贝 MoE 配置 JSON 到 `boltops/fused_moe/triton/configs/triton_<capability>`
 3. 只跑 benchmark（复用现有配置，不再训练）
 4. 快速排障（选卡、日志、参数一致性）
 
@@ -79,7 +79,7 @@
 - Triton 3.2 能力的搜索空间不传 `use_block_pingpong`；
 - backend 实际支持该 option 时，搜索空间增加
   `use_block_pingpong=False/True`，`True` 只用于 8-warp、2-stage 配置；
-- 新结果写入 `configs/moe/triton_3_2|triton_3_6|triton_3_8`；
+- 新结果写入 `configs/triton_3_2|triton_3_6|triton_3_8`；
 - 运行时先读当前能力目录，高版本可逐级回退到低版本。
 
 ---
@@ -144,9 +144,9 @@ boltops-fused-moe-tune-cli nmz int8_channel
 在框架运行日志中，先检查是否命中已存在的 MoE config：
 
 ```text
-[boltops] Using default MoE config. Performance might be sub-optimal! Config file not found at /usr/local/lib/python3.10/dist-packages/boltops/fused_moe/triton/configs/moe/triton_3_6/E=512,N=168,arch=gfx936.json
-[2026-04-20 17:44:46 TP7] Using default MoE config. Performance might be sub-optimal! Config file not found at /usr/local/lib/python3.10/dist-packages/boltops/fused_moe/triton/configs/moe/triton_3_6/E=512,N=168,arch=gfx936.json
-[boltops] Using configuration from /usr/local/lib/python3.10/dist-packages/boltops/fused_moe/triton/configs/moe/triton_3_2/E=512,N=336,arch=gfx936,is_bottom=True.json for MoE layer.
+[boltops] Using default MoE config. Performance might be sub-optimal! Config file not found at /usr/local/lib/python3.10/dist-packages/boltops/fused_moe/triton/configs/triton_3_6/E=512,N=168,arch=gfx936.json
+[2026-04-20 17:44:46 TP7] Using default MoE config. Performance might be sub-optimal! Config file not found at /usr/local/lib/python3.10/dist-packages/boltops/fused_moe/triton/configs/triton_3_6/E=512,N=168,arch=gfx936.json
+[boltops] Using configuration from /usr/local/lib/python3.10/dist-packages/boltops/fused_moe/triton/configs/triton_3_2/E=512,N=336,arch=gfx936,is_bottom=True.json for MoE layer.
 ```
 
 判断规则：
@@ -209,10 +209,10 @@ boltops-fused-moe-tune-cli nmz int8_channel \
 ### 阶段C（建议）：确认是否提交配置到 boltops 仓库
 
 训练后生成的配置会拷贝到当前 Triton 能力目录（如
-`/usr/local/lib/python3.10/dist-packages/boltops/fused_moe/triton/configs/moe/triton_3_6`）。
+`/usr/local/lib/python3.10/dist-packages/boltops/fused_moe/triton/configs/triton_3_6`）。
 建议再做一步判断：这些配置是否需要回传到 boltops 仓库长期保存。
 
-目标仓库路径：`boltops/fused_moe/triton/configs/moe/triton_<capability>`
+目标仓库路径：`boltops/fused_moe/triton/configs/triton_<capability>`
 
 建议提交的场景：
 

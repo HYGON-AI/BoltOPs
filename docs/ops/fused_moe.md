@@ -130,7 +130,7 @@ def fused_experts(
 | dtype        | BF16                            |
 
 线上 MoE 的 `E` / `N` / dtype / quant 组合由
-`boltops/fused_moe/triton/configs/moe/triton_<capability>/*.json` 按 GPU ISA
+`boltops/fused_moe/triton/configs/triton_<capability>/*.json` 按 GPU ISA
 `arch`（如 `gfx938`）选择；高 Triton 能力版本可向低版本配置回退，
 缺配置时回退默认并打日志。
 `boltops-fused-moe-tune-cli` 的第一个参数仍是站点码（`nmz`/`bmz`/`zd`/`yy`），
@@ -183,7 +183,7 @@ output     = routed_out + shared_out
 安装后（推荐 `pip install -e ".[tune]"` 或安装带 `tune` extra 的 wheel）可在任意目录执行：
 
 ```bash
-# 训练 + 生成 configs/moe/triton_<capability> JSON + Step4 正确性/性能
+# 训练 + 生成 configs/triton_<capability> JSON + Step4 正确性/性能
 boltops-fused-moe-tune-cli <device_name> <test_type>
 # 例：boltops-fused-moe-tune-cli nmz bf16
 #     boltops-fused-moe-tune-cli nmz int8_channel --num-experts 256 --top-k 8
@@ -207,7 +207,7 @@ wheel、普通安装和 editable 安装均可在任意目录执行，日志写�
 | 用途              | 文件                                                                                               |
 | ----------------- | -------------------------------------------------------------------------------------------------- |
 | 公开接口          | `boltops/fused_moe/__init__.py`                                                                  |
-| MoE JSON 配置     | `boltops/fused_moe/triton/configs/moe/triton_<capability>/`                                     |
+| MoE JSON 配置     | `boltops/fused_moe/triton/configs/triton_<capability>/`                                         |
 | 正确性 / 调参 / 测速 | `boltops-fused-moe-tune-cli` → `boltops.tools.fused_moe_triton_tune.tune_moe_cli:main` |
 | Autotune 使用手册 | [`tune_moe_triton_user_guide.md`](../../boltops/tools/fused_moe_triton_tune/tune_moe_triton_user_guide.md) |
 
@@ -220,4 +220,4 @@ wheel、普通安装和 editable 安装均可在任意目录执行，日志写�
 
 - 公开 `fused_experts` 转发至 `fused_experts_impl`（带 `torch_compile_guard`）。
 - Sorting 使用同目录下 `moe_sorting_hipc/` 的 `aicc` JIT；kernel 源码在 `csrc/`。
-- Launch 配置优先读当前 `configs/moe/triton_<capability>`，再向低能力版本回退。
+- Launch 配置优先读当前 `configs/triton_<capability>`，再向低能力版本回退。

@@ -59,7 +59,7 @@ def _parse_autotune_config(config_text):
     }
 
 
-def parse_log_file(log_content):
+def _parse_log_cases(log_content):
     # 匹配测试用例起始点（Config 1: 且包含fused_moe_kernel）
     test_case_pattern = r'(?=Config 1:.*?fused_moe_kernel:)'
     test_cases = re.split(test_case_pattern, log_content, flags=re.DOTALL)
@@ -163,6 +163,34 @@ def parse_log_file(log_content):
 
     return all_results
 
+
+def parse_log_file(log_content):
+    batch_matches = list(
+        re.finditer(
+            r'^(?:Test:|Test Count \d+:)\s*m=(\d+),',
+            log_content,
+            re.MULTILINE,
+        )
+    )
+    if not batch_matches:
+        # Keep compatibility with older standalone logs that do not print m.
+        return _parse_log_cases(log_content)
+
+    all_results = []
+    for idx, match in enumerate(batch_matches):
+        section_end = (
+            batch_matches[idx + 1].start()
+            if idx + 1 < len(batch_matches)
+            else len(log_content)
+        )
+        section_results = _parse_log_cases(
+            log_content[match.start():section_end]
+        )
+        batch_size = int(match.group(1))
+        all_results.extend((*result, batch_size) for result in section_results)
+    return all_results
+
+
 def get_special_key(idx):
     """根据索引获取特殊键值"""
     if idx in SPECIAL_KEY_MAP:
@@ -171,13 +199,20 @@ def get_special_key(idx):
         # 超过64后，使用2的幂次：128, 256, 512, 1024, ...
         return 2 ** (idx - 8 + 6)  # 从2^7(128)开始
 
+
+def _result_key_and_fields(idx, result):
+    if len(result) == 8:
+        return result[-1], result[:-1]
+    return get_special_key(idx), result
+
+
 def print_results(results):
     print("┌──────────────┬────────────┬──────────────┬──────────────┬──────────────┬───────────────────────────────────────────────────────────────────────────────────────┐")
     print("│ 特殊键值     │ Config ID  │ Kernel1 ID   │ Kernel2 ID   │ 总耗时 (ms)  │ 配置参数                                                                                │")
     print("├──────────────┼────────────┼──────────────┼──────────────┼──────────────┼───────────────────────────────────────────────────────────────────────────────────────┤")
-    for idx, (cfg_num, params, k1_id, k2_id, total, k1_params, k2_params) in enumerate(results, 1):
-        # 生成特殊键名
-        special_key = get_special_key(idx)
+    for idx, result in enumerate(results, 1):
+        special_key, fields = _result_key_and_fields(idx, result)
+        cfg_num, params, k1_id, k2_id, total, k1_params, k2_params = fields
 
         # 构建参数字符串
         full_params = (
@@ -193,15 +228,14 @@ def save_results_to_json(results, k1_filename, k2_filename):
     json_data_k1 = {}
     json_data_k2 = {}
 
-    for idx, (cfg_num, params, k1_id, k2_id, total, k1_params, k2_params) in enumerate(results, 1):
+    for idx, result in enumerate(results, 1):
+        special_key, fields = _result_key_and_fields(idx, result)
+        cfg_num, params, k1_id, k2_id, total, k1_params, k2_params = fields
         config_dict = ast.literal_eval(params)
         block_size_m = config_dict["BLOCK_SIZE_M"]
 
         entry_k1 = {"BLOCK_SIZE_M": block_size_m, **k1_params}
         entry_k2 = {"BLOCK_SIZE_M": block_size_m, **k2_params}
-
-        # 生成特殊键名
-        special_key = get_special_key(idx)
 
         json_data_k1[f"{special_key}"] = entry_k1
         json_data_k2[f"{special_key}"] = entry_k2
@@ -220,7 +254,6 @@ def resolve_boltops_moe_config_dir() -> Path:
         / "fused_moe"
         / "triton"
         / "configs"
-        / "moe"
     )
     return get_triton_config_dir(config_root, get_triton_capabilities())
 

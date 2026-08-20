@@ -20,7 +20,7 @@ def _clear_moe_config_cache():
 
 
 def _write_config(config_root: Path, version: str, file_name: str, marker: str):
-    config_dir = config_root / "moe" / f"triton_{version.replace('.', '_')}"
+    config_dir = config_root / f"triton_{version.replace('.', '_')}"
     config_dir.mkdir(parents=True, exist_ok=True)
     (config_dir / file_name).write_text(
         json.dumps({"1": {"marker": marker}}), encoding="utf-8"
@@ -100,9 +100,39 @@ def test_log_parser_omits_unsupported_pingpong_option(tmp_path):
     assert "use_block_pingpong" not in json.loads(bottom.read_text())["1"]
 
 
+def test_log_parser_uses_logged_batch_key_after_missing_result(tmp_path):
+    missing = (
+        "Test: m=1024, n=1536, k=1232, e=392, topk=1\n"
+        "Config 1: {'BLOCK_SIZE_M': 64}\n"
+    )
+    valid_bf16 = (
+        "Test: m=2048, n=1536, k=1232, e=392, topk=1\n"
+        + _autotune_log("True")
+    )
+    valid_fp8 = (
+        "Test Count 3: m=4096, n=1536, k=1232, e=392, topk=1\n"
+        + _autotune_log("True")
+    )
+    results = moe_log_parser.parse_log_file(missing + valid_bf16 + valid_fp8)
+    top = tmp_path / "top.json"
+    bottom = tmp_path / "bottom.json"
+
+    moe_log_parser.save_results_to_json(results, top, bottom)
+
+    assert list(json.loads(top.read_text())) == ["2048", "4096"]
+    assert list(json.loads(bottom.read_text())) == ["2048", "4096"]
+
+
 def test_tuner_copies_results_to_current_capability_directory(monkeypatch):
     monkeypatch.setattr(
         moe_log_parser, "get_triton_capabilities", lambda: _caps("3.6")
     )
 
-    assert moe_log_parser.resolve_boltops_moe_config_dir().name == "triton_3_6"
+    expected = (
+        Path(moe_log_parser.__file__).resolve().parents[2]
+        / "fused_moe"
+        / "triton"
+        / "configs"
+        / "triton_3_6"
+    )
+    assert moe_log_parser.resolve_boltops_moe_config_dir() == expected
