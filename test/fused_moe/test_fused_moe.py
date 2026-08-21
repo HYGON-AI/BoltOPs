@@ -9,6 +9,11 @@ import torch.nn.functional as F
 pytest.importorskip("triton")
 
 from boltops.fused_moe import fused_experts  # noqa: E402
+from boltops.fused_moe.triton.moe_compat import pertoken_quant  # noqa: E402
+from boltops.fused_moe.triton.quant import (  # noqa: E402
+    dynamic_per_token_quant_fp8_i8,
+    static_per_tensor_quant_fp8_i8,
+)
 from boltops.tools.fused_moe_triton_tune.common import (  # noqa: E402
     quantize_weights,
     scalar_types,
@@ -153,7 +158,9 @@ def _dynamic_group_quant_int8(
     groups = tensor.reshape(-1, group_size)
     absmax = groups.abs().amax(dim=-1, keepdim=True).clamp(min=1e-10).float()
     scales = absmax / torch.iinfo(torch.int8).max
-    quantized = (groups.float() / scales).clamp(-128, 127).to(torch.int8)
+    quantized = (
+        (groups.float() / scales).round().clamp(-128, 127).to(torch.int8)
+    )
     return (
         quantized.reshape_as(tensor),
         scales.reshape(*tensor.shape[:-1], tensor.shape[-1] // group_size),
@@ -188,6 +195,92 @@ def _block_scaled_int8_matmul(
             ]
             output[:, n_start:n_end] += product * scale
     return output.to(output_dtype)
+
+
+def _int8_rounding_input(rows: int, cols: int) -> torch.Tensor:
+    values = torch.zeros((rows, cols), device=DEVICE, dtype=torch.float16)
+    values[:, :5] = torch.tensor(
+        [0.5, -0.5, 1.5, -1.5, 127.0],
+        device=DEVICE,
+        dtype=torch.float16,
+    )
+    return values
+
+
+@GPU_REQUIRED
+@torch.inference_mode()
+@pytest.mark.parametrize("rows,cols", [(1, 8), (256, 128)])
+def test_dynamic_per_token_int8_rounds_to_nearest(rows: int, cols: int):
+    values = _int8_rounding_input(rows, cols)
+    quantized = torch.empty_like(values, dtype=torch.int8)
+    scales = torch.empty(rows, device=DEVICE, dtype=torch.float32)
+
+    dynamic_per_token_quant_fp8_i8(quantized, values, scales)
+
+    expected = values.float().round().to(torch.int8)
+    torch.testing.assert_close(scales, torch.ones_like(scales))
+    torch.testing.assert_close(quantized, expected)
+
+
+@GPU_REQUIRED
+@torch.inference_mode()
+def test_dynamic_per_token_int8_tiled_path_rounds_to_nearest():
+    num_cus = torch.cuda.get_device_properties(DEVICE).multi_processor_count
+    rows = max(1025, 16 * num_cus)
+    values = _int8_rounding_input(rows, 8)
+    quantized = torch.empty_like(values, dtype=torch.int8)
+    scales = torch.empty(rows, device=DEVICE, dtype=torch.float32)
+
+    dynamic_per_token_quant_fp8_i8(quantized, values, scales)
+
+    expected = values.float().round().to(torch.int8)
+    torch.testing.assert_close(scales, torch.ones_like(scales))
+    torch.testing.assert_close(quantized, expected)
+
+
+@GPU_REQUIRED
+@torch.inference_mode()
+def test_dynamic_per_token_fp8_keeps_fractional_values():
+    values = torch.tensor(
+        [[0.5, 1.5, 2.5, 448.0]],
+        device=DEVICE,
+        dtype=torch.float16,
+    )
+    quantized = torch.empty_like(values, dtype=torch.float8_e4m3fn)
+    scales = torch.empty(1, device=DEVICE, dtype=torch.float32)
+
+    dynamic_per_token_quant_fp8_i8(quantized, values, scales)
+
+    torch.testing.assert_close(scales, torch.ones_like(scales))
+    torch.testing.assert_close(quantized.float(), values.float())
+
+
+@GPU_REQUIRED
+@torch.inference_mode()
+def test_static_per_tensor_int8_rounds_to_nearest():
+    values = _int8_rounding_input(2, 8)
+    quantized = torch.empty_like(values, dtype=torch.int8)
+    scale = torch.ones(1, device=DEVICE, dtype=torch.float32)
+
+    static_per_tensor_quant_fp8_i8(quantized, values, scale)
+
+    expected = values.float().round().to(torch.int8)
+    torch.testing.assert_close(quantized, expected)
+
+
+@GPU_REQUIRED
+@torch.inference_mode()
+def test_torch_int8_quant_helper_rounds_to_nearest():
+    values = _int8_rounding_input(2, 8)
+    scale = torch.ones((2, 1), device=DEVICE, dtype=torch.float32)
+
+    quantized, actual_scale = pertoken_quant(
+        values, scale=scale, quant_dtype=torch.int8
+    )
+
+    expected = values.float().round().to(torch.int8)
+    torch.testing.assert_close(actual_scale, scale)
+    torch.testing.assert_close(quantized, expected)
 
 
 def _torch_w8a8_moe(
