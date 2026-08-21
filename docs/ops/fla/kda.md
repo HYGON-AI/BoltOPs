@@ -96,7 +96,7 @@ propagation；上游依赖的公共 cumsum/l2norm helper 也已在本仓库补�
 
 ## 2. 接口说明
 
-公开接口从 `boltops.fla.kda` 导入：
+KDA 公开接口算子从 `boltops.fla.kda` 导入：
 
 ```python
 from boltops.fla.kda import (
@@ -111,6 +111,9 @@ from boltops.fla.kda import (
     recompute_w_u_fwd,
 )
 ```
+
+与 GDN WY 重计算的完整参数、shape、测试和调用说明见
+[recompute W/U](recompute_w_u_fwd.md)。
 
 ### 2.1 Gate 激活与 chunk-local cumsum
 

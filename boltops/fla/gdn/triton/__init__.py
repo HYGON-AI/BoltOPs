@@ -18,6 +18,13 @@ from .fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update_recurrent_kernel,
 )
 
+
+def recompute_w_u_fwd(k, v, beta, g_cumsum, A, cu_seqlens=None, chunk_indices=None):
+    """GDN/SGLang WY-recomputation facade returning ``(w, u)``."""
+    from .recompute_w_u import recompute_w_u_fwd_gdn
+
+    return recompute_w_u_fwd_gdn(k, v, beta, g_cumsum, A, cu_seqlens, chunk_indices)
+
 __all__ = [
     "chunk_fwd_kernel_o",
     "chunk_fwd_o",
@@ -29,4 +36,5 @@ __all__ = [
     "fused_sigmoid_gating_delta_rule_update_kernel",
     "fused_sigmoid_gating_delta_rule_update_recurrent",
     "fused_sigmoid_gating_delta_rule_update_recurrent_kernel",
+    "recompute_w_u_fwd",
 ]

@@ -11,8 +11,6 @@ still works without Triton installed (it is an optional dependency).
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
-
 import torch
 
 
@@ -28,21 +26,6 @@ def attn_res(
     from boltops.generic.triton.attn_res import attn_res as impl
 
     return impl(prefix, blocks, norm_weight, qk_weight, num_blocks, eps)
-
-
-def recompute_w_u_fwd(
-    k: torch.Tensor,
-    v: torch.Tensor,
-    beta: torch.Tensor,
-    g_cumsum: torch.Tensor,
-    A: torch.Tensor,
-    cu_seqlens: Optional[torch.LongTensor],
-    chunk_indices: torch.LongTensor | None = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Recompute the gated-delta WY tensors ``w`` and ``u``."""
-    from boltops.generic.triton.recompute_w_u import recompute_w_u_fwd as impl
-
-    return impl(k, v, beta, g_cumsum, A, cu_seqlens, chunk_indices)
 
 
 def fused_mamba_state_scatter_with_mask(
@@ -86,6 +69,5 @@ __all__ = [
     "attn_res",
     "causal_conv1d_fn",
     "causal_conv1d_update",
-    "recompute_w_u_fwd",
     "fused_mamba_state_scatter_with_mask",
 ]

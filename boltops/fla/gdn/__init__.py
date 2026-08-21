@@ -7,6 +7,21 @@ from typing import Optional, Tuple
 import torch
 
 
+def recompute_w_u_fwd(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    g_cumsum: torch.Tensor,
+    A: torch.Tensor,
+    cu_seqlens: torch.LongTensor | None = None,
+    chunk_indices: torch.LongTensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Recompute GDN WY intermediates with the GDN Triton kernel."""
+    from .triton import recompute_w_u_fwd as impl
+
+    return impl(k, v, beta, g_cumsum, A, cu_seqlens, chunk_indices)
+
+
 def fused_recurrent_gated_delta_rule_packed_decode(
     mixed_qkv: torch.Tensor,
     a: torch.Tensor,
@@ -222,4 +237,5 @@ __all__ = [
     "fused_recurrent_gated_delta_rule_packed_decode",
     "fused_sigmoid_gating_delta_rule_update",
     "fused_sigmoid_gating_delta_rule_update_recurrent",
+    "recompute_w_u_fwd",
 ]

@@ -1,8 +1,7 @@
 # Generic 系列算子说明
 
 Generic 用于归类不属于 Gemm、MoE、KDA 等专用系列的通用融合算子。目前包含
-注意力残差融合、Gated Delta Net 的 W/U 重计算、带 mask 的 Mamba state
-scatter，以及 causal conv1d（fwd + update，统一入口 + SGLang/vLLM 双 port）。
+注意力残差融合和带 mask 的 Mamba state scatter，以及 causal conv1d（fwd + update，统一入口 + SGLang/vLLM 双 port）。
 
 公开 API 统一从 `boltops.generic` 导入：
 
@@ -11,7 +10,6 @@ from boltops.generic import (
     attn_res,
     causal_conv1d_fn,
     causal_conv1d_update,
-    recompute_w_u_fwd,
     fused_mamba_state_scatter_with_mask,
 )
 ```
@@ -21,7 +19,6 @@ from boltops.generic import (
 | 公开 API | 功能 | 公开包 | 实现 | 详细文档 |
 | --- | --- | --- | --- | --- |
 | `attn_res` | 对 prefix 与多路 residual 做 RMSNorm、softmax 打分和加权融合 | `boltops.generic` | Triton | [注意力残差](attn_res.md) |
-| `recompute_w_u_fwd` | 根据 `k`、`v`、`beta`、`g_cumsum` 和 chunk 矩阵 `A` 重建 WY 张量 | `boltops.generic` | Triton | [recompute W/U](recompute_w_u.md) |
 | `fused_mamba_state_scatter_with_mask` | 按目标索引和 step mask 更新 Mamba state cache | `boltops.generic` | Triton | [Mamba state scatter](mamba_state_scatter.md) |
 | `causal_conv1d_fn` | varlen 连续批处理的 causal depthwise conv1d（extend/prefill），自动路由 SGLang/vLLM port | `boltops.generic` | Triton | [causal conv1d](causal_conv1d.md) |
 | `causal_conv1d_update` | decode 单步的 causal conv1d + state 更新，自动路由 SGLang/vLLM port | `boltops.generic` | Triton | [causal conv1d](causal_conv1d.md) |
@@ -47,13 +44,11 @@ from boltops.generic import (
 ```bash
 # 正确性与接口测试
 pytest -q test/test_generic_attn_res.py
-pytest -q test/test_generic_recompute_w_u.py
 pytest -q test/test_generic_mamba_state_scatter.py
 pytest -q test/test_generic_causal_conv1d.py
 
 # 各算子的 benchmark case
 pytest -q test/test_generic_attn_res.py --bench -s
-pytest -q test/test_generic_recompute_w_u.py --bench -s
 pytest -q test/test_generic_mamba_state_scatter.py --bench -s
 pytest -q test/test_generic_causal_conv1d.py --bench -s
 ```
