@@ -5,10 +5,18 @@ import functools
 import triton
 import triton.language as tl
 import torch
+from triton.language.extra import libdevice
 
 
 _PER_TOKEN_QUANT_4ROW_PROGRAMS_PER_CU = 16
 _PER_TOKEN_QUANT_4ROW_N2048_PROGRAMS_PER_CU = 80
+
+
+@triton.jit
+def _cast_quantized(value, output_dtype: tl.constexpr):
+    if output_dtype == tl.int8:
+        value = libdevice.nearbyint(value)
+    return value.to(output_dtype)
 
 
 @functools.lru_cache(maxsize=None)
@@ -38,7 +46,7 @@ def _static_per_tensor_quant_fp8_i8_kernel(
     scale = tl.load(scale_in_ptr)
     scale_recip = 1 / scale
 
-    qx = (x * scale_recip).to(qx_ptr.dtype.element_ty)
+    qx = _cast_quantized(x * scale_recip, qx_ptr.dtype.element_ty)
 
     tl.store(qx_ptr + offs, qx, mask=mask)
 
@@ -149,7 +157,7 @@ def _dynamic_per_token_quant_fp8_i8_1d_kernel(
     x = tl.load(x_in_ptr + offs, mask=mask, other=0.0, cache_modifier=".cg")
     m = tl.max(tl.abs(x))
     scale_out = m.to(tl.float32) / DTYPE_MAX
-    qx = (x * (1.0 / scale_out)).to(qx_ptr.dtype.element_ty)
+    qx = _cast_quantized(x * (1.0 / scale_out), qx_ptr.dtype.element_ty)
 
     tl.store(scale_out_ptr + row, scale_out)
     tl.store(qx_ptr + offs, qx, mask=mask, cache_modifier=".cs")
@@ -184,7 +192,9 @@ def _dynamic_per_token_quant_fp8_i8_n128_kernel(
         )
 
     scale_out = tl.max(tl.abs(x), axis=-1).to(tl.float32) / DTYPE_MAX
-    qx = (x * (1.0 / scale_out)[:, None]).to(qx_ptr.dtype.element_ty)
+    qx = _cast_quantized(
+        x * (1.0 / scale_out)[:, None], qx_ptr.dtype.element_ty
+    )
 
     if EVEN_M:
         tl.store(scale_out_ptr + row_offs, scale_out)
@@ -233,7 +243,7 @@ def _dynamic_per_token_quant_fp8_i8_kernel(
     scale_out = m.to(tl.float32) / DTYPE_MAX
     scale_recip = 1.0 / scale_out
 
-    qx = (x * scale_recip[:, None]).to(qx_ptr.dtype.element_ty)
+    qx = _cast_quantized(x * scale_recip[:, None], qx_ptr.dtype.element_ty)
 
     tl.store(scale_out_ptr + row_offs, scale_out, mask=row_mask)
 

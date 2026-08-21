@@ -21,7 +21,10 @@ def pertoken_quant(
     if scale is None:
         scale = values.abs().amax(dim=-1, keepdim=True) / dtype_max
         scale = torch.where(scale == 0, torch.ones_like(scale), scale)
-    return (values / scale).to(quant_dtype), scale.float()
+    quantized = values / scale
+    if quant_dtype == torch.int8:
+        quantized = quantized.round()
+    return quantized.to(quant_dtype), scale.float()
 
 
 def per_token_quant_hip(
