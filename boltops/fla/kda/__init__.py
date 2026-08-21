@@ -9,6 +9,22 @@ from __future__ import annotations
 import torch
 
 
+def recompute_w_u_fwd(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    A: torch.Tensor,
+    q: torch.Tensor | None = None,
+    gk: torch.Tensor | None = None,
+    cu_seqlens: torch.Tensor | None = None,
+    chunk_indices: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, None, torch.Tensor | None]:
+    """Recompute KDA WY intermediates with the KDA Triton kernel."""
+    from .triton import recompute_w_u_fwd as impl
+
+    return impl(k, v, beta, A, q, gk, cu_seqlens, chunk_indices)
+
+
 def chunk_kda(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor,
     beta: torch.Tensor, scale: float | None = None,
@@ -54,31 +70,6 @@ def chunk_kda_with_fused_gate_fwd(
     from boltops.fla.kda.triton import chunk_kda_with_fused_gate_fwd as impl
     return impl(q, k, v, raw_g, raw_beta, A_log, g_bias, scale,
                 initial_state, output_final_state, lower_bound, cu_seqlens)
-
-
-def recompute_w_u_fwd(
-    k: torch.Tensor,
-    v: torch.Tensor,
-    beta: torch.Tensor,
-    A: torch.Tensor,
-    q: torch.Tensor | None = None,
-    gk: torch.Tensor | None = None,
-    cu_seqlens: torch.Tensor | None = None,
-    chunk_indices: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, None, torch.Tensor | None]:
-    """Recompute the KDA ``w`` and ``u`` chunk intermediates."""
-    from boltops.fla.kda.triton import recompute_w_u_fwd as impl
-
-    return impl(
-        k,
-        v,
-        beta,
-        A,
-        q=q,
-        gk=gk,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-    )
 
 
 def chunk_gla_fwd_o_gk(

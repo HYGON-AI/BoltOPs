@@ -12,8 +12,9 @@ from boltops.fused_moe import (
 from boltops.generic import (
     attn_res,
     fused_mamba_state_scatter_with_mask,
-    recompute_w_u_fwd,
 )
+from boltops.fla.kda import recompute_w_u_fwd as recompute_w_u_fwd_kda
+from boltops.fla.gdn import recompute_w_u_fwd as recompute_w_u_fwd_gdn
 from boltops.gemm import (
     awq_gemm_triton,
     batched_gemm_a16wfp4,
@@ -34,8 +35,9 @@ def test_version():
 
 def test_operator_package_exports():
     assert callable(attn_res)
-    assert callable(recompute_w_u_fwd)
     assert callable(fused_mamba_state_scatter_with_mask)
+    assert callable(recompute_w_u_fwd_kda)
+    assert callable(recompute_w_u_fwd_gdn)
     assert callable(fused_experts)
     assert callable(matmul_persistent)
     assert callable(gemm_a16w16)
@@ -57,7 +59,6 @@ def test_root_package_does_not_reexport_operators():
     assert boltops.__all__ == ["__version__"]
     for name in (
         "attn_res",
-        "recompute_w_u_fwd",
         "fused_mamba_state_scatter_with_mask",
         "fused_experts",
         "moe_activation",
@@ -75,4 +76,3 @@ def test_gemm_fp16_not_public():
 
 def test_moe_tune_cli_is_packaged():
     assert callable(moe_tune_main)
-

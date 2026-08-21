@@ -49,7 +49,6 @@ from boltops.generic import (
     attn_res,
     causal_conv1d_fn,
     causal_conv1d_update,
-    recompute_w_u_fwd,
     fused_mamba_state_scatter_with_mask,
 )
 from boltops.fused_moe import (
@@ -80,12 +79,26 @@ from boltops.fla.kda import (
     fused_recurrent_kda,
     fused_recurrent_kda_fwd,
     fused_recurrent_kda_packed_decode,
-    recompute_w_u_fwd as kda_recompute_w_u_fwd,
+    recompute_w_u_fwd as recompute_w_u_fwd_kda,
+)
+from boltops.fla.gdn import (
+    chunk_fwd_o,
+    chunk_gated_delta_rule_fwd_h,
+    fused_recurrent_gated_delta_rule_packed_decode,
+    fused_sigmoid_gating_delta_rule_update,
+    fused_sigmoid_gating_delta_rule_update_recurrent,
+    recompute_w_u_fwd as recompute_w_u_fwd_gdn,
 )
 
 mixed = attn_res(prefix, blocks, norm_weight, qk_weight, num_blocks, eps)
 
-w, u = recompute_w_u_fwd(k, v, beta, g_cumsum, A, cu_seqlens)
+# GDN / SGLang WY 重计算
+w, u = recompute_w_u_fwd_gdn(
+    k=k, v=v, beta=beta, g_cumsum=g_cumsum, A=A, cu_seqlens=cu_seqlens
+)
+
+# KDA / vLLM WY 重计算
+w, u, qg, kg = recompute_w_u_fwd_kda(k=k, v=v, beta=beta, A=A, gk=gk)
 
 fused_mamba_state_scatter_with_mask(dst, src, dst_indices_raw, step_indices_raw)
 
@@ -116,7 +129,7 @@ decode_attention_fwd(
 需要做实现 A/B 时，直接 import 后端模块，不要绕公开 API：
 
 ```python
-from boltops.generic.triton.recompute_w_u import recompute_w_u_fwd as triton_impl
+from boltops.generic.triton.attn_res import attn_res as triton_impl
 ```
 
 
@@ -126,7 +139,7 @@ from boltops.generic.triton.recompute_w_u import recompute_w_u_fwd as triton_imp
 
 | 算子类别                                                                            | 接口名                                                                                                                                                                                                                                    | DSLs                | 维护者                                           | 出厂后端                         | 介绍和文档                                                                                              |
 | ------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------- | --------------------------------------------- | ---------------------------- | -------------------------------------------------------------------------------------------------- |
-| Generic                                                                         | `attn_res` `recompute_w_u_fwd` `fused_mamba_state_scatter_with_mask`<br>`causal_conv1d_fn`<br>`causal_conv1d_update`                                                                                                                                                                   | Triton ✅ TileLang ❌ | Triton @all                                   | Triton                       | [docs](docs/ops/generic/generic.md)                                                                |
+| Generic                                                                         | `attn_res` `fused_mamba_state_scatter_with_mask`<br>`causal_conv1d_fn`<br>`causal_conv1d_update`                                                                                                                                                                                        | Triton ✅ TileLang ❌ | Triton @all                                   | Triton                       | [docs](docs/ops/generic/generic.md)                                                                |
 | FLA/KDA 系列                                                                      | `chunk_gla_fwd_o_gk` `chunk_kda_fwd_intra` `chunk_kda_fwd_intra_token_parallel` `fused_kda_gate` `fused_kda_gate_chunk_cumsum` `fused_recurrent_kda` `fused_recurrent_kda_fwd` `fused_recurrent_kda_packed_decode` `recompute_w_u_fwd` | Triton ✅ TileLang ❌ | Triton @liji                                  | Triton                       | [docs](docs/ops/fla/kda.md)                                                                        |
 | FLA/GDN 系列                                                                      |                                                                                                                                                                                                                                        |                     | Trtion @huangteng                             |                              |                                                                                                    |
 | MoE 系列                                                                          | `fused_experts` `moe_activation`                                                                                                                                                                                                       | Triton ✅ TileLang ❌ | Triton @zhenxin TileLang @xxx                 | Triton（`fused_experts` 混合策略） | [docs](docs/ops/fused_moe.md) [调参指南](boltops/tools/fused_moe_triton_tune/tune_moe_triton_user_guide.md) |
@@ -186,8 +199,8 @@ pip install -e ".[triton,dev]"
 pytest test                  # 正确性（功能 / case 覆盖）
 pytest test --bench -s       # 正确性 + 真实模型尺寸性能
 # 单算子：
-# pytest test/test_generic_recompute_w_u.py
-# pytest test/test_generic_recompute_w_u.py --bench -s
+# pytest test/fla/test_gdn_recompute_w_u.py
+# pytest test/fla/test_gdn_recompute_w_u.py --bench -s
 ```
 
 **新算子：**
