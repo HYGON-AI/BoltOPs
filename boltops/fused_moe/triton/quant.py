@@ -9,7 +9,7 @@ from triton.language.extra import libdevice
 
 
 _PER_TOKEN_QUANT_4ROW_PROGRAMS_PER_CU = 16
-_PER_TOKEN_QUANT_4ROW_N2048_PROGRAMS_PER_CU = 80
+_PER_TOKEN_QUANT_4ROW_N2048_PROGRAMS_PER_CU = 160
 
 
 @triton.jit
@@ -156,7 +156,7 @@ def _dynamic_per_token_quant_fp8_i8_1d_kernel(
 
     x = tl.load(x_in_ptr + offs, mask=mask, other=0.0, cache_modifier=".cg")
     m = tl.max(tl.abs(x))
-    scale_out = m.to(tl.float32) / DTYPE_MAX
+    scale_out = tl.maximum(m.to(tl.float32), 1.0e-10) / DTYPE_MAX
     qx = _cast_quantized(x * (1.0 / scale_out), qx_ptr.dtype.element_ty)
 
     tl.store(scale_out_ptr + row, scale_out)
@@ -191,7 +191,8 @@ def _dynamic_per_token_quant_fp8_i8_n128_kernel(
             cache_modifier=".cg",
         )
 
-    scale_out = tl.max(tl.abs(x), axis=-1).to(tl.float32) / DTYPE_MAX
+    m = tl.max(tl.abs(x), axis=-1)
+    scale_out = tl.maximum(m.to(tl.float32), 1.0e-10) / DTYPE_MAX
     qx = _cast_quantized(
         x * (1.0 / scale_out)[:, None], qx_ptr.dtype.element_ty
     )
@@ -240,7 +241,7 @@ def _dynamic_per_token_quant_fp8_i8_kernel(
         )
 
     m = tl.max(tl.abs(x), axis=-1)
-    scale_out = m.to(tl.float32) / DTYPE_MAX
+    scale_out = tl.maximum(m.to(tl.float32), 1.0e-10) / DTYPE_MAX
     scale_recip = 1.0 / scale_out
 
     qx = _cast_quantized(x * scale_recip[:, None], qx_ptr.dtype.element_ty)
@@ -277,6 +278,10 @@ def dynamic_per_token_quant_fp8_i8(
     - qx: Quantized output values.
     - scale_out: Scale tensor of shape (M, )
     """
+    assert x_in.is_contiguous(), "x_in must be contiguous"
+    assert qx.is_contiguous(), "qx must be contiguous"
+    assert scale_out.is_contiguous(), "scale_out must be contiguous"
+
     rows = x_in.shape[0]
     cols = x_in.shape[1]
     block_n = triton.next_power_of_2(cols)
