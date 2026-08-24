@@ -618,6 +618,12 @@ def parse_args() -> argparse.Namespace:
         default=int(full["num_groups_compile"]),
         help=f"compile-only 分组数。默认: {full['num_groups_compile']}",
     )
+    runtime_group.add_argument(
+        "--num-groups-run",
+        type=int,
+        default=None,
+        help="autotune 运行分组数。默认由 launcher 决定；可设为可用 GPU 数。",
+    )
 
     runtime_group.add_argument("--device-start-id", type=int, default=None, help="起始设备 ID。默认: 自动选择")
     runtime_group.add_argument("--device-count", type=int, default=None, help="连续设备数量。默认: 自动选择")
@@ -699,6 +705,9 @@ def main() -> int:
         return 1
     if args.num_groups_compile <= 0:
         print(f"错误: --num-groups-compile 必须 > 0，当前值: {args.num_groups_compile}", file=sys.stderr)
+        return 1
+    if args.num_groups_run is not None and args.num_groups_run <= 0:
+        print(f"错误: --num-groups-run 必须 > 0，当前值: {args.num_groups_run}", file=sys.stderr)
         return 1
     if args.num_shared_experts < 0:
         print(f"错误: --num-shared-experts 必须 >= 0，当前值: {args.num_shared_experts}", file=sys.stderr)
@@ -863,6 +872,8 @@ def main() -> int:
         return 1
 
     env.update(resolved_env)
+    if args.num_groups_run is not None:
+        env["AUTOTUNE_NUM_GROUPS_RUN"] = str(args.num_groups_run)
 
     # 当 batch 数量小于运行分组数时，自动收敛运行分组，避免收集阶段报错。
     # 例如 --batch-sizes 1 时，只需要 1 个 run group。
@@ -919,6 +930,10 @@ def main() -> int:
         (
             "use_block_pingpong",
             triton_capabilities.supports("use_block_pingpong"),
+        ),
+        (
+            "buffer_cache_swizzle",
+            triton_capabilities.supports("buffer_cache_swizzle"),
         ),
         ("device_name", args.device_name),
         ("test_type", args.test_type),
