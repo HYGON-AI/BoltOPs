@@ -37,6 +37,7 @@ _SAVED_CONFIG_KEYS = (
     "sched_latency",
     "kpack",
     "use_block_pingpong",
+    "buffer_cache_swizzle",
     "num_warps",
     "num_stages",
 )

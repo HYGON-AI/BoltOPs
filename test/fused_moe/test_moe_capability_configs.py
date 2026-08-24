@@ -62,9 +62,17 @@ def test_lower_capability_never_reads_higher_config(monkeypatch, tmp_path):
     assert moe_config_utils.get_moe_configs(256, 256, None) is None
 
 
-def _autotune_log(use_block_pingpong: str | None) -> str:
+def _autotune_log(
+    use_block_pingpong: str | None,
+    buffer_cache_swizzle: str | None = None,
+) -> str:
     pingpong = (
         "" if use_block_pingpong is None else f", use_block_pingpong: {use_block_pingpong}"
+    )
+    cache_swizzle = (
+        ""
+        if buffer_cache_swizzle is None
+        else f", buffer_cache_swizzle: {buffer_cache_swizzle}"
     )
     kernel = (
         "fused_moe_kernel:\n"
@@ -72,7 +80,7 @@ def _autotune_log(use_block_pingpong: str | None) -> str:
         "* 0  : BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 64, GROUP_SIZE_M: 1, "
         "COMBINE_SCALE_LOAD: False, USE_MLS_LOAD: False, waves_per_eu: 1, "
         "instruction_sched_variant: none, sched_latency: none, kpack: 1"
-        f"{pingpong}, num_warps: 8, num_ctas: 1, num_stages: 2, maxnreg: None\n"
+        f"{pingpong}{cache_swizzle}, num_warps: 8, num_ctas: 1, num_stages: 2, maxnreg: None\n"
         "\t : times(20 statics, rep:20 ms): 1.0 ms\n"
     )
     return "Config 1: {'BLOCK_SIZE_M': 64}\n" + kernel + kernel
@@ -98,6 +106,17 @@ def test_log_parser_omits_unsupported_pingpong_option(tmp_path):
 
     assert "use_block_pingpong" not in json.loads(top.read_text())["1"]
     assert "use_block_pingpong" not in json.loads(bottom.read_text())["1"]
+
+
+def test_log_parser_preserves_supported_buffer_cache_swizzle_option(tmp_path):
+    results = moe_log_parser.parse_log_file(_autotune_log("False", "True"))
+    top = tmp_path / "top.json"
+    bottom = tmp_path / "bottom.json"
+
+    moe_log_parser.save_results_to_json(results, top, bottom)
+
+    assert json.loads(top.read_text())["1"]["buffer_cache_swizzle"] is True
+    assert json.loads(bottom.read_text())["1"]["buffer_cache_swizzle"] is True
 
 
 def test_log_parser_uses_logged_batch_key_after_missing_result(tmp_path):

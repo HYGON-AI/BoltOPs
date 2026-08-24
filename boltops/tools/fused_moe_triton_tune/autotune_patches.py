@@ -79,6 +79,7 @@ def _keep_autotune_config(
     block_m,
     n,
     k,
+    num_tokens,
     is_gemm1,
     per_channel_quant,
     num_stages,
@@ -94,6 +95,24 @@ def _keep_autotune_config(
     use_mls_load = config["USE_MLS_LOAD"]
     bottom_a_use_mls_load = config["bottom_a_use_mls_load"]
     kpack = config.get("kpack")
+
+    # Cache swizzle is useful only once the runtime token dimension is large
+    # enough to provide multiple concurrently active workgroups.  Keep the
+    # explicit guard here as a backstop even though the option list below also
+    # omits the True candidate for small M.
+    if (
+        config.get("buffer_cache_swizzle", False)
+        and num_tokens < _LARGE_MOE_TOKEN_THRESHOLD
+    ):
+        return False
+
+    # BlockPingpong already forces buffer cache swizzle in the HCU backend.
+    # Tuning both flags as True would benchmark the same generated program as
+    # pingpong=True, buffer_cache_swizzle=False.
+    if config.get("use_block_pingpong", False) and config.get(
+        "buffer_cache_swizzle", False
+    ):
+        return False
 
     if use_mls_load or bottom_a_use_mls_load:
         if num_stages >= 3 or n % block_n != 0 or k % block_k != 0:
@@ -165,10 +184,17 @@ def _keep_autotune_config(
         return False
 
     if config.get("use_block_pingpong", False):
+        # Blockwise FP8 adds scale-tensor loads to the reduction loop.  The
+        # current HCU PrepareBlockPingpong matcher cannot rematch that loop,
+        # even for its otherwise-supported BK=32/64 shapes.
+        if test_type == "fp8":
+            return False
         return (
             num_warps == 8
             and block_m >= 128
             and block_n >= 128
+            # PrepareBlockPingpong only supports these reduction tile sizes.
+            and block_k in (32, 64)
             # GEMM2 with a short total reduction cannot amortize PP setup.
             # This is the runtime GEMM K, not BLOCK_SIZE_K.
             and (is_gemm1 or k > 256)
@@ -309,6 +335,12 @@ def generate_config2_lists(
     use_block_pingpong_options = _compiler_option_values(
         "use_block_pingpong", (False, True)
     )
+    buffer_cache_swizzle_options = _compiler_option_values(
+        "buffer_cache_swizzle",
+        (False, True)
+        if num_tokens >= _LARGE_MOE_TOKEN_THRESHOLD
+        else (False,),
+    )
     # PrepareBlockPingpong owns the actual three-stage/two-buffer pipeline.
     # Keep one canonical frontend stage value for PP to avoid tuning duplicate
     # configurations; do not make PP legality depend on this external value.
@@ -332,7 +364,8 @@ def generate_config2_lists(
                 schedule_options: {schedule_options}, \
                 sched_latency: {sched_latency}, \
                 kpack_options: {kpack_options}, \
-                use_block_pingpong_options: {use_block_pingpong_options}")
+                use_block_pingpong_options: {use_block_pingpong_options}, \
+                buffer_cache_swizzle_options: {buffer_cache_swizzle_options}")
 
     configs = []
     config_count = 0
@@ -344,6 +377,7 @@ def generate_config2_lists(
             group_size_m_options,
             combine_scale_load_options,
             pipeline_options,
+            buffer_cache_swizzle_options,
             num_warp_options,
             schedule_options,
             kpack_options,
@@ -356,6 +390,7 @@ def generate_config2_lists(
             group_m,
             combine_scale_load,
             (num_stage, use_block_pingpong),
+            buffer_cache_swizzle,
             num_warp,
             schedule,
             kpack,
@@ -376,6 +411,7 @@ def generate_config2_lists(
                 sched_latency=sched_latency,
                 kpack=kpack,
                 use_block_pingpong=use_block_pingpong,
+                buffer_cache_swizzle=buffer_cache_swizzle,
             )
             _add_schedule_option(config, schedule_option_name, schedule)
 
@@ -384,6 +420,7 @@ def generate_config2_lists(
                 block_m=block_m,
                 n=N,
                 k=K,
+                num_tokens=num_tokens,
                 is_gemm1=is_gemm1,
                 per_channel_quant=per_channel_quant,
                 num_stages=num_stage,

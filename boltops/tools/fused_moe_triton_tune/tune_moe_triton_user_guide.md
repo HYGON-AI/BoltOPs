@@ -79,6 +79,10 @@
 - Triton 3.2 能力的搜索空间不传 `use_block_pingpong`；
 - backend 实际支持该 option 时，搜索空间增加
   `use_block_pingpong=False/True`，`True` 只用于 8-warp、2-stage 配置；
+- backend 支持 `buffer_cache_swizzle` 时，仅在运行时 `M >= 2048`
+  的 case 中搜索 `buffer_cache_swizzle=False/True`，小 M 只保留 `False`；
+- `use_block_pingpong=True` 在 HCU backend 中会强制开启 cache swizzle，
+  因此不重复搜索两个选项同时为 `True` 的等价配置；
 - 新结果写入 `configs/triton_3_2|triton_3_6|triton_3_8`；
 - 运行时先读当前能力目录，高版本可逐级回退到低版本。
 
@@ -265,6 +269,7 @@ boltops-fused-moe-tune-cli nmz int8_channel \
 - `--num-groups-compile`：compile-only 分组数
 - `--device-start-id`：手工指定起始设备
 - `--device-count`：手工指定连续设备数量
+- `--num-groups-run`：autotune 运行分组数；需充分利用多卡时可设为可用 GPU 数
 - `--disable-auto-select-devices-by-hy-smi`：禁用自动选卡
 - `--hy-smi-max-vram-pct`：自动选卡阈值（VRAM/HCU 共用）
 - `--break-on-error [true|false]`：遇错是否立即退出
