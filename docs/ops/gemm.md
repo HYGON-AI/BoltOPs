@@ -15,6 +15,7 @@
 | `gemm_a8w8_blockscale` | A8W8 block-scale | `Y = X @ W^T` | aiter | |
 | `gemm_afp4wfp4` | MXFP4 | `Y = X @ W^T` | aiter | 需 `is_fp4_avail()` |
 | `batched_gemm_a16wfp4` | A16WFP4 batched | `Y[i] = X[i] @ W[i]^T` | aiter | 需 FP4 |
+| `batched_gemm_bf16` | BF16 / FP16 batched | `Y[i] = X[i] @ W[i]^T`，`W[B,N,K]` | aiter | HCU JSON：`K100_AI` / `BW200` |
 | `w8a8_block_int8_matmul` | INT8 block-scale | `B[N,K]` | SGLang | HCU JSON：`BW200` / `gfx938` |
 
 未公开：`gemm_fp16`（内部 HCU WASP/WDRA 实验）。
@@ -29,6 +30,7 @@ from boltops.gemm import (
     gemm_a8w8_blockscale,
     gemm_afp4wfp4,
     batched_gemm_a16wfp4,
+    batched_gemm_bf16,
     w8a8_block_int8_matmul,
 )
 # 或 from boltops.gemm import ...
@@ -155,6 +157,68 @@ y = batched_gemm_a16wfp4(x, w, w_scales, dtype=torch.bfloat16)
 - `x`：`[B, M, K]` BF16/FP16；`w`：`[B, N, K//2]` FP4
 
 实现：`triton/batched_gemm_a16wfp4.py` + `_op.py`。溯源：aiter batched path。
+
+---
+
+## `batched_gemm_bf16`
+
+aiter Triton batched BF16/FP16 GEMM：`Y[i] = X[i] @ W[i]^T`。
+
+```python
+y = batched_gemm_bf16(x, w, bias=None, dtype=torch.bfloat16, y=None, config=None)
+```
+
+- `x`：`[B, M, K]`；`w`：`[B, N, K]`（内部转置）；可选 `bias`：`[B, 1, N]`
+- `dtype`：`bfloat16` / `float16`；`splitK` 必须为 `None`
+- HCU JSON（可选）：`triton/configs/batched_gemm_bf16/`  
+  - batch 专用：`BATCHED_BF16-B={B}-N={N}-K={K}_{bf16|fp16}_{device}.json`
+  - shape 通用：`BATCHED_BF16-N={N}-K={K}_{bf16|fp16}_{device}.json`
+  - 设备默认：`BATCHED_BF16-DEFAULT_{bf16|fp16}_{device}.json`
+  - 按上述顺序回退，表内选择最接近的 `M`
+- 无 JSON 时静默使用内置 large/small tile（`M+N >= 4096` → large）
+
+### BW200 FP16 性能记录
+
+#### BlockPingpong 关闭后的 autotune（2026-08-25）
+
+本轮因动态 `K` 的 BlockPingpong 编译路径存在精度问题，候选空间固定
+`use_block_pingpong=false`。使用 `triton.testing.do_bench`，warmup 10 ms、
+repeat 30 ms，表中 latency 为无 profiler 环境下的中位数。
+
+| 环境项 | 值 |
+| --- | --- |
+| GPU | BW200, UBB BW1000（gfx936），64 GiB |
+| CU 数量 | 80 CU |
+| SCLK | DPM 300–1500 MHz；调优后采样活动档为 1350 MHz，未锁频 |
+| PyTorch / HIP | PyTorch 2.10.0 / HIP 6.3.26113 |
+| Triton | 3.6.0 |
+| 输入 / 输出 dtype | FP16 / FP16 |
+
+| Shape `[B,M,N,K]` | 最优配置 `[BM,BN,BK,GROUP,warps,stages,waves,PP]` | latency | TFLOPS |
+| --- | --- | ---: | ---: |
+| `[56,234,4928,1232]` | `[256,128,32,4,8,2,1,false]` | 1.477919 ms | 107.66 |
+| `[56,234,1232,2464]` | `[256,256,32,4,8,2,2,false]` | 0.755680 ms | 105.28 |
+
+此外，`B=16` 的三组 AITER size（`N/K=1024/4096`、`8192/1024`、
+`1280/8192`）已对全部 15 个 M 点重新调优；写入的 47 条专用配置均显式关闭
+BlockPingpong。TFLOPS 按 `2*B*M*N*K / latency` 计算。
+
+#### xprof 历史记录（2026-08-24）
+
+2026-08-24 使用 GPU 2、`xprof --enable-sqtt` 采集。每个 shape 单独运行，
+kernel 过滤器为 `batched_gemm`，计数器覆盖 `speed_of_light`、memory、occupancy、
+instruction、compute、scheduler、wave、cache、UMC 和 UTCL2 等全部 11 个 section。
+
+| Shape `[B,M,N,K]` | 专用 launch 配置 `[BM,BN,BK,GROUP,warps,stages,waves]` | 原始 dispatch | PMC replay 中位数 | replay TFLOPS |
+| --- | --- | ---: | ---: | ---: |
+| `[56,234,4928,1232]` | `[256,128,32,4,4,2,2]` | 2.001 ms | 1.735 ms | 91.73 |
+| `[56,234,1232,2464]` | `[256,256,64,4,8,1,1]` | 0.914 ms | 0.703 ms | 113.14 |
+
+TFLOPS 按 `2*B*M*N*K / latency` 计算。以上数据来自 xprof PMC replay，适合分析
+单 kernel 的硬件利用率；由于计数器 replay/SQTT 会扰动执行时间，不作为无 profiler
+端到端 benchmark 的性能门槛。
+
+实现：`triton/batched_gemm_bf16.py`。溯源：aiter `batched_gemm_bf16`。
 
 ---
 
