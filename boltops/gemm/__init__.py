@@ -20,6 +20,7 @@ Public operators:
 * ``gemm_a8w8_blockscale``
 * ``gemm_afp4wfp4``
 * ``batched_gemm_a16wfp4``
+* ``batched_gemm_bf16``
 * ``w8a8_block_int8_matmul``
 
 Internal-only (not exported): ``gemm_fp16`` (HCU WASP/WDRA).
@@ -212,6 +213,29 @@ def batched_gemm_a16wfp4(
     )
 
 
+def batched_gemm_bf16(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    dtype: Optional[torch.dtype] = torch.bfloat16,
+    splitK: Optional[int] = None,
+    y: Optional[torch.Tensor] = None,
+    config: Optional[dict] = None,
+) -> torch.Tensor:
+    """aiter Triton batched BF16/FP16 GEMM: ``Y[i] = X[i] @ W[i]^T``."""
+    from boltops.gemm.triton.batched_gemm_bf16 import batched_gemm_bf16 as impl
+
+    return impl(
+        x,
+        w,
+        bias=bias,
+        dtype=dtype,
+        splitK=splitK,
+        y=y,
+        config=config,
+    )
+
+
 def w8a8_block_int8_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -231,6 +255,7 @@ def w8a8_block_int8_matmul(
 __all__ = [
     "awq_gemm_triton",
     "batched_gemm_a16wfp4",
+    "batched_gemm_bf16",
     "gemm_a16w16",
     "gemm_a8w8_blockscale",
     "gemm_afp4wfp4",

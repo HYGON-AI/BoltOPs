@@ -18,6 +18,7 @@ from boltops.fla.gdn import recompute_w_u_fwd as recompute_w_u_fwd_gdn
 from boltops.gemm import (
     awq_gemm_triton,
     batched_gemm_a16wfp4,
+    batched_gemm_bf16,
     gemm_a16w16,
     gemm_a8w8_blockscale,
     gemm_afp4wfp4,
@@ -47,6 +48,7 @@ def test_operator_package_exports():
     assert callable(gemm_a8w8_blockscale)
     assert callable(gemm_afp4wfp4)
     assert callable(batched_gemm_a16wfp4)
+    assert callable(batched_gemm_bf16)
     assert callable(w8a8_block_int8_matmul)
     assert callable(moe_activation)
     assert callable(moe_activation_output_size)
