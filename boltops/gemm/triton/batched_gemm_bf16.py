@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# Modified by Hygon Information Technology Co., Ltd., 2026.
 """Vendored aiter Triton batched BF16/FP16 GEMM.
 
 Upstream: ROCm/aiter ``aiter.ops.triton.batched_gemm_bf16``.
@@ -50,6 +51,7 @@ _LAUNCH_KEYS = frozenset(
         "use_block_pingpong",
         "waves_per_eu",
         "matrix_instr_nonkdim",
+        "optimize_epilogue",
     }
 )
 

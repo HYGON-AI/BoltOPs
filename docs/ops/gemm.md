@@ -179,11 +179,12 @@ y = batched_gemm_bf16(x, w, bias=None, dtype=torch.bfloat16, y=None, config=None
 
 ### BW200 FP16 性能记录
 
-#### BlockPingpong 关闭后的 autotune（2026-08-25）
+#### BlockPingpong / optimized epilogue 四组合 autotune（2026-08-26）
 
-本轮因动态 `K` 的 BlockPingpong 编译路径存在精度问题，候选空间固定
-`use_block_pingpong=false`。使用 `triton.testing.do_bench`，warmup 10 ms、
-repeat 30 ms，表中 latency 为无 profiler 环境下的中位数。
+更新至 Triton `release/3.6.x` 提交 `80d21d979`（llvm-triton
+`ddb5c4b4b`）后，对 `BlockPingpong` 开/关和 optimized epilogue 开/关四种组合
+重新 autotune。候选初筛使用 warmup 10 ms、repeat 30 ms；四套 winner 再统一使用
+warmup 20 ms、repeat 100 ms 复测，表中 latency 为复测中位数。
 
 | 环境项 | 值 |
 | --- | --- |
@@ -191,17 +192,18 @@ repeat 30 ms，表中 latency 为无 profiler 环境下的中位数。
 | CU 数量 | 80 CU |
 | SCLK | DPM 300–1500 MHz；调优后采样活动档为 1350 MHz，未锁频 |
 | PyTorch / HIP | PyTorch 2.10.0 / HIP 6.3.26113 |
-| Triton | 3.6.0 |
+| Triton | 3.6.0 (`80d21d979`)；llvm-triton `ddb5c4b4b` |
 | 输入 / 输出 dtype | FP16 / FP16 |
 
-| Shape `[B,M,N,K]` | 最优配置 `[BM,BN,BK,GROUP,warps,stages,waves,PP]` | latency | TFLOPS |
+| Shape `[B,M,N,K]` | 最优配置 `[BM,BN,BK,GROUP,warps,stages,waves,PP,epi]` | latency | TFLOPS |
 | --- | --- | ---: | ---: |
-| `[56,234,4928,1232]` | `[256,128,32,4,8,2,1,false]` | 1.477919 ms | 107.66 |
-| `[56,234,1232,2464]` | `[256,256,32,4,8,2,2,false]` | 0.755680 ms | 105.28 |
+| `[56,234,4928,1232]` | `[256,128,32,4,8,2,2,true,false]` | 1.480240 ms | 107.49 |
+| `[56,234,1232,2464]` | `[256,256,16,4,8,3,2,true,true]` | 0.726720 ms | 109.48 |
 
 此外，`B=16` 的三组 AITER size（`N/K=1024/4096`、`8192/1024`、
-`1280/8192`）已对全部 15 个 M 点重新调优；写入的 47 条专用配置均显式关闭
-BlockPingpong。TFLOPS 按 `2*B*M*N*K / latency` 计算。
+`1280/8192`）已对全部 15 个 M 点重新调优。47 条专用配置的四组合胜出分布为：
+PP关/epi关 21 条、PP关/epi开 9 条、PP开/epi关 15 条、PP开/epi开 2 条。
+TFLOPS 按 `2*B*M*N*K / latency` 计算。
 
 #### xprof 历史记录（2026-08-24）
 
