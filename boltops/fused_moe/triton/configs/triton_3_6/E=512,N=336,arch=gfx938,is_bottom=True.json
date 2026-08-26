@@ -65,8 +65,8 @@
     },
     "16": {
         "BLOCK_SIZE_M": 16,
-        "BLOCK_SIZE_N": 256,
-        "BLOCK_SIZE_K": 64,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 128,
         "GROUP_SIZE_M": 1,
         "COMBINE_SCALE_LOAD": false,
         "USE_MLS_LOAD": false,
@@ -76,7 +76,7 @@
         "kpack": 1,
         "use_block_pingpong": false,
         "buffer_cache_swizzle": false,
-        "num_warps": 4,
+        "num_warps": 2,
         "num_stages": 1
     },
     "24": {
@@ -97,7 +97,7 @@
     },
     "32": {
         "BLOCK_SIZE_M": 16,
-        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_N": 128,
         "BLOCK_SIZE_K": 128,
         "GROUP_SIZE_M": 1,
         "COMBINE_SCALE_LOAD": false,
@@ -208,7 +208,7 @@
         "num_stages": 1
     },
     "4096": {
-        "BLOCK_SIZE_M": 64,
+        "BLOCK_SIZE_M": 128,
         "BLOCK_SIZE_N": 128,
         "BLOCK_SIZE_K": 64,
         "GROUP_SIZE_M": 1,
@@ -240,22 +240,6 @@
         "num_stages": 1
     },
     "16384": {
-        "BLOCK_SIZE_M": 256,
-        "BLOCK_SIZE_N": 512,
-        "BLOCK_SIZE_K": 32,
-        "GROUP_SIZE_M": 1,
-        "COMBINE_SCALE_LOAD": false,
-        "USE_MLS_LOAD": false,
-        "waves_per_eu": 1,
-        "schedule_hint": "none",
-        "sched_latency": "none",
-        "kpack": 1,
-        "use_block_pingpong": false,
-        "buffer_cache_swizzle": true,
-        "num_warps": 16,
-        "num_stages": 2
-    },
-    "32768": {
         "BLOCK_SIZE_M": 256,
         "BLOCK_SIZE_N": 512,
         "BLOCK_SIZE_K": 32,

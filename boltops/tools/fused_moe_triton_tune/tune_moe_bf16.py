@@ -98,7 +98,7 @@ if compile_only == 1:
         num_groups_compile=num_groups_compile,
         device_start_id=device_start_id,
         device_count=device_count,
-        compile_batches=[1, 64],
+        compile_batches=[1, 64, 2048],
     )
     print(f"{group_ids=}")
 else:

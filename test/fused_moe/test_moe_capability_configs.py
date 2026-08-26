@@ -5,6 +5,7 @@ import pytest
 
 from boltops.fused_moe.triton import moe_config_utils
 from boltops.tools.fused_moe_triton_tune import moe_log_parser
+from boltops.tools.fused_moe_triton_tune import autotune_patches
 from boltops.utility.triton_capability import TritonCapabilities
 
 
@@ -155,3 +156,36 @@ def test_tuner_copies_results_to_current_capability_directory(monkeypatch):
         / "triton_3_6"
     )
     assert moe_log_parser.resolve_boltops_moe_config_dir() == expected
+
+
+def test_gemm2_large_option_pruning_uses_input_token_count(monkeypatch):
+    class _BufferCacheSwizzleOnly:
+        @staticmethod
+        def supports(name):
+            return name == "buffer_cache_swizzle"
+
+    monkeypatch.setattr(
+        autotune_patches, "triton_capabilities", _BufferCacheSwizzleOnly()
+    )
+    monkeypatch.setattr(autotune_patches, "test_type", "bf16")
+    monkeypatch.setattr(autotune_patches, "capMLS", False)
+    monkeypatch.setattr(autotune_patches, "compile_only", 0)
+
+    def configs(num_input_tokens):
+        return autotune_patches.generate_config2_lists(
+            BLOCK_SIZE_M=128,
+            N=256,
+            K=4096,
+            MUL_ROUTED_WEIGHT=True,
+            num_valid_tokens=4096,
+            top_k=1,
+            num_input_tokens=num_input_tokens,
+        )
+
+    small = configs(512)
+    large = configs(2048)
+
+    assert small
+    assert large
+    assert not any(c.kwargs.get("buffer_cache_swizzle") for c in small)
+    assert any(c.kwargs.get("buffer_cache_swizzle") for c in large)
