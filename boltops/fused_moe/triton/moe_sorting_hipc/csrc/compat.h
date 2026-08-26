@@ -37,6 +37,19 @@ namespace boltops_hipc {
 using index_t      = int32_t;
 using long_index_t = int64_t;
 
+// HIP 7 / aicc clang>=22: `warpSize` is a non-constexpr device object
+// (`operator int()` wrapping __builtin_amdgcn_wavefrontsize()), so it can no
+// longer initialize constexpr members or non-type template arguments.
+// This kernel is wave64-only (Hygon gfx9xx / CK get_warp_size() on GFX9).
+BOLT_OPS_HIPC_HOST_DEVICE constexpr index_t get_warp_size()
+{
+#if defined(__AMDGCN_WAVEFRONT_SIZE)
+    return static_cast<index_t>(__AMDGCN_WAVEFRONT_SIZE);
+#else
+    return 64;
+#endif
+}
+
 template <typename T>
 using remove_cvref_t = std::remove_cv_t<std::remove_reference_t<T>>;
 

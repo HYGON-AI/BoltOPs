@@ -17,7 +17,7 @@ struct MoeSortingProblemEx
     using WeightType = remove_cvref_t<WeightType_>;
     using IndexType  = remove_cvref_t<IndexType_>;
 
-    static constexpr index_t WarpSize               = warpSize;
+    static constexpr index_t WarpSize               = get_warp_size();
     static constexpr index_t WarpsPerBlock          = 1;
     static constexpr index_t SubTokenTile           = SubTokenTile_;
     static constexpr bool SubTokenOneShot           = SubTokenOneShot_;
