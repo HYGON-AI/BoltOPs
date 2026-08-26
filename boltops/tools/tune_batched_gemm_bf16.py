@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
+
 """Autotune BoltOps Triton batched A16W16 GEMM for selected shapes."""
 
 from __future__ import annotations
@@ -17,10 +20,14 @@ from boltops.gemm.triton.batched_gemm_bf16 import batched_gemm_bf16
 AITer_M_VALUES = (1, 8, 16, 32, 64, 128, 192, 256, 320, 512, 1024, 2048, 4096, 8192, 16384)
 
 
-def candidates(m: int) -> list[dict]:
-    # Start with the gfx942 AITER choices, then add BW200-oriented larger tiles
-    # with BlockPingpong disabled. Keeping this list compact makes the full
-    # 15-point sweep practical while still covering the important dimensions.
+def candidates(
+    m: int,
+    optimize_epilogue: bool = False,
+    use_block_pingpong: bool = False,
+) -> list[dict]:
+    # Start with the gfx942 AITER choices, then add BW200-oriented larger tiles.
+    # Keeping this list compact makes the full 15-point sweep practical while
+    # still covering the important dimensions.
     if m <= 8:
         tiles = [(8, 64, 128, 4), (16, 64, 64, 4), (32, 64, 32, 4)]
     elif m <= 32:
@@ -40,22 +47,36 @@ def candidates(m: int) -> list[dict]:
             (256, 256, 32, 8), (256, 256, 64, 8),
         ]
 
+    if optimize_epilogue and m >= 128:
+        tiles.extend([(256, 128, 16, 8), (256, 256, 16, 8)])
+    tiles = list(dict.fromkeys(tiles))
+
     result = []
     for bm, bn, bk, nw in tiles:
-        for waves in (1, 2):
-            result.append(
-                {
-                    "BLOCK_SIZE_M": bm,
-                    "BLOCK_SIZE_N": bn,
-                    "BLOCK_SIZE_K": bk,
-                    "GROUP_SIZE_M": 4 if bm >= 64 else 1,
-                    "num_warps": nw,
-                    "num_stages": 2,
-                    "use_block_pingpong": False,
-                    "waves_per_eu": waves,
-                    "matrix_instr_nonkdim": 16,
-                }
-            )
+        stages = (2,)
+        if optimize_epilogue:
+            if m < 128:
+                stages = (1, 2, 3)
+            elif bk == 16:
+                stages = (2, 3)
+            elif bm == 256 and bn == 256 and bk == 32:
+                stages = (1, 2, 3)
+        for stage in stages:
+            for waves in (1, 2):
+                result.append(
+                    {
+                        "BLOCK_SIZE_M": bm,
+                        "BLOCK_SIZE_N": bn,
+                        "BLOCK_SIZE_K": bk,
+                        "GROUP_SIZE_M": 4 if bm >= 64 else 1,
+                        "num_warps": nw,
+                        "num_stages": stage,
+                        "use_block_pingpong": use_block_pingpong,
+                        "waves_per_eu": waves,
+                        "matrix_instr_nonkdim": 16,
+                        "optimize_epilogue": optimize_epilogue,
+                    }
+                )
     return result
 
 
@@ -68,14 +89,23 @@ def bench(fn, warmup_ms: int, rep_ms: int) -> float:
 
 
 def tune_shape(
-    b: int, m: int, n: int, k: int, warmup_ms: int, rep_ms: int
+    b: int,
+    m: int,
+    n: int,
+    k: int,
+    warmup_ms: int,
+    rep_ms: int,
+    optimize_epilogue: bool = False,
+    use_block_pingpong: bool = False,
 ) -> tuple[dict, float]:
     x = torch.empty((b, m, k), device="cuda", dtype=torch.float16)
     w = torch.empty((b, n, k), device="cuda", dtype=torch.float16)
     y = torch.empty((b, m, n), device="cuda", dtype=torch.float16)
     best_cfg = None
     best_ms = math.inf
-    for index, cfg in enumerate(candidates(m), 1):
+    for index, cfg in enumerate(
+        candidates(m, optimize_epilogue, use_block_pingpong), 1
+    ):
         try:
             fn = lambda cfg=cfg: batched_gemm_bf16(
                 x, w, dtype=torch.float16, y=y, config=cfg
@@ -102,24 +132,40 @@ def main() -> None:
     parser.add_argument("--m-values", type=int, nargs="+", default=AITer_M_VALUES)
     parser.add_argument("--warmup-ms", type=int, default=10)
     parser.add_argument("--rep-ms", type=int, default=30)
+    parser.add_argument("--optimize-epilogue", action="store_true")
+    parser.add_argument("--block-pingpong", action="store_true")
+    parser.add_argument("--resume", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
+    timing_path = args.output.with_suffix(".timings.json")
     output = {}
     timing = {}
+    if args.resume and args.output.exists():
+        output = json.loads(args.output.read_text())
+        if timing_path.exists():
+            timing = json.loads(timing_path.read_text())
     for m in args.m_values:
+        if str(m) in output and str(m) in timing:
+            print(f"SKIP B={args.b} M={m} N={args.n} K={args.k}", flush=True)
+            continue
         print(f"TUNING B={args.b} M={m} N={args.n} K={args.k}", flush=True)
         cfg, ms = tune_shape(
-            args.b, m, args.n, args.k, args.warmup_ms, args.rep_ms
+            args.b,
+            m,
+            args.n,
+            args.k,
+            args.warmup_ms,
+            args.rep_ms,
+            args.optimize_epilogue,
+            args.block_pingpong,
         )
         output[str(m)] = cfg
         timing[str(m)] = ms
         print(f"BEST M={m}: {ms:.6f} ms {cfg}", flush=True)
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(output, indent=4) + "\n")
-        args.output.with_suffix(".timings.json").write_text(
-            json.dumps(timing, indent=4) + "\n"
-        )
+        timing_path.write_text(json.dumps(timing, indent=4) + "\n")
 
 
 if __name__ == "__main__":

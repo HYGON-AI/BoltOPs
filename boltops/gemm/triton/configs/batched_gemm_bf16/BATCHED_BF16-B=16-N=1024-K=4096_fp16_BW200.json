@@ -1,25 +1,27 @@
 {
     "1": {
-        "BLOCK_SIZE_M": 8,
+        "BLOCK_SIZE_M": 32,
         "BLOCK_SIZE_N": 64,
-        "BLOCK_SIZE_K": 128,
+        "BLOCK_SIZE_K": 32,
         "GROUP_SIZE_M": 1,
         "num_warps": 4,
         "num_stages": 2,
-        "use_block_pingpong": false,
+        "use_block_pingpong": true,
         "waves_per_eu": 2,
-        "matrix_instr_nonkdim": 16
+        "matrix_instr_nonkdim": 16,
+        "optimize_epilogue": true
     },
     "8": {
-        "BLOCK_SIZE_M": 8,
+        "BLOCK_SIZE_M": 32,
         "BLOCK_SIZE_N": 64,
-        "BLOCK_SIZE_K": 128,
+        "BLOCK_SIZE_K": 32,
         "GROUP_SIZE_M": 1,
         "num_warps": 4,
         "num_stages": 2,
-        "use_block_pingpong": false,
-        "waves_per_eu": 1,
-        "matrix_instr_nonkdim": 16
+        "use_block_pingpong": true,
+        "waves_per_eu": 2,
+        "matrix_instr_nonkdim": 16,
+        "optimize_epilogue": false
     },
     "16": {
         "BLOCK_SIZE_M": 32,
@@ -29,8 +31,9 @@
         "num_warps": 4,
         "num_stages": 2,
         "use_block_pingpong": false,
-        "waves_per_eu": 1,
-        "matrix_instr_nonkdim": 16
+        "waves_per_eu": 2,
+        "matrix_instr_nonkdim": 16,
+        "optimize_epilogue": true
     },
     "32": {
         "BLOCK_SIZE_M": 32,
@@ -41,7 +44,8 @@
         "num_stages": 2,
         "use_block_pingpong": false,
         "waves_per_eu": 1,
-        "matrix_instr_nonkdim": 16
+        "matrix_instr_nonkdim": 16,
+        "optimize_epilogue": false
     },
     "64": {
         "BLOCK_SIZE_M": 64,
@@ -52,7 +56,8 @@
         "num_stages": 2,
         "use_block_pingpong": false,
         "waves_per_eu": 1,
-        "matrix_instr_nonkdim": 16
+        "matrix_instr_nonkdim": 16,
+        "optimize_epilogue": false
     },
     "128": {
         "BLOCK_SIZE_M": 128,
@@ -61,9 +66,10 @@
         "GROUP_SIZE_M": 4,
         "num_warps": 8,
         "num_stages": 2,
-        "use_block_pingpong": false,
+        "use_block_pingpong": true,
         "waves_per_eu": 1,
-        "matrix_instr_nonkdim": 16
+        "matrix_instr_nonkdim": 16,
+        "optimize_epilogue": false
     },
     "192": {
         "BLOCK_SIZE_M": 256,
@@ -72,9 +78,10 @@
         "GROUP_SIZE_M": 4,
         "num_warps": 8,
         "num_stages": 2,
-        "use_block_pingpong": false,
+        "use_block_pingpong": true,
         "waves_per_eu": 1,
-        "matrix_instr_nonkdim": 16
+        "matrix_instr_nonkdim": 16,
+        "optimize_epilogue": false
     },
     "256": {
         "BLOCK_SIZE_M": 256,
@@ -83,9 +90,10 @@
         "GROUP_SIZE_M": 4,
         "num_warps": 8,
         "num_stages": 2,
-        "use_block_pingpong": false,
-        "waves_per_eu": 2,
-        "matrix_instr_nonkdim": 16
+        "use_block_pingpong": true,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "optimize_epilogue": false
     },
     "320": {
         "BLOCK_SIZE_M": 256,
@@ -94,31 +102,34 @@
         "GROUP_SIZE_M": 4,
         "num_warps": 8,
         "num_stages": 2,
-        "use_block_pingpong": false,
-        "waves_per_eu": 1,
-        "matrix_instr_nonkdim": 16
+        "use_block_pingpong": true,
+        "waves_per_eu": 2,
+        "matrix_instr_nonkdim": 16,
+        "optimize_epilogue": false
     },
     "512": {
         "BLOCK_SIZE_M": 256,
         "BLOCK_SIZE_N": 256,
-        "BLOCK_SIZE_K": 64,
+        "BLOCK_SIZE_K": 32,
         "GROUP_SIZE_M": 4,
         "num_warps": 8,
         "num_stages": 2,
-        "use_block_pingpong": false,
-        "waves_per_eu": 1,
-        "matrix_instr_nonkdim": 16
+        "use_block_pingpong": true,
+        "waves_per_eu": 2,
+        "matrix_instr_nonkdim": 16,
+        "optimize_epilogue": false
     },
     "1024": {
         "BLOCK_SIZE_M": 256,
         "BLOCK_SIZE_N": 256,
-        "BLOCK_SIZE_K": 64,
+        "BLOCK_SIZE_K": 32,
         "GROUP_SIZE_M": 4,
         "num_warps": 8,
-        "num_stages": 2,
+        "num_stages": 1,
         "use_block_pingpong": false,
-        "waves_per_eu": 1,
-        "matrix_instr_nonkdim": 16
+        "waves_per_eu": 2,
+        "matrix_instr_nonkdim": 16,
+        "optimize_epilogue": true
     },
     "2048": {
         "BLOCK_SIZE_M": 256,
@@ -128,8 +139,9 @@
         "num_warps": 8,
         "num_stages": 2,
         "use_block_pingpong": false,
-        "waves_per_eu": 1,
-        "matrix_instr_nonkdim": 16
+        "waves_per_eu": 2,
+        "matrix_instr_nonkdim": 16,
+        "optimize_epilogue": false
     },
     "4096": {
         "BLOCK_SIZE_M": 256,
@@ -140,7 +152,8 @@
         "num_stages": 2,
         "use_block_pingpong": false,
         "waves_per_eu": 1,
-        "matrix_instr_nonkdim": 16
+        "matrix_instr_nonkdim": 16,
+        "optimize_epilogue": false
     },
     "8192": {
         "BLOCK_SIZE_M": 256,
@@ -151,17 +164,19 @@
         "num_stages": 2,
         "use_block_pingpong": false,
         "waves_per_eu": 1,
-        "matrix_instr_nonkdim": 16
+        "matrix_instr_nonkdim": 16,
+        "optimize_epilogue": false
     },
     "16384": {
         "BLOCK_SIZE_M": 256,
         "BLOCK_SIZE_N": 256,
-        "BLOCK_SIZE_K": 32,
+        "BLOCK_SIZE_K": 64,
         "GROUP_SIZE_M": 4,
         "num_warps": 8,
         "num_stages": 2,
         "use_block_pingpong": false,
-        "waves_per_eu": 2,
-        "matrix_instr_nonkdim": 16
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "optimize_epilogue": true
     }
 }

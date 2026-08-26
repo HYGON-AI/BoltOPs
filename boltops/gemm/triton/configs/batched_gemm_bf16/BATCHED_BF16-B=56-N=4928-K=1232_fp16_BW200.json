@@ -6,8 +6,9 @@
         "GROUP_SIZE_M": 4,
         "num_warps": 8,
         "num_stages": 2,
-        "use_block_pingpong": false,
-        "waves_per_eu": 1,
-        "matrix_instr_nonkdim": 16
+        "use_block_pingpong": true,
+        "waves_per_eu": 2,
+        "matrix_instr_nonkdim": 16,
+        "optimize_epilogue": false
     }
 }
