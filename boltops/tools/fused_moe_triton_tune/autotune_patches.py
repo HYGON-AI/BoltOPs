@@ -276,6 +276,7 @@ def generate_config2_lists(
     bottom_a_use_mls_load=False,
     num_valid_tokens=None,
     top_k=1,
+    num_input_tokens=None,
 ):
     is_gemm1 = MUL_ROUTED_WEIGHT == False
 
@@ -304,14 +305,22 @@ def generate_config2_lists(
         block_size_k_options = [2**i for i in range(mode_autotune_min_block_size_k.bit_length() - 1,
                                                 min(mode_autotune_max_block_size_k.bit_length(), (K.bit_length())))]
 
+    if torch.is_tensor(num_input_tokens):
+        num_input_tokens = int(num_input_tokens.item())
     if torch.is_tensor(num_valid_tokens):
         num_valid_tokens = int(num_valid_tokens.item())
     if torch.is_tensor(top_k):
         top_k = int(top_k.item())
     top_k = max(int(top_k), 1)
-    num_tokens = (
-        int(num_valid_tokens) // top_k if num_valid_tokens is not None else 0
-    )
+    # Gemm2 is launched with top_k=1 even though num_valid_tokens still counts
+    # the original M*MoE-topk routed entries. Prefer the explicit input M so
+    # large-M-only options are not accidentally enabled for small Gemm2 cases.
+    if num_input_tokens is not None:
+        num_tokens = int(num_input_tokens)
+    elif num_valid_tokens is not None:
+        num_tokens = int(num_valid_tokens) // top_k
+    else:
+        num_tokens = 0
     group_size_m_options = (
         [1, 4, 8] if num_tokens >= _LARGE_MOE_TOKEN_THRESHOLD else [1]
     )
@@ -568,6 +577,14 @@ def dynamic_autotune(fn):
                 K = 16 if K is None else K
 
                 # 动态生成配置列表
+                topk_weights = kwargs.get(
+                    "topk_weights_ptr", named_args.get("topk_weights_ptr")
+                )
+                num_input_tokens = (
+                    int(topk_weights.shape[0])
+                    if torch.is_tensor(topk_weights) and topk_weights.ndim > 0
+                    else None
+                )
                 dynamic_configs = generate_config2_lists(
                     BLOCK_SIZE_M=BLOCK_SIZE_M,
                     N=N,
@@ -579,6 +596,7 @@ def dynamic_autotune(fn):
                         "num_valid_tokens", named_args.get("num_valid_tokens")
                     ),
                     top_k=kwargs.get("top_k", named_args.get("top_k", 1)),
+                    num_input_tokens=num_input_tokens,
                 )
                 if "int4" in test_type:
                     for cfg in dynamic_configs:
