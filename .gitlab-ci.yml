@@ -112,22 +112,31 @@ build:test-wheel:
       echo "Source commit: ${BOLTOPS_SOURCE_SHA}"
       echo "Target commit: ${BOLTOPS_TARGET_SHA}"
       echo "Integrated commit: $(git rev-parse HEAD)"
-    - python -m pip install "torch==${TORCH_VERSION}" triton pytest "numpy==1.24.3" pandas build wheel ciupload cismi ninja
-    - python -m pip show torch triton
-    # tilelang 0.1.12 wheels on nightly are torch==2.10.0 only (Requires-Dist pin).
-    # Match tilelang CI: apache-tvm-ffi comes from Aliyun, not dtk2604 nightly.
+    # Keep pip from replacing the Torch/NumPy versions selected by this matrix job
+    # while resolving TileLang and its transitive dependencies.
     - |
-      if [ "${TORCH_VERSION}" = "2.10.0" ]; then
-        python -m pip install "apache-tvm-ffi==0.1.11" \
-          -i https://mirrors.aliyun.com/pypi/simple/ \
-          --trusted-host mirrors.aliyun.com
-        python -m pip install "tilelang==0.1.12" \
-          --extra-index-url https://mirrors.aliyun.com/pypi/simple/ \
-          --trusted-host mirrors.aliyun.com
-        python -m pip show tilelang apache-tvm-ffi
-      else
-        echo "Skip tilelang install on torch ${TORCH_VERSION}"
-      fi
+      printf 'torch==%s\nnumpy==1.24.3\n' "${TORCH_VERSION}" > /tmp/boltops-constraints.txt
+      cat /tmp/boltops-constraints.txt
+    - python -m pip install --constraint /tmp/boltops-constraints.txt "torch==${TORCH_VERSION}" triton pytest "numpy==1.24.3" pandas build wheel ciupload cismi ninja
+    - python -m pip show torch triton
+    # Match TileLang CI: apache-tvm-ffi comes from Aliyun, while the constraint
+    # makes pip choose the TileLang wheel compatible with this Torch matrix job.
+    - python -m pip install --constraint /tmp/boltops-constraints.txt "apache-tvm-ffi==0.1.11" -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
+    - python -m pip install --constraint /tmp/boltops-constraints.txt "tilelang==0.1.12" --extra-index-url https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
+    - python -m pip check
+    - python -m pip show torch triton tilelang apache-tvm-ffi numpy
+    - |
+      python - <<'PY'
+      import os
+      import numpy
+      import torch
+
+      expected_torch = os.environ["TORCH_VERSION"]
+      actual_torch = torch.__version__.split("+", 1)[0]
+      assert actual_torch == expected_torch, (actual_torch, expected_torch)
+      assert numpy.__version__ == "1.24.3", numpy.__version__
+      print(f"Validated dependency set: torch={torch.__version__}, numpy={numpy.__version__}")
+      PY
   script:
     - |
       HIP_VISIBLE_DEVICES=$(CIsmi need 1 --timeout "${CISMI_TIMEOUT}")
