@@ -82,3 +82,35 @@ def test_decode_protocols_match_torch_reference(
             actual_state, expected_state, atol=8e-2, rtol=4e-2,
             msg=f"{name} state mismatch",
         )
+
+
+@GPU_REQUIRED
+def test_dense_decode_single_sequence_state_chain() -> None:
+    """Exercise the multi-token recurrent loop used by software pipelining."""
+    torch.manual_seed(211)
+    T, H, K, V = 3, 2, 32, 32
+    q = torch.randn(1, T, H, K, device=DEVICE, dtype=torch.bfloat16) * 0.1
+    k = torch.randn_like(q)
+    v = torch.randn(1, T, H, V, device=DEVICE, dtype=torch.bfloat16) * 0.1
+    gate = torch.randn(1, T, H, K, device=DEVICE, dtype=torch.float32) * -0.01
+    beta = torch.sigmoid(torch.randn(1, T, H, device=DEVICE, dtype=torch.float32))
+    initial = torch.randn(1, H, V, K, device=DEVICE, dtype=torch.float32) * 0.01
+    expected_out, expected_state = naive_recurrent_kda(
+        q, k, v, beta, gate, scale=K**-0.5,
+        initial_state=initial, use_qk_l2norm=True,
+    )
+
+    state = torch.zeros(T + 1, H, V, K, device=DEVICE, dtype=torch.float32)
+    state[1] = initial[0]
+    out, _ = fused_recurrent_kda_fwd(
+        q, k, v, gate, beta, initial_state=state,
+        cu_seqlens=torch.tensor([0, T], device=DEVICE, dtype=torch.int32),
+        ssm_state_indices=torch.arange(
+            1, T + 1, device=DEVICE, dtype=torch.int32,
+        ).view(1, T),
+        use_qk_l2norm_in_kernel=True,
+    )
+    torch.testing.assert_close(out, expected_out, atol=3e-2, rtol=2e-2)
+    torch.testing.assert_close(
+        state[T], expected_state[0], atol=8e-2, rtol=4e-2,
+    )

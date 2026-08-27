@@ -47,6 +47,76 @@ def chunk_kda_fwd(
                 cu_seqlens)
 
 
+def chunk_gated_delta_rule_fwd_h(
+    k: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    g: torch.Tensor | None = None,
+    gk: torch.Tensor | None = None,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    chunk_size: int = 64,
+    save_new_value: bool = True,
+    cu_seqlens: torch.Tensor | None = None,
+    chunk_indices: torch.Tensor | None = None,
+    chunk_offsets: torch.Tensor | None = None,
+    use_exp2: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """Compute KDA chunk states through the standalone public wrapper."""
+    from .triton import chunk_gated_delta_rule_fwd_h as impl
+
+    return impl(
+        k,
+        w,
+        u,
+        g=g,
+        gk=gk,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        chunk_size=chunk_size,
+        save_new_value=save_new_value,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        chunk_offsets=chunk_offsets,
+        use_exp2=use_exp2,
+    )
+
+
+def chunk_kda_fwd_state_output_fused(
+    q: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    g: torch.Tensor,
+    kg: torch.Tensor,
+    Aqk: torch.Tensor,
+    o: torch.Tensor,
+    scale: float,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    cu_seqlens: torch.Tensor | None = None,
+    chunk_indices: torch.Tensor | None = None,
+    chunk_size: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Run the standalone KDA state/output fusion stage."""
+    from .triton import chunk_kda_fwd_state_output_fused as impl
+
+    return impl(
+        q,
+        w,
+        u,
+        g,
+        kg,
+        Aqk,
+        o,
+        scale,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        chunk_size=chunk_size,
+    )
+
+
 def chunk_kda_with_fused_gate(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, raw_g: torch.Tensor,
     raw_beta: torch.Tensor, A_log: torch.Tensor, g_bias: torch.Tensor | None,
@@ -325,6 +395,8 @@ def fused_recurrent_kda_packed_decode(
 __all__ = [
     "chunk_kda",
     "chunk_kda_fwd",
+    "chunk_gated_delta_rule_fwd_h",
+    "chunk_kda_fwd_state_output_fused",
     "chunk_kda_with_fused_gate",
     "chunk_kda_with_fused_gate_fwd",
     "chunk_gla_fwd_o_gk",

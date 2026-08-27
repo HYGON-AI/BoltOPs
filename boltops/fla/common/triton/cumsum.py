@@ -22,7 +22,7 @@ CHUNK_LOCAL_CUMSUM_SCALAR_CONFIGS: tuple[dict[str, int], ...] = (
 CHUNK_LOCAL_CUMSUM_VECTOR_CONFIGS: tuple[dict[str, int], ...] = (
     {"BS": 32, "num_warps": 4},
     {"BS": 64, "num_warps": 4},
-    {"BS": 64, "num_warps": 2},
+    {"BS": 128, "num_warps": 4},
 )
 
 
@@ -36,7 +36,22 @@ def get_chunk_local_cumsum_scalar_config(
 def get_chunk_local_cumsum_vector_config(
     T: int, H: int, S: int, is_varlen: bool
 ) -> dict[str, int]:
-    del T, H, S, is_varlen
+    """Pick the widest S-block the row affords.
+
+    The kernel is purely bandwidth-bound, and ``BS`` decides how much of each
+    row is read in one contiguous run: the rows are ``H * S`` apart, so a
+    narrow block turns every row into its own short burst.  At ``S=128``,
+    ``T=16384, H=64`` on BW1100 the measured cost is 2.64 ms at ``BS=32``,
+    1.98 ms at 64 and 1.71 ms at 128 (407 / 542 / 627 GB/s); warp count and
+    stage count are flat to within 1% at every width, so only ``BS`` is tuned.
+    Replacing the ``dot(tril, s)`` scan with ``tl.cumsum`` was measured within
+    noise of the matmul, so the mask-matmul formulation is kept.
+    """
+    del T, H, is_varlen
+    if S >= 128:
+        return CHUNK_LOCAL_CUMSUM_VECTOR_CONFIGS[2]
+    if S >= 64:
+        return CHUNK_LOCAL_CUMSUM_VECTOR_CONFIGS[1]
     return CHUNK_LOCAL_CUMSUM_VECTOR_CONFIGS[0]
 
 
@@ -47,6 +62,7 @@ def chunk_local_cumsum_scalar_kernel(
     o,
     cu_seqlens,
     chunk_indices,
+    cumsum_scale,
     T,
     B: tl.constexpr,
     H: tl.constexpr,
@@ -54,6 +70,7 @@ def chunk_local_cumsum_scalar_kernel(
     REVERSE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     HEAD_FIRST: tl.constexpr,
+    output_scale,
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
@@ -86,6 +103,7 @@ def chunk_local_cumsum_scalar_kernel(
     if REVERSE:
         b_z = tl.sum(b_s, axis=0)
         b_o = -b_o + b_z[None] + b_s
+    b_o = b_o * cumsum_scale
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0,))
 
 
@@ -96,6 +114,7 @@ def chunk_local_cumsum_vector_kernel(
     o,
     cu_seqlens,
     chunk_indices,
+    cumsum_scale,
     T,
     B: tl.constexpr,
     H: tl.constexpr,
@@ -105,6 +124,7 @@ def chunk_local_cumsum_vector_kernel(
     REVERSE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     HEAD_FIRST: tl.constexpr,
+    output_scale,
 ):
     i_s, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
@@ -163,7 +183,7 @@ def chunk_local_cumsum_vector_kernel(
         )
     # [BT, BS]
     b_s = tl.load(p_s, boundary_check=(0, 1)).to(tl.float32)
-    b_o = tl.dot(m_s, b_s, allow_tf32=False)
+    b_o = tl.dot(m_s, b_s, allow_tf32=False) * cumsum_scale
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
 
@@ -175,6 +195,7 @@ def chunk_local_cumsum_scalar(
     chunk_indices: torch.Tensor | None = None,
     head_first: bool = False,
     output_dtype: torch.dtype | None = torch.float,
+    cumsum_scale: float = 1.0,
 ) -> torch.Tensor:
     if head_first:
         B, H, T = g.shape
@@ -195,12 +216,14 @@ def chunk_local_cumsum_scalar(
         g,
         cu_seqlens,
         chunk_indices,
+        cumsum_scale=cumsum_scale,
         T=T,
         B=B,
         H=H,
         BT=BT,
         HEAD_FIRST=head_first,
         REVERSE=reverse,
+        output_scale=output_scale,
         **config,
     )
     return g
@@ -214,6 +237,7 @@ def chunk_local_cumsum_vector(
     chunk_indices: torch.Tensor | None = None,
     head_first: bool = False,
     output_dtype: torch.dtype | None = torch.float,
+    cumsum_scale: float = 1.0,
 ) -> torch.Tensor:
     if head_first:
         B, H, T, S = g.shape
@@ -240,6 +264,7 @@ def chunk_local_cumsum_vector(
         g,
         cu_seqlens,
         chunk_indices,
+        cumsum_scale=cumsum_scale,
         T=T,
         B=B,
         H=H,
@@ -247,6 +272,7 @@ def chunk_local_cumsum_vector(
         BT=BT,
         HEAD_FIRST=head_first,
         REVERSE=reverse,
+        output_scale=output_scale,
         **config,
     )
     return g
@@ -260,8 +286,16 @@ def chunk_local_cumsum(
     chunk_indices: torch.Tensor | None = None,
     head_first: bool = False,
     output_dtype: torch.dtype | None = torch.float,
+    cumsum_scale: float = 1.0,
     **kwargs,
 ) -> torch.Tensor:
+    """``cumsum_scale`` scales the result inside the kernel.
+
+    KDA needs the log2-domain gate, i.e. the running sum times ``1/ln 2``.
+    Doing that as a torch multiply costs a full extra read-modify-write of an
+    FP32 ``[B,T,H,K]`` tensor -- 0.61 ms at ``T=16384, H=64, K=128`` on
+    BW1100 -- while folding it into the store is free.
+    """
     if cu_seqlens is not None:
         assert g.shape[0] == 1, (
             "Only batch size 1 is supported when cu_seqlens are provided"
@@ -275,6 +309,7 @@ def chunk_local_cumsum(
             chunk_indices,
             head_first,
             output_dtype,
+            cumsum_scale,
         )
     elif len(g.shape) == 4:
         return chunk_local_cumsum_vector(
@@ -285,6 +320,7 @@ def chunk_local_cumsum(
             chunk_indices,
             head_first,
             output_dtype,
+            cumsum_scale,
         )
     else:
         raise ValueError(
