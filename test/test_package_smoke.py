@@ -27,6 +27,7 @@ from boltops.gemm import (
     w8a8_block_int8_matmul,
     w8a8_triton_block_scaled_mm,
 )
+from boltops.ihc import ihc_head, ihc_post, ihc_pre
 from boltops.mhc import (
     hc_split_sinkhorn,
     mhc_fused_tilelang,
@@ -65,6 +66,9 @@ def test_operator_package_exports():
     assert callable(mhc_post_fwd)
     assert callable(mhc_pre_big_fuse)
     assert callable(pre_big_fuse_tilelang)
+    assert callable(ihc_pre)
+    assert callable(ihc_post)
+    assert callable(ihc_head)
 
 
 def test_root_package_does_not_reexport_operators():
