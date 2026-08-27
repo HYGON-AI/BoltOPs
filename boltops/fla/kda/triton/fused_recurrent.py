@@ -18,7 +18,7 @@ cdiv = triton.cdiv
 next_power_of_2 = triton.next_power_of_2
 
 
-# Offline-tuned on BW1100, BF16/FP32, D=128.  These candidate sets cover
+# Offline-tuned on BW1000_H, BF16/FP32, D=128.  These candidate sets cover
 # decode (tokens, heads)={(1,3),(4,3),(6,3/6/24/96),(8,12),(16,24)}.
 KDA_GATE_BETA_CONFIGS = (
     {"BT": 2, "num_warps": 2, "num_stages": 3},  # T=1 and T=6
@@ -28,8 +28,9 @@ KDA_GATE_BETA_CONFIGS = (
 
 FUSED_RECURRENT_KDA_CONFIGS = (
     {"BV": 8, "num_warps": 1, "num_stages": 2},  # B=1
-    {"BV": 16, "num_warps": 1, "num_stages": 1},  # B>=16 or H>=24
+    {"BV": 16, "num_warps": 1, "num_stages": 1},  # fused B=2..31 or H>=24
     {"BV": 8, "num_warps": 1, "num_stages": 1},  # B=4 or B=8
+    {"BV": 32, "num_warps": 4, "num_stages": 1},  # fused gate, B>=32
 )
 
 FUSED_RECURRENT_KDA_PACKED_DECODE_CONFIGS = (
@@ -58,6 +59,8 @@ def get_fused_recurrent_kda_config(
     if use_gate_in_kernel:
         if B <= 1:
             return FUSED_RECURRENT_KDA_CONFIGS[0]
+        if B >= 32 and H >= 24:
+            return FUSED_RECURRENT_KDA_CONFIGS[3]
         if H < 24:
             return FUSED_RECURRENT_KDA_CONFIGS[2]
         return FUSED_RECURRENT_KDA_CONFIGS[1]
@@ -236,6 +239,7 @@ def fused_recurrent_kda_fwd_kernel(
     APPLY_BETA_SIGMOID: tl.constexpr,
     HAS_DT_BIAS: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
+    FAST_L2_NORM: tl.constexpr,
     num_stages: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -291,8 +295,12 @@ def fused_recurrent_kda_fwd_kernel(
             tl.float32
         )
         if USE_QK_L2NORM_IN_KERNEL:
-            b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
-            b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
+            if FAST_L2_NORM:
+                b_q = b_q * tl.rsqrt(tl.sum(b_q * b_q) + 1e-6)
+                b_k = b_k * tl.rsqrt(tl.sum(b_k * b_k) + 1e-6)
+            else:
+                b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
+                b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
         b_q *= scale
 
         b_gate = tl.load(
@@ -451,6 +459,7 @@ def fused_recurrent_kda_fwd(
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         USE_GATE_IN_KERNEL=use_gate_in_kernel,
         APPLY_BETA_SIGMOID=use_beta_sigmoid_in_kernel,
+        FAST_L2_NORM=H >= 24,
         **config,
     )
     return out, initial_state
@@ -537,6 +546,7 @@ def fused_recurrent_kda_packed_decode_kernel(
     BV: tl.constexpr,
     SOFTPLUS_THRESHOLD: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
+    FAST_L2_NORM: tl.constexpr,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
@@ -572,8 +582,12 @@ def fused_recurrent_kda_packed_decode_kernel(
         other=0,
     ).to(tl.float32)
 
-    b_q /= tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
-    b_k /= tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
+    if FAST_L2_NORM:
+        b_q *= tl.rsqrt(tl.sum(b_q * b_q) + 1e-6)
+        b_k *= tl.rsqrt(tl.sum(b_k * b_k) + 1e-6)
+    else:
+        b_q /= tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
+        b_k /= tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
     b_q *= scale
 
     p_g = raw_g + i_n * stride_g_token + i_h * K + o_k
@@ -625,6 +639,7 @@ def fused_recurrent_kda_packed_decode_3d_kernel(
     V: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
+    FAST_L2_NORM: tl.constexpr,
 ):
     """Bounded-gate packed decode with direct (V tile, head, token) IDs."""
     i_v, i_h, i_n = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -648,8 +663,12 @@ def fused_recurrent_kda_packed_decode_3d_kernel(
         mask=mask_k,
         other=0.0,
     ).to(tl.float32)
-    b_q /= tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
-    b_k /= tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
+    if FAST_L2_NORM:
+        b_q *= tl.rsqrt(tl.sum(b_q * b_q) + 1e-6)
+        b_k *= tl.rsqrt(tl.sum(b_k * b_k) + 1e-6)
+    else:
+        b_q /= tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
+        b_k /= tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
     b_q *= scale
 
     b_g = tl.load(
@@ -752,6 +771,7 @@ def fused_recurrent_kda_packed_decode(
         lower_bound is not None
         and K == 128
         and V == 128
+        and H >= 24
         and initial_state.dtype == torch.float32
     )
     if use_direct_3d:
@@ -775,11 +795,19 @@ def fused_recurrent_kda_packed_decode(
             K=K,
             V=V,
             BK=BK,
+            FAST_L2_NORM=H >= 24,
             **config,
         )
     else:
         # Preserve the upstream softplus and generic-shape implementation.
-        config = {"BV": 16, "num_warps": 1, "num_stages": 3}
+        # Keep the upstream generic launch for small heads, softplus gates,
+        # non-square dimensions, and non-FP32 state.  The direct-3D sibling
+        # is deliberately restricted to the shape family where it wins.
+        config = {
+            "BV": min(next_power_of_2(V), 32),
+            "num_warps": 4,
+            "num_stages": 2,
+        }
         grid = (cdiv(V, config["BV"]), B * H)
         fused_recurrent_kda_packed_decode_kernel[grid](
             mixed_qkv=mixed_qkv,
@@ -802,6 +830,7 @@ def fused_recurrent_kda_packed_decode(
             BK=BK,
             SOFTPLUS_THRESHOLD=20.0,
             USE_LOWER_BOUND=lower_bound is not None,
+            FAST_L2_NORM=H >= 24,
             **config,
         )
     return out, initial_state

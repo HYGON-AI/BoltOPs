@@ -16,6 +16,10 @@ from .chunk import (
 )
 from .chunk_intra import chunk_kda_fwd_intra
 from .chunk_intra_token_parallel import chunk_kda_fwd_intra_token_parallel
+from .chunk_state import (
+    chunk_gated_delta_rule_fwd_h,
+    chunk_kda_fwd_state_output_fused,
+)
 from .fused_recurrent import (
     fused_recurrent_kda,
     fused_recurrent_kda_fwd,
@@ -37,6 +41,8 @@ __all__ = [
     "chunk_kda_with_fused_gate_fwd",
     "chunk_kda_fwd_intra",
     "chunk_kda_fwd_intra_token_parallel",
+    "chunk_gated_delta_rule_fwd_h",
+    "chunk_kda_fwd_state_output_fused",
     "fused_kda_gate",
     "fused_kda_gate_chunk_cumsum",
     "fused_recurrent_kda",

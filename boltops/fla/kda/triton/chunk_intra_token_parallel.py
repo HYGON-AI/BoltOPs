@@ -29,7 +29,7 @@ CHUNK_KDA_INTRA_TOKEN_PARALLEL_CONFIGS: tuple[dict[str, int], ...] = (
 def get_chunk_kda_intra_token_parallel_config(
     T: int, H: int, HV: int, is_varlen: bool
 ) -> dict[str, int]:
-    """Select a BW1100 config without runtime autotuning.
+    """Select a BW1000_H config without runtime autotuning.
 
     The three candidates were measured at the KDA Prefill model shape; the
     winning sibling was also validated on fixed and varlen tail shapes.

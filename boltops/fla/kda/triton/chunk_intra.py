@@ -8,6 +8,8 @@
 # Forward-only adaptation of flash-linear-attention 0.5.0.
 # ruff: noqa: E501
 
+import functools
+
 import torch
 
 import triton
@@ -23,12 +25,20 @@ from ...common.triton.utils import (
 )
 
 
-# BW1100 candidates retained for the KDA Prefill model shape.  Optimized
+# BW1000_H candidates retained for the KDA Prefill model shape.  Optimized
 # siblings also passed fixed/varlen multi-sequence tail smoke tests.
+# Build the inverted diagonal blocks inside the inter+solve kernel instead of
+# in a separate polynomial pass.  Both kernels are bandwidth bound at the
+# measured HBM peak, and they read the same q/k/g rows, so the second pass is
+# almost pure duplicated traffic.  Kept as a named switch so the two paths stay
+# A/B comparable.
+FUSE_INTRA_DIAGONAL = True
+
 CHUNK_KDA_INTER_SOLVE_CONFIGS: tuple[dict[str, int], ...] = (
     {"BK": 64, "num_warps": 1, "num_stages": 2},
     {"BK": 64, "num_warps": 1, "num_stages": 1},
     {"BK": 32, "num_warps": 1, "num_stages": 1},
+    {"BK": 32, "num_warps": 1, "num_stages": 2},
 )
 
 CHUNK_KDA_INTRA_SUB_CHUNK_CONFIGS: tuple[dict[str, int | bool], ...] = (
@@ -44,20 +54,100 @@ def get_chunk_kda_inter_solve_config(
     HV: int,
     is_varlen: bool,
     safe_gate: bool,
+    fuse_diag: bool = False,
 ) -> dict[str, int]:
-    """Select one of three offline configs for the inter/solve kernel."""
-    del H, HV, is_varlen, safe_gate
+    """Select one of four offline configs for the inter/solve kernel.
+
+    ``BK`` flips with ``fuse_diag``.  Without the fusion the kernel is
+    read-bound, so the wide tile wins by halving the number of passes over the
+    q/k/g rows.  Folding the diagonal in adds eight ``[BC, BC]`` accumulators,
+    a ``q0`` tile and the A2/A4/A8 chain, which pushes it over into being
+    register-bound: measured on BW1100 at ``T=16384, H=64`` the fused kernel
+    runs 2.46 ms at ``BK=32`` against 2.90 ms at ``BK=64`` (546 vs 463 GB/s),
+    even though the narrow tile reads the rows four times instead of twice.
+    """
+    del H, HV, safe_gate
+    if fuse_diag:
+        return CHUNK_KDA_INTER_SOLVE_CONFIGS[3]
     if T <= 128:
         return CHUNK_KDA_INTER_SOLVE_CONFIGS[1]
+    if is_varlen:
+        return CHUNK_KDA_INTER_SOLVE_CONFIGS[1]
+    # Fixed length used to take the BK=32 tile.  With K=128 that is four
+    # passes over the q/k/g rows where BK=64 needs two, and the unfused kernel
+    # is read-bound rather than register-bound, so the wider tile is a strict
+    # win: bit-identical output at 1.16-1.26x on BW1100 (T=512..16384,
+    # H=16/64).  Varlen already ran a BK=64 tile.
     return CHUNK_KDA_INTER_SOLVE_CONFIGS[0]
 
 
 def get_chunk_kda_intra_sub_chunk_config(
-    T: int, H: int, HV: int, is_varlen: bool
+    T: int, H: int, HV: int, K: int, is_varlen: bool
 ) -> dict[str, int | bool]:
     """Select one of three offline configs for the polynomial sibling."""
     del T, H, HV, is_varlen
-    return CHUNK_KDA_INTRA_SUB_CHUNK_CONFIGS[0]
+    config = dict(CHUNK_KDA_INTRA_SUB_CHUNK_CONFIGS[1])
+    config["BK"] = triton.next_power_of_2(K)
+    return config
+
+
+################################################################################
+# Diagonal 16x16 block: products and nilpotent-polynomial inverse
+################################################################################
+
+
+@triton.jit
+def _diag_block_products(
+    b_q,
+    b_k,
+    b_g,
+    g,
+    i_row,
+    o_k,
+    m_k,
+    m_row,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+):
+    """The two ``[BC, BC]`` products of one diagonal sub-chunk block.
+
+    ``i_row`` is the *midpoint* row of the sub-chunk, not its first row.  The
+    off-diagonal blocks can reference their own first row because every
+    exponent they form is then non-positive, but a diagonal block needs both
+    ``exp2(+gm)`` and ``exp2(-gm)``; referencing the midpoint halves the span
+    each direction has to cover, which is what keeps the discarded upper
+    triangle from overflowing FP32.  Measured KDA gate spans reach ~105 in
+    log2 over 16 tokens against a 2^128 ceiling, so the halving is load
+    bearing, not a micro-optimization.
+    """
+    b_gn = tl.load(g + i_row * HV * K + o_k, mask=m_k, other=0.0).to(tl.float32)
+    b_gm = (b_g - b_gn[None, :]).to(tl.float32)
+    b_gq = tl.where(m_row[:, None], exp2(b_gm), 0.0)
+    b_gk = tl.where(m_row[:, None], exp2(-b_gm), 0.0)
+    b_right = tl.trans(b_k * b_gk)
+    return (
+        tl.dot(b_q * b_gq, b_right, input_precision="ieee"),
+        tl.dot(b_k * b_gq, b_right, input_precision="ieee"),
+    )
+
+
+@triton.jit
+def _invert_strict_lower(A, BC: tl.constexpr):
+    """Invert ``I - A`` for strict-lower ``A`` via its nilpotent polynomial.
+
+    Every input and intermediate stays FP32: the published inverse is BF16 but
+    narrowing between products compounds the error along the A2/A4/A8 chain.
+    """
+    o_i = tl.arange(0, BC)
+    identity = (o_i[:, None] == o_i[None, :]).to(tl.float32)
+    A2 = tl.dot(A, A, input_precision="ieee", out_dtype=tl.float32)
+    X = tl.dot(
+        identity - A, identity + A2, input_precision="ieee", out_dtype=tl.float32
+    )
+    A4 = tl.dot(A2, A2, input_precision="ieee", out_dtype=tl.float32)
+    X = tl.dot(X, identity + A4, input_precision="ieee", out_dtype=tl.float32)
+    A8 = tl.dot(A4, A4, input_precision="ieee", out_dtype=tl.float32)
+    return tl.dot(X, identity + A8, input_precision="ieee", out_dtype=tl.float32)
 
 
 ################################################################################
@@ -91,11 +181,19 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
     BK: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_SAFE_GATE: tl.constexpr,
+    FUSE_DIAG: tl.constexpr,
     SOLVE_TRIL_DOT_PRECISION: tl.constexpr,
 ):
     """
     Fused kernel: compute inter-subchunk Akk + solve_tril in one pass.
-    Prerequisite: token_parallel has already computed diagonal Akk blocks in Akkd.
+    Prerequisite: the diagonal Akk blocks are already inverted in ``Akkd`` --
+    unless ``FUSE_DIAG``, in which case this kernel builds them itself and
+    ``Akkd`` is never touched.  The separate polynomial kernel reads the same
+    ``q``/``k``/``g`` rows this one already has in registers, and both kernels
+    run at the measured HBM peak (838 and 782 GB/s on BW1100), so the second
+    read pass is pure cost: folding it in removes ~1073 MB of reads plus the
+    ``Akkd`` round trip.  ``FUSE_DIAG`` requires ``USE_SAFE_GATE`` since it
+    produces the already-inverted form.
 
     This kernel:
     1. Computes off-diagonal Aqk blocks -> writes to global
@@ -138,6 +236,7 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
     Akkd += (bos * HV + i_hv) * BC
 
     o_i = tl.arange(0, BC)
+    m_tc0 = (i_tc0 + o_i) < T
     m_tc1 = (i_tc1 + o_i) < T
     m_tc2 = (i_tc2 + o_i) < T
     m_tc3 = (i_tc3 + o_i) < T
@@ -149,6 +248,16 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
     b_Akk20 = tl.zeros([BC, BC], dtype=tl.float32)
     b_Aqk21 = tl.zeros([BC, BC], dtype=tl.float32)
     b_Akk21 = tl.zeros([BC, BC], dtype=tl.float32)
+
+    if FUSE_DIAG:
+        b_Adq0 = tl.zeros([BC, BC], dtype=tl.float32)
+        b_Adk0 = tl.zeros([BC, BC], dtype=tl.float32)
+        b_Adq1 = tl.zeros([BC, BC], dtype=tl.float32)
+        b_Adk1 = tl.zeros([BC, BC], dtype=tl.float32)
+        b_Adq2 = tl.zeros([BC, BC], dtype=tl.float32)
+        b_Adk2 = tl.zeros([BC, BC], dtype=tl.float32)
+        b_Adq3 = tl.zeros([BC, BC], dtype=tl.float32)
+        b_Adk3 = tl.zeros([BC, BC], dtype=tl.float32)
 
     b_Aqk30 = tl.zeros([BC, BC], dtype=tl.float32)
     b_Akk30 = tl.zeros([BC, BC], dtype=tl.float32)
@@ -173,6 +282,19 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
         b_k0 = tl.load(p_k0, boundary_check=(0, 1)).to(tl.float32)
         b_g0 = tl.load(p_g0, boundary_check=(0, 1)).to(tl.float32)
 
+        if FUSE_DIAG:
+            p_q0 = tl.make_block_ptr(
+                q, (T, K), (H * K, 1), (i_tc0, i_k * BK), (BC, BK), (1, 0)
+            )
+            b_q0 = tl.load(p_q0, boundary_check=(0, 1)).to(tl.float32)
+            b_dq, b_dk = _diag_block_products(
+                b_q0, b_k0, b_g0, g,
+                i_tc0 + min(BC // 2, T - i_tc0 - 1),
+                o_k, m_k, m_tc0, HV, K,
+            )
+            b_Adq0 += b_dq
+            b_Adk0 += b_dk
+
         if i_tc1 < T:
             p_q1 = tl.make_block_ptr(
                 q, (T, K), (H * K, 1), (i_tc1, i_k * BK), (BC, BK), (1, 0)
@@ -188,6 +310,15 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
             b_k1 = tl.load(p_k1, boundary_check=(0, 1)).to(tl.float32)
             b_g1 = tl.load(p_g1, boundary_check=(0, 1)).to(tl.float32)
             # [BK]
+            if FUSE_DIAG:
+                b_dq, b_dk = _diag_block_products(
+                    b_q1, b_k1, b_g1, g,
+                    i_tc1 + min(BC // 2, T - i_tc1 - 1),
+                    o_k, m_k, m_tc1, HV, K,
+                )
+                b_Adq1 += b_dq
+                b_Adk1 += b_dk
+
             b_gn1 = tl.load(g + i_tc1 * HV * K + o_k, mask=m_k, other=0).to(tl.float32)
             # [BC, BK]
             b_gqn = tl.where(m_tc1[:, None], exp2(b_g1 - b_gn1[None, :]), 0)
@@ -212,6 +343,15 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
                 b_k2 = tl.load(p_k2, boundary_check=(0, 1)).to(tl.float32)
                 b_g2 = tl.load(p_g2, boundary_check=(0, 1)).to(tl.float32)
                 # [BK]
+                if FUSE_DIAG:
+                    b_dq, b_dk = _diag_block_products(
+                        b_q2, b_k2, b_g2, g,
+                        i_tc2 + min(BC // 2, T - i_tc2 - 1),
+                        o_k, m_k, m_tc2, HV, K,
+                    )
+                    b_Adq2 += b_dq
+                    b_Adk2 += b_dk
+
                 b_gn2 = tl.load(g + i_tc2 * HV * K + o_k, mask=m_k, other=0).to(
                     tl.float32
                 )
@@ -244,6 +384,15 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
                     b_k3 = tl.load(p_k3, boundary_check=(0, 1)).to(tl.float32)
                     b_g3 = tl.load(p_g3, boundary_check=(0, 1)).to(tl.float32)
                     # [BK]
+                    if FUSE_DIAG:
+                        b_dq, b_dk = _diag_block_products(
+                            b_q3, b_k3, b_g3, g,
+                            i_tc3 + min(BC // 2, T - i_tc3 - 1),
+                            o_k, m_k, m_tc3, HV, K,
+                        )
+                        b_Adq3 += b_dq
+                        b_Adk3 += b_dk
+
                     b_gn3 = tl.load(g + i_tc3 * HV * K + o_k, mask=m_k, other=0).to(
                         tl.float32
                     )
@@ -331,22 +480,92 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
         b_Akk31 = b_Akk31 * b_b3[:, None]
         b_Akk32 = b_Akk32 * b_b3[:, None]
 
-    p_Akk00 = tl.make_block_ptr(
-        Akkd, (T, BC), (HV * BC, 1), (i_tc0, 0), (BC, BC), (1, 0)
-    )
-    p_Akk11 = tl.make_block_ptr(
-        Akkd, (T, BC), (HV * BC, 1), (i_tc1, 0), (BC, BC), (1, 0)
-    )
-    p_Akk22 = tl.make_block_ptr(
-        Akkd, (T, BC), (HV * BC, 1), (i_tc2, 0), (BC, BC), (1, 0)
-    )
-    p_Akk33 = tl.make_block_ptr(
-        Akkd, (T, BC), (HV * BC, 1), (i_tc3, 0), (BC, BC), (1, 0)
-    )
-    b_Ai00 = tl.load(p_Akk00, boundary_check=(0, 1)).to(tl.float32)
-    b_Ai11 = tl.load(p_Akk11, boundary_check=(0, 1)).to(tl.float32)
-    b_Ai22 = tl.load(p_Akk22, boundary_check=(0, 1)).to(tl.float32)
-    b_Ai33 = tl.load(p_Akk33, boundary_check=(0, 1)).to(tl.float32)
+    if FUSE_DIAG:
+        m_le = o_i[:, None] >= o_i[None, :]
+        m_lt = o_i[:, None] > o_i[None, :]
+        # Rows past the sequence end never accumulated anything, so their
+        # blocks are zero and every store below is boundary checked; the
+        # inverse of a zero block is the identity rather than the zero the
+        # ``Akkd`` path would have loaded, which is equally discarded.
+        p_bd0 = tl.make_block_ptr(
+            beta + bos * HV + i_hv, (T,), (HV,), (i_tc0,), (BC,), (0,)
+        )
+        p_bd1 = tl.make_block_ptr(
+            beta + bos * HV + i_hv, (T,), (HV,), (i_tc1,), (BC,), (0,)
+        )
+        p_bd2 = tl.make_block_ptr(
+            beta + bos * HV + i_hv, (T,), (HV,), (i_tc2,), (BC,), (0,)
+        )
+        p_bd3 = tl.make_block_ptr(
+            beta + bos * HV + i_hv, (T,), (HV,), (i_tc3,), (BC,), (0,)
+        )
+        b_bd0 = tl.load(p_bd0, boundary_check=(0,)).to(tl.float32)
+        b_bd1 = tl.load(p_bd1, boundary_check=(0,)).to(tl.float32)
+        b_bd2 = tl.load(p_bd2, boundary_check=(0,)).to(tl.float32)
+        b_bd3 = tl.load(p_bd3, boundary_check=(0,)).to(tl.float32)
+
+        p_Aqk00 = tl.make_block_ptr(
+            Aqk, (T, BT), (HV * BT, 1), (i_tc0, 0), (BC, BC), (1, 0)
+        )
+        p_Aqk11 = tl.make_block_ptr(
+            Aqk, (T, BT), (HV * BT, 1), (i_tc1, BC), (BC, BC), (1, 0)
+        )
+        p_Aqk22 = tl.make_block_ptr(
+            Aqk, (T, BT), (HV * BT, 1), (i_tc2, 2 * BC), (BC, BC), (1, 0)
+        )
+        p_Aqk33 = tl.make_block_ptr(
+            Aqk, (T, BT), (HV * BT, 1), (i_tc3, 3 * BC), (BC, BC), (1, 0)
+        )
+        tl.store(
+            p_Aqk00,
+            (tl.where(m_le, b_Adq0, 0.0) * scale).to(Aqk.dtype.element_ty),
+            boundary_check=(0, 1),
+        )
+        tl.store(
+            p_Aqk11,
+            (tl.where(m_le, b_Adq1, 0.0) * scale).to(Aqk.dtype.element_ty),
+            boundary_check=(0, 1),
+        )
+        tl.store(
+            p_Aqk22,
+            (tl.where(m_le, b_Adq2, 0.0) * scale).to(Aqk.dtype.element_ty),
+            boundary_check=(0, 1),
+        )
+        tl.store(
+            p_Aqk33,
+            (tl.where(m_le, b_Adq3, 0.0) * scale).to(Aqk.dtype.element_ty),
+            boundary_check=(0, 1),
+        )
+
+        b_Ai00 = _invert_strict_lower(
+            tl.where(m_lt, b_Adk0 * b_bd0[:, None], 0.0), BC
+        )
+        b_Ai11 = _invert_strict_lower(
+            tl.where(m_lt, b_Adk1 * b_bd1[:, None], 0.0), BC
+        )
+        b_Ai22 = _invert_strict_lower(
+            tl.where(m_lt, b_Adk2 * b_bd2[:, None], 0.0), BC
+        )
+        b_Ai33 = _invert_strict_lower(
+            tl.where(m_lt, b_Adk3 * b_bd3[:, None], 0.0), BC
+        )
+    else:
+        p_Akk00 = tl.make_block_ptr(
+            Akkd, (T, BC), (HV * BC, 1), (i_tc0, 0), (BC, BC), (1, 0)
+        )
+        p_Akk11 = tl.make_block_ptr(
+            Akkd, (T, BC), (HV * BC, 1), (i_tc1, 0), (BC, BC), (1, 0)
+        )
+        p_Akk22 = tl.make_block_ptr(
+            Akkd, (T, BC), (HV * BC, 1), (i_tc2, 0), (BC, BC), (1, 0)
+        )
+        p_Akk33 = tl.make_block_ptr(
+            Akkd, (T, BC), (HV * BC, 1), (i_tc3, 0), (BC, BC), (1, 0)
+        )
+        b_Ai00 = tl.load(p_Akk00, boundary_check=(0, 1)).to(tl.float32)
+        b_Ai11 = tl.load(p_Akk11, boundary_check=(0, 1)).to(tl.float32)
+        b_Ai22 = tl.load(p_Akk22, boundary_check=(0, 1)).to(tl.float32)
+        b_Ai33 = tl.load(p_Akk33, boundary_check=(0, 1)).to(tl.float32)
 
     ################################################################################
     # forward substitution on diagonals
@@ -473,6 +692,34 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
     tl.store(p_Akk31, b_Ai31.to(Akk.dtype.element_ty), boundary_check=(0, 1))
     tl.store(p_Akk32, b_Ai32.to(Akk.dtype.element_ty), boundary_check=(0, 1))
     tl.store(p_Akk33, b_Ai33.to(Akk.dtype.element_ty), boundary_check=(0, 1))
+
+    # Zero the strictly-upper triangle so callers get a full BT x BT tile
+    # without a separate device-wide memset of ``Akk`` (which is B*T*HV*BT and
+    # costs a full extra pass over the largest intra buffer).  Block shapes
+    # must stay powers of two, so the six 16x16 blocks above the diagonal are
+    # covered by two 16x32 stores and two 16x16 stores.
+    b_zero_wide = tl.zeros([BC, 2 * BC], dtype=Akk.dtype.element_ty)
+    b_zero = tl.zeros([BC, BC], dtype=Akk.dtype.element_ty)
+    tl.store(
+        tl.make_block_ptr(Akk, (T, BT), (HV * BT, 1), (i_tc0, BC), (BC, 2 * BC), (1, 0)),
+        b_zero_wide,
+        boundary_check=(0, 1),
+    )
+    tl.store(
+        tl.make_block_ptr(Akk, (T, BT), (HV * BT, 1), (i_tc0, 3 * BC), (BC, BC), (1, 0)),
+        b_zero,
+        boundary_check=(0, 1),
+    )
+    tl.store(
+        tl.make_block_ptr(Akk, (T, BT), (HV * BT, 1), (i_tc1, 2 * BC), (BC, 2 * BC), (1, 0)),
+        b_zero_wide,
+        boundary_check=(0, 1),
+    )
+    tl.store(
+        tl.make_block_ptr(Akk, (T, BT), (HV * BT, 1), (i_tc2, 3 * BC), (BC, BC), (1, 0)),
+        b_zero,
+        boundary_check=(0, 1),
+    )
 
 
 @triton.heuristics(
@@ -616,6 +863,7 @@ def chunk_kda_fwd_kernel_intra_sub_chunk_poly_solve_optimized(
     BC: tl.constexpr,
     BK: tl.constexpr,
     EARLY_AQK_STORE: tl.constexpr,
+    NORMALIZE_QK: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
     """Invert a strict-lower 16x16 block with its nilpotent polynomial."""
@@ -651,6 +899,18 @@ def chunk_kda_fwd_kernel_intra_sub_chunk_poly_solve_optimized(
     p_beta = tl.make_block_ptr(beta, (T,), (HV,), (i_ti,), (BC,), (0,))
     b_q = tl.load(p_q, boundary_check=(0, 1))
     b_k = tl.load(p_k, boundary_check=(0, 1))
+    if NORMALIZE_QK:
+        b_qf = b_q.to(tl.float32)
+        b_kf = b_k.to(tl.float32)
+        b_q = (b_qf * tl.rsqrt(tl.sum(b_qf * b_qf, axis=1)[:, None] + 1e-6)).to(
+            tl.bfloat16
+        )
+        b_k = (b_kf * tl.rsqrt(tl.sum(b_kf * b_kf, axis=1)[:, None] + 1e-6)).to(
+            tl.bfloat16
+        )
+        # The following inter-solve and recompute kernels consume q/k again.
+        tl.store(p_q, b_q, boundary_check=(0, 1))
+        tl.store(p_k, b_k, boundary_check=(0, 1))
     b_g = tl.load(p_g, boundary_check=(0, 1))
     b_beta = tl.load(p_beta, boundary_check=(0,)).to(tl.float32)
     o_k = tl.arange(0, BK)
@@ -725,6 +985,14 @@ def chunk_kda_fwd_kernel_intra_sub_chunk_poly_solve_optimized(
     tl.store(p_Akk, X.to(Akk.dtype.element_ty), boundary_check=(0, 1))
 
 
+@functools.lru_cache(maxsize=1)
+def _solve_tril_dot_precision() -> str:
+    """Cached device query: it costs ~microseconds and cannot change."""
+    if current_platform.is_cuda() and current_platform.has_device_capability(80):
+        return "tf32"
+    return "ieee"
+
+
 def chunk_kda_fwd_intra(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -735,32 +1003,57 @@ def chunk_kda_fwd_intra(
     chunk_size: int = 64,
     chunk_indices: torch.LongTensor | None = None,
     safe_gate: bool = False,
+    normalize_qk: bool = False,
 ):
     B, T, H, K, HV = *k.shape, gk.shape[2]
     BT = chunk_size
     BC = 16
+    if BT != 4 * BC:
+        # ``chunk_kda_fwd_kernel_inter_solve_fused`` is hand-unrolled for
+        # exactly four BC=16 sub-chunks and is on the unconditional path.  Its
+        # sub-chunk origins are only guarded against T, not against the chunk
+        # boundary, so at BT=16 they address the *next three chunks* and four
+        # programs race to overwrite each other's tiles -- silently, since the
+        # out-of-range column offsets are clipped by ``boundary_check``.  Fail
+        # loudly instead of returning corrupt coefficients.
+        raise ValueError(
+            f"KDA intra requires chunk_size == {4 * BC}, got {BT}"
+        )
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     NC = triton.cdiv(BT, BC)
 
     Aqk = torch.empty(B, T, HV, BT, device=k.device, dtype=k.dtype)
-    # Akk must be zero-initialized - kernel only writes lower triangular
-    Akk = torch.zeros(B, T, HV, BT, device=k.device, dtype=k.dtype)
-    # Separate fp32 buffer for diagonal 16x16 blocks (for precision in solve_tril)
-    Akkd = torch.empty(B, T, HV, BC, device=k.device, dtype=torch.float32)
+    # ``chunk_kda_fwd_kernel_inter_solve_fused`` below is the only writer of
+    # ``Akk`` and it stores every block of the BT x BT tile, zeros included,
+    # so no pre-zeroing pass is needed.
+    Akk = torch.empty(B, T, HV, BT, device=k.device, dtype=k.dtype)
 
     # Compute diagonal blocks into Akkd in fp32.  For the model-shape class the
     # polynomial sibling writes the already-inverted 16x16 diagonal blocks, so
-    # the inter kernel can skip four serial forward-substitution loops.  The
-    # public token-parallel wrapper still retains its raw-Akkd contract.
+    # the inter kernel can skip four serial forward-substitution loops -- or,
+    # under ``FUSE_DIAG``, builds them itself from the q/k/g rows it is already
+    # reading and never materializes ``Akkd`` at all.  The public
+    # token-parallel wrapper still retains its raw-Akkd contract.
     use_poly_solve = K == 128 and BT == 64 and BC == 16
-    if use_poly_solve:
+    fuse_diag = use_poly_solve and FUSE_INTRA_DIAGONAL
+    # Separate fp32 buffer for diagonal 16x16 blocks (for precision in solve_tril)
+    Akkd = (
+        k.new_empty(1, dtype=torch.float32)
+        if fuse_diag
+        else torch.empty(B, T, HV, BC, device=k.device, dtype=torch.float32)
+    )
+
+    if fuse_diag:
+        pass
+    elif use_poly_solve:
         grid = (NT, NC, B * HV if cu_seqlens is None else HV)
         config = get_chunk_kda_intra_sub_chunk_config(
             T=T,
             H=H,
             HV=HV,
+            K=K,
             is_varlen=cu_seqlens is not None,
         )
         chunk_kda_fwd_kernel_intra_sub_chunk_poly_solve_optimized[grid](
@@ -779,6 +1072,7 @@ def chunk_kda_fwd_intra(
             K=K,
             BT=BT,
             BC=BC,
+            NORMALIZE_QK=normalize_qk,
             **config,
         )
     elif safe_gate:
@@ -820,11 +1114,7 @@ def chunk_kda_fwd_intra(
         )
 
     # Step 2: Fused inter + solve_tril (works for both fixed-len and varlen)
-    solve_tril_dot_precision = (
-        "tf32"
-        if current_platform.is_cuda() and current_platform.has_device_capability(80)
-        else "ieee"
-    )
+    solve_tril_dot_precision = _solve_tril_dot_precision()
     grid = (NT, B * HV)
     diagonal_is_presolved = safe_gate or use_poly_solve
     config = get_chunk_kda_inter_solve_config(
@@ -833,6 +1123,7 @@ def chunk_kda_fwd_intra(
         HV=HV,
         is_varlen=cu_seqlens is not None,
         safe_gate=diagonal_is_presolved,
+        fuse_diag=fuse_diag,
     )
     chunk_kda_fwd_kernel_inter_solve_fused[grid](
         q=q,
@@ -852,6 +1143,7 @@ def chunk_kda_fwd_intra(
         BT=BT,
         BC=BC,
         USE_SAFE_GATE=diagonal_is_presolved,
+        FUSE_DIAG=fuse_diag,
         SOLVE_TRIL_DOT_PRECISION=solve_tril_dot_precision,
         **config,
     )

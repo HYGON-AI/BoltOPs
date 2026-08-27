@@ -15,7 +15,11 @@ import triton
 import triton.language as tl
 
 from .chunk_intra import chunk_kda_fwd_intra
-from .chunk_state import chunk_gated_delta_rule_fwd_h
+from .chunk_state import (
+    chunk_gated_delta_rule_fwd_h,
+    chunk_kda_fwd_state_output_fused,
+)
+from .prefill_optimized import can_run_prefill_optimized, prefill_optimized_fwd
 from ...common.triton.cumsum import chunk_local_cumsum
 from ...common.triton.l2norm import l2norm_fwd
 from ...common.triton.math import exp2, log
@@ -25,7 +29,7 @@ RCP_LN2 = 1.4426950408889634
 cdiv = triton.cdiv
 next_power_of_2 = triton.next_power_of_2
 
-# Offline candidates retained on BW1100.  The new recompute/output champions
+# Offline candidates retained on BW1000_H.  The new recompute/output champions
 # were selected at B=1, T=8192, H=24, K=V=128; wrappers select one config
 # directly and never run online autotuning.
 RECOMPUTE_W_U_FWD_CONFIGS = (
@@ -38,10 +42,16 @@ CHUNK_GLA_FWD_O_CONFIGS = (
     {"BK": 128, "BV": 128, "num_warps": 8, "num_stages": 2},
     {"BK": 64, "BV": 64, "num_warps": 8, "num_stages": 2},
 )
+# Retuned on BW1100 (72 CU) against a torch reference over
+# BS x num_warps x num_stages.  The kernel is latency-bound rather than
+# bandwidth-bound (33% of HBM roofline at its best), and a single wavefront
+# per program wins at every measured shape: widening to 2-8 warps splits the
+# 64-row cumsum across wavefronts and costs 10-25%.  Larger BS then amortizes
+# the per-program prologue, so the tile grows with the launch.
 KDA_GATE_CHUNK_CUMSUM_VECTOR_CONFIGS = (
-    {"BS": 32, "num_warps": 2},
-    {"BS": 32, "num_warps": 4},
-    {"BS": 64, "num_warps": 2},
+    {"BS": 32, "num_warps": 1, "num_stages": 1},
+    {"BS": 64, "num_warps": 1, "num_stages": 2},
+    {"BS": 128, "num_warps": 1, "num_stages": 1},
 )
 KDA_GATE_FWD_CONFIGS = (
     {"BT": 32, "num_warps": 16, "num_stages": 2},
@@ -73,22 +83,114 @@ def get_chunk_gla_fwd_o_config(
 
 
 def get_kda_gate_chunk_cumsum_vector_config(
-    T: int, H: int, _S: int, is_varlen: bool
+    T: int, H: int, S: int, is_varlen: bool
 ) -> dict:
+    del is_varlen  # the index math differs, the tile economics do not
+    # Measured best-of-80 (BS x warps x stages) per shape, K=V=128:
+    #   T*H >= 512K  -> BS=128 (0.85 ms vs 0.99 ms at T=8192 H=64)
+    #   T*H >=  32K  -> BS= 64 (0.26 ms vs 0.30 ms at T=16384 H=16)
+    #   else         -> BS= 32 (0.088 ms vs 0.097 ms at T=1024 H=16)
     work = T * H
-    if work <= 16_384:
-        return KDA_GATE_CHUNK_CUMSUM_VECTOR_CONFIGS[1]
-    if is_varlen or T >= 4096:
-        return KDA_GATE_CHUNK_CUMSUM_VECTOR_CONFIGS[2]
-    return KDA_GATE_CHUNK_CUMSUM_VECTOR_CONFIGS[0]
+    if work >= 512 * 1024:
+        config = KDA_GATE_CHUNK_CUMSUM_VECTOR_CONFIGS[2]
+    elif work >= 32 * 1024:
+        config = KDA_GATE_CHUNK_CUMSUM_VECTOR_CONFIGS[1]
+    else:
+        config = KDA_GATE_CHUNK_CUMSUM_VECTOR_CONFIGS[0]
+    if config["BS"] > S:
+        # A tile wider than the gate dimension is all boundary-masked waste.
+        return {**config, "BS": max(16, next_power_of_2(S))}
+    return config
 
 
 def get_kda_gate_fwd_config(T: int, H: int, _D: int) -> dict:
     if H <= 3 or T <= 512:
         return KDA_GATE_FWD_CONFIGS[0]
-    if T <= 8192:
-        return KDA_GATE_FWD_CONFIGS[1]
-    return KDA_GATE_FWD_CONFIGS[2]
+    # ``T`` is flattened B*T at this call site.  Long prefill launches on
+    # BW1000_H favors the smaller BT32 tile; the BT64/BT128 choices remain for
+    # medium decode-like launches.
+    if T >= 8192:
+        return KDA_GATE_FWD_CONFIGS[0]
+    return KDA_GATE_FWD_CONFIGS[1]
+
+
+def _use_kda_state_output_fused(
+    q: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    g: torch.Tensor,
+    kg: torch.Tensor,
+    Aqk: torch.Tensor,
+    chunk_size: int,
+    cu_seqlens: torch.Tensor | None,
+    output_final_state: bool = False,
+) -> bool:
+    """Select the standalone same-head KDA state/output fusion fast path."""
+    del output_final_state  # both paths now produce a bit-identical final state
+    if chunk_size != 64 or q.ndim != 4 or u.ndim != 4:
+        return False
+    if q.shape[2] != u.shape[2] or kg.shape != q.shape:
+        return False
+    if w.shape != q.shape or g.shape != q.shape or Aqk.shape[:3] != q.shape[:3]:
+        return False
+    if q.dtype != torch.bfloat16 or w.dtype != q.dtype or u.dtype != q.dtype:
+        return False
+    if kg.dtype != q.dtype or Aqk.dtype != q.dtype:
+        return False
+    if g.dtype not in (torch.bfloat16, torch.float32):
+        return False
+    kdim, vdim = q.shape[-1], u.shape[-1]
+    # KDA's ordinary prefill shapes are K/V=128 and 256.  K/V=64 remains on
+    # the split path because its smaller state tile does not amortize fusion.
+    if kdim < 128 or vdim < 128:
+        return False
+    if cu_seqlens is not None and cu_seqlens.ndim != 1:
+        return False
+    n = q.shape[0] if cu_seqlens is None else cu_seqlens.numel() - 1
+    if kdim < 256 or vdim < 256:
+        # This used to require N*H >= 40.  That crossover belonged to the old
+        # fixed BV=64 tile, whose grid was 2*N*H workgroups and could not fill
+        # the device at small N*H.  The tile is now chosen from N*H (see
+        # get_fused_state_output_config), which keeps the grid near one CU
+        # wave at every head count, and fusion wins throughout.  Measured on
+        # BW1100 (72 CU) at T=16384 -- the worst case for the fused path,
+        # since it has the most serial chunks and no chunk-level parallelism
+        # to lose -- split/fused is 1.25x at N*H=2, 1.37x at 8, 1.48x at 16,
+        # 1.66x at 32 and 1.65x at 48.
+        return True
+    return q.shape[1] * q.shape[2] >= 96 * 8192
+
+
+def _use_chunk_gla_fwd_o_local_tri32(
+    q: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    h: torch.Tensor,
+    A: torch.Tensor,
+    chunk_size: int,
+    cu_seqlens: torch.Tensor | None,
+) -> bool:
+    """Whether the 32-row triangular local-causal path is shape-safe.
+
+    The prototype relies on a fixed 64-token chunk split into two 32-row
+    programs.  It is deliberately restricted to the matrix-heavy K/V class;
+    all other shapes keep using the upstream-compatible dense-mask kernel.
+    """
+    if chunk_size != 64 or q.ndim != 4 or v.ndim != 4 or g.ndim != 4:
+        return False
+    if h.ndim != 5 or A.ndim != 4:
+        return False
+    if q.shape[:3] != v.shape[:3] or q.shape[:3] != g.shape[:3]:
+        return False
+    if h.shape[0] != q.shape[0] or h.shape[2] != q.shape[2]:
+        return False
+    if h.shape[-2:] != (v.shape[-1], q.shape[-1]):
+        return False
+    if A.shape[:3] != q.shape[:3] or A.shape[-1] != chunk_size:
+        return False
+    if q.shape[-1] < 128 or v.shape[-1] < 128:
+        return False
+    return cu_seqlens is None or cu_seqlens.ndim == 1
 
 
 @triton.heuristics(
@@ -424,7 +526,9 @@ def recompute_w_u_fwd(
     gk: torch.Tensor | None = None,
     cu_seqlens: torch.Tensor | None = None,
     chunk_indices: torch.Tensor | None = None,
+    u_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, None, torch.Tensor | None]:
+    """Rebuild the WY factors ``w``/``u`` and the decayed key ``kg``."""
     B, T, H, K, V = *k.shape, v.shape[-1]
     BT = A.shape[-1]
     if chunk_indices is None and cu_seqlens is not None:
@@ -432,7 +536,12 @@ def recompute_w_u_fwd(
     NT = cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
     w = torch.empty_like(k)
-    u = torch.empty_like(v)
+    if u_out is not None:
+        if u_out.shape != v.shape or u_out.dtype != v.dtype or not u_out.is_contiguous():
+            raise ValueError("u_out must be contiguous and match v")
+        u = u_out
+    else:
+        u = torch.empty_like(v)
     kg = torch.empty_like(k) if gk is not None else None
     config = get_recompute_w_u_fwd_config(
         T, H, K, V, cu_seqlens is not None
@@ -691,6 +800,128 @@ def chunk_gla_fwd_kernel_o_local_first(
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
 
+@triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
+@triton.jit(do_not_specialize=["T"])
+def chunk_gla_fwd_kernel_o_local_tri32(
+    q,
+    v,
+    g,
+    h,
+    o,
+    A,
+    cu_seqlens,
+    chunk_indices,
+    scale,
+    T,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+):
+    """Local-causal output with a 64 -> 32x32 triangular decomposition.
+
+    The dense implementation performs one 64x64 dot after masking its upper
+    triangle.  This kernel computes the upper row half from the lower-left
+    diagonal block and the lower row half from the full lower-left plus the
+    lower-right diagonal block, so the zero upper-right block never reaches a
+    matrix multiply.  State contribution and addressing remain identical to
+    ``chunk_gla_fwd_kernel_o_local_first``.
+    """
+    i_v, i_ts, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    i_b, i_h = i_bh // H, i_bh % H
+    i_row = i_ts % 2
+    i_tg = i_ts // 2
+    if IS_VARLEN:
+        i_n, i_t = (
+            tl.load(chunk_indices + i_tg * 2).to(tl.int32),
+            tl.load(chunk_indices + i_tg * 2 + 1).to(tl.int32),
+        )
+        bos, eos = (
+            tl.load(cu_seqlens + i_n).to(tl.int32),
+            tl.load(cu_seqlens + i_n + 1).to(tl.int32),
+        )
+        T = eos - bos
+    else:
+        NT = tl.cdiv(T, BT)
+        i_t = i_tg % NT
+        i_tg = i_b * NT + i_t
+        bos, eos = i_b * T, i_b * T + T
+
+    row_base = i_row * 32
+    rows = tl.arange(0, 32)
+    b_o = tl.zeros([32, BV], dtype=tl.float32)
+
+    # Only the blocks at or below the diagonal are materialized as dots.
+    for i_col in range(2):
+        col_base = i_col * 32
+        p_v = tl.make_block_ptr(
+            v + (bos * H + i_h) * V,
+            (T, V),
+            (H * V, 1),
+            (i_t * BT + col_base, i_v * BV),
+            (32, BV),
+            (1, 0),
+        )
+        p_A = tl.make_block_ptr(
+            A + (bos * H + i_h) * BT,
+            (T, BT),
+            (H * BT, 1),
+            (i_t * BT + row_base, col_base),
+            (32, 32),
+            (1, 0),
+        )
+        b_v = tl.load(p_v, boundary_check=(0, 1))
+        b_A = tl.load(p_A, boundary_check=(0, 1))
+        causal = (row_base + rows)[:, None] >= (col_base + rows)[None, :]
+        b_A = tl.where(causal, b_A, 0.0).to(b_v.dtype)
+        b_o += tl.dot(b_A, b_v, allow_tf32=False)
+
+    for i_k in range(tl.cdiv(K, BK)):
+        p_q = tl.make_block_ptr(
+            q + (bos * H + i_h) * K,
+            (T, K),
+            (H * K, 1),
+            (i_t * BT + row_base, i_k * BK),
+            (32, BK),
+            (1, 0),
+        )
+        p_g = tl.make_block_ptr(
+            g + (bos * H + i_h) * K,
+            (T, K),
+            (H * K, 1),
+            (i_t * BT + row_base, i_k * BK),
+            (32, BK),
+            (1, 0),
+        )
+        p_h = tl.make_block_ptr(
+            h + (i_tg * H + i_h) * K * V,
+            (V, K),
+            (K, 1),
+            (i_v * BV, i_k * BK),
+            (BV, BK),
+            (1, 0),
+        )
+        b_q = tl.load(p_q, boundary_check=(0, 1))
+        b_g = tl.load(p_g, boundary_check=(0, 1))
+        b_h = tl.load(p_h, boundary_check=(0, 1))
+        b_q = (b_q * scale).to(b_q.dtype)
+        b_qg = (b_q * exp2(b_g)).to(b_q.dtype)
+        b_o += tl.dot(b_qg, tl.trans(b_h).to(b_qg.dtype))
+
+    p_o = tl.make_block_ptr(
+        o + (bos * H + i_h) * V,
+        (T, V),
+        (H * V, 1),
+        (i_t * BT + row_base, i_v * BV),
+        (32, BV),
+        (1, 0),
+    )
+    tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
+
+
 def chunk_gla_fwd_o_gk(
     q: torch.Tensor,
     v: torch.Tensor,
@@ -712,13 +943,19 @@ def chunk_gla_fwd_o_gk(
     config = get_chunk_gla_fwd_o_config(
         T, H, K, V, cu_seqlens is not None
     )
-    grid = (cdiv(V, config["BV"]), NT, B * H)
-
-    kernel = (
-        chunk_gla_fwd_kernel_o_local_first
-        if K >= 128 and V >= 128 and BT == 64
-        else chunk_gla_fwd_kernel_o
+    use_tri32 = _use_chunk_gla_fwd_o_local_tri32(
+        q, v, g, h, A, BT, cu_seqlens
     )
+    grid = (cdiv(V, config["BV"]), NT * (2 if use_tri32 else 1), B * H)
+
+    if use_tri32:
+        kernel = chunk_gla_fwd_kernel_o_local_tri32
+    else:
+        kernel = (
+            chunk_gla_fwd_kernel_o_local_first
+            if K >= 128 and V >= 128 and BT == 64
+            else chunk_gla_fwd_kernel_o
+        )
     kernel[grid](
         q=q,
         v=v,
@@ -935,16 +1172,38 @@ def _chunk_kda_fwd_with_cumulative_g(
     chunk_indices: torch.Tensor | None = None,
     chunk_size: int = FLA_CHUNK_SIZE,
     safe_gate: bool = False,
+    normalize_qk: bool = False,
 ):
     Aqk, A = chunk_kda_fwd_intra(
         q=q, k=k, gk=g, beta=beta, scale=scale,
         cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
         chunk_size=chunk_size, safe_gate=safe_gate,
+        normalize_qk=normalize_qk,
     )
     w, u, _, kg = recompute_w_u_fwd(
         k=k, v=v, beta=beta, A=A, gk=g,
         cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
+        u_out=v,
     )
+    if kg is not None and _use_kda_state_output_fused(
+        q, w, u, g, kg, Aqk, chunk_size, cu_seqlens,
+        output_final_state=output_final_state,
+    ):
+        return chunk_kda_fwd_state_output_fused(
+            q=q,
+            w=w,
+            u=u,
+            g=g,
+            kg=kg,
+            Aqk=Aqk,
+            o=v,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            chunk_size=chunk_size,
+        )
     h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
         k=kg, w=w, u=u, gk=g, initial_state=initial_state,
         output_final_state=output_final_state, cu_seqlens=cu_seqlens,
@@ -974,10 +1233,14 @@ def chunk_kda_fwd(
         prepare_chunk_indices(cu_seqlens, chunk_size)
         if cu_seqlens is not None else None
     )
+    # RCP_LN2 (natural-log -> log2) is folded into the cumsum store rather
+    # than applied as a torch multiply: the tensor is FP32 [B,T,H,K], so the
+    # separate pass cost a 1074 MB round trip (0.61 ms at T=16384, H=64).
+    # Keep in sync with `cumsum_scale` in the fused-gate cumsum kernel.
     g = chunk_local_cumsum(
         g, chunk_size=chunk_size, cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-    ) * RCP_LN2
+        chunk_indices=chunk_indices, cumsum_scale=RCP_LN2,
+    )
     return _chunk_kda_fwd_with_cumulative_g(
         q=q, k=k, v=v, g=g, beta=beta, scale=scale,
         initial_state=initial_state, output_final_state=output_final_state,
@@ -999,6 +1262,7 @@ def chunk_kda_with_fused_gate_fwd(
     output_final_state: bool,
     lower_bound: float | None = None,
     cu_seqlens: torch.Tensor | None = None,
+    normalize_qk: bool = False,
 ):
     chunk_size = FLA_CHUNK_SIZE
     chunk_indices = (
@@ -1015,6 +1279,7 @@ def chunk_kda_with_fused_gate_fwd(
         initial_state=initial_state, output_final_state=output_final_state,
         cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
         chunk_size=chunk_size, safe_gate=lower_bound is not None,
+        normalize_qk=normalize_qk,
     )
 
 
@@ -1064,15 +1329,55 @@ def chunk_kda_with_fused_gate(
     del kwargs
     if scale is None:
         scale = k.shape[-1] ** -0.5
+    if q.shape[1] <= 1024 and q.shape[2] <= 64 and can_run_prefill_optimized(
+        q,
+        k,
+        v,
+        raw_g,
+        raw_beta,
+        lower_bound=lower_bound,
+        cu_seqlens=cu_seqlens,
+    ):
+        return prefill_optimized_fwd(
+            q=q,
+            k=k,
+            v=v,
+            g=raw_g,
+            beta=raw_beta,
+            scale=scale,
+            initial_state=(
+                initial_state.contiguous() if initial_state is not None else None
+            ),
+            output_final_state=output_final_state,
+            A_log=A_log.contiguous(),
+            g_bias=g_bias.contiguous() if g_bias is not None else None,
+            lower_bound=lower_bound,
+            use_qk_l2norm=use_qk_l2norm_in_kernel,
+            apply_beta_sigmoid=True,
+        )
+    normalize_qk = False
     if use_qk_l2norm_in_kernel:
-        q = l2norm_fwd(q.contiguous())
-        k = l2norm_fwd(k.contiguous())
+        # The K=128, BT=64 intra polynomial kernel can normalize q/k while
+        # computing Aqk/Akk. Keep contiguous storage for its write-back; other
+        # shapes retain the standalone l2norm path below.
+        if q.shape[-1] == 128 and k.shape[-1] == 128 and q.shape[1] % 64 == 0:
+            # The intra kernel writes the normalized rows for recompute/output
+            # consumers, so do not alias the caller's q/k tensors.
+            # If q is already contiguous, clone directly (1 copy).  If not,
+            # .contiguous() creates a fresh private buffer — no second clone.
+            q = q.clone() if q.is_contiguous() else q.contiguous()
+            k = k.clone() if k.is_contiguous() else k.contiguous()
+            normalize_qk = True
+        else:
+            q = l2norm_fwd(q.contiguous())
+            k = l2norm_fwd(k.contiguous())
     return chunk_kda_with_fused_gate_fwd(
         q=q, k=k, v=v.contiguous(), raw_g=raw_g.contiguous(),
         raw_beta=raw_beta, A_log=A_log, g_bias=g_bias, scale=scale,
         initial_state=initial_state.contiguous() if initial_state is not None else None,
         output_final_state=output_final_state, lower_bound=lower_bound,
         cu_seqlens=cu_seqlens,
+        normalize_qk=normalize_qk,
     )
 
 
@@ -1092,6 +1397,7 @@ def kda_gate_fwd_kernel(
     BD: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
+    FAST_DIV: tl.constexpr,
 ):
     i_t, i_h = tl.program_id(0), tl.program_id(1)
     n_t = i_t * BT
@@ -1134,7 +1440,11 @@ def kda_gate_fwd_kernel(
     else:
         g_scaled = b_g * beta
         use_linear = g_scaled > threshold
-        sp = tl.where(use_linear, b_g, (1.0 / beta) * log(1.0 + tl.exp(g_scaled)))
+        if FAST_DIV:
+            inv_beta = tl.fdiv_fast(1.0, beta)
+        else:
+            inv_beta = 1.0 / beta
+        sp = tl.where(use_linear, b_g, inv_beta * log(1.0 + tl.exp(g_scaled)))
         b_y = -b_a * sp
 
     tl.store(y_ptr, b_y.to(y.dtype.element_ty), boundary_check=(0, 1))
@@ -1183,6 +1493,7 @@ def fused_kda_gate(
         BD=next_power_of_2(head_k_dim),
         HAS_BIAS=g_bias is not None,
         USE_LOWER_BOUND=lower_bound is not None,
+        FAST_DIV=hasattr(tl, "fdiv_fast"),
         **config,
     )
 
