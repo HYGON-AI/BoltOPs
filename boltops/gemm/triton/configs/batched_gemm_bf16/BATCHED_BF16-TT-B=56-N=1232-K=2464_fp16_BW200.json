@@ -1,0 +1,16 @@
+{
+    "234": {
+        "BLOCK_SIZE_M": 256,
+        "BLOCK_SIZE_N": 256,
+        "BLOCK_SIZE_K": 32,
+        "GROUP_SIZE_M": 4,
+        "num_warps": 8,
+        "num_stages": 3,
+        "use_block_pingpong": true,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "optimize_epilogue": true,
+        "amdgpu_enable_max_ilp_scheduling_strategy": false,
+        "BATCH_LAST_GRID": true
+    }
+}

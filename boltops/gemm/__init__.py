@@ -222,7 +222,7 @@ def batched_gemm_bf16(
     y: Optional[torch.Tensor] = None,
     config: Optional[dict] = None,
 ) -> torch.Tensor:
-    """aiter Triton batched BF16/FP16 GEMM: ``Y[i] = X[i] @ W[i]^T``."""
+    """Triton batched BF16/FP16 GEMM with inferred TN/TT weight storage."""
     from boltops.gemm.triton.batched_gemm_bf16 import batched_gemm_bf16 as impl
 
     return impl(

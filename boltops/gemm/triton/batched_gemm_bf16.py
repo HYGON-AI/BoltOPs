@@ -52,6 +52,8 @@ _LAUNCH_KEYS = frozenset(
         "waves_per_eu",
         "matrix_instr_nonkdim",
         "optimize_epilogue",
+        "amdgpu_enable_max_ilp_scheduling_strategy",
+        "BATCH_LAST_GRID",
     }
 )
 
@@ -100,7 +102,7 @@ def _filter_launch_config(config: dict) -> dict:
 
 @functools.lru_cache
 def get_batched_gemm_bf16_configs(
-    B: int, N: int, K: int, dtype_tag: str
+    B: int, N: int, K: int, dtype_tag: str, layout: str = "tn"
 ) -> Optional[dict[int, Any]]:
     """Load the most specialized HCU table available for ``(B, N, K)``.
 
@@ -110,12 +112,15 @@ def get_batched_gemm_bf16_configs(
     """
     device = _device_name_for_config()
     dtype_tags = (dtype_tag, "fp16") if dtype_tag == "bf16" else (dtype_tag,)
+    layout = "tn" if layout == "nt" else layout
+    assert layout in ("tn", "tt"), f"Unsupported {layout=}"
+    prefix = "BATCHED_BF16" if layout == "tn" else "BATCHED_BF16-TT"
     filenames = tuple(
         filename
         for pattern in (
-            "BATCHED_BF16-B={B}-N={N}-K={K}_{dtype}_{device}.json",
-            "BATCHED_BF16-N={N}-K={K}_{dtype}_{device}.json",
-            "BATCHED_BF16-DEFAULT_{dtype}_{device}.json",
+            "{prefix}-B={B}-N={N}-K={K}_{dtype}_{device}.json",
+            "{prefix}-N={N}-K={K}_{dtype}_{device}.json",
+            "{prefix}-DEFAULT_{dtype}_{device}.json",
         )
         for candidate_dtype in dtype_tags
         for filename in (
@@ -125,6 +130,7 @@ def get_batched_gemm_bf16_configs(
                 K=K,
                 dtype=candidate_dtype,
                 device=device,
+                prefix=prefix,
             ),
         )
     )
@@ -150,8 +156,9 @@ def _get_config(
     K: int,
     dtype: torch.dtype,
     B: int = 1,
+    layout: str = "tn",
 ) -> dict:
-    configs = get_batched_gemm_bf16_configs(B, N, K, _dtype_tag(dtype))
+    configs = get_batched_gemm_bf16_configs(B, N, K, _dtype_tag(dtype), layout)
     if configs:
         return _filter_launch_config(
             configs[min(configs.keys(), key=lambda x: abs(x - M))]
@@ -159,6 +166,24 @@ def _get_config(
     if M + N >= 4096:
         return dict(_FALLBACK_LARGE)
     return dict(_FALLBACK_SMALL)
+
+
+def _infer_weight_layout(x: torch.Tensor, w: torch.Tensor) -> str:
+    """Infer TN versus TT storage for logical ``w[B,N,K]`` from its strides."""
+    assert w.shape[2] == x.shape[2], (
+        f"Incompatible K dimensions: x.shape={tuple(x.shape)}, "
+        f"w.shape={tuple(w.shape)}"
+    )
+    k_contiguous = w.stride(2) == 1
+    n_contiguous = w.stride(1) == 1
+    if k_contiguous:
+        return "tn"
+    if n_contiguous:
+        return "tt"
+    raise AssertionError(
+        "w must have either contiguous K (TN) or contiguous N (TT): "
+        f"w.shape={tuple(w.shape)}, w.stride={w.stride()}"
+    )
 
 
 @triton.heuristics(
@@ -194,6 +219,7 @@ def _batched_gemm_bf16_kernel(
     GROUP_SIZE_M: tl.constexpr,
     EVEN_K: tl.constexpr,
     GRID_MN: tl.constexpr,
+    BATCH_LAST_GRID: tl.constexpr,
 ):
     """Batched matmul ``C[i] = A[i] @ B[i]`` (+ optional bias). Not for direct use."""
 
@@ -208,8 +234,16 @@ def _batched_gemm_bf16_kernel(
     tl.assume(stride_cn > 0)
     tl.assume(stride_biasb > 0)
 
-    batch_id = tl.program_id(axis=0)
-    pid = tl.program_id(axis=1)
+    # Tensile launches this workload with the tile coordinate in grid.x and
+    # batch in grid.z.  Keep the legacy ordering available for existing config
+    # files, while allowing tuned shapes to use the same hardware dispatch
+    # order as rocBLAS.
+    if BATCH_LAST_GRID:
+        pid = tl.program_id(axis=0)
+        batch_id = tl.program_id(axis=2)
+    else:
+        batch_id = tl.program_id(axis=0)
+        pid = tl.program_id(axis=1)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
@@ -295,22 +329,23 @@ def batched_gemm_bf16(
     y: Optional[torch.Tensor] = None,
     config: Optional[dict] = None,
 ) -> torch.Tensor:
-    """Batched GEMM ``Y[i] = X[i] @ W[i]^T`` (+ optional bias).
+    """Batched GEMM ``Y[i] = X[i] @ W[i]`` (+ optional bias).
 
     Args:
         x: ``[B, M, K]`` BF16/FP16
-        w: ``[B, N, K]`` BF16/FP16 (internally transposed to ``[B, K, N]``)
+        w: logical ``[B, N, K]`` tensor. K-contiguous storage selects TN;
+            N-contiguous storage selects TT.
         bias: optional ``[B, 1, N]``
         dtype: output dtype (``bfloat16`` or ``float16``)
         splitK: must be ``None`` (unsupported on this Triton path)
         y: optional preallocated ``[B, M, N]``
         config: optional launch dict; else HCU JSON or built-in fallback
     """
-    x = x.contiguous()
-    w = w.contiguous()
-
+    assert x.ndim == 3 and w.ndim == 3, "x and w must be rank-3 tensors"
     assert x.shape[0] == w.shape[0], "Incompatible Batch dimensions!!!"
-    assert x.shape[2] == w.shape[2], "Incompatible K dimensions!!!"
+    layout = _infer_weight_layout(x, w)
+    x = x.contiguous()
+
     assert dtype in [
         torch.bfloat16,
         torch.float16,
@@ -329,7 +364,7 @@ def batched_gemm_bf16(
         y = torch.empty((B, M, N), dtype=dtype, device=x.device)
 
     if config is None:
-        config = _get_config(M, N, K, dtype, B=B)
+        config = _get_config(M, N, K, dtype, B=B, layout=layout)
     else:
         config = _filter_launch_config(config)
 
@@ -337,10 +372,15 @@ def batched_gemm_bf16(
     bias_arg = bias if has_bias else y
     bias_stride = bias.stride(0) if has_bias else 1
 
-    grid = lambda META: (  # noqa: E731
-        B,
-        triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
-    )
+    def grid(META):
+        grid_mn = triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(
+            N, META["BLOCK_SIZE_N"]
+        )
+        if META.get("BATCH_LAST_GRID", False):
+            return (grid_mn, 1, B)
+        return (B, grid_mn)
+
+    config.setdefault("BATCH_LAST_GRID", False)
 
     _batched_gemm_bf16_kernel[grid](
         x,
