@@ -1,12 +1,17 @@
 import json
+import importlib
 from pathlib import Path
 
 import pytest
+from triton.runtime.errors import HSACOError
 
 from boltops.fused_moe.triton import moe_config_utils
 from boltops.tools.fused_moe_triton_tune import moe_log_parser
 from boltops.tools.fused_moe_triton_tune import autotune_patches
 from boltops.utility.triton_capability import TritonCapabilities
+
+
+fused_moe_impl = importlib.import_module("boltops.fused_moe.triton.fused_moe")
 
 
 def _caps(version: str, *options: str) -> TritonCapabilities:
@@ -66,6 +71,8 @@ def test_lower_capability_never_reads_higher_config(monkeypatch, tmp_path):
 def _autotune_log(
     use_block_pingpong: str | None,
     buffer_cache_swizzle: str | None = None,
+    enable_v_mmac_cluster: str | None = None,
+    bottom_a_use_mls_load: str | None = None,
 ) -> str:
     pingpong = (
         "" if use_block_pingpong is None else f", use_block_pingpong: {use_block_pingpong}"
@@ -75,13 +82,25 @@ def _autotune_log(
         if buffer_cache_swizzle is None
         else f", buffer_cache_swizzle: {buffer_cache_swizzle}"
     )
+    mmac_cluster = (
+        ""
+        if enable_v_mmac_cluster is None
+        else f", enable_v_mmac_cluster: {enable_v_mmac_cluster}"
+    )
+    bottom_a_mls = (
+        ""
+        if bottom_a_use_mls_load is None
+        else f", bottom_a_use_mls_load: {bottom_a_use_mls_load}"
+    )
     kernel = (
         "fused_moe_kernel:\n"
         "('key',) Configs:\n"
         "* 0  : BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 64, GROUP_SIZE_M: 1, "
         "COMBINE_SCALE_LOAD: False, USE_MLS_LOAD: False, waves_per_eu: 1, "
         "instruction_sched_variant: none, sched_latency: none, kpack: 1"
-        f"{pingpong}{cache_swizzle}, num_warps: 8, num_ctas: 1, num_stages: 2, maxnreg: None\n"
+        f"{pingpong}{cache_swizzle}{mmac_cluster}{bottom_a_mls}, "
+        "num_warps: 8, num_ctas: 1, "
+        "num_stages: 2, maxnreg: None\n"
         "\t : times(20 statics, rep:20 ms): 1.0 ms\n"
     )
     return "Config 1: {'BLOCK_SIZE_M': 64}\n" + kernel + kernel
@@ -96,6 +115,8 @@ def test_log_parser_preserves_supported_pingpong_option(tmp_path):
 
     assert json.loads(top.read_text())["1"]["use_block_pingpong"] is True
     assert json.loads(bottom.read_text())["1"]["use_block_pingpong"] is True
+    assert "waves_per_eu" not in json.loads(top.read_text())["1"]
+    assert "waves_per_eu" not in json.loads(bottom.read_text())["1"]
 
 
 def test_log_parser_omits_unsupported_pingpong_option(tmp_path):
@@ -118,6 +139,30 @@ def test_log_parser_preserves_supported_buffer_cache_swizzle_option(tmp_path):
 
     assert json.loads(top.read_text())["1"]["buffer_cache_swizzle"] is True
     assert json.loads(bottom.read_text())["1"]["buffer_cache_swizzle"] is True
+
+
+def test_log_parser_preserves_supported_mmac_cluster_option(tmp_path):
+    results = moe_log_parser.parse_log_file(_autotune_log("False", "False", "2"))
+    top = tmp_path / "top.json"
+    bottom = tmp_path / "bottom.json"
+
+    moe_log_parser.save_results_to_json(results, top, bottom)
+
+    assert json.loads(top.read_text())["1"]["enable_v_mmac_cluster"] == 2
+    assert json.loads(bottom.read_text())["1"]["enable_v_mmac_cluster"] == 2
+
+
+def test_log_parser_preserves_bottom_a_mls_only_for_gemm2(tmp_path):
+    results = moe_log_parser.parse_log_file(
+        _autotune_log("False", "False", "0", "True")
+    )
+    top = tmp_path / "top.json"
+    bottom = tmp_path / "bottom.json"
+
+    moe_log_parser.save_results_to_json(results, top, bottom)
+
+    assert "bottom_a_use_mls_load" not in json.loads(top.read_text())["1"]
+    assert json.loads(bottom.read_text())["1"]["bottom_a_use_mls_load"] is True
 
 
 def test_log_parser_uses_logged_batch_key_after_missing_result(tmp_path):
@@ -189,3 +234,312 @@ def test_gemm2_large_option_pruning_uses_input_token_count(monkeypatch):
     assert large
     assert not any(c.kwargs.get("buffer_cache_swizzle") for c in small)
     assert any(c.kwargs.get("buffer_cache_swizzle") for c in large)
+
+
+def test_int8_channel_autotune_includes_legal_kpack2_configs(monkeypatch):
+    class _KpackOnly:
+        @staticmethod
+        def supports(name):
+            return name == "kpack"
+
+    monkeypatch.setattr(autotune_patches, "triton_capabilities", _KpackOnly())
+    monkeypatch.setattr(autotune_patches, "test_type", "int8_channel")
+    monkeypatch.setattr(autotune_patches, "capMLS", False)
+    monkeypatch.setattr(autotune_patches, "compile_only", 0)
+    monkeypatch.setattr(autotune_patches, "mode_autotune_min_block_size_n1", 128)
+    monkeypatch.setattr(autotune_patches, "mode_autotune_max_block_size_n1", 128)
+    monkeypatch.setattr(
+        autotune_patches, "mode_autotune_min_block_size_k1", 32, raising=False
+    )
+    monkeypatch.setattr(
+        autotune_patches, "mode_autotune_max_block_size_k1", 128, raising=False
+    )
+
+    configs = autotune_patches.generate_config2_lists(
+        BLOCK_SIZE_M=128,
+        N=256,
+        K=7168,
+        MUL_ROUTED_WEIGHT=False,
+        per_channel_quant=True,
+        num_valid_tokens=8192 * 8,
+        top_k=8,
+        num_input_tokens=8192,
+    )
+
+    generated = {
+        (c.kwargs["BLOCK_SIZE_K"], c.kwargs.get("kpack")) for c in configs
+    }
+    assert not any("waves_per_eu" in c.kwargs for c in configs)
+    assert (32, 1) in generated
+    assert (32, 2) not in generated
+    assert (64, 1) in generated
+    assert (64, 2) in generated
+    assert (128, 2) in generated
+
+
+@pytest.mark.parametrize("tune_type", ["fp8_channel", "int8_channel"])
+def test_mls_autotune_excludes_ignored_kpack2_and_pingpong(monkeypatch, tune_type):
+    class _KpackAndPingpong:
+        @staticmethod
+        def supports(name):
+            return name in ("kpack", "use_block_pingpong")
+
+    monkeypatch.setattr(
+        autotune_patches, "triton_capabilities", _KpackAndPingpong()
+    )
+    monkeypatch.setattr(autotune_patches, "test_type", tune_type)
+    monkeypatch.setattr(autotune_patches, "capMLS", True)
+    monkeypatch.setattr(autotune_patches, "compile_only", 0)
+    monkeypatch.setattr(autotune_patches, "mode_autotune_min_block_size_n1", 128)
+    monkeypatch.setattr(autotune_patches, "mode_autotune_max_block_size_n1", 128)
+    monkeypatch.setattr(
+        autotune_patches, "mode_autotune_min_block_size_k1", 64, raising=False
+    )
+    monkeypatch.setattr(
+        autotune_patches, "mode_autotune_max_block_size_k1", 64, raising=False
+    )
+    configs = autotune_patches.generate_config2_lists(
+        BLOCK_SIZE_M=128,
+        N=256,
+        K=7168,
+        MUL_ROUTED_WEIGHT=False,
+        per_channel_quant=True,
+        num_valid_tokens=8192 * 8,
+        top_k=8,
+        num_input_tokens=8192,
+    )
+
+    assert any(c.kwargs["USE_MLS_LOAD"] for c in configs)
+    assert any(c.kwargs.get("use_block_pingpong", False) for c in configs)
+    assert not any(
+        (c.kwargs["USE_MLS_LOAD"] or c.kwargs.get("bottom_a_use_mls_load", False))
+        and (c.kwargs.get("kpack") == 2 or c.kwargs.get("use_block_pingpong", False))
+        for c in configs
+    )
+
+
+@pytest.mark.parametrize("tune_type", ["fp8_channel", "int8_channel"])
+def test_bottom_a_mls_does_not_prune_gemm1_load_options(monkeypatch, tune_type):
+    class _KpackAndPingpong:
+        @staticmethod
+        def supports(name):
+            return name in ("kpack", "use_block_pingpong")
+
+    monkeypatch.setattr(
+        autotune_patches, "triton_capabilities", _KpackAndPingpong()
+    )
+    monkeypatch.setattr(autotune_patches, "test_type", tune_type)
+    monkeypatch.setattr(autotune_patches, "capMLS", True)
+    monkeypatch.setattr(autotune_patches, "compile_only", 0)
+    monkeypatch.setattr(autotune_patches, "mode_autotune_min_block_size_n1", 128)
+    monkeypatch.setattr(autotune_patches, "mode_autotune_max_block_size_n1", 128)
+    monkeypatch.setattr(
+        autotune_patches, "mode_autotune_min_block_size_k1", 64, raising=False
+    )
+    monkeypatch.setattr(
+        autotune_patches, "mode_autotune_max_block_size_k1", 64, raising=False
+    )
+    monkeypatch.setattr(
+        autotune_patches, "mode_autotune_min_block_size_k2", 64, raising=False
+    )
+    monkeypatch.setattr(
+        autotune_patches, "mode_autotune_max_block_size_k2", 64, raising=False
+    )
+
+    gemm1_configs = autotune_patches.generate_config2_lists(
+        BLOCK_SIZE_M=128,
+        N=256,
+        K=7168,
+        MUL_ROUTED_WEIGHT=False,
+        per_channel_quant=True,
+        bottom_a_use_mls_load=True,
+        num_valid_tokens=8192 * 8,
+        top_k=8,
+        num_input_tokens=8192,
+    )
+    assert any(
+        not c.kwargs["USE_MLS_LOAD"] and c.kwargs.get("kpack") == 2
+        for c in gemm1_configs
+    )
+    assert any(
+        not c.kwargs["USE_MLS_LOAD"]
+        and c.kwargs.get("use_block_pingpong", False)
+        for c in gemm1_configs
+    )
+    assert not any(
+        c.kwargs["USE_MLS_LOAD"]
+        and (c.kwargs.get("kpack") == 2 or c.kwargs.get("use_block_pingpong", False))
+        for c in gemm1_configs
+    )
+
+    gemm2_configs = autotune_patches.generate_config2_lists(
+        BLOCK_SIZE_M=128,
+        N=7168,
+        K=256,
+        MUL_ROUTED_WEIGHT=True,
+        per_channel_quant=True,
+        bottom_a_use_mls_load=True,
+        num_valid_tokens=8192 * 8,
+        top_k=1,
+        num_input_tokens=8192,
+    )
+    assert gemm2_configs
+    assert not any(
+        c.kwargs.get("kpack") == 2
+        or c.kwargs.get("use_block_pingpong", False)
+        for c in gemm2_configs
+    )
+
+
+def test_bottom_a_mls_is_an_outer_fused_moe_choice(monkeypatch):
+    monkeypatch.setattr(autotune_patches, "capMLS", True)
+    monkeypatch.setattr(autotune_patches, "test_type", "fp8_channel")
+    monkeypatch.setattr(autotune_patches, "mode_best_config_tune", False)
+
+    configs = autotune_patches.generate_config_lists()
+
+    assert len(configs) == 10
+    assert {
+        (config["BLOCK_SIZE_M"], config["bottom_a_use_mls_load"])
+        for config in configs
+    } == {
+        (block_m, bottom_a_mls)
+        for block_m in (16, 32, 64, 128, 256)
+        for bottom_a_mls in (False, True)
+    }
+
+
+def test_gemm2_inner_search_keeps_outer_bottom_a_mls_choice(monkeypatch):
+    class _NoCompilerOptions:
+        @staticmethod
+        def supports(_name):
+            return False
+
+    monkeypatch.setattr(autotune_patches, "triton_capabilities", _NoCompilerOptions())
+    monkeypatch.setattr(autotune_patches, "test_type", "fp8_channel")
+    monkeypatch.setattr(autotune_patches, "capMLS", True)
+    monkeypatch.setattr(autotune_patches, "compile_only", 0)
+    monkeypatch.setattr(
+        autotune_patches, "mode_autotune_min_block_size_k2", 64, raising=False
+    )
+    monkeypatch.setattr(
+        autotune_patches, "mode_autotune_max_block_size_k2", 128, raising=False
+    )
+    monkeypatch.setattr(autotune_patches, "mode_autotune_min_block_size_n2", 16)
+    monkeypatch.setattr(autotune_patches, "mode_autotune_max_block_size_n2", 512)
+
+    configs = autotune_patches.generate_config2_lists(
+        BLOCK_SIZE_M=128,
+        N=256,
+        K=7168,
+        MUL_ROUTED_WEIGHT=True,
+        per_channel_quant=True,
+        bottom_a_use_mls_load=True,
+        num_valid_tokens=8192 * 8,
+        top_k=1,
+        num_input_tokens=8192,
+    )
+
+    assert configs
+    assert all(c.kwargs["bottom_a_use_mls_load"] is True for c in configs)
+
+
+def test_bottom_a_mls_config_is_explicit(monkeypatch):
+    monkeypatch.setattr(fused_moe_impl, "_bottom_moe_use_mls", lambda: True)
+    assert not fused_moe_impl._bottom_a_uses_mls({"USE_MLS_LOAD": True}, False)
+    assert not fused_moe_impl._bottom_a_uses_mls(
+        {"USE_MLS_LOAD": True, "bottom_a_use_mls_load": False}, False
+    )
+    assert fused_moe_impl._bottom_a_uses_mls(
+        {"USE_MLS_LOAD": False, "bottom_a_use_mls_load": True}, False
+    )
+    assert not fused_moe_impl._bottom_a_uses_mls(
+        {"USE_MLS_LOAD": True, "bottom_a_use_mls_load": True}, True
+    )
+
+    monkeypatch.setattr(fused_moe_impl, "_bottom_moe_use_mls", lambda: False)
+    assert not fused_moe_impl._bottom_a_uses_mls(
+        {"USE_MLS_LOAD": True, "bottom_a_use_mls_load": True}, False
+    )
+
+
+def test_checked_in_bottom_configs_have_explicit_a_side_mls():
+    config_root = (
+        Path(__file__).resolve().parents[2]
+        / "boltops"
+        / "fused_moe"
+        / "triton"
+        / "configs"
+    )
+    for version in ("triton_3_2", "triton_3_6"):
+        paths = sorted((config_root / version).glob("*is_bottom=True*.json"))
+        assert paths
+        for path in paths:
+            if path.stat().st_size == 0:
+                continue
+            entries = json.loads(path.read_text(encoding="utf-8"))
+            for m, config in entries.items():
+                assert isinstance(config.get("bottom_a_use_mls_load"), bool), (
+                    f"{path.name}: M={m} lacks explicit A-side MLS state"
+                )
+
+
+def test_autotune_skips_unloadable_hip_candidate():
+    def broken_bench(_kernel_call, _quantiles):
+        raise RuntimeError("Triton Error [HIP]: Code: 500, named symbol not found")
+
+    robust_bench = autotune_patches._skip_invalid_hip_loads(broken_bench)
+
+    with pytest.raises(HSACOError, match="named symbol not found"):
+        robust_bench(lambda: None, (0.5, 0.2, 0.8))
+
+
+def test_autotune_does_not_hide_other_runtime_errors():
+    def broken_bench(_kernel_call, _quantiles):
+        raise RuntimeError("device-side assert triggered")
+
+    robust_bench = autotune_patches._skip_invalid_hip_loads(broken_bench)
+
+    with pytest.raises(RuntimeError, match="device-side assert"):
+        robust_bench(lambda: None, (0.5, 0.2, 0.8))
+
+
+def test_small_fp8_channel_autotune_searches_cross_region_mmac_cluster(
+    monkeypatch,
+):
+    class _MmacClusterOnly:
+        @staticmethod
+        def supports(name):
+            return name == "enable_v_mmac_cluster"
+
+    monkeypatch.setattr(
+        autotune_patches, "triton_capabilities", _MmacClusterOnly()
+    )
+    monkeypatch.setattr(autotune_patches, "test_type", "fp8_channel")
+    monkeypatch.setattr(autotune_patches, "capMLS", False)
+    monkeypatch.setattr(autotune_patches, "compile_only", 0)
+    monkeypatch.setattr(autotune_patches, "mode_autotune_min_block_size_n1", 32)
+    monkeypatch.setattr(autotune_patches, "mode_autotune_max_block_size_n1", 32)
+    monkeypatch.setattr(
+        autotune_patches, "mode_autotune_min_block_size_k1", 64, raising=False
+    )
+    monkeypatch.setattr(
+        autotune_patches, "mode_autotune_max_block_size_k1", 64, raising=False
+    )
+
+    def cluster_values(num_input_tokens):
+        configs = autotune_patches.generate_config2_lists(
+            BLOCK_SIZE_M=16,
+            N=320,
+            K=7168,
+            MUL_ROUTED_WEIGHT=False,
+            per_channel_quant=True,
+            num_valid_tokens=num_input_tokens * 8,
+            top_k=8,
+            num_input_tokens=num_input_tokens,
+        )
+        assert configs
+        return {c.kwargs.get("enable_v_mmac_cluster") for c in configs}
+
+    assert cluster_values(4) == {0, 2}
+    assert cluster_values(2048) == {0}

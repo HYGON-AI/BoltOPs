@@ -9,7 +9,7 @@ import triton
 import triton.testing
 
 from boltops.tools.fused_moe_triton_tune.routing import fused_topk
-from boltops.fused_moe.triton.moe_compat import per_token_quant_hip
+from boltops.fused_moe.triton.moe_compat import per_token_quant_triton
 from boltops.utility import dtypes
 import boltops.fused_moe.triton as fused_moe_module
 
@@ -171,7 +171,7 @@ def torch_w8a8_per_column_moe_expert_mask(
     B, D = a.shape
     topk = topk_weight.shape[1]
     # Perform per-token quantization
-    a_q, a_s = per_token_quant_hip(a)
+    a_q, a_s = per_token_quant_triton(a)
     # Repeat tokens to match topk
     a_q = a_q.view(B, -1, D).repeat(1, topk, 1).reshape(-1, D)
     # Also repeat the scale
@@ -199,7 +199,7 @@ def torch_w8a8_per_column_moe_expert_mask(
                 is_gated=IS_GATED,
             )
             # Quantize activation output with per-token
-            act_out_q, act_out_s = per_token_quant_hip(act_out)
+            act_out_q, act_out_s = per_token_quant_triton(act_out)
 
             # Second MLP layer
             out[mask] = native_w8a8_per_token_matmul(

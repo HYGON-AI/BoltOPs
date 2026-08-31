@@ -312,8 +312,6 @@ def input_helper(
 
     torch.manual_seed(seed)
     factor_for_scale = 1e-2
-    fp8_info = torch.finfo(torch.float8_e4m3fn)
-    fp8_max, fp8_min = fp8_info.max, fp8_info.min
     e_sum = e + num_shared_experts
     inter_dim = 2 * n if IS_GATED else n
     final_topk = topk + num_shared_experts
@@ -321,11 +319,16 @@ def input_helper(
     a = torch.randn((m, k), dtype=dtype, device=device) / 10
     e_per_rank = e // ep_size
 
-    # 始终基于全局专家（非共享 + 共享）生成权重，后续再按 ep/local 筛选
-    w1_global_bf16 = (torch.rand((e_sum, inter_dim, k), dtype=torch.bfloat16, device=device) - 0.5) * 2 * fp8_max
-    w2_global_bf16 = (torch.rand((e_sum, k, n), dtype=torch.bfloat16, device=device) - 0.5) * 2 * fp8_max
-    w1_global = w1_global_bf16.clamp(min=fp8_min, max=fp8_max).to(torch.float8_e4m3fn)
-    w2_global = w2_global_bf16.clamp(min=fp8_min, max=fp8_max).to(torch.float8_e4m3fn)
+    # The tune only needs representative FP8 values.  Building them through a
+    # BF16 arithmetic expression creates several full-size temporaries and can
+    # OOM large-E cases.  INT8 is supported by random_ and bounds the temporary
+    # storage to one byte per element before converting to the final FP8 tensor.
+    w1_global = torch.empty(
+        (e_sum, inter_dim, k), dtype=torch.int8, device=device
+    ).random_(-127, 128).to(torch.float8_e4m3fn)
+    w2_global = torch.empty(
+        (e_sum, k, n), dtype=torch.int8, device=device
+    ).random_(-127, 128).to(torch.float8_e4m3fn)
 
     block_n, block_k = block_size
     n_tiles_w1 = (inter_dim + block_n - 1) // block_n

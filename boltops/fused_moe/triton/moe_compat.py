@@ -27,7 +27,7 @@ def pertoken_quant(
     return quantized.to(quant_dtype), scale.float()
 
 
-def per_token_quant_hip(
+def per_token_quant_triton(
     x: torch.Tensor,
     scale: Optional[torch.Tensor] = None,
     quant_dtype: torch.dtype = torch.int8,
@@ -97,7 +97,7 @@ moe_align_block_size = _align_with_local_triton
 __all__ = [
     "moe_align_block_size",
     "per_block_quant_wrapper",
-    "per_token_quant_hip",
+    "per_token_quant_triton",
     "pertoken_quant",
     "sgl_moe_align_block_size",
 ]

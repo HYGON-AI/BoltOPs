@@ -10,6 +10,9 @@ pytest.importorskip("triton")
 
 from boltops.fused_moe import fused_experts  # noqa: E402
 from boltops.fused_moe.triton.moe_compat import pertoken_quant  # noqa: E402
+from boltops.fused_moe.triton.moe_sorting_decode import (  # noqa: E402
+    moe_sorting_decode_fwd,
+)
 from boltops.fused_moe.triton.quant import (  # noqa: E402
     dynamic_per_token_quant_fp8_i8,
     static_per_tensor_quant_fp8_i8,
@@ -34,6 +37,42 @@ HIDDEN_SIZE = 384
 INTERMEDIATE_SIZE = 7168
 NUM_EXPERTS = 8
 TOPK = 4
+
+
+@GPU_REQUIRED
+@torch.inference_mode()
+@pytest.mark.parametrize(
+    "num_tokens,topk",
+    [(1, 1), (1, 2), (1, 4), (1, 8), (2, 8), (3, 8), (4, 8),
+     (8, 4), (16, 2), (32, 1)],
+)
+@pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
+def test_moe_sorting_decode_matches_flattened_encoding(
+    num_tokens, topk, id_dtype
+):
+    block_size_m = 16
+    # Include repeated experts: real routing does not guarantee unique expert
+    # IDs across tokens, while the decode fast path pads each route separately.
+    topk_ids = (torch.arange(
+        num_tokens * topk, device=DEVICE, dtype=id_dtype
+    ) % 7).view(num_tokens, topk)
+    sorted_ids, expert_ids, num_padded = (
+        moe_sorting_decode_fwd(
+            topk_ids, block_size_m
+        )
+    )
+    sorted_ids = sorted_ids.view(-1, block_size_m)
+    route_ids = torch.arange(
+        num_tokens * topk, device=DEVICE, dtype=torch.int32
+    )
+
+    torch.testing.assert_close(sorted_ids[:, 0], route_ids)
+    torch.testing.assert_close(
+        sorted_ids[:, 1:],
+        torch.full_like(sorted_ids[:, 1:], num_tokens * topk),
+    )
+    torch.testing.assert_close(expert_ids, topk_ids.view(-1).to(torch.int32))
+    assert num_padded.item() == num_tokens * topk * block_size_m
 
 
 def _routing(

@@ -12,7 +12,7 @@ import triton.language as tl
 
 import torch.nn.functional as F
 from boltops.tools.fused_moe_triton_tune.routing import fused_topk
-from boltops.fused_moe.triton.moe_compat import per_token_quant_hip, pertoken_quant
+from boltops.fused_moe.triton.moe_compat import per_token_quant_triton, pertoken_quant
 import boltops.fused_moe.triton as fused_moe_module
 
 from boltops.utility import dtypes
@@ -183,7 +183,7 @@ def torch_w8a8_per_channel_fp8_moe_expert_mask(
     topk = topk_weight.shape[1]
 
     # Match triton path: quantize activations per token before each GEMM.
-    a_q, a_s = per_token_quant_hip(a, quant_dtype=dtypes.fp8)
+    a_q, a_s = per_token_quant_triton(a, quant_dtype=dtypes.fp8)
     a_q = a_q.view(B, -1, D).repeat(1, topk, 1).reshape(-1, D).to(torch.float32)
     a_s = a_s.view(B, -1, 1).repeat(1, topk, 1).reshape(-1, 1)
     out = torch.zeros(B * topk, w2.shape[1], dtype=a.dtype, device=a.device)
@@ -204,7 +204,7 @@ def torch_w8a8_per_channel_fp8_moe_expert_mask(
                 activation_name=ACTIVATION_NAME,
                 is_gated=IS_GATED,
             )
-            act_q, act_s = per_token_quant_hip(act_out, quant_dtype=dtypes.fp8)
+            act_q, act_s = per_token_quant_triton(act_out, quant_dtype=dtypes.fp8)
             out[mask] = native_w8a8_per_token_matmul(
                 act_q, w2[i], act_s, w2_s[i], output_dtype=a.dtype
             )

@@ -20,10 +20,11 @@ from boltops.fused_moe.triton.moe_config_utils import get_optimal_moe_config_fun
 from boltops.fused_moe.triton.moe_compat import (
     moe_align_block_size as moe_align_block_size_aiter,
     per_block_quant_wrapper,
-    per_token_quant_hip,
+    per_token_quant_triton,
     sgl_moe_align_block_size as sgl_moe_align_block_size_aiter,
 )
 from boltops.utility.torch_guard import torch_compile_guard
+from boltops.fused_moe.triton.moe_sorting_decode import moe_sorting_decode_fwd
 from boltops.fused_moe.triton.moe_sorting_hipc import moe_sorting_fwd
 from boltops.utility import dtypes
 
@@ -719,6 +720,12 @@ def _bottom_moe_use_mls():
     return support_mls()
 
 
+def _bottom_a_uses_mls(config, use_int4_w4a8):
+    if not _bottom_moe_use_mls() or use_int4_w4a8 or config is None:
+        return False
+    return config.get("bottom_a_use_mls_load", False)
+
+
 @torch_compile_guard(gen_fake=fused_moe_fake)
 def fused_experts_impl(hidden_states: torch.Tensor,
                        w1: torch.Tensor,
@@ -827,11 +834,9 @@ def fused_experts_impl(hidden_states: torch.Tensor,
             f"top={config['BLOCK_SIZE_M']}, bottom={config2['BLOCK_SIZE_M']}"
         )
 
-    bottom_moe_a_use_mls = (
-        _bottom_moe_use_mls()
-        and not use_int4_w4a8
-        and config2 is not None
-        and config2.get("USE_MLS_LOAD", False))
+    bottom_moe_a_use_mls = _bottom_a_uses_mls(config2, use_int4_w4a8)
+    config2_kernel = config2.copy()
+    config2_kernel.pop("bottom_a_use_mls_load", None)
 
     max_padded_tokens = (
         min(M * topk, E + 1) * (max_block_m - 1) if bottom_moe_a_use_mls else 0
@@ -885,11 +890,11 @@ def fused_experts_impl(hidden_states: torch.Tensor,
                     "Top and bottom MoE configs must use the same BLOCK_SIZE_M: "
                     f"top={config['BLOCK_SIZE_M']}, bottom={config2['BLOCK_SIZE_M']}"
                 )
-            bottom_moe_a_use_mls = (
-                _bottom_moe_use_mls()
-                and config2 is not None
-                and config2.get("USE_MLS_LOAD", False)
-                and (block_shape is not None and (use_int8_w8a8 or use_fp8_w8a8)))
+            bottom_moe_a_use_mls = _bottom_a_uses_mls(
+                config2, use_int4_w4a8
+            )
+            config2_kernel = config2.copy()
+            config2_kernel.pop("bottom_a_use_mls_load", None)
             intermediate_cache3 = intermediate_cache3[:tokens_in_chunk]
 
         padded_tokens = (
@@ -917,7 +922,16 @@ def fused_experts_impl(hidden_states: torch.Tensor,
 
         ck_sorting = True
         sorted_weights = None
-        if not ck_sorting:
+        direct_routing = (
+            tokens_in_chunk * topk <= 32
+            and expert_map is None
+            and not bottom_moe_a_use_mls
+        )
+        if direct_routing:
+            sorted_token_ids, expert_ids, num_tokens_post_padded = (
+                moe_sorting_decode_fwd(curr_topk_ids, config["BLOCK_SIZE_M"]))
+            ck_sorting = False
+        elif not ck_sorting:
             sorted_token_ids, expert_ids, num_tokens_post_padded = (
                 moe_align_block_size(curr_topk_ids, config['BLOCK_SIZE_M'],
                                     global_num_experts, expert_map))
@@ -934,7 +948,7 @@ def fused_experts_impl(hidden_states: torch.Tensor,
         if (use_int8_w8a8 or use_fp8_w8a8 or use_int4_w4a8) and per_channel_quant:
             quant_dtype = torch.float8_e4m3fn if use_fp8_w8a8 else torch.int8
             if curr_hidden_states.dtype == torch.float16 or curr_hidden_states.dtype==torch.bfloat16:
-                input_q,input_scale = per_token_quant_hip(curr_hidden_states,quant_dtype=quant_dtype)
+                input_q,input_scale = per_token_quant_triton(curr_hidden_states,quant_dtype=quant_dtype)
             else:
                 input_q,input_scale = curr_hidden_states,a1_scale
             invoke_fused_moe_kernel(input_q,
@@ -967,7 +981,7 @@ def fused_experts_impl(hidden_states: torch.Tensor,
         elif block_shape is not None and (use_int8_w8a8 or use_int4_w4a8 or use_fp8_w8a8):
             quant_dtype = torch.float8_e4m3fn if use_fp8_w8a8 else torch.int8
             if curr_hidden_states.dtype == torch.float16 or curr_hidden_states.dtype==torch.bfloat16:
-                input_q, input_scale = per_block_quant_wrapper((1,block_shape[1]))(per_token_quant_hip)(curr_hidden_states,quant_dtype=quant_dtype)
+                input_q, input_scale = per_block_quant_wrapper((1,block_shape[1]))(per_token_quant_triton)(curr_hidden_states,quant_dtype=quant_dtype)
             else:
                 input_q, input_scale = curr_hidden_states,a1_scale
             invoke_fused_moe_kernel(input_q,
@@ -1044,7 +1058,9 @@ def fused_experts_impl(hidden_states: torch.Tensor,
 
         if (use_int8_w8a8 or use_fp8_w8a8 or use_int4_w4a8) and per_channel_quant:
             quant_dtype = torch.float8_e4m3fn if use_fp8_w8a8 else torch.int8
-            bridge_q, bridge_scale = per_token_quant_hip(intermediate_cache2, quant_dtype=quant_dtype)
+            bridge_q, bridge_scale = per_token_quant_triton(
+                intermediate_cache2, quant_dtype=quant_dtype
+            )
             invoke_fused_moe_kernel(bridge_q,
                                     w2,
                                     intermediate_cache3,
@@ -1072,10 +1088,10 @@ def fused_experts_impl(hidden_states: torch.Tensor,
                                     ck_topk=topk,
                                     scale_bias_with_routed_weight=(not apply_router_weight_on_input) and (not no_combine),
                                     B_bias=b2,
-                                    config=config2)
+                                    config=config2_kernel)
         elif block_shape is not None and (use_int8_w8a8 or use_int4_w4a8 or use_fp8_w8a8):
             quant_dtype = torch.float8_e4m3fn if use_fp8_w8a8 else torch.int8
-            bridge_q, bridge_scale = per_block_quant_wrapper((1,block_shape[1]))(per_token_quant_hip)(intermediate_cache2, quant_dtype=quant_dtype)
+            bridge_q, bridge_scale = per_block_quant_wrapper((1,block_shape[1]))(per_token_quant_triton)(intermediate_cache2, quant_dtype=quant_dtype)
             invoke_fused_moe_kernel(bridge_q,
                                     w2,
                                     intermediate_cache3,
@@ -1103,7 +1119,7 @@ def fused_experts_impl(hidden_states: torch.Tensor,
                                     ck_topk=topk,
                                     scale_bias_with_routed_weight=(not apply_router_weight_on_input) and (not no_combine),
                                     B_bias=b2,
-                                    config=config2)
+                                    config=config2_kernel)
         else:
             invoke_fused_moe_kernel(intermediate_cache2,
                         w2,
@@ -1132,7 +1148,7 @@ def fused_experts_impl(hidden_states: torch.Tensor,
                         ck_topk=topk,
                         scale_bias_with_routed_weight=(not apply_router_weight_on_input) and (not no_combine),
                         B_bias=b2,
-                        config=config2)
+                        config=config2_kernel)
         if no_combine:
             out_hidden_states[begin_chunk_idx:end_chunk_idx].copy_(intermediate_cache3)
         else:
