@@ -80,6 +80,36 @@ VALID_MOE_ACTIVATIONS = {
     "relu2",
 }
 
+_PYTHON_COMMAND_RE = r"(?:\S*/)?python(?:3(?:\.\d+)?)?"
+_MOE_PROCESS_PATTERNS = (
+    re.compile(r"\bpytest\b.*\btune_moe_.*\.py\b"),
+    re.compile(
+        r"\btune_moe_"
+        r"(bf16|fp8|fp8_channel|int4|int4int8|int4int8_channel|int8|int8_channel)"
+        r"\.py\b"
+    ),
+    # The CLI is normally launched as a module in development containers:
+    #   python3 -u -m boltops.tools.fused_moe_triton_tune.tune_moe_cli ...
+    # Anchor Python entry points at argv[0] so a parent `bash -lc ...` command
+    # containing the same text is not mistaken for the CLI process itself.
+    re.compile(
+        rf"^{_PYTHON_COMMAND_RE}(?:\s+-\S+)*\s+-m\s+"
+        r"boltops\.tools\.fused_moe_triton_tune\.tune_moe_cli(?:\s|$)"
+    ),
+    re.compile(
+        rf"^{_PYTHON_COMMAND_RE}(?:\s+-\S+)*\s+(?:\S*/)?tune_moe_cli\.py(?:\s|$)"
+    ),
+    re.compile(
+        rf"^(?:{_PYTHON_COMMAND_RE}(?:\s+-\S+)*\s+)?"
+        r"(?:\S*/)?boltops-fused-moe-tune-cli(?:\s|$)"
+    ),
+    re.compile(r"\brun_test_moe_training\.sh\b"),
+)
+
+
+def is_moe_process_command(command: str) -> bool:
+    return any(pattern.search(command) for pattern in _MOE_PROCESS_PATTERNS)
+
 
 def parse_int_list(raw: str, name: str) -> list[int]:
     tokens = [token.strip() for token in raw.replace(",", " ").split() if token.strip()]
@@ -303,17 +333,36 @@ def run_benchmark_step(
 
 def kill_moe_processes() -> tuple[list[int], list[int]]:
     # 仅匹配 fused_moe 相关训练/调度进程，避免误杀其他任务。
-    patterns = [
-        re.compile(r"\bpytest\b.*\btune_moe_.*\.py\b"),
-        re.compile(r"\btune_moe_(bf16|fp8|fp8_channel|int4|int4int8|int4int8_channel|int8|int8_channel)\.py\b"),
-        re.compile(r"\btune_moe_cli\.py\b"),
-        re.compile(r"\brun_test_moe_training\.sh\b"),
-    ]
-
-    try:
-        ps_output = subprocess.check_output(["ps", "-eo", "pid,args"], text=True)
-    except Exception as exc:
-        raise RuntimeError(f"读取进程列表失败: {exc}") from exc
+    ps_error: Exception | None = None
+    for attempt in range(3):
+        try:
+            ps_output = subprocess.check_output(["ps", "-eo", "pid,args"], text=True)
+            break
+        except Exception as exc:
+            ps_error = exc
+            if attempt < 2:
+                time.sleep(0.2 * (attempt + 1))
+    else:
+        # Some container runtimes intermittently make procps return 1 even
+        # though /proc remains readable.  Preserve the concurrency guard by
+        # enumerating cmdlines directly instead of aborting or skipping it.
+        proc_rows = ["PID COMMAND"]
+        try:
+            for proc_dir in Path("/proc").iterdir():
+                if not proc_dir.name.isdigit():
+                    continue
+                try:
+                    raw_cmd = (proc_dir / "cmdline").read_bytes()
+                except (FileNotFoundError, PermissionError, ProcessLookupError):
+                    continue
+                cmd = raw_cmd.replace(b"\0", b" ").decode(errors="replace").strip()
+                if cmd:
+                    proc_rows.append(f"{proc_dir.name} {cmd}")
+        except OSError as exc:
+            raise RuntimeError(
+                f"读取进程列表失败: ps={ps_error}; /proc={exc}"
+            ) from exc
+        ps_output = "\n".join(proc_rows)
 
     self_pid = os.getpid()
     targets: list[int] = []
@@ -331,7 +380,7 @@ def kill_moe_processes() -> tuple[list[int], list[int]]:
             continue
         if pid == self_pid:
             continue
-        if any(p.search(cmd) for p in patterns):
+        if is_moe_process_command(cmd):
             targets.append(pid)
 
     targets = sorted(set(targets))
@@ -956,6 +1005,7 @@ def main() -> int:
         ("fixed_group_size", FIXED_GROUP_SIZE_BY_TEST.get(args.test_type, "<n/a>")),
         ("batch_sizes", env.get("MOE_BATCH_SIZES")),
         ("splitk_size", env.get("SPLITK_SIZE")),
+        ("triton_fast_jit", env.get("TRITON_FAST_JIT", "<inherited-unset>")),
         ("skip_compile_only", args.skip_compile_only),
         ("num_groups_compile", args.num_groups_compile),
         ("device_start_id", env.get("AUTOTUNE_DEVICE_START_ID")),

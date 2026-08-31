@@ -7,10 +7,11 @@ from unittest.mock import patch
 import torch
 import triton
 import triton.language as tl
+from triton.runtime.errors import HSACOError
 
 import boltops.fused_moe.triton.moe_op as moe_op
 import boltops.utility.arch_info as arch_info
-from boltops.fused_moe.triton.moe_compat import per_token_quant_hip, per_block_quant_wrapper
+from boltops.fused_moe.triton.moe_compat import per_token_quant_triton, per_block_quant_wrapper
 from boltops.fused_moe.triton import (
     triton_moe_sum,
     moe_align_block_size,
@@ -41,6 +42,27 @@ mode_best_config_tune = False
 _ALLOWED_OUTPUT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _SCHEDULE_OPTION_NAMES = ("instruction_sched_variant", "schedule_hint")
 _LARGE_MOE_TOKEN_THRESHOLD = 2048
+_SKIPPABLE_HIP_LOAD_ERRORS = ("named symbol not found",)
+
+
+def _skip_invalid_hip_loads(do_bench):
+    """Make a broken HSACO one invalid candidate instead of aborting a tune."""
+
+    def robust_do_bench(kernel_call, quantiles):
+        try:
+            return do_bench(kernel_call, quantiles)
+        except RuntimeError as exc:
+            message = str(exc)
+            if not any(marker in message for marker in _SKIPPABLE_HIP_LOAD_ERRORS):
+                raise
+            print(f"[autotune] skip unloadable HIP candidate: {message}")
+            # Triton's Autotuner already maps HSACOError to an infinite timing.
+            # The HCU loader reports the same invalid-code-object condition as
+            # a generic RuntimeError, which would otherwise abort every later
+            # config (including smaller BLOCK_SIZE_M candidates).
+            raise HSACOError(message) from exc
+
+    return robust_do_bench
 
 
 def _compiler_option_values(name, values):
@@ -95,27 +117,34 @@ def _keep_autotune_config(
     use_mls_load = config["USE_MLS_LOAD"]
     bottom_a_use_mls_load = config["bottom_a_use_mls_load"]
     kpack = config.get("kpack")
+    # For Gemm1, bottom_a_use_mls_load only requests the c_sorted output
+    # layout that Gemm2 will consume; Gemm1 itself still uses ordinary A/B
+    # loads.  For Gemm2, the same flag selects an MLS matrix_load for A.
+    uses_matrix_load_mls = use_mls_load or (
+        bottom_a_use_mls_load and not is_gemm1
+    )
 
-    # Cache swizzle is useful only once the runtime token dimension is large
-    # enough to provide multiple concurrently active workgroups.  Keep the
-    # explicit guard here as a backstop even though the option list below also
-    # omits the True candidate for small M.
+    # Cache swizzle needs enough runtime workgroups to amortize its setup.
     if (
         config.get("buffer_cache_swizzle", False)
         and num_tokens < _LARGE_MOE_TOKEN_THRESHOLD
     ):
         return False
 
-    # BlockPingpong already forces buffer cache swizzle in the HCU backend.
-    # Tuning both flags as True would benchmark the same generated program as
-    # pingpong=True, buffer_cache_swizzle=False.
+    # BlockPingpong already forces buffer cache swizzle in the HCU backend;
+    # tuning both flags would benchmark the same generated program twice.
     if config.get("use_block_pingpong", False) and config.get(
         "buffer_cache_swizzle", False
     ):
         return False
 
-    if use_mls_load or bottom_a_use_mls_load:
+    if uses_matrix_load_mls:
         if num_stages >= 3 or n % block_n != 0 or k % block_k != 0:
+            return False
+        # The HCU MLS lowering fixes kWidth to the MLS base width and ignores
+        # kpack.  Keeping kpack=2 would compile the same program as kpack=1
+        # and could save a misleading configuration.
+        if kpack == 2:
             return False
 
     if per_channel_quant:
@@ -136,9 +165,6 @@ def _keep_autotune_config(
             return False
         if block_k != mode_autotune_max_block_size_k or not is_gemm1:
             return False
-        if bottom_a_use_mls_load:
-            return False
-
     # A one-stage pipeline ignores non-default scheduling hints, so those
     # candidates would only duplicate the default schedule.
     if num_stages == 1 and schedule not in (None, "none"):
@@ -184,16 +210,18 @@ def _keep_autotune_config(
         return False
 
     if config.get("use_block_pingpong", False):
-        # Blockwise FP8 adds scale-tensor loads to the reduction loop.  The
-        # current HCU PrepareBlockPingpong matcher cannot rematch that loop,
-        # even for its otherwise-supported BK=32/64 shapes.
+        # BlockPingpong deliberately does not match MLS matrix-load ops, so
+        # this combination cannot generate a pingpong loop.
+        if uses_matrix_load_mls:
+            return False
+        # Blockwise FP8 scale loads prevent the current HCU PP matcher from
+        # rematching the reduction loop.
         if test_type == "fp8":
             return False
         return (
             num_warps == 8
             and block_m >= 128
             and block_n >= 128
-            # PrepareBlockPingpong only supports these reduction tile sizes.
             and block_k in (32, 64)
             # GEMM2 with a short total reduction cannot amortize PP setup.
             # This is the runtime GEMM K, not BLOCK_SIZE_K.
@@ -328,18 +356,23 @@ def generate_config2_lists(
     combine_scale_load_options = [False, True] if test_type in ["int8", "int4int8", "fp8"] else [False]
 
     use_mls_load_options = [False, True] if test_type in ["fp8", "fp8_channel", "int8", "int8_channel", "bf16"] and capMLS == True else [False]
-    bottom_a_use_mls_load_options = [False, True] if bottom_a_use_mls_load else [False]
+    # Gemm2's A-side MLS layout is selected by the outer fused-MoE search.
+    # It changes Gemm1's output layout, padding and Gemm2's input addressing,
+    # so it cannot be independently autotuned inside Gemm2.
+    bottom_a_use_mls_load_options = [bool(bottom_a_use_mls_load)]
 
     # warp 1 no selected, so no need to tune
     num_warp_options = [2, 4, 8, 16]
-    waves_per_eu = 1 if triton_capabilities.supports("waves_per_eu") else None
-
     schedule_option_name = _schedule_option_name()
     schedule_options = ("none", "local-prefetch") if schedule_option_name else (None,)
     sched_latency = "none" if triton_capabilities.supports("sched_latency") else None
 
     kpack_options = _compiler_option_values(
-        "kpack", (1, 2) if test_type == "bf16" else (1,)
+        "kpack", (1, 2)
+        if test_type in (
+            "bf16", "fp8", "fp8_channel", "int8", "int8_channel"
+        )
+        else (1,),
     )
     use_block_pingpong_options = _compiler_option_values(
         "use_block_pingpong", (False, True)
@@ -349,6 +382,16 @@ def generate_config2_lists(
         (False, True)
         if num_tokens >= _LARGE_MOE_TOKEN_THRESHOLD
         else (False,),
+    )
+    # Mode 2 includes mode 1's barriers and cross-region A/B-load analysis.
+    # It matched or beat mode 1 in the profitable small FP8-channel cases, so
+    # keep only the default and mode 2 in this targeted search.
+    enable_v_mmac_cluster_options = _compiler_option_values(
+        "enable_v_mmac_cluster",
+        (0, 2)
+        if test_type == "fp8_channel"
+        and num_tokens < _LARGE_MOE_TOKEN_THRESHOLD
+        else (0,),
     )
     # PrepareBlockPingpong owns the actual three-stage/two-buffer pipeline.
     # Keep one canonical frontend stage value for PP to avoid tuning duplicate
@@ -368,13 +411,13 @@ def generate_config2_lists(
                 use_mls_load_options: {use_mls_load_options}, \
                 bottom_a_use_mls_load_options: {bottom_a_use_mls_load_options}, \
                 num_warp_options: {num_warp_options},   \
-                waves_per_eu: {waves_per_eu}, \
                 schedule_option_name: {schedule_option_name}, \
                 schedule_options: {schedule_options}, \
                 sched_latency: {sched_latency}, \
                 kpack_options: {kpack_options}, \
                 use_block_pingpong_options: {use_block_pingpong_options}, \
-                buffer_cache_swizzle_options: {buffer_cache_swizzle_options}")
+                buffer_cache_swizzle_options: {buffer_cache_swizzle_options}, \
+                enable_v_mmac_cluster_options: {enable_v_mmac_cluster_options}")
 
     configs = []
     config_count = 0
@@ -387,6 +430,7 @@ def generate_config2_lists(
             combine_scale_load_options,
             pipeline_options,
             buffer_cache_swizzle_options,
+            enable_v_mmac_cluster_options,
             num_warp_options,
             schedule_options,
             kpack_options,
@@ -400,6 +444,7 @@ def generate_config2_lists(
             combine_scale_load,
             (num_stage, use_block_pingpong),
             buffer_cache_swizzle,
+            enable_v_mmac_cluster,
             num_warp,
             schedule,
             kpack,
@@ -416,11 +461,11 @@ def generate_config2_lists(
             }
             _add_compiler_options(
                 config,
-                waves_per_eu=waves_per_eu,
                 sched_latency=sched_latency,
                 kpack=kpack,
                 use_block_pingpong=use_block_pingpong,
                 buffer_cache_swizzle=buffer_cache_swizzle,
+                enable_v_mmac_cluster=enable_v_mmac_cluster,
             )
             _add_schedule_option(config, schedule_option_name, schedule)
 
@@ -608,9 +653,12 @@ def dynamic_autotune(fn):
                         cfg_use_mls = bool(cfg_kwargs.get("USE_MLS_LOAD", False))
                         cfg_bottom_mls = bool(cfg_kwargs.get("bottom_a_use_mls_load", False))
                         cfg_block_k = int(cfg_kwargs.get("BLOCK_SIZE_K", 0))
-                        # Any MLS path (kernel MLS load or bottom-A MLS load) must
-                        # satisfy BLOCK_SIZE_K lower-bound constraints.
-                        if cfg_use_mls or cfg_bottom_mls:
+                        # bottom-A means an MLS input load only for Gemm2.
+                        # In Gemm1 it merely selects the c_sorted output layout.
+                        cfg_uses_matrix_load_mls = cfg_use_mls or (
+                            cfg_bottom_mls and bool(MUL_ROUTED_WEIGHT)
+                        )
+                        if cfg_uses_matrix_load_mls:
                             if test_type == "bf16" and cfg_block_k < 32:
                                 continue
                             if test_type in ["fp8", "fp8_channel", "int8", "int8_channel"] and cfg_block_k < 64:
@@ -630,6 +678,9 @@ def dynamic_autotune(fn):
                     prune_configs_by={"early_config_prune": _prune_configs_by_runtime_constraints},
                     rep=20
                 )(self.kernel_fn)
+                autotuned_fn.__dict__["do_bench"] = _skip_invalid_hip_loads(
+                    autotuned_fn.do_bench
+                )
 
                 # 使用grid调用autotuned内核
                 print(f"DEBUG - {compile_only=}, kwargs keys being passed to kernel:{list(launch_kwargs.keys())}")
@@ -657,13 +708,22 @@ def generate_config_lists():
     if mode_best_config_tune == False:
         block_size_m_options = [2**i for i in range(4, 9)]       # 16 to 256
 
+        bottom_a_mls_options = (
+            (False, True)
+            if capMLS
+            and test_type in ("bf16", "fp8", "fp8_channel", "int8", "int8_channel")
+            else (False,)
+        )
+
         for block_m in block_size_m_options:
-            config = {
-                "BLOCK_SIZE_M": block_m,
-            }
-            config_count += 1
-            print(f"Config {config_count}: {config}")
-            configs.append(config)
+            for bottom_a_use_mls_load in bottom_a_mls_options:
+                config = {
+                    "BLOCK_SIZE_M": block_m,
+                    "bottom_a_use_mls_load": bottom_a_use_mls_load,
+                }
+                config_count += 1
+                print(f"Config {config_count}: {config}")
+                configs.append(config)
     else:
         # bs=16 & gemm1 best config
         config = { "BLOCK_SIZE_M": 16 }
@@ -1119,15 +1179,13 @@ def fused_experts_impl(hidden_states: torch.Tensor,
     M = min(num_tokens, CHUNK_SIZE)
 
 
-    # Note: we always assume that use bottom_a_use_mls_load can gen good performance than not using it.
-    # TODO: need split it but need solved gemm1 & gemm2 bind problem.
-    bottom_a_use_mls_load = (capMLS and not use_int4_w4a8)
+    can_use_bottom_a_mls = capMLS and not use_int4_w4a8
 
 
     max_block_m = 256
     topk = top_k_num
     max_padded_tokens = (
-        min(M * topk, E + 1) * (max_block_m - 1) if bottom_a_use_mls_load else 0
+        min(M * topk, E + 1) * (max_block_m - 1) if can_use_bottom_a_mls else 0
     )
     max_total_tokens = M * topk + max_padded_tokens
 
@@ -1185,6 +1243,10 @@ def fused_experts_impl(hidden_states: torch.Tensor,
         for config in config_list:
             config_count += 1
             print(f"Config {config_count}: {config}")
+            bottom_a_use_mls_load = bool(
+                config.get("bottom_a_use_mls_load", False)
+            )
+            kernel_config = {"BLOCK_SIZE_M": config["BLOCK_SIZE_M"]}
 
             # when compile_only=True, num_tokens == 1 we also check and prune configs
             if not compile_only:
@@ -1253,7 +1315,7 @@ def fused_experts_impl(hidden_states: torch.Tensor,
             if (use_int8_w8a8 or use_fp8_w8a8 or use_int4_w4a8) and per_channel_quant:
                 quant_dtype = torch.float8_e4m3fn if use_fp8_w8a8 else torch.int8
                 if curr_hidden_states.dtype == torch.float16 or curr_hidden_states.dtype == torch.bfloat16:
-                    input_q, input_scale = per_token_quant_hip(curr_hidden_states, quant_dtype=quant_dtype)
+                    input_q, input_scale = per_token_quant_triton(curr_hidden_states, quant_dtype=quant_dtype)
                 else:
                     input_q, input_scale = curr_hidden_states, a1_scale
                 fused_moe(input_q,
@@ -1279,11 +1341,11 @@ def fused_experts_impl(hidden_states: torch.Tensor,
                             block_shape=block_shape,
                             c_sorted=bottom_a_use_mls_load,
                             B_bias=b1,
-                            config=config)
+                            config=kernel_config)
             elif block_shape is not None and (use_int8_w8a8 or use_int4_w4a8 or use_fp8_w8a8):
                 quant_dtype = torch.float8_e4m3fn if use_fp8_w8a8 else torch.int8
                 if curr_hidden_states.dtype == torch.float16 or curr_hidden_states.dtype == torch.bfloat16:
-                    input_q, input_scale = per_block_quant_wrapper((1, block_shape[1]))(per_token_quant_hip)(curr_hidden_states, quant_dtype=quant_dtype)
+                    input_q, input_scale = per_block_quant_wrapper((1, block_shape[1]))(per_token_quant_triton)(curr_hidden_states, quant_dtype=quant_dtype)
                 else:
                     input_q, input_scale = curr_hidden_states, a1_scale
                 fused_moe(input_q,
@@ -1309,7 +1371,7 @@ def fused_experts_impl(hidden_states: torch.Tensor,
                             block_shape=block_shape,
                             c_sorted=bottom_a_use_mls_load,
                             B_bias=b1,
-                            config=config)
+                            config=kernel_config)
             else:
                 fused_moe(curr_hidden_states,
                             w1,
@@ -1334,7 +1396,7 @@ def fused_experts_impl(hidden_states: torch.Tensor,
                             block_shape=block_shape,
                             c_sorted=bottom_a_use_mls_load,
                             B_bias=b1,
-                            config=config)
+                            config=kernel_config)
             _apply_activation(
                 activation=activation,
                 is_gated=is_gated,
@@ -1350,7 +1412,7 @@ def fused_experts_impl(hidden_states: torch.Tensor,
             if (use_int8_w8a8 or use_fp8_w8a8 or use_int4_w4a8) and per_channel_quant:
                 quant_dtype = torch.float8_e4m3fn if use_fp8_w8a8 else torch.int8
                 if intermediate_cache2.dtype == torch.float16 or intermediate_cache2.dtype == torch.bfloat16:
-                    bridge_q, bridge_scale = per_token_quant_hip(intermediate_cache2, quant_dtype=quant_dtype)
+                    bridge_q, bridge_scale = per_token_quant_triton(intermediate_cache2, quant_dtype=quant_dtype)
                 else:
                     bridge_q, bridge_scale = intermediate_cache2, a2_scale
                 fused_moe(bridge_q,
@@ -1377,11 +1439,11 @@ def fused_experts_impl(hidden_states: torch.Tensor,
                             bottom_a_use_mls_load=bottom_a_use_mls_load,
                             scale_bias_with_routed_weight=(not apply_router_weight_on_input) and (not no_combine),
                             B_bias=b2,
-                            config=config)
+                            config=kernel_config)
             elif block_shape is not None and (use_int8_w8a8 or use_int4_w4a8 or use_fp8_w8a8):
                 quant_dtype = torch.float8_e4m3fn if use_fp8_w8a8 else torch.int8
                 if intermediate_cache2.dtype == torch.float16 or intermediate_cache2.dtype == torch.bfloat16:
-                    bridge_q, bridge_scale = per_block_quant_wrapper((1, block_shape[1]))(per_token_quant_hip)(intermediate_cache2, quant_dtype=quant_dtype)
+                    bridge_q, bridge_scale = per_block_quant_wrapper((1, block_shape[1]))(per_token_quant_triton)(intermediate_cache2, quant_dtype=quant_dtype)
                 else:
                     bridge_q, bridge_scale = intermediate_cache2, a2_scale
                 fused_moe(bridge_q,
@@ -1408,7 +1470,7 @@ def fused_experts_impl(hidden_states: torch.Tensor,
                             bottom_a_use_mls_load=bottom_a_use_mls_load,
                             scale_bias_with_routed_weight=(not apply_router_weight_on_input) and (not no_combine),
                             B_bias=b2,
-                            config=config)
+                            config=kernel_config)
             else:
                 fused_moe(intermediate_cache2,
                             w2,
@@ -1434,7 +1496,7 @@ def fused_experts_impl(hidden_states: torch.Tensor,
                             bottom_a_use_mls_load=bottom_a_use_mls_load,
                             scale_bias_with_routed_weight=(not apply_router_weight_on_input) and (not no_combine),
                             B_bias=b2,
-                            config=config)
+                            config=kernel_config)
 
 
             if no_combine:

@@ -11,7 +11,7 @@ import torch.nn.functional as F
 import triton
 
 import boltops.fused_moe.triton as fused_moe_module
-from boltops.fused_moe.triton.moe_compat import per_token_quant_hip
+from boltops.fused_moe.triton.moe_compat import per_token_quant_triton
 from boltops.utility.perf_utils import perftest
 try:
     from boltops.tools.fused_moe_triton_tune.common import (
@@ -372,7 +372,7 @@ def torch_w4a8_channelwise_reference_fallback(
 ):
     num_tokens, hidden = a.shape
     topk = topk_weights.shape[1]
-    a_q, a_scale = per_token_quant_hip(a)
+    a_q, a_scale = per_token_quant_triton(a)
 
     a_q = a_q.view(num_tokens, 1, hidden).repeat(1, topk, 1).reshape(-1, hidden)
     a_scale = a_scale.view(num_tokens, 1, 1).repeat(1, topk, 1).reshape(-1, 1)
@@ -399,7 +399,7 @@ def torch_w4a8_channelwise_reference_fallback(
             is_gated=IS_GATED,
         ).to(a.dtype)
 
-        act_q, act_scale = per_token_quant_hip(act)
+        act_q, act_scale = per_token_quant_triton(act)
         out[mask] = torch.matmul(
             act_q.to(torch.float32),
             w2_ref[expert_id].to(torch.float32).T,

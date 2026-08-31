@@ -15,7 +15,7 @@ import sys
 
 import boltops.fused_moe.triton as fused_moe_module
 from boltops.tools.fused_moe_triton_tune.routing import fused_topk
-from boltops.fused_moe.triton.moe_compat import per_token_quant_hip, per_block_quant_wrapper
+from boltops.fused_moe.triton.moe_compat import per_token_quant_triton, per_block_quant_wrapper
 from boltops.utility.perf_utils import perftest
 try:
     from boltops.tools.fused_moe_triton_tune.common import (
@@ -348,7 +348,7 @@ def input_helper(
 
     e_map, quantized_weights = build_expert_map(e, ep_size, device, *quantized_weights)
     topk_weights, topk_ids = fused_topk(a, score_all, topk, renormalize=renormalize)
-    a_q, a_scale = per_block_quant_wrapper((1, group_size))(per_token_quant_hip)(a)
+    a_q, a_scale = per_block_quant_wrapper((1, group_size))(per_token_quant_triton)(a)
     w1_qweight, w2_qweight, w1_scales, w2_scales, w1_qzeros, w2_qzeros = quantized_weights
     return (
         a_q,

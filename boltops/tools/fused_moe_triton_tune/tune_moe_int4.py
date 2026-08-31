@@ -9,7 +9,7 @@ import pytest
 import torch
 import boltops.fused_moe.triton as fused_moe_module
 from boltops.tools.fused_moe_triton_tune.routing import fused_topk
-from boltops.fused_moe.triton.moe_compat import per_token_quant_hip, per_block_quant_wrapper
+from boltops.fused_moe.triton.moe_compat import per_token_quant_triton, per_block_quant_wrapper
 from boltops.utility.perf_utils import checkAllclose, perftest
 try:
     from boltops.tools.fused_moe_triton_tune.common import (

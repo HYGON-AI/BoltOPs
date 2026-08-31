@@ -1411,7 +1411,9 @@ def fused_moe_kernel(
     token_mask = offs_token < num_valid_tokens
 
     offs_bn = (pid_n * BLOCK_SIZE_N +
-               tl.arange(0, BLOCK_SIZE_N).to(tl.int32)) % N
+               tl.arange(0, BLOCK_SIZE_N).to(tl.int32))
+    if not block_n_diviable:
+        offs_bn = offs_bn % N
 
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     if USE_ADDR_OFFSET_INT64_A:
@@ -1481,7 +1483,14 @@ def fused_moe_kernel(
     # We accumulate into a `[BLOCK_SIZE_M, BLOCK_SIZE_N]` block
     # of fp32 values for higher accuracy.
     # `accumulator` will be converted back to fp16 after the loop.
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    # Channel-wise/tensor-wise INT8 applies scales only after the complete K
+    # reduction. Keep the MFMA accumulator in i32 through that reduction and
+    # convert once in the epilogue; using fp32 here forces an i32->fp32
+    # conversion and a separate floating-point add for every K block.
+    if use_int8_w8a8 and not (group_k > 0 and group_n > 0):
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.int32)
+    else:
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     mls_offs_k = 0
     if COMBINE_SCALE_LOAD:
         for k in range(0, tl.cdiv(K, BLOCK_SIZE_K), 2):
@@ -1881,7 +1890,9 @@ def fused_moe_splitk_kernel(
     token_mask = offs_token < num_valid_tokens
 
     offs_bn = (pid_n * BLOCK_SIZE_N +
-               tl.arange(0, BLOCK_SIZE_N).to(tl.int32)) % N
+               tl.arange(0, BLOCK_SIZE_N).to(tl.int32))
+    if not block_n_diviable:
+        offs_bn = offs_bn % N
 
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     if USE_ADDR_OFFSET_INT64_A:

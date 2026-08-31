@@ -31,13 +31,14 @@ _SAVED_CONFIG_KEYS = (
     "GROUP_SIZE_M",
     "COMBINE_SCALE_LOAD",
     "USE_MLS_LOAD",
-    "waves_per_eu",
+    "bottom_a_use_mls_load",
     "instruction_sched_variant",
     "schedule_hint",
     "sched_latency",
     "kpack",
     "use_block_pingpong",
     "buffer_cache_swizzle",
+    "enable_v_mmac_cluster",
     "num_warps",
     "num_stages",
 )
@@ -235,7 +236,14 @@ def save_results_to_json(results, k1_filename, k2_filename):
         config_dict = ast.literal_eval(params)
         block_size_m = config_dict["BLOCK_SIZE_M"]
 
-        entry_k1 = {"BLOCK_SIZE_M": block_size_m, **k1_params}
+        entry_k1 = {
+            "BLOCK_SIZE_M": block_size_m,
+            **{
+                key: value
+                for key, value in k1_params.items()
+                if key != "bottom_a_use_mls_load"
+            },
+        }
         entry_k2 = {"BLOCK_SIZE_M": block_size_m, **k2_params}
 
         json_data_k1[f"{special_key}"] = entry_k1
