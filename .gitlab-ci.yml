@@ -1,6 +1,7 @@
 stages:
   - prepare
   - build
+  - performance
   - publish
 
 variables:
@@ -166,6 +167,112 @@ build:test-wheel:
       junit: boltops_test.xml
     expire_in: 7 days
 
+performance:optest:
+  extends: .dcu-runner
+  stage: performance
+  timeout: 3h
+  tags:
+    - ${RUNNER_TAG}
+  needs:
+    - job: select:source
+      artifacts: true
+    - job: build:test-wheel
+      artifacts: true
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"'
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_REF_NAME == "main"'
+  parallel:
+    matrix:
+      - RUNNER_TAG: [nmz, bw]
+        TORCH_VERSION: ["2.10.0"]
+  before_script:
+    - !reference [.dcu-runner, before_script]
+    - !reference [.git-auth, before_script]
+    # Use the same fixed source/target pair selected for the correctness jobs.
+    - |
+      test "$(git rev-parse HEAD)" = "${BOLTOPS_SOURCE_SHA}"
+      if [ "${CI_PIPELINE_SOURCE}" = "merge_request_event" ]; then
+        git config user.email "ci@local"
+        git config user.name "CI"
+        git fetch origin "${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}"
+        git cat-file -e "${BOLTOPS_TARGET_SHA}^{commit}"
+        git merge "${BOLTOPS_TARGET_SHA}" --no-edit
+      else
+        test "${BOLTOPS_SOURCE_SHA}" = "${BOLTOPS_TARGET_SHA}"
+      fi
+      echo "Performance source commit: ${BOLTOPS_SOURCE_SHA}"
+      echo "Performance target commit: ${BOLTOPS_TARGET_SHA}"
+      echo "Performance integrated commit: $(git rev-parse HEAD)"
+    # Protect the selected Torch/NumPy environment while installing optest and
+    # its transitive dependencies.
+    - |
+      printf 'torch==%s\nnumpy==1.24.3\n' "${TORCH_VERSION}" > /tmp/boltops-constraints.txt
+      cat /tmp/boltops-constraints.txt
+    - python -m pip install --constraint /tmp/boltops-constraints.txt "torch==${TORCH_VERSION}" triton "numpy==1.24.3" pandas cismi ninja optest
+    - python -m pip install --constraint /tmp/boltops-constraints.txt "apache-tvm-ffi==0.1.11" -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
+    - python -m pip install --constraint /tmp/boltops-constraints.txt "tilelang==0.1.12" --extra-index-url https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
+    - python -m pip check
+    # Install the exact repaired wheel produced and validated by build:test-wheel.
+    - |
+      TORCH_TAG=$(echo "${TORCH_VERSION}" | tr -d '.')
+      BOLTOPS_WHEEL=$(find output -maxdepth 1 -type f -name "*torch${TORCH_TAG}*.whl" -print -quit)
+      test -n "${BOLTOPS_WHEEL}"
+      echo "Performance wheel: ${BOLTOPS_WHEEL}"
+      python -m pip install --force-reinstall --no-deps "${BOLTOPS_WHEEL}"
+    - |
+      python - <<'PY'
+      import os
+      import numpy
+      import torch
+
+      expected_torch = os.environ["TORCH_VERSION"]
+      actual_torch = torch.__version__.split("+", 1)[0]
+      assert actual_torch == expected_torch, (actual_torch, expected_torch)
+      assert numpy.__version__ == "1.24.3", numpy.__version__
+      print(f"Performance dependency set: torch={torch.__version__}, numpy={numpy.__version__}")
+      PY
+    # optest uses the current branch name in its output directory.
+    - git checkout -B "_ci_performance_${RUNNER_TAG}"
+  script:
+    - |
+      HIP_VISIBLE_DEVICES=$(CIsmi need 1 --timeout "${CISMI_TIMEOUT}")
+      test -n "${HIP_VISIBLE_DEVICES}"
+      export HIP_VISIBLE_DEVICES
+      echo "Allocated performance DCU: ${HIP_VISIBLE_DEVICES}"
+    - |
+      optest_rc=0
+      optest --op_name boltops --test_mode per --test_dir "${CI_PROJECT_DIR}" || optest_rc=$?
+
+      mkdir -p "optest_artifacts/${RUNNER_TAG}"
+      latest_results=$(find /op_test_output/boltops -mindepth 2 -maxdepth 2 \
+        -name .optest-results.json -printf '%T@ %h\n' 2>/dev/null | \
+        sort -n | tail -n1 | cut -d' ' -f2-)
+      if [ -n "${latest_results}" ]; then
+        version_dir=$(basename "${latest_results}")
+        cp -a "${latest_results}" "optest_artifacts/${RUNNER_TAG}/results"
+        if [ -d "/op_test_log/boltops/${version_dir}" ]; then
+          cp -a "/op_test_log/boltops/${version_dir}" \
+            "optest_artifacts/${RUNNER_TAG}/logs"
+        fi
+      fi
+
+      report_rc=0
+      python ci_script/optest_to_junit.py "${CI_PROJECT_DIR}" "${RUNNER_TAG}" || report_rc=$?
+      if [ "${report_rc}" -ne 0 ]; then
+        exit "${report_rc}"
+      fi
+      if [ "${optest_rc}" -ne 0 ]; then
+        exit "${optest_rc}"
+      fi
+  artifacts:
+    when: always
+    paths:
+      - scripts/${RUNNER_TAG}_boltops_output.xml
+      - optest_artifacts/${RUNNER_TAG}/
+    reports:
+      junit: scripts/${RUNNER_TAG}_boltops_output.xml
+    expire_in: 7 days
+
 publish:
   stage: publish
   tags:
@@ -173,6 +280,8 @@ publish:
   needs:
     - job: build:test-wheel
       artifacts: true
+    - job: performance:optest
+      artifacts: false
   rules:
     - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_REF_NAME == "main"'
   before_script:
