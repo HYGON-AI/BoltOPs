@@ -28,7 +28,22 @@ from boltops.gemm import (
     w8a8_block_int8_matmul,
     w8a8_triton_block_scaled_mm,
 )
+from boltops.mla import decode_attention_fwd, compute_num_kv_splits
 from boltops.ihc import ihc_head, ihc_post, ihc_pre
+from boltops.step4_dsa import (
+    triton_build_rope_cache,
+    triton_csa_compress_regions,
+    triton_csa_region_layout,
+    triton_decode_sparse_meta,
+    triton_indexer_logits,
+    triton_indexer_norm_rope,
+    triton_merge_split_states,
+    triton_prefill_sparse_meta,
+    triton_region_topk_ids,
+    triton_sparse_attention_decode,
+    triton_sparse_attention_prefill,
+    triton_topk_select_and_pack,
+)
 from boltops.mhc import (
     hc_split_sinkhorn,
     mhc_fused_tilelang,
@@ -71,6 +86,20 @@ def test_operator_package_exports():
     assert callable(ihc_pre)
     assert callable(ihc_post)
     assert callable(ihc_head)
+    assert callable(decode_attention_fwd)
+    assert callable(compute_num_kv_splits)
+    assert callable(triton_build_rope_cache)
+    assert callable(triton_indexer_norm_rope)
+    assert callable(triton_csa_region_layout)
+    assert callable(triton_csa_compress_regions)
+    assert callable(triton_indexer_logits)
+    assert callable(triton_region_topk_ids)
+    assert callable(triton_topk_select_and_pack)
+    assert callable(triton_prefill_sparse_meta)
+    assert callable(triton_decode_sparse_meta)
+    assert callable(triton_sparse_attention_prefill)
+    assert callable(triton_sparse_attention_decode)
+    assert callable(triton_merge_split_states)
 
 
 def test_root_package_does_not_reexport_operators():
@@ -84,6 +113,7 @@ def test_root_package_does_not_reexport_operators():
         "moe_activation",
         "matmul_persistent",
         "gemm_a16w16",
+        "triton_indexer_logits",
     ):
         assert not hasattr(boltops, name)
 

@@ -73,6 +73,11 @@ from boltops.mla import (
 from boltops.mqa_logits import (
     fp8_mqa_logits,
 )
+from boltops.step4_dsa import (
+    triton_indexer_logits,
+    triton_sparse_attention_prefill,
+    triton_sparse_attention_decode,
+)
 from boltops.fla.kda import (
     chunk_gla_fwd_o_gk,
     chunk_kda_fwd_intra,
@@ -127,6 +132,13 @@ decode_attention_fwd(
     block_table, seq_lens, attn_logits, splits, sm_scale,
     page_size=64, is_mla=True,
 )
+
+# Step-4 DSA（vendor 合同 step4-dsa-ops-v1）
+logits = triton_indexer_logits(index_q, weights, index_k)
+out, lse = triton_sparse_attention_decode(
+    q, k_cache, v_cache, packed, counts, kv_seqlens,
+    num_kv_groups=1,
+)
 ```
 
 需要做实现 A/B 时，直接 import 后端模块，不要绕公开 API：
@@ -148,6 +160,7 @@ from boltops.generic.triton.attn_res import attn_res as triton_impl
 | MoE 系列                                                                          | `fused_experts` `moe_activation`                                                                                                                                                                                                       | Triton ✅ TileLang ❌ | Triton @zhenxin TileLang @xxx                 | Triton（`fused_experts` 混合策略） | [文档](docs/ops/fused_moe/fused_moe.md) [性能实测](docs/ops/fused_moe/performance_report.md) [调参指南](boltops/tools/fused_moe_triton_tune/tune_moe_triton_user_guide.md) |
 | FA 系列（UnifiedAttention / PagedAttention / ExtendAttention / SagedAttention/...） |                                                                                                                                                                                                                                        |                     | Triton @huangshuang @sunchunhao @fangzx |                              |                                                                                                    |
 | MLA / FlashMLA / Sparse MLA                                                     | `decode_attention_fwd` `decode_attention_fwd_grouped` `decode_attention_fwd_normal` `compute_num_kv_splits`                                                                                                                              | Triton ✅ TileLang ❌ | Triton @xukang                                | Triton                       | [docs](docs/ops/mla.md)（目前 dense MLA decode；FlashMLA / Sparse 待迁）                              |
+| Step-4 DSA                                                                      | `triton_build_rope_cache` `triton_indexer_norm_rope` `triton_csa_*` `triton_indexer_logits` `triton_region_topk_ids` `triton_topk_select_and_pack` `triton_*_sparse_meta` `triton_sparse_attention_*` `triton_merge_split_states`           | Triton ✅ TileLang ❌ | Triton @duyubo                                | Triton                       | [docs](docs/ops/step4_dsa.md)                                                                      |
 | MQA Logits（paged）                                                               |                                                                                                                                                                                                                                        |                     | Triton @fangzx                            |                              |                                                                                                    |
 | MHC                                                                             | `mhc_pre_big_fuse` `pre_big_fuse_tilelang` `mhc_post_fwd` `hc_split_sinkhorn` `mhc_fused_tilelang`                                                                                                                                      | TileLang ✅          | TileLang @zhouweiwang                        | TileLang                     | [docs](docs/ops/mhc.md)                                                                            |
 | IHC                                                                             | `ihc_pre` `ihc_post` `ihc_head`                                                                                                                                                                                                         | TileLang ✅          | TileLang @zhouweiwang                        | TileLang                     | [docs](docs/ops/ihc.md)                                                                            |
@@ -169,6 +182,10 @@ boltops/
     __init__.py      # 公开接口 + 出厂后端分流（lazy-import）
     triton/          # Triton 实现（含 configs）
     tilelang/        # TileLang 实现（预留）
+  step4_dsa/         # Step-4 DSA 数值 Triton 算子（vendor 合同 v1）
+    geometry.py      # 模型几何常量（不是 kernel）
+    triton/          # kernel + launch helper
+    tilelang/        # 占位
   tools/             # 随包发布的开发工具（含 MoE autotune）
   utility/           # 公共运行时工具
 docs/ops/            # 算子文档
