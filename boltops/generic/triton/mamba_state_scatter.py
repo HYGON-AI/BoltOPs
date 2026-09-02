@@ -26,6 +26,19 @@ def _select_mamba_state_scatter_config(
     return _MAMBA_STATE_SCATTER_CONFIGS[0]
 
 
+def _use_request_major_mapping(elem_per_entry: int, requests: int) -> bool:
+    """Enable the measured request-major shape classes only."""
+    if elem_per_entry == 12288:  # TP2 Conv
+        return requests >= 32
+    if elem_per_entry == 6144:  # TP4 Conv
+        return requests >= 64
+    if elem_per_entry == 131072:  # TP4 SSM
+        return requests in (4, 8, 16, 32)
+    if elem_per_entry == 262144:  # TP2 SSM
+        return requests <= 32
+    return False
+
+
 @triton.jit
 def _fused_mamba_state_scatter_with_mask_kernel(
     src_ptr,
@@ -81,6 +94,54 @@ def _fused_mamba_state_scatter_with_mask_kernel(
     offsets = start + tl.arange(0, BLOCK_SIZE)
     mask = offsets < elem_per_entry
 
+    data = tl.load(src_ptr + src_offset + offsets, mask=mask)
+    tl.store(dst_ptr + dst_offset + offsets, data, mask=mask)
+
+
+@triton.jit
+def _fused_mamba_state_scatter_with_mask_request_major_kernel(
+    src_ptr,
+    dst_ptr,
+    dst_indices_raw_ptr,
+    step_indices_raw_ptr,
+    elem_per_entry: tl.constexpr,
+    src_layer_stride,
+    src_req_stride,
+    src_step_stride,
+    dst_layer_stride,
+    dst_req_stride,
+    src_req_size,
+    src_step_size,
+    dst_req_size,
+    BLOCK_SIZE: tl.constexpr,
+    num_blocks: tl.constexpr,
+):
+    """Request-major kernel for the selected shape classes."""
+    pid = tl.program_id(0)
+    pid_req = pid // num_blocks
+    pid_block = (pid - pid_req * num_blocks).to(tl.int64)
+    pid_layer = tl.program_id(1).to(tl.int64)
+
+    step_idx = tl.load(step_indices_raw_ptr + pid_req).to(tl.int64)
+    if step_idx < 0:
+        return
+    dst_idx = tl.load(dst_indices_raw_ptr + pid_req).to(tl.int64)
+    if not (
+        (dst_idx >= 0)
+        & (dst_idx < dst_req_size)
+        & (pid_req < src_req_size)
+        & (step_idx < src_step_size)
+    ):
+        return
+
+    src_offset = (
+        pid_layer * src_layer_stride
+        + pid_req * src_req_stride
+        + step_idx * src_step_stride
+    )
+    dst_offset = pid_layer * dst_layer_stride + dst_idx * dst_req_stride
+    offsets = pid_block * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < elem_per_entry
     data = tl.load(src_ptr + src_offset + offsets, mask=mask)
     tl.store(dst_ptr + dst_offset + offsets, data, mask=mask)
 
@@ -146,9 +207,35 @@ def fused_mamba_state_scatter_with_mask(
 
     config = _select_mamba_state_scatter_config(elem_per_entry, total_requests)
     block_size = config["BLOCK_SIZE"]
-    grid = (triton.cdiv(elem_per_entry, block_size), num_layers, total_requests)
+    if not _use_request_major_mapping(elem_per_entry, total_requests):
+        grid = (
+            triton.cdiv(elem_per_entry, block_size),
+            num_layers,
+            total_requests,
+        )
+        _fused_mamba_state_scatter_with_mask_kernel[grid](
+            src,
+            dst,
+            dst_indices_raw,
+            step_indices_raw,
+            elem_per_entry,
+            src_layer_stride,
+            src_req_stride,
+            src_step_stride,
+            dst_layer_stride,
+            dst_req_stride,
+            src_req_size,
+            src_step_size,
+            dst_req_size,
+            BLOCK_SIZE=block_size,
+            num_warps=config["num_warps"],
+            num_stages=config["num_stages"],
+        )
+        return
 
-    _fused_mamba_state_scatter_with_mask_kernel[grid](
+    num_blocks = triton.cdiv(elem_per_entry, block_size)
+    grid = (total_requests * num_blocks, num_layers)
+    _fused_mamba_state_scatter_with_mask_request_major_kernel[grid](
         src,
         dst,
         dst_indices_raw,
@@ -163,6 +250,7 @@ def fused_mamba_state_scatter_with_mask(
         src_step_size,
         dst_req_size,
         BLOCK_SIZE=block_size,
+        num_blocks=num_blocks,
         num_warps=config["num_warps"],
         num_stages=config["num_stages"],
     )

@@ -209,6 +209,68 @@ def test_real_network_shapes(trailing, dtype):
             )
 
 
+@GPU_REQUIRED
+@pytest.mark.parametrize(
+    ("trailing", "dtype", "request_count"),
+    [
+        pytest.param(
+            (4096, 3), torch.bfloat16, 31, id="tp2-conv-b31-block-major"
+        ),
+        pytest.param(
+            (4096, 3), torch.bfloat16, 32, id="tp2-conv-b32-request-major"
+        ),
+        pytest.param(
+            (2048, 3), torch.bfloat16, 63, id="tp4-conv-b63-block-major"
+        ),
+        pytest.param(
+            (2048, 3), torch.bfloat16, 64, id="tp4-conv-b64-request-major"
+        ),
+        pytest.param(
+            (16, 128, 128), torch.float32, 32, id="tp2-ssm-b32-request-major"
+        ),
+        pytest.param(
+            (16, 128, 128), torch.float32, 33, id="tp2-ssm-b33-block-major"
+        ),
+        pytest.param(
+            (8, 128, 128), torch.float32, 31, id="tp4-ssm-b31-block-major"
+        ),
+        pytest.param(
+            (8, 128, 128), torch.float32, 32, id="tp4-ssm-b32-request-major"
+        ),
+    ],
+)
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("partial", [False, True])
+def test_request_major_thresholds_match_reference(
+    trailing, dtype, request_count, index_dtype, partial
+):
+    """Check correctness on both sides of each request-major gate threshold."""
+    torch.manual_seed(42)
+    layers, draft_steps = 2, 3
+    src = torch.randn(
+        (layers, request_count, draft_steps, *trailing),
+        device=DEVICE,
+        dtype=dtype,
+    )
+    initial = torch.randn(
+        (layers, request_count + 3, *trailing),
+        device=DEVICE,
+        dtype=dtype,
+    )
+    dst_indices = torch.arange(request_count, device=DEVICE, dtype=index_dtype)
+    step_indices = (
+        torch.arange(request_count, device=DEVICE, dtype=torch.int32) % draft_steps
+    )
+    if partial:
+        step_indices[::5] = -1
+
+    expected = initial.clone()
+    actual = initial.clone()
+    _ref_scatter_with_mask(expected, src, dst_indices, step_indices)
+    fused_mamba_state_scatter_with_mask(actual, src, dst_indices, step_indices)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 # ---------------------------------------------------------------------------
 # Performance (captured / derived network sizes). Different from the small
 # functional cases above. Skipped unless ``pytest --bench``.
@@ -228,13 +290,22 @@ _BENCH_SHAPES = {
     "common-tp4-ssm": _BenchShape("common-tp4-ssm", (8, 128, 128), torch.float32),
     "common-tp4-conv": _BenchShape("common-tp4-conv", (2048, 3), torch.bfloat16),
 }
-_BENCH_REQUESTS = (1, 4, 16, 31, 32)
+_BENCH_REQUESTS = {
+    "observed-ssm": (1, 4, 16, 31, 32),
+    "observed-conv": (1, 4, 16, 31, 32, 64, 128),
+    "common-tp4-ssm": (1, 4, 16, 31, 32),
+    "common-tp4-conv": (1, 4, 16, 31, 32, 64, 128),
+}
+_BENCH_CASES = [
+    pytest.param(shape_name, request_count, id=f"{shape_name}-b{request_count}")
+    for shape_name, request_counts in _BENCH_REQUESTS.items()
+    for request_count in request_counts
+]
 
 
 @GPU_REQUIRED
 @pytest.mark.bench
-@pytest.mark.parametrize("shape_name", list(_BENCH_SHAPES))
-@pytest.mark.parametrize("request_count", _BENCH_REQUESTS)
+@pytest.mark.parametrize(("shape_name", "request_count"), _BENCH_CASES)
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("mask_mode", ["all-valid", "ten-percent-invalid"])
 def test_bench_mamba_state_scatter(
@@ -248,7 +319,10 @@ def test_bench_mamba_state_scatter(
 ):
     """Time ship API on observed / TP-derived network state shapes."""
     case = _BENCH_SHAPES[shape_name]
-    layers, cache, spec_size, draft_steps = 30, 287, 49, 4
+    layers, cache, draft_steps = 30, 287, 4
+    # Keep the captured capacity for legacy cases, but ensure every request in
+    # the added Conv B64/B128 cases has a corresponding source entry.
+    spec_size = max(49, request_count)
     src = torch.empty(
         (layers, spec_size, draft_steps, *case.trailing),
         device=DEVICE,
