@@ -125,6 +125,45 @@ def test_sparse_decode_matches_ref(empty_rows: bool):
 
 
 @C.GPU_REQUIRED
+def test_sparse_decode_split_overlap_window_matches_ref():
+    """packed_width not divisible by splits*BLOCK_R used to double-count slots."""
+    data = _make_decode_case(
+        num_reqs=4, topk=17, context_len=256, empty_rows=False, seed=63
+    )
+    from boltops.step4_dsa.triton.decode import sparse_attention_decode
+
+    out, lse = sparse_attention_decode(
+        data["query"],
+        data["key_cache"],
+        data["value_cache"],
+        data["packed"],
+        data["counts"],
+        data["kv_seqlens"],
+        num_kv_groups=data["groups"],
+        region_size=data["region_size"],
+        softmax_scale=data["scale"],
+        num_splits=8,
+        config={"BLOCK_R": 2, "BLOCK_H": 16, "BLOCK_D": 256, "num_warps": 2, "num_stages": 2},
+    )
+    ref_out, ref_lse = ref_sparse_attention_decode(
+        data["query"],
+        data["key_cache"],
+        data["value_cache"],
+        data["packed"],
+        data["counts"],
+        data["kv_seqlens"],
+        num_kv_groups=data["groups"],
+        region_size=data["region_size"],
+        softmax_scale=data["scale"],
+    )
+    torch.cuda.synchronize()
+    out_check = compare(out.float(), ref_out.float(), rtol=OUT_RTOL, atol=OUT_ATOL)
+    lse_check = compare(lse, ref_lse, rtol=LSE_RTOL, atol=LSE_ATOL)
+    assert out_check.passed, out_check.format()
+    assert lse_check.passed, lse_check.format()
+
+
+@C.GPU_REQUIRED
 def test_sparse_decode_split_then_merge_matches_single():
     data = _make_decode_case(
         num_reqs=4, topk=16, context_len=256, empty_rows=False, seed=62

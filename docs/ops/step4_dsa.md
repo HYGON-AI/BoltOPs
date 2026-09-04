@@ -20,7 +20,7 @@
 | `triton_prefill_sparse_meta` | 宽 `topk+1` 的 prefill metadata（当前 region 追加） |
 | `triton_decode_sparse_meta` | int64 decode metadata |
 | `triton_sparse_attention_prefill` | 稀疏 GQA prefill；tiled 路径 `block_q=128` |
-| `triton_sparse_attention_decode` | 稀疏 decode，可选 split-KV |
+| `triton_sparse_attention_decode` | 稀疏 decode；默认 `num_splits=1` 自动按 CU 做 KV-split |
 | `triton_merge_split_states` | split LSE 合并 |
 
 Vendor 常量（可直接作为 handoff `--ops-module boltops.step4_dsa`）：
@@ -50,7 +50,7 @@ from boltops.step4_dsa import (
 ```bash
 pytest -q test/step4_dsa/
 pytest -q test/step4_dsa/ --bench -s
-python3 scripts/benchmarks/triton/benchmark_step4_dsa.py --output-dir /tmp/dsa-bench
+python3 scripts/benchmarks/triton/step4_dsa/benchmark_step4_dsa.py --output-dir /tmp/dsa-bench
 ```
 
 正确性对 `test/step4_dsa/ref.py`（handoff `torch_ref`）的 FP32 oracle，禁止 Triton-vs-Triton 作为门禁。`--bench` 跑 `tp8-production` 全表，包含 metadata 宽度 513、`num_splits=16` 的 decode。
@@ -77,7 +77,7 @@ python3 scripts/benchmarks/triton/step4_dsa/benchmark_sparse_attn_decode.py \
 
 ## 已知问题
 
-decode 在 **width=513 + `num_splits=16`** 上，现有 kernel 会让相邻 split 的最后一个 `BLOCK_R` tile 重叠（`ceil(513/16)=33`）。这些 case 已保留在 production bench 中，不要删。修复属于后续独立改动。本轮性能表只覆盖已落地 JSON 的 `splits=1` occupancy。
+decode 在 **width=513 + `num_splits=16`** 上，旧 kernel 会让相邻 split 的最后一个 `BLOCK_R` tile 重叠（`ceil(513/16)=33`）。2026-09-04 已用 `slots < window_end` 修掉；这些 case 仍留在 production bench 里，不要删。occupancy 性能表只覆盖已落地 JSON 的 `splits=1` 入口（公开 API 会自动再切 KV）。
 
 ---
 
@@ -170,8 +170,11 @@ e2e 约为 2.50 / 2.93 ms，接近此前把构造算进 `do_bench` 的 2.67 / 3.
 
 ## `triton_sparse_attention_decode`
 
-稀疏 GQA decode。`num_splits==1` 直接返回最终 `out` / `lse`；`>1` 时返回
-带 leading split 轴的 partial，交给 `triton_merge_split_states`。
+稀疏 GQA decode。`num_splits==1` 按设备 CU 数自动 KV-split（
+`ceil(CUs / (B·G))`，再按 packed 宽度封顶），merge 后返回最终 `out` /
+`lse`；`>1` 时按调用方份数切，返回带 leading split 轴的 partial，交给
+`triton_merge_split_states`。split 窗口用 `slots < window_end` 做分区，
+避免 `ceil(packed_width / splits) % BLOCK_R != 0` 时相邻 split 重叠计数。
 
 ```python
 out, lse = triton_sparse_attention_decode(
@@ -184,14 +187,21 @@ out, lse = triton_sparse_attention_decode(
 - `query`：`[B, H, D]`；`kv_seqlens`：`[B]` int32
 - `packed_regions`：`[G * B, packed_width]` **int64**
 - `config=None` 按 occupancy 读 JSON（`batch=B`，`context=kv_seqlens[0]`）；
-  `config={}` 或缺文件走内置 tile
+  自动切分后若没有 `s{N}` 文件，回退 `s1` JSON，再缺则走内置 tile。
+  `config={}` 跳过查找，用内置 tile。
 
 ### BW1100 TP8 性能
 
 环境与 prefill 相同。metadata（`triton_decode_sparse_meta`）在计时区外。
-当前只测已落地 JSON 的 `(B=4, ctx=16384, splits=1)`。
+当前只测已落地 JSON 的 `(B=4, ctx=16384, splits=1)` 入口。加速比定义为
+`default latency / tuned latency`，大于 1 表示 JSON 更快。CSV 来自
+`scripts/benchmarks/triton/step4_dsa/result/`。GPU 未锁频，数据用于同轮
+相对比较，不作为稳定性能门槛。
 
 #### occupancy JSON（2026-09-03）
+
+当时 kernel 未做 KV-split，`grid=(B, G, 1)` 只有 4 个 workgroup。本表只
+对照 launch JSON，没有改 kernel。
 
 | 环境项 | 值 |
 | --- | --- |
@@ -212,5 +222,34 @@ out, lse = triton_sparse_attention_decode(
   - 当前：`decode-k513-s1-b4-ctx16384-hpg8-d192-r8_bf16_BW1100.json`
   - 缺文件时静默使用内置 `_decode_tile_defaults`
 
-实现：`triton/decode.py`。溯源：Step-4 DSA handoff `sparse_attn.py`。
+#### KV-split occupancy（2026-09-04）
+
+公开入口 `num_splits=1` 自动切 packed slots，再 `merge_split_states`。
+72 CU 上 `ceil(72 / (B·G)) = 18` splits，grid `(4, 1, 18)` = 72 workgroup。
+`latency_ms` 含 decode + merge（生产 e2e）；tile 仍用上一小节的 `s1` JSON，
+没有按 18-way 再 tune 一份。
+
+| 环境项 | 值 |
+| --- | --- |
+| GPU | BW1100（gfx938），72 CU |
+| Shape | `B=4, context=16384, splits=1（launch 18）, H=8, G=1, topk=512, D=192` |
+| 输入 / 输出 dtype | BF16 / BF16 |
+| 计时 | `triton.testing.do_bench`，warmup 10 ms、rep 30 ms、中位数 |
+| default | `[BLOCK_R,BLOCK_H,BLOCK_D]=[8,16,256]`，未指定 warps/stages/waves |
+| tuned | `[2,16,256, warps=2, stages=2, waves=1]`（复用 s1 JSON） |
+
+| 实现 | 延迟 (ms) | 相对 default | 相对 09-03 同行 |
+|---|---:|---:|---:|
+| default | 0.074080 | 1.00x | 11.3x |
+| tuned | 0.058080 | 1.28x | 11.3x |
+
+相对 09-03 的倍数是 `当时同行延迟 / 本行延迟`（default `0.834720`，tuned
+`0.656000`）。收益来自 occupancy（4 → 72 workgroup），不是更大的
+`BLOCK_R` / warps / stages。
+
+- HCU JSON：同上 `decode-k513-s1-b4-ctx16384-hpg8-d192-r8_bf16_BW1100.json`
+- 无对应 `s18` 文件时回退该 `s1` tile；`config={}` 走内置 `_decode_tile_defaults`
+
+实现：`triton/decode.py`（`sparse_attention_decode`）。溯源：Step-4 DSA
+handoff `sparse_attn.py`。
 

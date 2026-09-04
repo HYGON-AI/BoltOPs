@@ -82,6 +82,7 @@ def _decode_kwargs(data: dict, *, num_splits: int) -> dict:
         "softmax_scale": float(query.shape[2]) ** -0.5,
         "num_splits": num_splits,
         "block_regions": 16,
+        "return_partials": num_splits > 1,
     }
 
 

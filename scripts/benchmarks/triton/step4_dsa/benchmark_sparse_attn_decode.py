@@ -27,10 +27,13 @@ if str(_TEST_ROOT) not in sys.path:
 from step4_dsa.bench_inputs import _build_decode_inputs  # noqa: E402
 from step4_dsa.benchmark_cases import BenchmarkCase, tp8_geometry  # noqa: E402
 
-from boltops.step4_dsa import triton_decode_sparse_meta  # noqa: E402
+from boltops.step4_dsa import (  # noqa: E402
+    triton_decode_sparse_meta,
+    triton_sparse_attention_decode,
+)
 from boltops.step4_dsa.triton.decode import (  # noqa: E402
     _decode_tile_defaults,
-    sparse_attention_decode,
+    choose_decode_kv_splits,
     sparse_attn_decode_config_path,
 )
 
@@ -119,7 +122,8 @@ def _bench(data: dict, config: dict | None, *, num_splits: int) -> float:
     kwargs = _decode_kwargs(data, num_splits=num_splits)
 
     def run() -> None:
-        sparse_attention_decode(**kwargs, config=config)
+        # Public decode: num_splits==1 auto KV-splits and merges (optimized).
+        triton_sparse_attention_decode(**kwargs, config=config)
 
     run()
     return float(
@@ -276,9 +280,14 @@ def main(argv: list[str] | None = None) -> int:
                     }
                 )
                 handle.flush()
+                launched_splits = (
+                    choose_decode_kv_splits(batch, GROUPS, packed_width)
+                    if num_splits == 1
+                    else num_splits
+                )
                 print(
-                    f"[bench] {mode} B={batch} ctx={context} s={num_splits}: "
-                    f"{latency_ms:.6f} ms",
+                    f"[bench] {mode} B={batch} ctx={context} s={num_splits} "
+                    f"(launch_splits={launched_splits}): {latency_ms:.6f} ms",
                     flush=True,
                 )
     print(f"Wrote {output_file}")
