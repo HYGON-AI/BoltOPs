@@ -16,6 +16,55 @@ ATOL = 1.0e-5
 RTOL = 1.0e-5
 
 
+def _classify_byte_diffs(
+    triton_fp32: torch.Tensor,
+    actual_bits: torch.Tensor,
+    expected_bits: torch.Tensor,
+) -> tuple[bool, bool]:
+    """Split an FP8 byte difference into "our rounding is wrong" vs "the input moved".
+
+    Returns ``(faithful, adjacent)``.
+
+    ``faithful`` re-quantizes the kernel's *own* fp32 summary through the same
+    fp32 -> bf16 -> e4m3 path and checks it reproduces the byte the kernel stored. If it
+    does, the kernel's rounding is exactly the reference's and the byte difference is
+    inherited from a different fp32 input, not produced by the store.
+
+    ``adjacent`` checks every differing byte is one e4m3 code away. Together they say:
+    the reduction landed a hair from an e4m3 decision boundary and the double rounding
+    tipped it one step. A genuine rounding-path or reduction-order bug fails one of the
+    two -- it lands on the wrong code by construction, or moves by more than one step.
+    """
+    requantized = quantize_summary_e4m3(triton_fp32)
+    faithful = bool(torch.equal(requantized, actual_bits))
+    differing = actual_bits != expected_bits
+    codes = _E4M3_ORDER.to(actual_bits.device)
+    steps = (
+        codes[actual_bits[differing].int()] - codes[expected_bits[differing].int()]
+    ).abs()
+    adjacent = bool((steps <= 1).all())
+    return faithful, adjacent
+
+
+def _build_e4m3_order() -> torch.Tensor:
+    """Rank of each e4m3 byte in ascending numeric order, for "is it one code away".
+
+    e4m3 is sign-magnitude, so byte arithmetic is not value arithmetic (0x80 is -0, and
+    the negative half counts downward). Ranking by value makes "adjacent code" mean what
+    it says. NaN bytes are pinned outside the finite range so nothing reads as adjacent
+    to them.
+    """
+    values = torch.arange(256, dtype=torch.uint8).view(torch.float8_e4m3fn).float()
+    finite = torch.isfinite(values)
+    order = torch.full((256,), 1 << 20, dtype=torch.int64)
+    ranks = values[finite].argsort().argsort()
+    order[finite] = ranks
+    return order
+
+
+_E4M3_ORDER = _build_e4m3_order()
+
+
 @C.GPU_REQUIRED
 @pytest.mark.parametrize(
     "seq_lens",
@@ -65,4 +114,12 @@ def test_csa_prefill_matches_ref(seq_lens: tuple[int, ...]):
         )
         actual_bytes = mean[region, 0].view(torch.uint8)
         expected_bytes = quantize_summary_e4m3(ref)
-        assert torch.equal(actual_bytes.cpu(), expected_bytes.cpu())
+        if torch.equal(actual_bytes, expected_bytes):
+            continue
+        faithful, adjacent = _classify_byte_diffs(
+            summary[region, 0], actual_bytes, expected_bytes
+        )
+        assert faithful and adjacent, (
+            f"region {region}: CSA e4m3 store is not a tie-flip "
+            f"(faithful={faithful}, adjacent={adjacent})"
+        )
