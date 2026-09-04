@@ -14,8 +14,8 @@ from pathlib import Path
 
 import torch
 
-# Fixtures live under test/ (not the wheel), same pattern as gemm benches.
-_TEST_DSA = Path(__file__).resolve().parents[3] / "test" / "step4_dsa"
+# This file is one directory deeper than the other triton benches.
+_TEST_DSA = Path(__file__).resolve().parents[4] / "test" / "step4_dsa"
 if str(_TEST_DSA) not in sys.path:
     sys.path.insert(0, str(_TEST_DSA))
 

@@ -298,7 +298,8 @@ def triton_sparse_attention_decode(
     block_regions: int = 16,
     config: Optional[dict] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Sparse GQA decode. ``num_splits > 1`` returns partial states for merge."""
+    """Sparse GQA decode. ``num_splits==1`` auto KV-splits to fill CUs and returns
+    merged states. ``num_splits > 1`` returns partial states for merge."""
     from boltops.step4_dsa.triton.decode import sparse_attention_decode as impl
 
     return impl(
@@ -311,9 +312,10 @@ def triton_sparse_attention_decode(
         num_kv_groups=num_kv_groups,
         region_size=region_size,
         softmax_scale=softmax_scale,
-        num_splits=num_splits,
+        num_splits=None if num_splits == 1 else num_splits,
         block_regions=block_regions,
         config=config,
+        return_partials=num_splits > 1,
     )
 
 
