@@ -1,6 +1,8 @@
 """Sparse GQA prefill attention over selected regions (scalar and query-tiled).
 
 Vendored from Step-4 DSA handoff ``inference/kernel.py`` (``sparse_attn`` prefill).
+Per-query ``num_splits is None`` chooses occupancy from device CU count; split
+windows are disjoint (``slots < window_end``). Tiled prefill is unchanged.
 """
 
 from __future__ import annotations
@@ -43,8 +45,10 @@ def _sparse_attn_prefill_kernel(
     stride_v_token,
     stride_v_group,
     stride_packed_row,
+    stride_out_split,
     stride_out_token,
     stride_out_head,
+    stride_lse_split,
     stride_lse_token,
     softmax_scale,
     total_q,
@@ -52,6 +56,7 @@ def _sparse_attn_prefill_kernel(
     heads_per_group: tl.constexpr,
     head_dim: tl.constexpr,
     region_size: tl.constexpr,
+    slots_per_split: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_R: tl.constexpr,
@@ -62,9 +67,14 @@ def _sparse_attn_prefill_kernel(
     max is per head, exactly as in dense flash attention -- the only difference is that
     the K/V rows come from a gather driven by the packed region list instead of a
     contiguous range.
+
+    ``program_id(2)`` partitions the packed row into disjoint slot windows;
+    ``slots < window_end`` keeps adjacent splits from overlapping when
+    ``slots_per_split % BLOCK_R != 0``. ``num_splits=1`` is the full packed row.
     """
     query = tl.program_id(0)
     group = tl.program_id(1)
+    split = tl.program_id(2)
     row = group * total_q + query
     count = tl.load(counts_ptr + row).to(tl.int32)
 
@@ -88,9 +98,11 @@ def _sparse_attn_prefill_kernel(
     accumulator = tl.zeros((BLOCK_H, BLOCK_D), dtype=tl.float32)
 
     offsets_in_region = tl.arange(0, region_size)
-    for base in tl.range(0, topk, BLOCK_R):
+    window_begin = split * slots_per_split
+    window_end = window_begin + slots_per_split
+    for base in tl.range(window_begin, window_end, BLOCK_R):
         slots = base + tl.arange(0, BLOCK_R)
-        slot_ok = slots < count
+        slot_ok = (slots < count) & (slots < topk) & (slots < window_end)
         meta = tl.load(
             packed_ptr + row * stride_packed_row + slots, mask=slot_ok, other=-1
         )
@@ -151,6 +163,7 @@ def _sparse_attn_prefill_kernel(
     output = tl.where(selected[:, None], accumulator / running_sum[:, None], 0.0)
     tl.store(
         out_ptr
+        + split * stride_out_split
         + query * stride_out_token
         + (group * heads_per_group + heads)[:, None] * stride_out_head
         + dims[None, :],
@@ -158,7 +171,11 @@ def _sparse_attn_prefill_kernel(
         mask=tile_ok,
     )
     tl.store(
-        lse_ptr + query * stride_lse_token + group * heads_per_group + heads,
+        lse_ptr
+        + split * stride_lse_split
+        + query * stride_lse_token
+        + group * heads_per_group
+        + heads,
         tl.where(selected, running_max + tl.log(running_sum), NEGATIVE_INFINITY),
         mask=head_ok,
     )
@@ -771,6 +788,10 @@ def sparse_attention_prefill(
     request_indices: torch.Tensor | None = None,
     block_q: int = 128,
     config: dict[str, Any] | None = None,
+    num_splits: int | None = None,
+    kv_split_target_programs: int | None = None,
+    min_slots_per_split: int = 8,
+    return_partials: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Sparse attention over per-query selected regions.
 
@@ -796,11 +817,16 @@ def sparse_attention_prefill(
             after tiles are built (``u`` is ``next_power_of_2`` of the union width). A
             mapping is used as-is (no shared-memory shrink). An empty mapping skips
             lookup and keeps the built-in defaults.
+        num_splits: ``None`` picks a split count from device CU count and ``Q * G``.
+            An explicit value is used as-is. With more than one split the default is
+            to merge to ``[total_q, heads, dim]``; pass ``return_partials=True``
+            to keep the leading split axis for :func:`merge_split_states`. Tiled
+            prefill ignores this argument.
 
     Returns:
-        ``(out, lse)`` shaped ``[total_q, num_heads, head_dim]`` and
-        ``[total_q, num_heads]``. Rows with no selected region get a zero output and
-        ``lse = -inf``.
+        Merged ``(out [total_q, num_heads, head_dim], lse [total_q, num_heads])``
+        unless ``return_partials`` is set, in which case both have a leading split
+        axis. Rows with no selected region get a zero output and ``lse = -inf``.
 
     The caller must guarantee the selected regions are distinct. Our selector does (the
     stage 3 gate checks it), but a union-with-sliding-window path would not, and duplicate
@@ -821,10 +847,6 @@ def sparse_attention_prefill(
     heads_per_group = num_heads // num_kv_groups
     topk = int(packed_regions.shape[1])
     scale = softmax_scale if softmax_scale is not None else head_dim**-0.5
-
-    out = torch.empty_like(query)
-    lse = torch.empty((total_q, num_heads), device=query.device, dtype=torch.float32)
-    block_d = triton.next_power_of_2(head_dim)
 
     if logical_regions is not None:
         if q_positions is None:
@@ -853,6 +875,8 @@ def sparse_attention_prefill(
             region_size=region_size,
             block_q=block_q,
         )
+        out = torch.empty_like(query)
+        lse = torch.empty((total_q, num_heads), device=query.device, dtype=torch.float32)
         return _run_tiled_prefill(
             query,
             key_cache,
@@ -875,6 +899,24 @@ def sparse_attention_prefill(
             lse=lse,
         )
 
+    from boltops.step4_dsa.triton.merge import merge_split_states
+
+    if num_splits is None:
+        num_splits = choose_prefill_kv_splits(
+            total_q,
+            num_kv_groups,
+            topk,
+            target_programs=kv_split_target_programs,
+            min_slots_per_split=min_slots_per_split,
+            device=query.device,
+        )
+    num_splits = max(int(num_splits), 1)
+    slots_per_split = -(-topk // num_splits)
+
+    out = torch.empty(
+        (num_splits, total_q, num_heads, head_dim), device=query.device, dtype=query.dtype
+    )
+    lse = torch.empty((num_splits, total_q, num_heads), device=query.device, dtype=torch.float32)
     launch = config
     if launch is None:
         launch = _load_sparse_attn_prefill_config(
@@ -888,7 +930,7 @@ def sparse_attention_prefill(
     default_h, default_d, default_r = _per_query_tile_defaults(
         heads_per_group=heads_per_group,
         head_dim=head_dim,
-        topk=topk,
+        topk=slots_per_split,
         block_regions=block_regions,
         region_size=region_size,
         element_size=key_cache.element_size(),
@@ -898,11 +940,15 @@ def sparse_attention_prefill(
         block_h = int(launch.get("BLOCK_H", default_h))
         block_d = int(launch.get("BLOCK_D", default_d))
         block_r = int(launch["BLOCK_R"])
-        extra = {key: launch[key] for key in _GRID_KEYS if key in launch}
+        extra = {
+            key: launch[key]
+            for key in _GRID_KEYS
+            if key in launch and key != "waves_per_eu"
+        }
     else:
         block_h, block_d, block_r = default_h, default_d, default_r
 
-    _sparse_attn_prefill_kernel[(total_q, num_kv_groups)](
+    _sparse_attn_prefill_kernel[(total_q, num_kv_groups, num_splits)](
         query,
         key_cache,
         value_cache,
@@ -919,16 +965,62 @@ def sparse_attention_prefill(
         packed_regions.stride(0),
         out.stride(0),
         out.stride(1),
+        out.stride(2),
         lse.stride(0),
+        lse.stride(1),
         scale,
         total_q,
         topk=topk,
         heads_per_group=heads_per_group,
         head_dim=head_dim,
         region_size=region_size,
+        slots_per_split=slots_per_split,
         BLOCK_H=block_h,
         BLOCK_D=block_d,
         BLOCK_R=block_r,
         **extra,
     )
-    return out, lse
+    if num_splits == 1:
+        return out[0], lse[0]
+    if return_partials:
+        return out, lse
+    return merge_split_states(out, lse)
+
+
+def choose_prefill_kv_splits(
+    total_q: int,
+    num_kv_groups: int,
+    packed_width: int,
+    *,
+    target_programs: int | None = None,
+    min_slots_per_split: int = 8,
+    device: torch.device | None = None,
+) -> int:
+    """Pick a packed-slot split count from CU occupancy, not an evidence-shape test.
+
+    Underfills (``Q * G < CUs``) use ``ceil(CUs / (Q*G))`` like decode. When the
+    per-query grid already covers the device, keep one split: extra waves plus
+    ``merge_split_states`` did not beat the serial packed-row loop on a full
+    grid. Callers may still pass ``target_programs`` to request extra waves.
+    Cap so a full row keeps ``min_slots_per_split`` slots per window.
+    """
+    packed_width = max(int(packed_width), 1)
+    programs_base = max(int(total_q) * int(num_kv_groups), 1)
+    if target_programs is None:
+        try:
+            index = (
+                device.index
+                if device is not None and device.index is not None
+                else torch.cuda.current_device()
+            )
+            target_programs = int(torch.cuda.get_device_properties(index).multi_processor_count)
+        except Exception:
+            target_programs = 1
+    target_programs = max(int(target_programs or 1), 1)
+    splits = -(-target_programs // programs_base)
+    max_splits = max(1, packed_width // max(int(min_slots_per_split), 1))
+    return min(max(splits, 1), max_splits, packed_width)
+
+
+# Previous landing name; same function.
+sparse_attention_prefill_optimized = sparse_attention_prefill

@@ -75,6 +75,10 @@ def _sparse_attn_decode_kernel(
     Split windows are a partition of the packed row: the last ``BLOCK_R`` tile is
     clamped with ``slots < window_end``. Without that, ``slots_per_split % BLOCK_R
     != 0`` walks into the next split and the same region is softmaxed twice.
+
+    K is loaded as ``[BLOCK_D, tokens]`` so QK is ``tl.dot(Q, K)`` without
+    ``tl.trans``. V stays ``[tokens, BLOCK_D]`` for ``P @ V``. Launch tiles come
+    from ``config/sparse_attn_decode``.
     """
     request = tl.program_id(0)
     group = tl.program_id(1)
@@ -130,8 +134,11 @@ def _sparse_attn_decode_kernel(
         )
 
         keys = tl.load(
-            k_ptr + tokens[:, None] * stride_k_token + group * stride_k_group + dims[None, :],
-            mask=token_ok[:, None] & dim_ok[None, :],
+            k_ptr
+            + tokens[None, :] * stride_k_token
+            + group * stride_k_group
+            + dims[:, None],
+            mask=dim_ok[:, None] & token_ok[None, :],
             other=0.0,
         )
         values = tl.load(
@@ -140,7 +147,7 @@ def _sparse_attn_decode_kernel(
             other=0.0,
         )
 
-        scores = tl.dot(queries, tl.trans(keys), out_dtype=tl.float32) * softmax_scale
+        scores = tl.dot(queries, keys, out_dtype=tl.float32) * softmax_scale
         scores = tl.where(token_ok[None, :] & head_ok[:, None], scores, NEGATIVE_INFINITY)
 
         tile_max = tl.maximum(running_max, tl.max(scores, axis=1))
@@ -520,7 +527,3 @@ def sparse_attention_decode(
     if return_partials:
         return out, lse
     return merge_split_states(out, lse)
-
-
-# Previous landing name; same function.
-sparse_attention_decode_optimized = sparse_attention_decode

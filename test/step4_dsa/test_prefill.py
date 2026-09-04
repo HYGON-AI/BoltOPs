@@ -168,3 +168,74 @@ def test_tiled_prefill_matches_scalar():
     lse_check = compare(tiled_lse, scalar_lse, rtol=LSE_RTOL, atol=LSE_ATOL)
     assert out_check.passed, out_check.format()
     assert lse_check.passed, lse_check.format()
+
+
+@C.GPU_REQUIRED
+def test_sparse_prefill_split_overlap_window_matches_ref():
+    """packed_width not divisible by splits*BLOCK_R must not double-count slots."""
+    data = _make_prefill_case(
+        total_q=8, seq_regions=32, topk=17, empty_rows=False, seed=43
+    )
+    from boltops.step4_dsa.triton.prefill import sparse_attention_prefill
+
+    out, lse = sparse_attention_prefill(
+        data["query"],
+        data["key_cache"],
+        data["value_cache"],
+        data["packed"],
+        data["counts"],
+        num_kv_groups=data["groups"],
+        region_size=data["region_size"],
+        softmax_scale=data["scale"],
+        num_splits=8,
+        config={"BLOCK_R": 8, "BLOCK_H": 16, "BLOCK_D": 256, "num_warps": 4, "num_stages": 1},
+    )
+    ref_out, ref_lse = ref_sparse_attention(
+        data["query"],
+        data["key_cache"],
+        data["value_cache"],
+        data["packed"],
+        data["counts"],
+        num_kv_groups=data["groups"],
+        region_size=data["region_size"],
+        softmax_scale=data["scale"],
+    )
+    torch.cuda.synchronize()
+    out_check = compare(out.float(), ref_out.float(), rtol=OUT_RTOL, atol=OUT_ATOL)
+    lse_check = compare(lse, ref_lse, rtol=LSE_RTOL, atol=LSE_ATOL)
+    assert out_check.passed, out_check.format()
+    assert lse_check.passed, lse_check.format()
+
+
+@C.GPU_REQUIRED
+def test_sparse_prefill_auto_kv_split_matches_ref():
+    """Wide packed rows with Q*G underfilling CUs should auto-split and match ref."""
+    data = _make_prefill_case(
+        total_q=4, seq_regions=64, topk=32, empty_rows=False, seed=44
+    )
+    out, lse = triton_sparse_attention_prefill(
+        data["query"],
+        data["key_cache"],
+        data["value_cache"],
+        data["packed"],
+        data["counts"],
+        num_kv_groups=data["groups"],
+        region_size=data["region_size"],
+        softmax_scale=data["scale"],
+        block_regions=4,
+    )
+    ref_out, ref_lse = ref_sparse_attention(
+        data["query"],
+        data["key_cache"],
+        data["value_cache"],
+        data["packed"],
+        data["counts"],
+        num_kv_groups=data["groups"],
+        region_size=data["region_size"],
+        softmax_scale=data["scale"],
+    )
+    torch.cuda.synchronize()
+    out_check = compare(out.float(), ref_out.float(), rtol=OUT_RTOL, atol=OUT_ATOL)
+    lse_check = compare(lse, ref_lse, rtol=LSE_RTOL, atol=LSE_ATOL)
+    assert out_check.passed, out_check.format()
+    assert lse_check.passed, lse_check.format()

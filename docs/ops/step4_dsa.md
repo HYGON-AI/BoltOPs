@@ -19,7 +19,7 @@
 | `triton_topk_select_and_pack` | 融合 select + prefill pack（物理 id） |
 | `triton_prefill_sparse_meta` | 宽 `topk+1` 的 prefill metadata（当前 region 追加） |
 | `triton_decode_sparse_meta` | int64 decode metadata |
-| `triton_sparse_attention_prefill` | 稀疏 GQA prefill；tiled 路径 `block_q=128` |
+| `triton_sparse_attention_prefill` | 稀疏 GQA prefill；tiled 路径 `block_q=128`；per-query 在 `Q*G` 填不满 CU 时自动 KV-split |
 | `triton_sparse_attention_decode` | 稀疏 decode；默认 `num_splits=1` 自动按 CU 做 KV-split |
 | `triton_merge_split_states` | split LSE 合并 |
 
@@ -85,6 +85,9 @@ decode 在 **width=513 + `num_splits=16`** 上，旧 kernel 会让相邻 split �
 
 稀疏 GQA prefill。未传 `logical_regions` 时每 query 一个 program；传入
 logical ids / positions / request ids 后走 tiled 路径（`block_q=128`）。
+per-query 路径在 ``Q * G < CUs`` 时按 ``ceil(CUs / (Q*G))`` 切 packed slots，
+再 ``merge_split_states``；生产 occupancy ``Q=128, G=1`` 已经盖住 72 CU，
+``splits=1`` 仍走同一个 ``_sparse_attn_prefill_kernel``（grid 第三维为 1）。
 
 ```python
 out, lse = triton_sparse_attention_prefill(
@@ -138,6 +141,33 @@ tile 尺寸与 default 相同，收益来自 `num_warps` / `num_stages` /
 
 实现：`triton/prefill.py`。溯源：Step-4 DSA handoff `sparse_attn.py`。
 
+#### KV-split occupancy（2026-09-04）
+
+公开入口 per-query 在 ``Q * G < CUs`` 时自动切 packed slots，再
+``merge_split_states``；``slots < window_end`` 避免 ``BLOCK_R`` 尾 tile 重叠。
+生产 occupancy ``Q=128, G=1`` 已有 128 workgroup（>72 CU），chooser 保持
+``splits=1``，与 09-03 tuned JSON 同行，仍走同一个
+``_sparse_attn_prefill_kernel``。小 ``Q`` 才吃 occupancy（与 decode 的
+``B=4`` 同类）。tile 仍复用上一小节的 ``prefill-k513-..._BW1100.json``
+（去掉 ``waves_per_eu``）。
+
+| 环境项 | 值 |
+| --- | --- |
+| GPU | BW1100（gfx938），72 CU |
+| Shape | `H=8, G=1, packed_width=513, D=192, region_size=8, cache_regions=4096` |
+| 输入 / 输出 dtype | BF16 / BF16 |
+| 计时 | `triton.testing.do_bench`，warmup 10 ms、rep 30 ms、中位数 |
+| tile | `[BLOCK_R,BLOCK_H,BLOCK_D]=[8,16,256]`，`warps=4`，`stages=1` |
+
+| Q | splits | splits=1 (ms) | auto-split (ms) | 相对 splits=1 |
+|---|---:|---:|---:|---:|
+| 128 | 1 | 0.682560 | 0.682640 | 1.00x |
+| 4 | 18 | 0.572480 | 0.056320 | 10.2x |
+
+``Q=4`` 的 grid 从 4 个 workgroup 升到 72；``Q=128`` 不额外加 wave（extra-wave
+split 在证据形状上不更快）。scalar kernel 已合并为带 split 轴的
+``_sparse_attn_prefill_kernel``。
+
 #### tiled launch JSON（2026-09-03）
 
 生产 tile `Q=128`、`block_q=128`。实测 tile union=528，配置按
@@ -175,6 +205,8 @@ e2e 约为 2.50 / 2.93 ms，接近此前把构造算进 `do_bench` 的 2.67 / 3.
 `lse`；`>1` 时按调用方份数切，返回带 leading split 轴的 partial，交给
 `triton_merge_split_states`。split 窗口用 `slots < window_end` 做分区，
 避免 `ceil(packed_width / splits) % BLOCK_R != 0` 时相邻 split 重叠计数。
+K 按 `[BLOCK_D, tokens]` 加载，QK 走 `tl.dot(Q, K)`，不再 `tl.trans(K)`；
+V 仍是 `[tokens, BLOCK_D]` 做 `P @ V`。
 
 ```python
 out, lse = triton_sparse_attention_decode(
@@ -193,7 +225,7 @@ out, lse = triton_sparse_attention_decode(
 ### BW1100 TP8 性能
 
 环境与 prefill 相同。metadata（`triton_decode_sparse_meta`）在计时区外。
-当前只测已落地 JSON 的 `(B=4, ctx=16384, splits=1)` 入口。加速比定义为
+记录表仍只引用默认生产点 `(B=4, ctx=16384, splits=1)`。加速比定义为
 `default latency / tuned latency`，大于 1 表示 JSON 更快。CSV 来自
 `scripts/benchmarks/triton/step4_dsa/result/`。GPU 未锁频，数据用于同轮
 相对比较，不作为稳定性能门槛。
@@ -247,7 +279,34 @@ out, lse = triton_sparse_attention_decode(
 `0.656000`）。收益来自 occupancy（4 → 72 workgroup），不是更大的
 `BLOCK_R` / warps / stages。
 
-- HCU JSON：同上 `decode-k513-s1-b4-ctx16384-hpg8-d192-r8_bf16_BW1100.json`
+- HCU JSON：当时为 `decode-k513-s1-b4-ctx16384-hpg8-d192-r8_bf16_BW1100.json`
+  （`warps=2, stages=2`）；无对应 `s18` 文件时回退该 `s1` tile
+
+#### QK layout + occupancy JSON（2026-09-08）
+
+`_sparse_attn_decode_kernel` 把 K 改成 `[BLOCK_D, tokens]` 加载，QK 直接
+`tl.dot(Q, K)`，去掉 `tl.trans(K)`；V 仍是 `[tokens, BLOCK_D]` 做 `P @ V`。
+公开入口仍是 `num_splits=1` 自动 KV-split + merge。生产点 `B=4, ctx=16384`
+的 s1 JSON 把 `num_warps` / `num_stages` 从 `2/2` 改成 `4/3`
+（`BLOCK_R/H/D` 不变）。本表只记该默认 shape；数字来自
+`scripts/benchmarks/triton/step4_dsa/result/triton_sparse_attn_decode_kernel_optimized.csv`。
+
+| 环境项 | 值 |
+| --- | --- |
+| GPU | BW1100（gfx938），72 CU |
+| Shape | `B=4, context=16384, splits=1（launch 18）, H=8, G=1, topk=512, D=192` |
+| 输入 / 输出 dtype | BF16 / BF16 |
+| 计时 | `triton.testing.do_bench`，warmup 10 ms、rep 30 ms、中位数 |
+| tuned | `[2,16,256, warps=4, stages=3, waves=1]` |
+
+| 实现 | 延迟 (ms) | 相对 09-04 tuned |
+|---|---:|---:|
+| tuned | 0.053600 | 1.08x |
+
+相对 09-04 tuned 的倍数是 `0.058080 / 0.053600`。CSV 只有 tuned 行，没有
+同轮 default。收益来自去掉 QK 的 `tl.trans`，以及 s1 JSON 的 warps/stages。
+
+- HCU JSON：`decode-k513-s1-b4-ctx16384-hpg8-d192-r8_bf16_BW1100.json`
 - 无对应 `s18` 文件时回退该 `s1` tile；`config={}` 走内置 `_decode_tile_defaults`
 
 实现：`triton/decode.py`（`sparse_attention_decode`）。溯源：Step-4 DSA

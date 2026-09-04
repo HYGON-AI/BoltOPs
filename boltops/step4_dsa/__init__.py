@@ -262,7 +262,11 @@ def triton_sparse_attention_prefill(
     block_q: int = 128,
     config: Optional[dict] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Sparse GQA prefill. Tiled path needs logical ids, positions, and request ids."""
+    """Sparse GQA prefill. Tiled path needs logical ids, positions, and request ids.
+
+    Per-query path auto KV-splits when ``Q * G`` underfills the device, then
+    merges with :func:`triton_merge_split_states`.
+    """
     from boltops.step4_dsa.triton.prefill import sparse_attention_prefill as impl
 
     return impl(
@@ -280,6 +284,7 @@ def triton_sparse_attention_prefill(
         request_indices=request_indices,
         block_q=block_q,
         config=config,
+        num_splits=None,
     )
 
 
