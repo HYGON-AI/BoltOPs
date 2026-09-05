@@ -44,8 +44,11 @@ def get_chunk_local_cumsum_vector_config(
     ``T=16384, H=64`` on BW1100 the measured cost is 2.64 ms at ``BS=32``,
     1.98 ms at 64 and 1.71 ms at 128 (407 / 542 / 627 GB/s); warp count and
     stage count are flat to within 1% at every width, so only ``BS`` is tuned.
-    Replacing the ``dot(tril, s)`` scan with ``tl.cumsum`` was measured within
-    noise of the matmul, so the mask-matmul formulation is kept.
+    The scan itself is a ``tl.cumsum`` along the chunk axis: the previous
+    ``dot(tril, s)`` mask-matmul routed its non-K-contiguous fp32 operand
+    through a swizzle-less shared-memory path (16-way LDS bank aliasing at
+    ``BT=64``) and cost ~16% more than the plain scan at ``T=8192, H=24,
+    S=128`` (0.169 vs 0.141 ms, num_warps=8), so it was replaced.
     """
     del T, H, is_varlen
     if S >= 128:
@@ -70,7 +73,6 @@ def chunk_local_cumsum_scalar_kernel(
     REVERSE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     HEAD_FIRST: tl.constexpr,
-    output_scale,
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
@@ -124,7 +126,6 @@ def chunk_local_cumsum_vector_kernel(
     REVERSE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     HEAD_FIRST: tl.constexpr,
-    output_scale,
 ):
     i_s, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
@@ -140,12 +141,6 @@ def chunk_local_cumsum_vector_kernel(
         T = eos - bos
     else:
         bos, eos = i_b * T, i_b * T + T
-
-    o_i = tl.arange(0, BT)
-    if REVERSE:
-        m_s = tl.where(o_i[:, None] <= o_i[None, :], 1.0, 0.0)
-    else:
-        m_s = tl.where(o_i[:, None] >= o_i[None, :], 1.0, 0.0)
 
     if HEAD_FIRST:
         p_s = tl.make_block_ptr(
@@ -183,7 +178,11 @@ def chunk_local_cumsum_vector_kernel(
         )
     # [BT, BS]
     b_s = tl.load(p_s, boundary_check=(0, 1)).to(tl.float32)
-    b_o = tl.dot(m_s, b_s, allow_tf32=False) * cumsum_scale
+    b_o = tl.cumsum(b_s, axis=0)
+    if REVERSE:
+        b_z = tl.sum(b_s, axis=0)
+        b_o = -b_o + b_z[None] + b_s
+    b_o = b_o * cumsum_scale
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
 
@@ -223,7 +222,6 @@ def chunk_local_cumsum_scalar(
         BT=BT,
         HEAD_FIRST=head_first,
         REVERSE=reverse,
-        output_scale=output_scale,
         **config,
     )
     return g
@@ -255,6 +253,13 @@ def chunk_local_cumsum_vector(
     config = get_chunk_local_cumsum_vector_config(
         T, H, S, cu_seqlens is not None
     )
+    # BW1100: 8 warps win at low-parallelism launches (interleaved A/B,
+    # KDA prefill shapes: -7.7% at 4K warps, -5.2% at 12K, -4.8% at 24K;
+    # flat/+0.1% at 65K), so widen only while the 4-warp launch fits under
+    # one full wave of warps on the 72-CU part.
+    warps_at_w4 = triton.cdiv(S, config["BS"]) * NT * B * H * 4
+    if config["BS"] >= 64 and warps_at_w4 < 32768:
+        config["num_warps"] = 8
 
     def grid(meta):
         return (triton.cdiv(meta["S"], meta["BS"]), NT, B * H)
@@ -272,7 +277,6 @@ def chunk_local_cumsum_vector(
         BT=BT,
         HEAD_FIRST=head_first,
         REVERSE=reverse,
-        output_scale=output_scale,
         **config,
     )
     return g
