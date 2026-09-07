@@ -11,6 +11,7 @@ Public APIs (aligned with vLLM ``TRITON_MLA`` / ``decode_attention_fwd``):
 
 Public operators:
 
+* ``flash_mla_sparse_fwd``
 * ``decode_attention_fwd``
 * ``decode_attention_fwd_grouped``
 * ``decode_attention_fwd_normal``
@@ -22,6 +23,21 @@ from __future__ import annotations
 from typing import Optional
 
 import torch
+
+
+def flash_mla_sparse_fwd(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    softmax_scale: float,
+    d_v: int = 512,
+    attn_sink: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """FlashMLA-compatible sparse forward operator."""
+    from boltops.mla.triton.flash_mla_sparse import flash_mla_sparse_fwd as impl
+
+    return impl(q, kv, indices, softmax_scale, d_v, attn_sink, topk_length)
 
 
 def decode_attention_fwd(
@@ -156,4 +172,5 @@ __all__ = [
     "decode_attention_fwd",
     "decode_attention_fwd_grouped",
     "decode_attention_fwd_normal",
+    "flash_mla_sparse_fwd",
 ]
