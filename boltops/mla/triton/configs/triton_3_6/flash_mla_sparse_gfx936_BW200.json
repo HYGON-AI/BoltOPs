@@ -1,11 +1,8 @@
 {
   "metadata": {
     "triton_version": "3.6.0",
-    "version_tag": "triton_3_6",
     "device_name": "BW200, UBB BW1000",
-    "device_slug": "BW200_UBB_BW1000",
-    "arch": "gfx936",
-    "dtype": "bfloat16"
+    "arch": "gfx936"
   },
   "configs": [
     {
