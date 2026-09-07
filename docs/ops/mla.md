@@ -65,7 +65,11 @@ register-pressure-aware scheduling on、optimized epilogue off、BlockPingpong o
 shape 和可选的 `_min`/`_max` 范围匹配；多个配置同时命中时优先选择更具体、
 范围更窄的配置，未命中时自动使用安全默认值。`s_kv` 仅参与运行时索引边界
 检查，不影响 kernel 循环结构，因此不作为当前配置的过滤条件。当前配置文件是
-`boltops/mla/triton/configs/triton_3_6/flash_mla_sparse_gfx936_BW200_UBB_BW1000.json`。
+`boltops/mla/triton/configs/triton_3_6/flash_mla_sparse_gfx936_BW200.json`。
+
+文件定位只使用产品型号 `BW200`，不使用设备名中逗号后的 `UBB BW1000`
+平台描述。JSON metadata 仅保留实际 Triton 版本、完整设备名和 gfx arch 用于
+结果追溯；版本目录、文件名 slug 和 dtype 等重复信息不再保存。
 
 溯源见 `boltops/mla/triton/SOURCE.md`。
 

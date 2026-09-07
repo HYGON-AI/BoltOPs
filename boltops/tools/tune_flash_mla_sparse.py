@@ -15,8 +15,6 @@ import triton
 from boltops.mla import flash_mla_sparse_fwd
 from boltops.mla.triton.flash_mla_sparse import (
     _device_identity,
-    _slug,
-    _triton_version_tag,
 )
 
 DTYPE = torch.bfloat16
@@ -206,11 +204,8 @@ def main(argv: list[str] | None = None) -> int:
     result = {
         "metadata": {
             "triton_version": triton.__version__,
-            "version_tag": _triton_version_tag(),
             "device_name": device_name,
-            "device_slug": _slug(device_name),
             "arch": arch,
-            "dtype": str(DTYPE).replace("torch.", ""),
         },
         "configs": entries,
     }

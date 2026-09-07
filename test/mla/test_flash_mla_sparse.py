@@ -13,7 +13,10 @@ import torch
 pytest.importorskip("triton")
 
 from boltops.mla import flash_mla_sparse_fwd
-from boltops.mla.triton.flash_mla_sparse import _config_match_score
+from boltops.mla.triton.flash_mla_sparse import (
+    _config_match_score,
+    _device_model,
+)
 
 
 GPU_REQUIRED = pytest.mark.skipif(
@@ -114,13 +117,13 @@ def test_flash_mla_sparse_tuned_config_schema():
     for path in paths:
         data = json.loads(path.read_text(encoding="utf-8"))
         metadata = data["metadata"]
-        assert path.parent.name == metadata["version_tag"]
         assert metadata["arch"] in path.name
-        assert metadata["device_slug"] in path.name
+        device_model = metadata["device_name"].split(",", 1)[0]
+        assert device_model in path.name
         matches = [tuple(sorted(entry["match"].items())) for entry in data["configs"]]
         assert len(matches) == len(set(matches))
         for entry in data["configs"]:
-            assert entry["match"]["dtype"] == metadata["dtype"]
+            assert "dtype" in entry["match"]
             assert entry["latency_ms"] > 0
             assert entry["speedup"] > 0
 
@@ -133,3 +136,8 @@ def test_tuned_config_range_matching_and_specificity():
     exact_score = _config_match_score({"s_q": 4, "topk": 2048}, shape)
     assert exact_score is not None and range_score is not None
     assert exact_score > range_score
+
+
+def test_device_model_excludes_platform_description():
+    assert _device_model("BW200, UBB BW1000") == "BW200"
+    assert _device_model("Product Name") == "Product_Name"

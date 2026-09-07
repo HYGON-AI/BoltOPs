@@ -27,6 +27,11 @@ def _slug(value: str) -> str:
     return re.sub(r"[^a-zA-Z0-9._-]+", "_", value).strip("_")
 
 
+def _device_model(device_name: str) -> str:
+    """Extract the product model, excluding optional platform descriptions."""
+    return _slug(device_name.split(",", 1)[0])
+
+
 def _triton_version_tag() -> str:
     match = re.match(r"(\d+)\.(\d+)", triton.__version__)
     return f"triton_{match.group(1)}_{match.group(2)}" if match else "triton_unknown"
@@ -45,7 +50,7 @@ def _device_identity(device: torch.device) -> tuple[str, str]:
 
 @functools.lru_cache(maxsize=None)
 def _load_device_configs(version_tag: str, arch: str, device_name: str) -> dict:
-    filename = f"flash_mla_sparse_{arch}_{_slug(device_name)}.json"
+    filename = f"flash_mla_sparse_{arch}_{_device_model(device_name)}.json"
     path = _CONFIG_ROOT / version_tag / filename
     if not path.is_file():
         return {}
