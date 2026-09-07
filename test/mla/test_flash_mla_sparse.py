@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import math
+from pathlib import Path
 from typing import Optional
 
 import pytest
@@ -96,3 +98,27 @@ def test_flash_mla_sparse_fwd_is_public():
     from boltops.mla import __all__
 
     assert "flash_mla_sparse_fwd" in __all__
+
+
+def test_flash_mla_sparse_tuned_config_schema():
+    config_root = (
+        Path(__file__).parents[2]
+        / "boltops"
+        / "mla"
+        / "triton"
+        / "configs"
+    )
+    paths = list(config_root.glob("triton_*_*/flash_mla_sparse_*.json"))
+    assert paths
+    for path in paths:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        metadata = data["metadata"]
+        assert path.parent.name == metadata["version_tag"]
+        assert metadata["arch"] in path.name
+        assert metadata["device_slug"] in path.name
+        matches = [tuple(sorted(entry["match"].items())) for entry in data["configs"]]
+        assert len(matches) == len(set(matches))
+        for entry in data["configs"]:
+            assert entry["match"]["dtype"] == metadata["dtype"]
+            assert entry["latency_ms"] > 0
+            assert entry["speedup"] > 0

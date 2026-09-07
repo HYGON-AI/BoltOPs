@@ -34,6 +34,32 @@ python scripts/benchmarks/triton/benchmark_flash_mla_sparse.py -h
 精度测试位于 `test/mla/test_flash_mla_sparse.py`；独立性能脚本会运行典型
 `topk=2048/4096` shape，并输出包含延迟和有效 TFLOPS 的 CSV。
 
+### Sparse FlashMLA benchmark 与 autotune
+
+测试环境：Triton 3.6.0、HIP 6.3、BW200 UBB BW1000（gfx936）、BF16。
+下表为 `100 ms warmup + 500 ms repeat` 的 median；baseline 使用迁入时的
+默认配置，tuned 使用随包发布的 size-specific config。
+
+| S_q | S_kv | H_q/H_kv | top-k | baseline (ms) | tuned (ms) | speedup | tuned TFLOPS |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 16384 | 16/1 | 2048 | 0.68464 | 0.55104 | 1.242x | 0.13 |
+| 4 | 16384 | 16/1 | 2048 | 0.68416 | 0.55008 | 1.244x | 0.52 |
+| 32 | 16384 | 16/1 | 2048 | 0.68560 | 0.55088 | 1.245x | 4.14 |
+| 4 | 32768 | 16/1 | 4096 | 1.34896 | 1.08224 | 1.246x | 0.53 |
+
+每个 size 的完整调优包含 108 个结构候选和 48 个编译/launch 候选，调节
+`BLOCK_N`、`BLOCK_H`、`BLOCK_DMODEL`、`num_warps`、`num_stages`、
+`waves_per_eu` 和 `kpack`。运行方式：
+
+```bash
+python boltops/tools/tune_flash_mla_sparse.py \
+  --output /tmp/flash_mla_sparse.json
+```
+
+配置按 Triton major/minor、gfx arch、完整设备名定位文件，再按 dtype 和完整
+shape 精确匹配；未命中配置时自动使用安全默认值。当前配置文件是
+`boltops/mla/triton/configs/triton_3_6/flash_mla_sparse_gfx936_BW200_UBB_BW1000.json`。
+
 溯源见 `boltops/mla/triton/SOURCE.md`。
 
 ---

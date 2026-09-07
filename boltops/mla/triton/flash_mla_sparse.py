@@ -7,11 +7,77 @@
 
 from __future__ import annotations
 
+import functools
+import json
+import re
+from pathlib import Path
 from typing import Optional
 
 import torch
 import triton
 import triton.language as tl
+
+
+_CONFIG_ROOT = Path(__file__).with_name("configs")
+
+
+def _slug(value: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9._-]+", "_", value).strip("_")
+
+
+def _triton_version_tag() -> str:
+    match = re.match(r"(\d+)\.(\d+)", triton.__version__)
+    return f"triton_{match.group(1)}_{match.group(2)}" if match else "triton_unknown"
+
+
+def _device_identity(device: torch.device) -> tuple[str, str]:
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    props = torch.cuda.get_device_properties(index)
+    arch_value = getattr(props, "gcnArchName", "") or getattr(
+        props, "arch_name", ""
+    )
+    arch_match = re.search(r"gfx[0-9a-f]+", str(arch_value).lower())
+    arch = arch_match.group(0) if arch_match else "unknown"
+    return arch, str(props.name)
+
+
+@functools.lru_cache(maxsize=None)
+def _load_device_configs(version_tag: str, arch: str, device_name: str) -> dict:
+    filename = f"flash_mla_sparse_{arch}_{_slug(device_name)}.json"
+    path = _CONFIG_ROOT / version_tag / filename
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _get_tuned_config(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    d_v: int,
+) -> dict:
+    arch, device_name = _device_identity(q.device)
+    data = _load_device_configs(_triton_version_tag(), arch, device_name)
+    shape = {
+        "s_q": q.shape[0],
+        "s_kv": kv.shape[0],
+        "h_q": q.shape[1],
+        "h_kv": kv.shape[1],
+        "topk": indices.shape[2],
+        "d_qk": q.shape[2],
+        "d_v": d_v,
+        "dtype": str(q.dtype).replace("torch.", ""),
+    }
+    for entry in data.get("configs", ()):
+        match = entry.get("match", {})
+        if isinstance(match, dict) and all(shape.get(k) == v for k, v in match.items()):
+            config = entry.get("config", {})
+            return dict(config) if isinstance(config, dict) else {}
+    return {}
 
 
 @triton.jit
@@ -224,6 +290,7 @@ def flash_mla_sparse_fwd(
     d_v: int = 512,
     attn_sink: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
+    config: Optional[dict] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute sparse MLA attention using token indices.
 
@@ -241,15 +308,24 @@ def flash_mla_sparse_fwd(
     max_logits = torch.empty((s_q, h_q), device=q.device, dtype=torch.float32)
     lse = torch.empty_like(max_logits)
 
-    # Splitting the 512-dimensional content part keeps register use practical
-    # on HIP. The final 64 dimensions of the common 576 layout are RoPE.
+    tuned = _get_tuned_config(q, kv, indices, d_v) if config is None else dict(config)
+    # Splitting the 512-dimensional content part keeps register use practical.
+    # The final 64 dimensions of the common 576 layout are RoPE.
     if d_qk == 576:
-        block_dmodel, dmodel_splits, block_dpe = 128, 4, 64
+        block_dmodel = int(tuned.get("BLOCK_DMODEL", 128))
+        if block_dmodel not in (64, 128, 256, 512) or 512 % block_dmodel:
+            raise ValueError("BLOCK_DMODEL must be one of 64, 128, 256, or 512")
+        dmodel_splits, block_dpe = 512 // block_dmodel, 64
     else:
         block_dmodel, dmodel_splits, block_dpe = triton.next_power_of_2(d_qk), 1, 0
     block_dv = triton.next_power_of_2(d_v)
-    block_n = 16 if torch.version.hip is not None and d_qk >= 576 else 32
-    block_h = 16
+    default_block_n = 16 if torch.version.hip is not None and d_qk >= 576 else 32
+    block_n = int(tuned.get("BLOCK_N", default_block_n))
+    block_h = int(tuned.get("BLOCK_H", 16))
+    num_warps = int(tuned.get("num_warps", 4))
+    num_stages = int(
+        tuned.get("num_stages", 1 if torch.version.hip is not None else 2)
+    )
     heads_per_program = min(block_h, h_q // h_kv)
     grid = (s_q, triton.cdiv(h_q, heads_per_program))
 
@@ -257,6 +333,11 @@ def flash_mla_sparse_fwd(
     kv = kv.contiguous()
     indices = indices.contiguous()
     topk_arg = topk_length.contiguous() if topk_length is not None else indices
+    launch_options = {"num_warps": num_warps, "num_stages": num_stages}
+    if torch.version.hip is not None:
+        for name in ("waves_per_eu", "matrix_instr_nonkdim", "kpack"):
+            if name in tuned:
+                launch_options[name] = int(tuned[name])
     _flash_mla_sparse_fwd_kernel[grid](
         q,
         kv,
@@ -287,8 +368,7 @@ def flash_mla_sparse_fwd(
         H_KV=h_kv,
         Lk=d_qk,
         Lv=d_v,
-        num_warps=4,
-        num_stages=1 if torch.version.hip is not None else 2,
+        **launch_options,
     )
 
     if attn_sink is not None:
