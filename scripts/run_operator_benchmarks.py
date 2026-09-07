@@ -15,6 +15,7 @@ BENCHMARK_ROOT = ROOT / "scripts" / "benchmarks"
 # distinct. The entry resolves to ``<backend>/benchmark_<kernel>.py``.
 BENCHMARK_KERNELS = (
     "triton/batched_gemm_bf16",
+    "triton/flash_mla_sparse",
 )
 
 

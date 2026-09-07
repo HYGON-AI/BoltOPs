@@ -3,7 +3,7 @@
 `boltops.mla` 公开 Triton **dense MLA / GQA decode** 注意力（布局对齐 vLLM
 `TRITON_MLA`）。实现位于 `boltops/mla/triton/`；维护人 Triton @xukang。
 
-FlashMLA / Sparse MLA 尚未迁入本包。
+同时提供与 vLLM HCU 调用方式兼容的 Sparse FlashMLA 前向接口。
 
 ## 当前支持一览
 
@@ -13,11 +13,13 @@ FlashMLA / Sparse MLA 尚未迁入本包。
 | `decode_attention_fwd_grouped` | GQA/MQA/MLA 路径 | vLLM | 底层 grouped stage1 |
 | `decode_attention_fwd_normal` | MHA 路径 | vLLM | 底层 normal stage1 |
 | `compute_num_kv_splits` | split-KV 数量启发式 | vLLM `triton_mla` | 与 workspace 预留一致 |
+| `flash_mla_sparse_fwd` | Sparse MLA prefill/decode | FlashMLA | 按 top-k token 索引 gather |
 
 ```python
 from boltops.mla import (
     decode_attention_fwd,
     compute_num_kv_splits,
+    flash_mla_sparse_fwd,
 )
 ```
 
@@ -26,7 +28,11 @@ from boltops.mla import (
 ```bash
 pytest -q test/mla/
 pytest -q test/mla/ --bench -s
+python scripts/benchmarks/triton/benchmark_flash_mla_sparse.py -h
 ```
+
+精度测试位于 `test/mla/test_flash_mla_sparse.py`；独立性能脚本会运行典型
+`topk=2048/4096` shape，并输出包含延迟和有效 TFLOPS 的 CSV。
 
 溯源见 `boltops/mla/triton/SOURCE.md`。
 
