@@ -8,3 +8,5 @@ Vendored Triton MLA sources:
 - `flash_mla_sparse.py` — FlashMLA-compatible sparse forward kernel adapted
   from the supplied `flashmla_mqa_logic` Triton implementation. It implements
   gather-by-index MLA attention and returns max logits plus LSE.
+  Tuned configs are selected by Triton major/minor version, accelerator arch
+  and product name, then by exact dtype and operator shape.

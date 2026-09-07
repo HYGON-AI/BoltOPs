@@ -33,11 +33,12 @@ def flash_mla_sparse_fwd(
     d_v: int = 512,
     attn_sink: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
+    config: Optional[dict] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """FlashMLA-compatible sparse forward operator."""
     from boltops.mla.triton.flash_mla_sparse import flash_mla_sparse_fwd as impl
 
-    return impl(q, kv, indices, softmax_scale, d_v, attn_sink, topk_length)
+    return impl(q, kv, indices, softmax_scale, d_v, attn_sink, topk_length, config)
 
 
 def decode_attention_fwd(

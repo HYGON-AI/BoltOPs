@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
 from pathlib import Path
 
@@ -12,6 +13,10 @@ import torch
 import triton
 
 from boltops.mla import flash_mla_sparse_fwd
+from boltops.mla.triton.flash_mla_sparse import (
+    _device_identity,
+    _get_tuned_config,
+)
 
 BACKEND = "triton"
 KERNEL = "flash_mla_sparse"
@@ -25,6 +30,13 @@ SHAPES = (
     (32, 16384, 16, 1, 2048, 576, 512),
     (4, 32768, 16, 1, 4096, 576, 512),
 )
+BASELINE_CONFIG = {
+    "BLOCK_N": 16,
+    "BLOCK_H": 16,
+    "BLOCK_DMODEL": 128,
+    "num_warps": 4,
+    "num_stages": 1,
+}
 
 
 def benchmark_case(
@@ -35,7 +47,8 @@ def benchmark_case(
     topk: int,
     d_qk: int,
     d_v: int,
-) -> tuple[float, float]:
+    mode: str,
+) -> tuple[float, float, dict]:
     q = torch.randn((s_q, h_q, d_qk), device="cuda", dtype=DTYPE)
     kv = torch.randn((s_kv, h_kv, d_qk), device="cuda", dtype=DTYPE)
     indices = torch.randint(
@@ -45,6 +58,11 @@ def benchmark_case(
         (s_q,), topk, device="cuda", dtype=torch.int32
     )
     softmax_scale = 1.0 / math.sqrt(d_qk)
+    config = (
+        BASELINE_CONFIG
+        if mode == "baseline"
+        else _get_tuned_config(q, kv, indices, d_v)
+    )
 
     def run() -> None:
         flash_mla_sparse_fwd(
@@ -54,6 +72,7 @@ def benchmark_case(
             softmax_scale=softmax_scale,
             d_v=d_v,
             topk_length=topk_length,
+            config=config,
         )
 
     run()
@@ -65,7 +84,7 @@ def benchmark_case(
     # QK and PV each perform one multiply-add per selected value.
     operations = 2.0 * s_q * h_q * topk * (d_qk + d_v)
     tflops = operations / (latency_ms * 1e-3) / 1e12
-    return latency_ms, tflops
+    return latency_ms, tflops, config
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -78,9 +97,14 @@ def main(argv: list[str] | None = None) -> int:
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     output_file = output_dir / f"{BACKEND}_{KERNEL}.csv"
+    arch, device_name = _device_identity(torch.device("cuda"))
     fields = (
         "backend",
         "operator",
+        "mode",
+        "triton_version",
+        "device_name",
+        "arch",
         "s_q",
         "s_kv",
         "h_q",
@@ -91,35 +115,42 @@ def main(argv: list[str] | None = None) -> int:
         "dtype",
         "latency_ms",
         "tflops",
+        "config",
     )
     with output_file.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
         for shape in SHAPES:
-            latency_ms, tflops = benchmark_case(*shape)
-            s_q, s_kv, h_q, h_kv, topk, d_qk, d_v = shape
-            writer.writerow(
-                {
-                    "backend": BACKEND,
-                    "operator": KERNEL,
-                    "s_q": s_q,
-                    "s_kv": s_kv,
-                    "h_q": h_q,
-                    "h_kv": h_kv,
-                    "topk": topk,
-                    "d_qk": d_qk,
-                    "d_v": d_v,
-                    "dtype": str(DTYPE).replace("torch.", ""),
-                    "latency_ms": f"{latency_ms:.6f}",
-                    "tflops": f"{tflops:.2f}",
-                }
-            )
-            handle.flush()
-            print(
-                f"[bench] Sq={s_q} Skv={s_kv} Hq={h_q} topk={topk}: "
-                f"{latency_ms:.6f} ms, {tflops:.2f} TFLOPS",
-                flush=True,
-            )
+            for mode in ("baseline", "tuned"):
+                latency_ms, tflops, config = benchmark_case(*shape, mode)
+                s_q, s_kv, h_q, h_kv, topk, d_qk, d_v = shape
+                writer.writerow(
+                    {
+                        "backend": BACKEND,
+                        "operator": KERNEL,
+                        "mode": mode,
+                        "triton_version": triton.__version__,
+                        "device_name": device_name,
+                        "arch": arch,
+                        "s_q": s_q,
+                        "s_kv": s_kv,
+                        "h_q": h_q,
+                        "h_kv": h_kv,
+                        "topk": topk,
+                        "d_qk": d_qk,
+                        "d_v": d_v,
+                        "dtype": str(DTYPE).replace("torch.", ""),
+                        "latency_ms": f"{latency_ms:.6f}",
+                        "tflops": f"{tflops:.2f}",
+                        "config": json.dumps(config, sort_keys=True),
+                    }
+                )
+                handle.flush()
+                print(
+                    f"[bench:{mode}] Sq={s_q} Skv={s_kv} Hq={h_q} "
+                    f"topk={topk}: {latency_ms:.6f} ms, {tflops:.2f} TFLOPS",
+                    flush=True,
+                )
     print(f"Wrote {output_file}")
     return 0
 

@@ -1,0 +1,116 @@
+{
+  "metadata": {
+    "triton_version": "3.6.0",
+    "version_tag": "triton_3_6",
+    "device_name": "BW200, UBB BW1000",
+    "device_slug": "BW200_UBB_BW1000",
+    "arch": "gfx936",
+    "dtype": "bfloat16"
+  },
+  "configs": [
+    {
+      "match": {
+        "s_q": 1,
+        "s_kv": 16384,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 2048,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "config": {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 256,
+        "num_warps": 2,
+        "num_stages": 1,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 2
+      },
+      "baseline_ms": 0.70176,
+      "latency_ms": 0.56976,
+      "speedup": 1.2317,
+      "valid_candidates": 138
+    },
+    {
+      "match": {
+        "s_q": 4,
+        "s_kv": 16384,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 2048,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "config": {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 256,
+        "num_warps": 2,
+        "num_stages": 1,
+        "waves_per_eu": 2,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 2
+      },
+      "baseline_ms": 0.68416,
+      "latency_ms": 0.54976,
+      "speedup": 1.2445,
+      "valid_candidates": 138
+    },
+    {
+      "match": {
+        "s_q": 32,
+        "s_kv": 16384,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 2048,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "config": {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 256,
+        "num_warps": 2,
+        "num_stages": 1,
+        "waves_per_eu": 2,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 2
+      },
+      "baseline_ms": 0.68576,
+      "latency_ms": 0.55072,
+      "speedup": 1.2452,
+      "valid_candidates": 138
+    },
+    {
+      "match": {
+        "s_q": 4,
+        "s_kv": 32768,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 4096,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "config": {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 256,
+        "num_warps": 2,
+        "num_stages": 1,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 2
+      },
+      "baseline_ms": 1.34872,
+      "latency_ms": 1.08352,
+      "speedup": 1.2448,
+      "valid_candidates": 138
+    }
+  ]
+}
