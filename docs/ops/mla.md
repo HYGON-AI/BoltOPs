@@ -61,8 +61,10 @@ python boltops/tools/tune_flash_mla_sparse.py \
 当前四个典型 size 的调度优化最优项一致为 max-ILP off、
 register-pressure-aware scheduling on、optimized epilogue off、BlockPingpong off。
 
-配置按 Triton major/minor、gfx arch、完整设备名定位文件，再按 dtype 和完整
-shape 精确匹配；未命中配置时自动使用安全默认值。当前配置文件是
+配置按 Triton major/minor、gfx arch、完整设备名定位文件，再按 dtype、关键
+shape 和可选的 `_min`/`_max` 范围匹配；多个配置同时命中时优先选择更具体、
+范围更窄的配置，未命中时自动使用安全默认值。`s_kv` 仅参与运行时索引边界
+检查，不影响 kernel 循环结构，因此不作为当前配置的过滤条件。当前配置文件是
 `boltops/mla/triton/configs/triton_3_6/flash_mla_sparse_gfx936_BW200_UBB_BW1000.json`。
 
 溯源见 `boltops/mla/triton/SOURCE.md`。

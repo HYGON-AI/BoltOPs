@@ -10,8 +10,7 @@
   "configs": [
     {
       "match": {
-        "s_q": 1,
-        "s_kv": 16384,
+        "s_q_max": 8,
         "h_q": 16,
         "h_kv": 1,
         "topk": 2048,
@@ -40,38 +39,7 @@
     },
     {
       "match": {
-        "s_q": 4,
-        "s_kv": 16384,
-        "h_q": 16,
-        "h_kv": 1,
-        "topk": 2048,
-        "d_qk": 576,
-        "d_v": 512,
-        "dtype": "bfloat16"
-      },
-      "config": {
-        "BLOCK_N": 32,
-        "BLOCK_H": 16,
-        "BLOCK_DMODEL": 64,
-        "num_warps": 4,
-        "num_stages": 2,
-        "waves_per_eu": 1,
-        "matrix_instr_nonkdim": 16,
-        "kpack": 1,
-        "amdgpu_enable_max_ilp_scheduling_strategy": false,
-        "misched_regpressure": true,
-        "optimize_epilogue": false,
-        "use_block_pingpong": false
-      },
-      "baseline_ms": 0.68416,
-      "latency_ms": 0.47632,
-      "speedup": 1.4374,
-      "valid_candidates": 32
-    },
-    {
-      "match": {
-        "s_q": 32,
-        "s_kv": 16384,
+        "s_q_min": 9,
         "h_q": 16,
         "h_kv": 1,
         "topk": 2048,
@@ -100,8 +68,7 @@
     },
     {
       "match": {
-        "s_q": 4,
-        "s_kv": 32768,
+        "s_q_max": 8,
         "h_q": 16,
         "h_kv": 1,
         "topk": 4096,

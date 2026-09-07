@@ -56,6 +56,36 @@ def _load_device_configs(version_tag: str, arch: str, device_name: str) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def _config_match_score(match: dict, shape: dict) -> Optional[tuple[int, int, float]]:
+    """Return match specificity, or ``None`` when a shape does not match."""
+    exact = 0
+    bounds = 0
+    widths = {}
+    for key, expected in match.items():
+        if key.endswith("_min") or key.endswith("_max"):
+            field, kind = key.rsplit("_", 1)
+            actual = shape.get(field)
+            if actual is None:
+                return None
+            if kind == "min" and actual < expected:
+                return None
+            if kind == "max" and actual > expected:
+                return None
+            widths.setdefault(field, {})[kind] = expected
+            bounds += 1
+        elif shape.get(key) != expected:
+            return None
+        else:
+            exact += 1
+    total_width = 0.0
+    for limits in widths.values():
+        if "min" in limits and "max" in limits:
+            total_width += limits["max"] - limits["min"]
+        else:
+            total_width += float("inf")
+    return exact, bounds, -total_width
+
+
 def _get_tuned_config(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -74,11 +104,18 @@ def _get_tuned_config(
         "d_v": d_v,
         "dtype": str(q.dtype).replace("torch.", ""),
     }
+    selected = None
+    selected_score = None
     for entry in data.get("configs", ()):
         match = entry.get("match", {})
-        if isinstance(match, dict) and all(shape.get(k) == v for k, v in match.items()):
-            config = entry.get("config", {})
-            return dict(config) if isinstance(config, dict) else {}
+        if not isinstance(match, dict):
+            continue
+        score = _config_match_score(match, shape)
+        if score is not None and (selected_score is None or score > selected_score):
+            selected, selected_score = entry, score
+    if selected is not None:
+        config = selected.get("config", {})
+        return dict(config) if isinstance(config, dict) else {}
     return {}
 
 

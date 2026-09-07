@@ -13,6 +13,7 @@ import torch
 pytest.importorskip("triton")
 
 from boltops.mla import flash_mla_sparse_fwd
+from boltops.mla.triton.flash_mla_sparse import _config_match_score
 
 
 GPU_REQUIRED = pytest.mark.skipif(
@@ -122,3 +123,13 @@ def test_flash_mla_sparse_tuned_config_schema():
             assert entry["match"]["dtype"] == metadata["dtype"]
             assert entry["latency_ms"] > 0
             assert entry["speedup"] > 0
+
+
+def test_tuned_config_range_matching_and_specificity():
+    shape = {"s_q": 4, "topk": 2048, "dtype": "bfloat16"}
+    assert _config_match_score({"s_q_max": 8, "topk": 2048}, shape) is not None
+    assert _config_match_score({"s_q_min": 9, "topk": 2048}, shape) is None
+    range_score = _config_match_score({"s_q_max": 8, "topk": 2048}, shape)
+    exact_score = _config_match_score({"s_q": 4, "topk": 2048}, shape)
+    assert exact_score is not None and range_score is not None
+    assert exact_score > range_score
