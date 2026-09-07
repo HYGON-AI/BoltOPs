@@ -12,6 +12,8 @@ from boltops.fused_moe.triton.moe_activation import (
     _normalize_activation_and_gate,
     adjust_N_for_activation,
     _apply_activation,
+    is_fused_activation_quant_supported,
+    triton_activation_quant,
 )
 
 from boltops.fused_moe.triton.moe_op import fused_moe as invoke_fused_moe_kernel, support_mls
@@ -24,7 +26,6 @@ from boltops.fused_moe.triton.moe_compat import (
     sgl_moe_align_block_size as sgl_moe_align_block_size_aiter,
 )
 from boltops.utility.torch_guard import torch_compile_guard
-from boltops.fused_moe.triton.moe_sorting_decode import moe_sorting_decode_fwd
 from boltops.fused_moe.triton.moe_sorting_hipc import moe_sorting_fwd
 from boltops.utility import dtypes
 
@@ -720,10 +721,115 @@ def _bottom_moe_use_mls():
     return support_mls()
 
 
-def _bottom_a_uses_mls(config, use_int4_w4a8):
-    if not _bottom_moe_use_mls() or use_int4_w4a8 or config is None:
+def _bottom_a_uses_sorted_layout(config, use_int4_w4a8):
+    """Whether GEMM1/GEMM2 use the padded expert-sorted bridge layout.
+
+    The historical config key mentions MLS because that was the first consumer
+    of this layout.  The layout itself does not require MLS: architectures
+    without ``tl.matrix_load`` can consume the same contiguous rows with a
+    regular ``tl.load``.
+    """
+    if use_int4_w4a8 or config is None:
         return False
     return config.get("bottom_a_use_mls_load", False)
+
+
+def _bottom_a_uses_mls(config, use_int4_w4a8):
+    return (
+        _bottom_moe_use_mls()
+        and _bottom_a_uses_sorted_layout(config, use_int4_w4a8)
+    )
+
+
+def _should_use_naive_block_assignment(
+    *,
+    num_routes: int,
+    global_num_experts: int,
+    has_expert_map: bool,
+    bottom_a_sorted: bool,
+    use_int8_w8a16: bool,
+    use_int4_w4a16: bool,
+    use_int4_w4a8: bool,
+    use_block_quant: bool,
+) -> bool:
+    """Return whether each route should own one GEMM tile without metadata."""
+    min_experts_per_route = 8 if use_block_quant else 4
+    return (
+        not has_expert_map
+        and not bottom_a_sorted
+        and not use_int8_w8a16
+        and not use_int4_w4a16
+        and not use_int4_w4a8
+        and num_routes * min_experts_per_route <= global_num_experts
+    )
+
+
+def _should_use_fused_activation_quant(
+    *,
+    use_int8_w8a8: bool,
+    use_fp8_w8a8: bool,
+    use_int4_w4a8: bool,
+    per_channel_quant: bool,
+    has_expert_map: bool,
+    activation: str,
+    is_gated: bool,
+    output_dim: int,
+    gemm1_alpha: Optional[float],
+    gemm1_limit: Optional[float],
+    activation_situ_beta: Optional[float],
+    activation_situ_linear_beta: Optional[float],
+) -> bool:
+    """Return whether activation and quantization may use the fused kernel."""
+    # INT4 W4A8 also uses INT8 activations, but its fused path is deferred
+    # until that weight path has dedicated correctness and performance tests.
+    w8a8_mode_count = int(use_int8_w8a8) + int(use_fp8_w8a8)
+    if (
+        w8a8_mode_count != 1
+        or use_int4_w4a8
+        or not per_channel_quant
+        or has_expert_map
+    ):
+        return False
+    quant_dtype = torch.float8_e4m3fn if use_fp8_w8a8 else torch.int8
+    return is_fused_activation_quant_supported(
+        activation,
+        is_gated,
+        quant_dtype,
+        output_dim,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_limit=gemm1_limit,
+        activation_situ_beta=activation_situ_beta,
+        activation_situ_linear_beta=activation_situ_linear_beta,
+    )
+
+
+def _should_fold_router_weight(
+    *,
+    fuse_activation_quant: bool,
+    needs_router_weight: bool,
+) -> bool:
+    """Return whether router weights can move into activation quant scales.
+
+    Before folding, every GEMM2 output element is multiplied by the route's
+    router weight::
+
+        route_output = (activation_q @ w2) * activation_scale * weight_scale
+        route_output *= router_weight
+
+    Fold the per-route scalar into the per-token activation scale instead::
+
+        folded_scale = activation_scale * router_weight
+        route_output = (activation_q @ w2) * folded_scale * weight_scale
+
+    A router weight is one scalar shared by the route's entire output row.
+    Folding adds one scalar multiply where activation quantization already
+    produces the per-token scale, while removing the router-weight load and
+    multiply from every GEMM2 output element. The saving therefore grows with
+    the GEMM2 output width. GEMM2 bias, when present, is still multiplied by
+    the router weight. Layout-specific row alignment is handled separately by
+    the caller.
+    """
+    return fuse_activation_quant and needs_router_weight
 
 
 @torch_compile_guard(gen_fake=fused_moe_fake)
@@ -802,7 +908,7 @@ def fused_experts_impl(hidden_states: torch.Tensor,
 
     # We execute the fused_moe kernel in chunks to circumvent this issue:
     # https://github.com/vllm-project/vllm/issues/5938
-    CHUNK_SIZE = int(os.environ.get("TRITON_FUSED_MOE_CHUNK_SIZE", "16384"))
+    CHUNK_SIZE = int(os.environ.get("TRITON_FUSED_MOE_CHUNK_SIZE", "32768"))
     M = min(num_tokens, CHUNK_SIZE)
 
     moe_config_func = get_optimal_moe_config_func(
@@ -834,12 +940,13 @@ def fused_experts_impl(hidden_states: torch.Tensor,
             f"top={config['BLOCK_SIZE_M']}, bottom={config2['BLOCK_SIZE_M']}"
         )
 
+    bottom_moe_a_sorted = _bottom_a_uses_sorted_layout(config2, use_int4_w4a8)
     bottom_moe_a_use_mls = _bottom_a_uses_mls(config2, use_int4_w4a8)
     config2_kernel = config2.copy()
     config2_kernel.pop("bottom_a_use_mls_load", None)
 
     max_padded_tokens = (
-        min(M * topk, E + 1) * (max_block_m - 1) if bottom_moe_a_use_mls else 0
+        min(M * topk, E + 1) * (max_block_m - 1) if bottom_moe_a_sorted else 0
     )
     total_tokens = M * topk + max_padded_tokens
 
@@ -890,6 +997,9 @@ def fused_experts_impl(hidden_states: torch.Tensor,
                     "Top and bottom MoE configs must use the same BLOCK_SIZE_M: "
                     f"top={config['BLOCK_SIZE_M']}, bottom={config2['BLOCK_SIZE_M']}"
                 )
+            bottom_moe_a_sorted = _bottom_a_uses_sorted_layout(
+                config2, use_int4_w4a8
+            )
             bottom_moe_a_use_mls = _bottom_a_uses_mls(
                 config2, use_int4_w4a8
             )
@@ -899,7 +1009,7 @@ def fused_experts_impl(hidden_states: torch.Tensor,
 
         padded_tokens = (
             min(tokens_in_chunk * topk, E + 1) * (config["BLOCK_SIZE_M"] - 1)
-            if bottom_moe_a_use_mls
+            if bottom_moe_a_sorted
             else 0
         )
         total_tokens = tokens_in_chunk * topk + padded_tokens
@@ -922,19 +1032,26 @@ def fused_experts_impl(hidden_states: torch.Tensor,
 
         ck_sorting = True
         sorted_weights = None
-        direct_routing = (
-            tokens_in_chunk * topk <= 32
-            and expert_map is None
-            and not bottom_moe_a_use_mls
+        num_routes = tokens_in_chunk * topk
+        naive_block_assignment = _should_use_naive_block_assignment(
+            num_routes=num_routes,
+            global_num_experts=global_num_experts,
+            has_expert_map=expert_map is not None,
+            bottom_a_sorted=bottom_moe_a_sorted,
+            use_int8_w8a16=use_int8_w8a16,
+            use_int4_w4a16=use_int4_w4a16,
+            use_int4_w4a8=use_int4_w4a8,
+            use_block_quant=block_shape is not None,
         )
-        if direct_routing:
-            sorted_token_ids, expert_ids, num_tokens_post_padded = (
-                moe_sorting_decode_fwd(curr_topk_ids, config["BLOCK_SIZE_M"]))
+        if naive_block_assignment:
+            assert curr_topk_weights.is_contiguous(), (
+                "Top-k weights must be contiguous for naive block assignment"
+            )
+            route_ids = curr_topk_ids.contiguous().view(-1)
+            sorted_token_ids = route_ids
+            expert_ids = route_ids
+            num_tokens_post_padded = route_ids
             ck_sorting = False
-        elif not ck_sorting:
-            sorted_token_ids, expert_ids, num_tokens_post_padded = (
-                moe_align_block_size(curr_topk_ids, config['BLOCK_SIZE_M'],
-                                    global_num_experts, expert_map))
         else:
             # Convert expert_map (global->local mapping, -1 for inactive) to
             # expert_mask (binary 0/1 mask) expected by moe_sorting_ck's C kernel.
@@ -973,9 +1090,10 @@ def fused_experts_impl(hidden_states: torch.Tensor,
                                     use_int4_w4a8=use_int4_w4a8,
                                     per_channel_quant=per_channel_quant,
                                     block_shape=block_shape,
-                                    c_sorted=bottom_moe_a_use_mls,
+                                    c_sorted=bottom_moe_a_sorted,
                                     ck_sorting=ck_sorting,
                                     ck_topk=topk,
+                                    naive_block_assignment=naive_block_assignment,
                                     B_bias=b1,
                                     config=config)
         elif block_shape is not None and (use_int8_w8a8 or use_int4_w4a8 or use_fp8_w8a8):
@@ -1006,9 +1124,10 @@ def fused_experts_impl(hidden_states: torch.Tensor,
                                     use_int4_w4a8=use_int4_w4a8,
                                     per_channel_quant=per_channel_quant,
                                     block_shape=block_shape,
-                                    c_sorted=bottom_moe_a_use_mls,
+                                    c_sorted=bottom_moe_a_sorted,
                                     ck_sorting=ck_sorting,
                                     ck_topk=topk,
+                                    naive_block_assignment=naive_block_assignment,
                                     B_bias=b1,
                                     config=config)
         else:
@@ -1034,21 +1153,81 @@ def fused_experts_impl(hidden_states: torch.Tensor,
                                     use_int4_w4a8=use_int4_w4a8,
                                     per_channel_quant=per_channel_quant,
                                     block_shape=block_shape,
-                                    c_sorted=bottom_moe_a_use_mls,
+                                    c_sorted=bottom_moe_a_sorted,
                                     ck_sorting=ck_sorting,
                                     ck_topk=topk,
+                                    naive_block_assignment=naive_block_assignment,
                                     B_bias=b1,
                                     config=config)
-        _apply_activation(
-            activation=activation,
-            is_gated=is_gated,
-            activated_out=intermediate_cache2,
-            ffn1_out_2d=intermediate_cache1.view(-1, N),
-            gemm1_alpha=gemm1_alpha,
-            gemm1_limit=gemm1_limit,
-            activation_situ_beta=activation_situ_beta,
-            activation_situ_linear_beta=activation_situ_linear_beta,
+        per_channel_a8 = (
+            (use_int8_w8a8 or use_fp8_w8a8 or use_int4_w4a8)
+            and per_channel_quant
         )
+        activation_quant_dtype = (
+            torch.float8_e4m3fn if use_fp8_w8a8 else torch.int8
+        )
+        fuse_activation_quant = (
+            _should_use_fused_activation_quant(
+                use_int8_w8a8=use_int8_w8a8,
+                use_fp8_w8a8=use_fp8_w8a8,
+                use_int4_w4a8=use_int4_w4a8,
+                per_channel_quant=per_channel_quant,
+                has_expert_map=expert_map is not None,
+                activation=activation,
+                is_gated=is_gated,
+                output_dim=activation_out_dim,
+                gemm1_alpha=gemm1_alpha,
+                gemm1_limit=gemm1_limit,
+                activation_situ_beta=activation_situ_beta,
+                activation_situ_linear_beta=activation_situ_linear_beta,
+            )
+        )
+        needs_router_weight = not (
+            apply_router_weight_on_input or no_combine
+        )
+        fold_router_weight = _should_fold_router_weight(
+            fuse_activation_quant=fuse_activation_quant,
+            needs_router_weight=needs_router_weight,
+        )
+        activation_input = intermediate_cache1.view(-1, N)
+        row_multiplier = None
+        if fold_router_weight:
+            if bottom_moe_a_sorted:
+                if sorted_weights is None:
+                    raise RuntimeError(
+                        "sorted activation layout requires sorted router weights"
+                    )
+                # Both buffers conservatively cover every valid padded route,
+                # but their allocation upper bounds are not always identical.
+                # Quantize only their common valid capacity.
+                rows = min(activation_input.shape[0], sorted_weights.numel())
+                activation_input = activation_input[:rows]
+                row_multiplier = sorted_weights[:rows]
+            else:
+                row_multiplier = curr_topk_weights.contiguous().view(-1)
+        if fuse_activation_quant:
+            activation_q, activation_scale = triton_activation_quant(
+                activation_input,
+                activation,
+                is_gated,
+                activation_quant_dtype,
+                gemm1_alpha=gemm1_alpha,
+                gemm1_limit=gemm1_limit,
+                activation_situ_beta=activation_situ_beta,
+                activation_situ_linear_beta=activation_situ_linear_beta,
+                row_multiplier=row_multiplier,
+            )
+        else:
+            _apply_activation(
+                activation=activation,
+                is_gated=is_gated,
+                activated_out=intermediate_cache2,
+                ffn1_out_2d=intermediate_cache1.view(-1, N),
+                gemm1_alpha=gemm1_alpha,
+                gemm1_limit=gemm1_limit,
+                activation_situ_beta=activation_situ_beta,
+                activation_situ_linear_beta=activation_situ_linear_beta,
+            )
         if expert_map != None:
             # for EP mode, intermediate_cache1 and intermediate_cache3 need be zeros inited
             # since intermediate_cache1 and intermediate_cache3 shared same buffer,
@@ -1056,15 +1235,19 @@ def fused_experts_impl(hidden_states: torch.Tensor,
             # intermediate_cache1 need inited to zeros after silu_and_mul
             intermediate_cache1.fill_(0)
 
-        if (use_int8_w8a8 or use_fp8_w8a8 or use_int4_w4a8) and per_channel_quant:
-            quant_dtype = torch.float8_e4m3fn if use_fp8_w8a8 else torch.int8
-            bridge_q, bridge_scale = per_token_quant_triton(
-                intermediate_cache2, quant_dtype=quant_dtype
-            )
-            invoke_fused_moe_kernel(bridge_q,
+        gemm2_mul_router_weight = (
+            needs_router_weight and not fold_router_weight
+        )
+
+        if per_channel_a8:
+            if not fuse_activation_quant:
+                activation_q, activation_scale = per_token_quant_triton(
+                    intermediate_cache2, quant_dtype=activation_quant_dtype
+                )
+            invoke_fused_moe_kernel(activation_q,
                                     w2,
                                     intermediate_cache3,
-                                    bridge_scale,
+                                    activation_scale,
                                     w2_scale,
                                     w2_zp,
                                     curr_topk_weights,
@@ -1073,7 +1256,7 @@ def fused_experts_impl(hidden_states: torch.Tensor,
                                     sorted_weights,
                                     expert_ids,
                                     num_tokens_post_padded,
-                                    (not apply_router_weight_on_input) and (not no_combine),
+                                    gemm2_mul_router_weight,
                                     1,
                                     compute_type=compute_type,
                                     use_fp8_w8a8=use_fp8_w8a8,
@@ -1083,19 +1266,21 @@ def fused_experts_impl(hidden_states: torch.Tensor,
                                     use_int4_w4a8=use_int4_w4a8,
                                     per_channel_quant=per_channel_quant,
                                     block_shape=block_shape,
+                                    a_sorted=bottom_moe_a_sorted,
                                     bottom_a_use_mls_load=bottom_moe_a_use_mls,
                                     ck_sorting=ck_sorting,
                                     ck_topk=topk,
-                                    scale_bias_with_routed_weight=(not apply_router_weight_on_input) and (not no_combine),
+                                    naive_block_assignment=naive_block_assignment,
+                                    scale_bias_with_routed_weight=needs_router_weight,
                                     B_bias=b2,
                                     config=config2_kernel)
         elif block_shape is not None and (use_int8_w8a8 or use_int4_w4a8 or use_fp8_w8a8):
             quant_dtype = torch.float8_e4m3fn if use_fp8_w8a8 else torch.int8
-            bridge_q, bridge_scale = per_block_quant_wrapper((1,block_shape[1]))(per_token_quant_triton)(intermediate_cache2, quant_dtype=quant_dtype)
-            invoke_fused_moe_kernel(bridge_q,
+            activation_q, activation_scale = per_block_quant_wrapper((1,block_shape[1]))(per_token_quant_triton)(intermediate_cache2, quant_dtype=quant_dtype)
+            invoke_fused_moe_kernel(activation_q,
                                     w2,
                                     intermediate_cache3,
-                                    bridge_scale,
+                                    activation_scale,
                                     w2_scale,
                                     w2_zp,
                                     curr_topk_weights,
@@ -1104,7 +1289,7 @@ def fused_experts_impl(hidden_states: torch.Tensor,
                                     sorted_weights,
                                     expert_ids,
                                     num_tokens_post_padded,
-                                    (not apply_router_weight_on_input) and (not no_combine),
+                                    gemm2_mul_router_weight,
                                     1,
                                     compute_type=compute_type,
                                     use_fp8_w8a8=use_fp8_w8a8,
@@ -1114,10 +1299,12 @@ def fused_experts_impl(hidden_states: torch.Tensor,
                                     use_int4_w4a8=use_int4_w4a8,
                                     per_channel_quant=per_channel_quant,
                                     block_shape=block_shape,
+                                    a_sorted=bottom_moe_a_sorted,
                                     bottom_a_use_mls_load=bottom_moe_a_use_mls,
                                     ck_sorting=ck_sorting,
                                     ck_topk=topk,
-                                    scale_bias_with_routed_weight=(not apply_router_weight_on_input) and (not no_combine),
+                                    naive_block_assignment=naive_block_assignment,
+                                    scale_bias_with_routed_weight=needs_router_weight,
                                     B_bias=b2,
                                     config=config2_kernel)
         else:
@@ -1133,7 +1320,7 @@ def fused_experts_impl(hidden_states: torch.Tensor,
                         sorted_weights,
                         expert_ids,
                         num_tokens_post_padded,
-                        (not apply_router_weight_on_input) and (not no_combine),
+                        gemm2_mul_router_weight,
                         1,
                         compute_type=compute_type,
                         use_fp8_w8a8=use_fp8_w8a8,
@@ -1143,10 +1330,12 @@ def fused_experts_impl(hidden_states: torch.Tensor,
                         use_int4_w4a8=use_int4_w4a8,
                         per_channel_quant=per_channel_quant,
                         block_shape=block_shape,
+                        a_sorted=bottom_moe_a_sorted,
                         bottom_a_use_mls_load=bottom_moe_a_use_mls,
                         ck_sorting=ck_sorting,
                         ck_topk=topk,
-                        scale_bias_with_routed_weight=(not apply_router_weight_on_input) and (not no_combine),
+                        naive_block_assignment=naive_block_assignment,
+                        scale_bias_with_routed_weight=needs_router_weight,
                         B_bias=b2,
                         config=config2_kernel)
         if no_combine:

@@ -31,6 +31,7 @@ _SAVED_CONFIG_KEYS = (
     "GROUP_SIZE_M",
     "COMBINE_SCALE_LOAD",
     "USE_MLS_LOAD",
+    "a_sorted",
     "bottom_a_use_mls_load",
     "instruction_sched_variant",
     "schedule_hint",
@@ -241,13 +242,28 @@ def save_results_to_json(results, k1_filename, k2_filename):
             **{
                 key: value
                 for key, value in k1_params.items()
-                if key != "bottom_a_use_mls_load"
+                if key not in ("a_sorted", "bottom_a_use_mls_load")
             },
         }
-        entry_k2 = {"BLOCK_SIZE_M": block_size_m, **k2_params}
+        entry_k2 = {
+            "BLOCK_SIZE_M": block_size_m,
+            **{key: value for key, value in k2_params.items() if key != "a_sorted"},
+        }
+        bottom_a_sorted = config_dict.get(
+            "bottom_a_use_mls_load",
+            k2_params.get("a_sorted", k2_params.get("bottom_a_use_mls_load")),
+        )
+        if bottom_a_sorted is not None:
+            # Keep the historical on-disk key for compatibility. It now means
+            # "use the sorted Gemm1/Gemm2 bridge"; runtime capability decides
+            # whether Gemm2 consumes it with matrix_load or regular loads.
+            entry_k2["bottom_a_use_mls_load"] = bool(bottom_a_sorted)
 
         json_data_k1[f"{special_key}"] = entry_k1
         json_data_k2[f"{special_key}"] = entry_k2
+
+    json_data_k1 = dict(sorted(json_data_k1.items(), key=lambda item: int(item[0])))
+    json_data_k2 = dict(sorted(json_data_k2.items(), key=lambda item: int(item[0])))
 
     # 保存两个文件
     with open(k1_filename, 'w', encoding='utf-8') as f:

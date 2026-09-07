@@ -65,7 +65,7 @@ from boltops.utility.perf_utils import checkAllclose, perftest,benchmark
 os.environ["AMDGCN_USE_BUFFER_OPS"] = "1"
 # os.environ["TRITON_DISABLE_LINE_INFO"] = "1"
 
-os.environ["TRITON_FUSED_MOE_CHUNK_SIZE"] = "16384"
+os.environ["TRITON_FUSED_MOE_CHUNK_SIZE"] = "32768"
 # 从环境变量获取配置，如果不存在则使用默认值
 # os.environ["TRITON_COMPILE_ONLY"] = "1"
 compile_only  = int(os.environ.get("TRITON_COMPILE_ONLY", "0"))

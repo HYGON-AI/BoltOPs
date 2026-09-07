@@ -16,6 +16,9 @@ from boltops.fused_moe.triton import (
     triton_moe_sum,
     moe_align_block_size,
 )
+from boltops.fused_moe.triton.fused_moe import (
+    _should_use_naive_block_assignment,
+)
 from boltops.fused_moe.triton.moe_activation import (
     _normalize_activation_and_gate,
     adjust_N_for_activation,
@@ -43,6 +46,23 @@ _ALLOWED_OUTPUT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _SCHEDULE_OPTION_NAMES = ("instruction_sched_variant", "schedule_hint")
 _LARGE_MOE_TOKEN_THRESHOLD = 2048
 _SKIPPABLE_HIP_LOAD_ERRORS = ("named symbol not found",)
+
+
+def _max_autotune_total_tokens(
+    num_tokens: int,
+    topk: int,
+    num_experts: int,
+    *,
+    allow_sorted_bridge: bool,
+    max_block_m: int = 256,
+) -> int:
+    """Size tuning buffers for the largest legal sorted-bridge padding."""
+    max_padded_tokens = (
+        min(num_tokens * topk, num_experts + 1) * (max_block_m - 1)
+        if allow_sorted_bridge
+        else 0
+    )
+    return num_tokens * topk + max_padded_tokens
 
 
 def _skip_invalid_hip_loads(do_bench):
@@ -117,12 +137,7 @@ def _keep_autotune_config(
     use_mls_load = config["USE_MLS_LOAD"]
     bottom_a_use_mls_load = config["bottom_a_use_mls_load"]
     kpack = config.get("kpack")
-    # For Gemm1, bottom_a_use_mls_load only requests the c_sorted output
-    # layout that Gemm2 will consume; Gemm1 itself still uses ordinary A/B
-    # loads.  For Gemm2, the same flag selects an MLS matrix_load for A.
-    uses_matrix_load_mls = use_mls_load or (
-        bottom_a_use_mls_load and not is_gemm1
-    )
+    uses_matrix_load_mls = use_mls_load or bottom_a_use_mls_load
 
     # Cache swizzle needs enough runtime workgroups to amortize its setup.
     if (
@@ -356,10 +371,13 @@ def generate_config2_lists(
     combine_scale_load_options = [False, True] if test_type in ["int8", "int4int8", "fp8"] else [False]
 
     use_mls_load_options = [False, True] if test_type in ["fp8", "fp8_channel", "int8", "int8_channel", "bf16"] and capMLS == True else [False]
-    # Gemm2's A-side MLS layout is selected by the outer fused-MoE search.
-    # It changes Gemm1's output layout, padding and Gemm2's input addressing,
-    # so it cannot be independently autotuned inside Gemm2.
-    bottom_a_use_mls_load_options = [bool(bottom_a_use_mls_load)]
+    # The outer fused-MoE search selects the bridge layout because it changes
+    # Gemm1 output, padding and Gemm2 addressing. The inner Gemm2 search only
+    # turns that layout into matrix_load when the target supports MLS.
+    bottom_a_sorted = bool(bottom_a_use_mls_load)
+    bottom_a_use_mls_load_options = [
+        bottom_a_sorted and capMLS and not is_gemm1
+    ]
 
     # warp 1 no selected, so no need to tune
     num_warp_options = [2, 4, 8, 16]
@@ -457,6 +475,7 @@ def generate_config2_lists(
                 "GROUP_SIZE_M": group_m,
                 "COMBINE_SCALE_LOAD": combine_scale_load,
                 "USE_MLS_LOAD": use_mls_load,
+                "a_sorted": bottom_a_sorted,
                 "bottom_a_use_mls_load": bottom_a_use_mls_load,
             }
             _add_compiler_options(
@@ -614,7 +633,10 @@ def dynamic_autotune(fn):
                     "channelwise" in kernel_name
                 )
 
-                bottom_a_use_mls_load = kwargs.get('bottom_a_use_mls_load', False)
+                bottom_a_sorted = bool(
+                    kwargs.get('a_sorted', False)
+                    or kwargs.get('bottom_a_use_mls_load', False)
+                )
 
                 # 确保所有参数都不是None
                 BLOCK_SIZE_M = 16 if BLOCK_SIZE_M is None else BLOCK_SIZE_M
@@ -636,7 +658,7 @@ def dynamic_autotune(fn):
                     K=K,
                     MUL_ROUTED_WEIGHT=MUL_ROUTED_WEIGHT,
                     per_channel_quant=per_channel_quant,
-                    bottom_a_use_mls_load=bottom_a_use_mls_load,
+                    bottom_a_use_mls_load=bottom_a_sorted,
                     num_valid_tokens=kwargs.get(
                         "num_valid_tokens", named_args.get("num_valid_tokens")
                     ),
@@ -653,11 +675,7 @@ def dynamic_autotune(fn):
                         cfg_use_mls = bool(cfg_kwargs.get("USE_MLS_LOAD", False))
                         cfg_bottom_mls = bool(cfg_kwargs.get("bottom_a_use_mls_load", False))
                         cfg_block_k = int(cfg_kwargs.get("BLOCK_SIZE_K", 0))
-                        # bottom-A means an MLS input load only for Gemm2.
-                        # In Gemm1 it merely selects the c_sorted output layout.
-                        cfg_uses_matrix_load_mls = cfg_use_mls or (
-                            cfg_bottom_mls and bool(MUL_ROUTED_WEIGHT)
-                        )
+                        cfg_uses_matrix_load_mls = cfg_use_mls or cfg_bottom_mls
                         if cfg_uses_matrix_load_mls:
                             if test_type == "bf16" and cfg_block_k < 32:
                                 continue
@@ -667,6 +685,7 @@ def dynamic_autotune(fn):
                     return pruned
 
                 launch_kwargs = dict(kwargs)
+                launch_kwargs.pop("a_sorted", None)
                 launch_kwargs.pop("bottom_a_use_mls_load", None)
                 # 应用autotune装饰器
                 autotuned_fn = triton.autotune(
@@ -710,8 +729,7 @@ def generate_config_lists():
 
         bottom_a_mls_options = (
             (False, True)
-            if capMLS
-            and test_type in ("bf16", "fp8", "fp8_channel", "int8", "int8_channel")
+            if test_type in ("bf16", "fp8", "fp8_channel", "int8", "int8_channel")
             else (False,)
         )
 
@@ -778,6 +796,7 @@ def fused_moe(
     block_shape: Optional[List[int]] = None,
     c_sorted: bool = False,
     bottom_a_use_mls_load: bool = False,
+    naive_block_assignment: bool = False,
     scale_bias_with_routed_weight: bool = False,
     B_bias: Optional[torch.Tensor] = None,
     config: Optional[Dict[str, Any]] = None,
@@ -803,12 +822,19 @@ def fused_moe(
     total_tokens = A.size(0)
     num_tokens = topk_ids.numel()
     sorted_weights = None
+    a_sorted = bool(bottom_a_use_mls_load)
+    bottom_a_use_mls_load = a_sorted and capMLS
+    if naive_block_assignment:
+        assert not a_sorted and not c_sorted
 
     if config is None:
        assert "BLOCK_SIZE_M need be set when autotune for moe!"
 
-    EM = sorted_token_ids.size(0)
-    if A.size(0) < config["BLOCK_SIZE_M"]:
+    if naive_block_assignment:
+        EM = num_tokens * config["BLOCK_SIZE_M"]
+    else:
+        EM = sorted_token_ids.size(0)
+    if not naive_block_assignment and A.size(0) < config["BLOCK_SIZE_M"]:
         # optimize for small batch_size.
         # We assume that top_ids of each token is unique, so
         # so num_valid_experts <= batch_size <= BLOCK_SIZE_M,
@@ -989,7 +1015,7 @@ def fused_moe(
         if mul_routed_weight or A.size(0) > 32:
             SPLIT_K = 0
 
-        if SPLIT_K != 0:
+        if SPLIT_K != 0 and not naive_block_assignment:
             grid = lambda META: (triton.cdiv(EM, META['BLOCK_SIZE_M']) * triton.cdiv(
                     B.shape[1], META['BLOCK_SIZE_N']), SPLIT_K)
             assert B.size(2) % (256 * SPLIT_K) == 0, "B.size(2) must be divisible by BLOCK_SIZE_K * SPLIT_K"
@@ -1046,6 +1072,7 @@ def fused_moe(
                 use_int8_w8a16=use_int8_w8a16,
                 per_channel_quant=per_channel_quant,
                 c_sorted=c_sorted,
+                a_sorted=a_sorted,
                 bottom_a_use_mls_load=bottom_a_use_mls_load,
                 ck_sorting=False,
                 ck_topk=8,
@@ -1103,9 +1130,11 @@ def fused_moe(
                 use_int8_w8a16=use_int8_w8a16,
                 per_channel_quant=per_channel_quant,
                 c_sorted=c_sorted,
+                a_sorted=a_sorted,
                 bottom_a_use_mls_load=bottom_a_use_mls_load,
                 ck_sorting=False,
                 ck_topk=8,
+                naive_block_assignment=naive_block_assignment,
                 NUM_XCDS=1,
                 SCALE_BIAS_WITH_ROUTED_WEIGHT=scale_bias_with_routed_weight,
                 ADD_BIAS=B_bias is not None,
@@ -1179,15 +1208,19 @@ def fused_experts_impl(hidden_states: torch.Tensor,
     M = min(num_tokens, CHUNK_SIZE)
 
 
-    can_use_bottom_a_mls = capMLS and not use_int4_w4a8
+    # bottom_a_use_mls_load selects the sorted GEMM1-to-GEMM2 bridge even on
+    # devices without MLS, where GEMM2 reads it with ordinary buffer loads.
+    # Reserve the sorted padding independently of the hardware MLS capability.
+    can_use_bottom_a_sorted = not use_int4_w4a8
 
 
-    max_block_m = 256
     topk = top_k_num
-    max_padded_tokens = (
-        min(M * topk, E + 1) * (max_block_m - 1) if can_use_bottom_a_mls else 0
+    max_total_tokens = _max_autotune_total_tokens(
+        M,
+        topk,
+        E,
+        allow_sorted_bridge=can_use_bottom_a_sorted,
     )
-    max_total_tokens = M * topk + max_padded_tokens
 
 
     # We can reuse the memory between these because by the time we need
@@ -1308,9 +1341,34 @@ def fused_experts_impl(hidden_states: torch.Tensor,
             curr_topk_ids = topk_ids[begin_chunk_idx:end_chunk_idx]
             curr_topk_weights = topk_weights[begin_chunk_idx:end_chunk_idx]
 
-            sorted_token_ids, expert_ids, num_tokens_post_padded = (
-                moe_align_block_size(curr_topk_ids, config['BLOCK_SIZE_M'],
-                                    global_num_experts, expert_map))
+            num_routes = tokens_in_chunk * topk
+            naive_block_assignment = _should_use_naive_block_assignment(
+                num_routes=num_routes,
+                global_num_experts=global_num_experts,
+                has_expert_map=expert_map is not None,
+                bottom_a_sorted=bottom_a_use_mls_load,
+                use_int8_w8a16=use_int8_w8a16,
+                use_int4_w4a16=use_int4_w4a16,
+                use_int4_w4a8=use_int4_w4a8,
+                use_block_quant=block_shape is not None,
+            )
+            if naive_block_assignment:
+                assert curr_topk_weights.is_contiguous(), (
+                    "Top-k weights must be contiguous for naive block assignment"
+                )
+                route_ids = curr_topk_ids.contiguous().view(-1)
+                sorted_token_ids = route_ids
+                expert_ids = route_ids
+                num_tokens_post_padded = route_ids
+            else:
+                sorted_token_ids, expert_ids, num_tokens_post_padded = (
+                    moe_align_block_size(
+                        curr_topk_ids,
+                        config["BLOCK_SIZE_M"],
+                        global_num_experts,
+                        expert_map,
+                    )
+                )
 
             if (use_int8_w8a8 or use_fp8_w8a8 or use_int4_w4a8) and per_channel_quant:
                 quant_dtype = torch.float8_e4m3fn if use_fp8_w8a8 else torch.int8
@@ -1340,6 +1398,7 @@ def fused_experts_impl(hidden_states: torch.Tensor,
                             per_channel_quant=per_channel_quant,
                             block_shape=block_shape,
                             c_sorted=bottom_a_use_mls_load,
+                            naive_block_assignment=naive_block_assignment,
                             B_bias=b1,
                             config=kernel_config)
             elif block_shape is not None and (use_int8_w8a8 or use_int4_w4a8 or use_fp8_w8a8):
@@ -1370,6 +1429,7 @@ def fused_experts_impl(hidden_states: torch.Tensor,
                             per_channel_quant=per_channel_quant,
                             block_shape=block_shape,
                             c_sorted=bottom_a_use_mls_load,
+                            naive_block_assignment=naive_block_assignment,
                             B_bias=b1,
                             config=kernel_config)
             else:
@@ -1395,6 +1455,7 @@ def fused_experts_impl(hidden_states: torch.Tensor,
                             per_channel_quant=per_channel_quant,
                             block_shape=block_shape,
                             c_sorted=bottom_a_use_mls_load,
+                            naive_block_assignment=naive_block_assignment,
                             B_bias=b1,
                             config=kernel_config)
             _apply_activation(
@@ -1437,6 +1498,7 @@ def fused_experts_impl(hidden_states: torch.Tensor,
                             per_channel_quant=per_channel_quant,
                             block_shape=block_shape,
                             bottom_a_use_mls_load=bottom_a_use_mls_load,
+                            naive_block_assignment=naive_block_assignment,
                             scale_bias_with_routed_weight=(not apply_router_weight_on_input) and (not no_combine),
                             B_bias=b2,
                             config=kernel_config)
@@ -1468,6 +1530,7 @@ def fused_experts_impl(hidden_states: torch.Tensor,
                             per_channel_quant=per_channel_quant,
                             block_shape=block_shape,
                             bottom_a_use_mls_load=bottom_a_use_mls_load,
+                            naive_block_assignment=naive_block_assignment,
                             scale_bias_with_routed_weight=(not apply_router_weight_on_input) and (not no_combine),
                             B_bias=b2,
                             config=kernel_config)
@@ -1494,6 +1557,7 @@ def fused_experts_impl(hidden_states: torch.Tensor,
                             per_channel_quant=per_channel_quant,
                             block_shape=block_shape,
                             bottom_a_use_mls_load=bottom_a_use_mls_load,
+                            naive_block_assignment=naive_block_assignment,
                             scale_bias_with_routed_weight=(not apply_router_weight_on_input) and (not no_combine),
                             B_bias=b2,
                             config=kernel_config)

@@ -73,6 +73,7 @@ def _autotune_log(
     buffer_cache_swizzle: str | None = None,
     enable_v_mmac_cluster: str | None = None,
     bottom_a_use_mls_load: str | None = None,
+    a_sorted: str | None = None,
 ) -> str:
     pingpong = (
         "" if use_block_pingpong is None else f", use_block_pingpong: {use_block_pingpong}"
@@ -92,13 +93,14 @@ def _autotune_log(
         if bottom_a_use_mls_load is None
         else f", bottom_a_use_mls_load: {bottom_a_use_mls_load}"
     )
+    sorted_a = "" if a_sorted is None else f", a_sorted: {a_sorted}"
     kernel = (
         "fused_moe_kernel:\n"
         "('key',) Configs:\n"
         "* 0  : BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 64, GROUP_SIZE_M: 1, "
         "COMBINE_SCALE_LOAD: False, USE_MLS_LOAD: False, waves_per_eu: 1, "
         "instruction_sched_variant: none, sched_latency: none, kpack: 1"
-        f"{pingpong}{cache_swizzle}{mmac_cluster}{bottom_a_mls}, "
+        f"{pingpong}{cache_swizzle}{mmac_cluster}{bottom_a_mls}{sorted_a}, "
         "num_warps: 8, num_ctas: 1, "
         "num_stages: 2, maxnreg: None\n"
         "\t : times(20 statics, rep:20 ms): 1.0 ms\n"
@@ -165,7 +167,21 @@ def test_log_parser_preserves_bottom_a_mls_only_for_gemm2(tmp_path):
     assert json.loads(bottom.read_text())["1"]["bottom_a_use_mls_load"] is True
 
 
-def test_log_parser_uses_logged_batch_key_after_missing_result(tmp_path):
+def test_log_parser_saves_sorted_buffer_bridge_under_legacy_key(tmp_path):
+    results = moe_log_parser.parse_log_file(
+        _autotune_log("False", bottom_a_use_mls_load="False", a_sorted="True")
+    )
+    top = tmp_path / "top.json"
+    bottom = tmp_path / "bottom.json"
+
+    moe_log_parser.save_results_to_json(results, top, bottom)
+
+    assert "a_sorted" not in json.loads(top.read_text())["1"]
+    assert "a_sorted" not in json.loads(bottom.read_text())["1"]
+    assert json.loads(bottom.read_text())["1"]["bottom_a_use_mls_load"] is True
+
+
+def test_log_parser_uses_logged_batch_key_and_sorts_output(tmp_path):
     missing = (
         "Test: m=1024, n=1536, k=1232, e=392, topk=1\n"
         "Config 1: {'BLOCK_SIZE_M': 64}\n"
@@ -178,7 +194,7 @@ def test_log_parser_uses_logged_batch_key_after_missing_result(tmp_path):
         "Test Count 3: m=4096, n=1536, k=1232, e=392, topk=1\n"
         + _autotune_log("True")
     )
-    results = moe_log_parser.parse_log_file(missing + valid_bf16 + valid_fp8)
+    results = moe_log_parser.parse_log_file(missing + valid_fp8 + valid_bf16)
     top = tmp_path / "top.json"
     bottom = tmp_path / "bottom.json"
 
@@ -391,8 +407,52 @@ def test_bottom_a_mls_does_not_prune_gemm1_load_options(monkeypatch, tune_type):
     )
 
 
-def test_bottom_a_mls_is_an_outer_fused_moe_choice(monkeypatch):
-    monkeypatch.setattr(autotune_patches, "capMLS", True)
+def test_bottom_a_sorted_buffer_load_keeps_gemm2_load_options(monkeypatch):
+    class _KpackAndPingpong:
+        @staticmethod
+        def supports(name):
+            return name in ("kpack", "use_block_pingpong")
+
+    monkeypatch.setattr(
+        autotune_patches, "triton_capabilities", _KpackAndPingpong()
+    )
+    monkeypatch.setattr(autotune_patches, "test_type", "int8_channel")
+    monkeypatch.setattr(autotune_patches, "capMLS", False)
+    monkeypatch.setattr(autotune_patches, "compile_only", 0)
+    monkeypatch.setattr(autotune_patches, "mode_autotune_min_block_size_n2", 128)
+    monkeypatch.setattr(autotune_patches, "mode_autotune_max_block_size_n2", 128)
+    monkeypatch.setattr(
+        autotune_patches, "mode_autotune_min_block_size_k2", 64, raising=False
+    )
+    monkeypatch.setattr(
+        autotune_patches, "mode_autotune_max_block_size_k2", 64, raising=False
+    )
+
+    configs = autotune_patches.generate_config2_lists(
+        BLOCK_SIZE_M=128,
+        N=7168,
+        K=512,
+        MUL_ROUTED_WEIGHT=True,
+        per_channel_quant=True,
+        bottom_a_use_mls_load=True,
+        num_valid_tokens=8192 * 8,
+        top_k=1,
+        num_input_tokens=8192,
+    )
+
+    assert configs
+    assert any(c.kwargs.get("kpack") == 2 for c in configs)
+    assert any(c.kwargs.get("use_block_pingpong", False) for c in configs)
+    assert all(not c.kwargs["USE_MLS_LOAD"] for c in configs)
+    assert all(c.kwargs["a_sorted"] for c in configs)
+    assert all(not c.kwargs["bottom_a_use_mls_load"] for c in configs)
+
+
+@pytest.mark.parametrize("cap_mls", [False, True])
+def test_bottom_a_sorted_layout_is_an_outer_fused_moe_choice(
+    monkeypatch, cap_mls
+):
+    monkeypatch.setattr(autotune_patches, "capMLS", cap_mls)
     monkeypatch.setattr(autotune_patches, "test_type", "fp8_channel")
     monkeypatch.setattr(autotune_patches, "mode_best_config_tune", False)
 
@@ -407,6 +467,20 @@ def test_bottom_a_mls_is_an_outer_fused_moe_choice(monkeypatch):
         for block_m in (16, 32, 64, 128, 256)
         for bottom_a_mls in (False, True)
     }
+
+
+def test_autotune_buffer_reserves_sorted_bridge_padding_without_mls(monkeypatch):
+    monkeypatch.setattr(autotune_patches, "capMLS", False)
+
+    total = autotune_patches._max_autotune_total_tokens(
+        13104,
+        1,
+        392,
+        allow_sorted_bridge=True,
+    )
+
+    assert total == 13104 + 393 * 255
+    assert total > 13104
 
 
 def test_gemm2_inner_search_keeps_outer_bottom_a_mls_choice(monkeypatch):
@@ -446,11 +520,17 @@ def test_gemm2_inner_search_keeps_outer_bottom_a_mls_choice(monkeypatch):
 
 def test_bottom_a_mls_config_is_explicit(monkeypatch):
     monkeypatch.setattr(fused_moe_impl, "_bottom_moe_use_mls", lambda: True)
+    assert not fused_moe_impl._bottom_a_uses_sorted_layout(
+        {"USE_MLS_LOAD": True}, False
+    )
     assert not fused_moe_impl._bottom_a_uses_mls({"USE_MLS_LOAD": True}, False)
     assert not fused_moe_impl._bottom_a_uses_mls(
         {"USE_MLS_LOAD": True, "bottom_a_use_mls_load": False}, False
     )
     assert fused_moe_impl._bottom_a_uses_mls(
+        {"USE_MLS_LOAD": False, "bottom_a_use_mls_load": True}, False
+    )
+    assert fused_moe_impl._bottom_a_uses_sorted_layout(
         {"USE_MLS_LOAD": False, "bottom_a_use_mls_load": True}, False
     )
     assert not fused_moe_impl._bottom_a_uses_mls(
@@ -459,6 +539,9 @@ def test_bottom_a_mls_config_is_explicit(monkeypatch):
 
     monkeypatch.setattr(fused_moe_impl, "_bottom_moe_use_mls", lambda: False)
     assert not fused_moe_impl._bottom_a_uses_mls(
+        {"USE_MLS_LOAD": True, "bottom_a_use_mls_load": True}, False
+    )
+    assert fused_moe_impl._bottom_a_uses_sorted_layout(
         {"USE_MLS_LOAD": True, "bottom_a_use_mls_load": True}, False
     )
 
@@ -482,6 +565,24 @@ def test_checked_in_bottom_configs_have_explicit_a_side_mls():
                 assert isinstance(config.get("bottom_a_use_mls_load"), bool), (
                     f"{path.name}: M={m} lacks explicit A-side MLS state"
                 )
+
+
+def test_checked_in_triton_3_6_configs_are_sorted_by_batch_size():
+    config_dir = (
+        Path(__file__).resolve().parents[2]
+        / "boltops"
+        / "fused_moe"
+        / "triton"
+        / "configs"
+        / "triton_3_6"
+    )
+    paths = sorted(config_dir.glob("*.json"))
+    assert paths
+    for path in paths:
+        if path.stat().st_size == 0:
+            continue
+        keys = list(json.loads(path.read_text(encoding="utf-8")))
+        assert keys == sorted(keys, key=int), f"{path.name} is not numerically sorted"
 
 
 def test_autotune_skips_unloadable_hip_candidate():
