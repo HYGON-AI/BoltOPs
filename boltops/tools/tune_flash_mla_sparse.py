@@ -7,7 +7,6 @@ import argparse
 import itertools
 import json
 import math
-import os
 from pathlib import Path
 
 import torch
@@ -175,21 +174,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--quick", action="store_true", help="use a smaller smoke-test search space"
     )
-    parser.add_argument(
-        "--rlc-enhance",
-        choices=("off", "on"),
-        default="off",
-        help=(
-            "set the process-wide TRITON_HCU_RLC_ENHANCE compile mode; run both "
-            "modes in separate processes when comparing RLC"
-        ),
-    )
     args = parser.parse_args(argv)
     if not torch.cuda.is_available():
         parser.error("a CUDA/HIP device is required")
 
-    rlc_enabled = args.rlc_enhance == "on"
-    os.environ["TRITON_HCU_RLC_ENHANCE"] = "1" if rlc_enabled else "0"
     arch, device_name = _device_identity(torch.device("cuda"))
     entries = []
     for shape in DEFAULT_SHAPES:
@@ -223,7 +211,6 @@ def main(argv: list[str] | None = None) -> int:
             "device_slug": _slug(device_name),
             "arch": arch,
             "dtype": str(DTYPE).replace("torch.", ""),
-            "rlc_enhance": rlc_enabled,
         },
         "configs": entries,
     }

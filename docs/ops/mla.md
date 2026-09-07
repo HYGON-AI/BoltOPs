@@ -58,20 +58,8 @@ python boltops/tools/tune_flash_mla_sparse.py \
   --output /tmp/flash_mla_sparse.json
 ```
 
-RLC enhance 是 `TRITON_HCU_RLC_ENHANCE` 控制的进程级编译模式，并非 kernel
-launch 参数。为避免 Triton cache 混用，需在两个独立进程中对比：
-
-```bash
-python boltops/tools/tune_flash_mla_sparse.py --rlc-enhance off \
-  --output /tmp/flash_mla_sparse_rlc_off.json
-python boltops/tools/tune_flash_mla_sparse.py --rlc-enhance on \
-  --output /tmp/flash_mla_sparse_rlc_on.json
-```
-
-当前四个典型 size 的 RLC on/off 独立进程扫描结果差异均小于约 0.2%，属于测试
-噪声范围，因此发布配置保持 `rlc_enhance=false`。四个 size 的调度优化最优项
-一致为 max-ILP off、register-pressure-aware scheduling on、optimized epilogue off、
-BlockPingpong off。
+当前四个典型 size 的调度优化最优项一致为 max-ILP off、
+register-pressure-aware scheduling on、optimized epilogue off、BlockPingpong off。
 
 配置按 Triton major/minor、gfx arch、完整设备名定位文件，再按 dtype 和完整
 shape 精确匹配；未命中配置时自动使用安全默认值。当前配置文件是

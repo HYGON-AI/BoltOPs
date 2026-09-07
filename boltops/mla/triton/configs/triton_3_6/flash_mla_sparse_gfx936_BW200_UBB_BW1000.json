@@ -5,8 +5,7 @@
     "device_name": "BW200, UBB BW1000",
     "device_slug": "BW200_UBB_BW1000",
     "arch": "gfx936",
-    "dtype": "bfloat16",
-    "rlc_enhance": false
+    "dtype": "bfloat16"
   },
   "configs": [
     {
