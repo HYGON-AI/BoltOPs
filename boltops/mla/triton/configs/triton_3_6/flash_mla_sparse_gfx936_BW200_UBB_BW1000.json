@@ -5,7 +5,8 @@
     "device_name": "BW200, UBB BW1000",
     "device_slug": "BW200_UBB_BW1000",
     "arch": "gfx936",
-    "dtype": "bfloat16"
+    "dtype": "bfloat16",
+    "rlc_enhance": false
   },
   "configs": [
     {
@@ -20,19 +21,23 @@
         "dtype": "bfloat16"
       },
       "config": {
-        "BLOCK_N": 16,
+        "BLOCK_N": 32,
         "BLOCK_H": 16,
-        "BLOCK_DMODEL": 256,
-        "num_warps": 2,
-        "num_stages": 1,
+        "BLOCK_DMODEL": 64,
+        "num_warps": 4,
+        "num_stages": 2,
         "waves_per_eu": 1,
         "matrix_instr_nonkdim": 16,
-        "kpack": 2
+        "kpack": 1,
+        "amdgpu_enable_max_ilp_scheduling_strategy": false,
+        "misched_regpressure": true,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false
       },
       "baseline_ms": 0.70176,
-      "latency_ms": 0.56976,
-      "speedup": 1.2317,
-      "valid_candidates": 138
+      "latency_ms": 0.4968,
+      "speedup": 1.4138,
+      "valid_candidates": 32
     },
     {
       "match": {
@@ -46,19 +51,23 @@
         "dtype": "bfloat16"
       },
       "config": {
-        "BLOCK_N": 16,
+        "BLOCK_N": 32,
         "BLOCK_H": 16,
-        "BLOCK_DMODEL": 256,
-        "num_warps": 2,
-        "num_stages": 1,
-        "waves_per_eu": 2,
+        "BLOCK_DMODEL": 64,
+        "num_warps": 4,
+        "num_stages": 2,
+        "waves_per_eu": 1,
         "matrix_instr_nonkdim": 16,
-        "kpack": 2
+        "kpack": 1,
+        "amdgpu_enable_max_ilp_scheduling_strategy": false,
+        "misched_regpressure": true,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false
       },
       "baseline_ms": 0.68416,
-      "latency_ms": 0.54976,
-      "speedup": 1.2445,
-      "valid_candidates": 138
+      "latency_ms": 0.47632,
+      "speedup": 1.4374,
+      "valid_candidates": 32
     },
     {
       "match": {
@@ -72,19 +81,23 @@
         "dtype": "bfloat16"
       },
       "config": {
-        "BLOCK_N": 16,
+        "BLOCK_N": 32,
         "BLOCK_H": 16,
-        "BLOCK_DMODEL": 256,
-        "num_warps": 2,
-        "num_stages": 1,
+        "BLOCK_DMODEL": 64,
+        "num_warps": 4,
+        "num_stages": 2,
         "waves_per_eu": 2,
         "matrix_instr_nonkdim": 16,
-        "kpack": 2
+        "kpack": 1,
+        "amdgpu_enable_max_ilp_scheduling_strategy": false,
+        "misched_regpressure": true,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false
       },
       "baseline_ms": 0.68576,
-      "latency_ms": 0.55072,
-      "speedup": 1.2452,
-      "valid_candidates": 138
+      "latency_ms": 0.48256,
+      "speedup": 1.4218,
+      "valid_candidates": 32
     },
     {
       "match": {
@@ -98,19 +111,23 @@
         "dtype": "bfloat16"
       },
       "config": {
-        "BLOCK_N": 16,
+        "BLOCK_N": 32,
         "BLOCK_H": 16,
-        "BLOCK_DMODEL": 256,
-        "num_warps": 2,
-        "num_stages": 1,
-        "waves_per_eu": 1,
+        "BLOCK_DMODEL": 64,
+        "num_warps": 4,
+        "num_stages": 2,
+        "waves_per_eu": 2,
         "matrix_instr_nonkdim": 16,
-        "kpack": 2
+        "kpack": 1,
+        "amdgpu_enable_max_ilp_scheduling_strategy": false,
+        "misched_regpressure": true,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false
       },
       "baseline_ms": 1.34872,
-      "latency_ms": 1.08352,
-      "speedup": 1.2448,
-      "valid_candidates": 138
+      "latency_ms": 0.93424,
+      "speedup": 1.4445,
+      "valid_candidates": 32
     }
   ]
 }

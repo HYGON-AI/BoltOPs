@@ -17,6 +17,8 @@ import torch
 import triton
 import triton.language as tl
 
+from boltops.utility.triton_capability import get_triton_capabilities
+
 
 _CONFIG_ROOT = Path(__file__).with_name("configs")
 
@@ -335,8 +337,18 @@ def flash_mla_sparse_fwd(
     topk_arg = topk_length.contiguous() if topk_length is not None else indices
     launch_options = {"num_warps": num_warps, "num_stages": num_stages}
     if torch.version.hip is not None:
-        for name in ("waves_per_eu", "matrix_instr_nonkdim", "kpack"):
-            if name in tuned:
+        capabilities = get_triton_capabilities()
+        compiler_options = (
+            "waves_per_eu",
+            "matrix_instr_nonkdim",
+            "kpack",
+            "amdgpu_enable_max_ilp_scheduling_strategy",
+            "misched_regpressure",
+            "optimize_epilogue",
+            "use_block_pingpong",
+        )
+        for name in compiler_options:
+            if name in tuned and capabilities.supports(name):
                 launch_options[name] = int(tuned[name])
     _flash_mla_sparse_fwd_kernel[grid](
         q,

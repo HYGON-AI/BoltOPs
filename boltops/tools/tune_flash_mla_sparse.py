@@ -7,6 +7,7 @@ import argparse
 import itertools
 import json
 import math
+import os
 from pathlib import Path
 
 import torch
@@ -64,6 +65,25 @@ def _compiler_candidates(base: dict, quick: bool) -> list[dict]:
                 "waves_per_eu": waves_per_eu,
                 "matrix_instr_nonkdim": 16,
                 "kpack": kpack,
+            }
+        )
+        candidates.append(config)
+    return candidates
+
+
+def _optimization_candidates(base: dict, quick: bool) -> list[dict]:
+    """Tune HCU scheduling/pipeline passes after tile and launch tuning."""
+    del quick
+    choices = itertools.product((False, True), repeat=4)
+    candidates = []
+    for max_ilp, regpressure, optimize_epilogue, block_pingpong in choices:
+        config = dict(base)
+        config.update(
+            {
+                "amdgpu_enable_max_ilp_scheduling_strategy": max_ilp,
+                "misched_regpressure": regpressure,
+                "optimize_epilogue": optimize_epilogue,
+                "use_block_pingpong": block_pingpong,
             }
         )
         candidates.append(config)
@@ -140,7 +160,8 @@ def tune_shape(
         return best_config, best_ms
 
     structural, _ = sweep(_structural_candidates(quick))
-    best_config, best_ms = sweep(_compiler_candidates(structural, quick))
+    compiler, _ = sweep(_compiler_candidates(structural, quick))
+    best_config, best_ms = sweep(_optimization_candidates(compiler, quick))
     del q, kv, indices, lengths, reference
     torch.cuda.empty_cache()
     return best_config, best_ms, baseline_ms, tested
@@ -154,10 +175,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--quick", action="store_true", help="use a smaller smoke-test search space"
     )
+    parser.add_argument(
+        "--rlc-enhance",
+        choices=("off", "on"),
+        default="off",
+        help=(
+            "set the process-wide TRITON_HCU_RLC_ENHANCE compile mode; run both "
+            "modes in separate processes when comparing RLC"
+        ),
+    )
     args = parser.parse_args(argv)
     if not torch.cuda.is_available():
         parser.error("a CUDA/HIP device is required")
 
+    rlc_enabled = args.rlc_enhance == "on"
+    os.environ["TRITON_HCU_RLC_ENHANCE"] = "1" if rlc_enabled else "0"
     arch, device_name = _device_identity(torch.device("cuda"))
     entries = []
     for shape in DEFAULT_SHAPES:
@@ -191,6 +223,7 @@ def main(argv: list[str] | None = None) -> int:
             "device_slug": _slug(device_name),
             "arch": arch,
             "dtype": str(DTYPE).replace("torch.", ""),
+            "rlc_enhance": rlc_enabled,
         },
         "configs": entries,
     }
