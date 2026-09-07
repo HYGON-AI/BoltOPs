@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Optional
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -9,10 +11,12 @@ import torch.nn.functional as F
 pytest.importorskip("triton")
 
 from boltops.fused_moe import fused_experts  # noqa: E402
-from boltops.fused_moe.triton.moe_compat import pertoken_quant  # noqa: E402
-from boltops.fused_moe.triton.moe_sorting_decode import (  # noqa: E402
-    moe_sorting_decode_fwd,
+import boltops.fused_moe.triton.fused_moe as fused_moe_module  # noqa: E402
+import boltops.fused_moe.triton.moe_op as moe_op_module  # noqa: E402
+from boltops.fused_moe.triton.moe_activation import (  # noqa: E402
+    FUSED_ACTIVATION_QUANT_ACTIVATIONS,
 )
+from boltops.fused_moe.triton.moe_compat import pertoken_quant  # noqa: E402
 from boltops.fused_moe.triton.quant import (  # noqa: E402
     dynamic_per_token_quant_fp8_i8,
     static_per_tensor_quant_fp8_i8,
@@ -21,11 +25,18 @@ from boltops.tools.fused_moe_triton_tune.common import (  # noqa: E402
     quantize_weights,
     scalar_types,
 )
+from boltops.utility.triton_capability import (  # noqa: E402
+    get_triton_capabilities,
+)
 
 
 DEVICE = "cuda"
 GPU_REQUIRED = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA/HIP device is required"
+)
+BLOCK_PINGPONG_REQUIRED = pytest.mark.skipif(
+    not get_triton_capabilities().supports("use_block_pingpong"),
+    reason="Triton backend does not support use_block_pingpong",
 )
 
 # Keep the matrix dimensions aligned with the tuning defaults while limiting
@@ -39,40 +50,25 @@ NUM_EXPERTS = 8
 TOPK = 4
 
 
-@GPU_REQUIRED
-@torch.inference_mode()
-@pytest.mark.parametrize(
-    "num_tokens,topk",
-    [(1, 1), (1, 2), (1, 4), (1, 8), (2, 8), (3, 8), (4, 8),
-     (8, 4), (16, 2), (32, 1)],
-)
-@pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
-def test_moe_sorting_decode_matches_flattened_encoding(
-    num_tokens, topk, id_dtype
-):
-    block_size_m = 16
-    # Include repeated experts: real routing does not guarantee unique expert
-    # IDs across tokens, while the decode fast path pads each route separately.
-    topk_ids = (torch.arange(
-        num_tokens * topk, device=DEVICE, dtype=id_dtype
-    ) % 7).view(num_tokens, topk)
-    sorted_ids, expert_ids, num_padded = (
-        moe_sorting_decode_fwd(
-            topk_ids, block_size_m
-        )
-    )
-    sorted_ids = sorted_ids.view(-1, block_size_m)
-    route_ids = torch.arange(
-        num_tokens * topk, device=DEVICE, dtype=torch.int32
-    )
+def _default_activation_kwargs(activation: str) -> dict:
+    return {"activation_situ_beta": 6.0} if activation == "situ" else {}
 
-    torch.testing.assert_close(sorted_ids[:, 0], route_ids)
-    torch.testing.assert_close(
-        sorted_ids[:, 1:],
-        torch.full_like(sorted_ids[:, 1:], num_tokens * topk),
-    )
-    torch.testing.assert_close(expert_ids, topk_ids.view(-1).to(torch.int32))
-    assert num_padded.item() == num_tokens * topk * block_size_m
+
+ROUTER_FOLD_ACT_CASES = [
+    (activation, is_gated, _default_activation_kwargs(activation))
+    for activation, is_gated in sorted(FUSED_ACTIVATION_QUANT_ACTIVATIONS)
+] + [
+    ("silu", True, {"gemm1_limit": 4.0}),
+    (
+        "situ",
+        True,
+        {
+            "activation_situ_beta": 6.0,
+            "activation_situ_linear_beta": 5.0,
+        },
+    ),
+    ("swiglustep", True, {"gemm1_limit": 4.0}),
+]
 
 
 def _routing(
@@ -418,6 +414,62 @@ def test_fused_experts_bf16_matches_torch():
 
 @GPU_REQUIRED
 @torch.inference_mode()
+@pytest.mark.parametrize("persistent", [False, True])
+def test_sorted_gemm_bridge_uses_buffer_load_without_mls(
+    monkeypatch, persistent
+):
+    """The expert-sorted GEMM1 output is not coupled to matrix_load support."""
+    monkeypatch.setattr(
+        fused_moe_module,
+        "_bottom_a_uses_sorted_layout",
+        lambda _config, _use_int4: True,
+    )
+    monkeypatch.setattr(
+        fused_moe_module,
+        "_bottom_a_uses_mls",
+        lambda _config, _use_int4: False,
+    )
+    monkeypatch.setattr(
+        moe_op_module, "_USE_MOE_PERSISTENT_KERNEL", persistent
+    )
+
+    torch.manual_seed(19)
+    num_tokens, hidden_size = 32, 336
+    intermediate_size, num_experts, topk = 512, 4, 2
+    hidden_states = torch.randn(
+        (num_tokens, hidden_size), device=DEVICE, dtype=torch.bfloat16
+    ) / 10
+    w1 = torch.randn(
+        (num_experts, 2 * intermediate_size, hidden_size),
+        device=DEVICE,
+        dtype=torch.bfloat16,
+    ) / 10
+    w2 = torch.randn(
+        (num_experts, hidden_size, intermediate_size),
+        device=DEVICE,
+        dtype=torch.bfloat16,
+    ) / 10
+    topk_weights, topk_ids = _routing(num_tokens, num_experts, topk)
+
+    actual = fused_experts(
+        hidden_states,
+        w1,
+        w2,
+        topk_weights,
+        topk_ids,
+        activation="silu",
+        is_gated=True,
+        global_num_experts=num_experts,
+    )
+    expected = _torch_moe(
+        hidden_states, w1, w2, topk_weights, topk_ids
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=3e-2, atol=2e-2)
+
+
+@GPU_REQUIRED
+@torch.inference_mode()
 def test_fused_experts_w4a16_matches_dequantized_reference():
     torch.manual_seed(2)
     group_size = 64
@@ -557,3 +609,600 @@ def test_fused_experts_w8a8_matches_block_quantized_reference():
     assert mean_relative_error < 0.02, (
         f"W8A8 mean relative error is {mean_relative_error.item():.6f}"
     )
+
+
+@GPU_REQUIRED
+@torch.inference_mode()
+@pytest.mark.parametrize(
+    ("quant_kind", "activation", "is_gated"),
+    [
+        ("int8", "gelu", True),
+        ("fp8", "gelu_tanh_no_mul", False),
+    ],
+)
+def test_per_channel_moe_fused_activation_quant_matches_fallback(
+    monkeypatch,
+    quant_kind,
+    activation,
+    is_gated,
+):
+    # Keep this test scoped to activation+quant fusion. Router-scale folding
+    # has its own numerical-equivalence coverage below.
+    monkeypatch.setattr(
+        fused_moe_module,
+        "_should_fold_router_weight",
+        lambda **kwargs: False,
+    )
+    torch.manual_seed(77)
+    num_tokens, hidden_size = 8, 128
+    intermediate_size, num_experts, topk = 64, 4, 2
+    w1_out = 2 * intermediate_size if is_gated else intermediate_size
+    hidden_states = torch.randn(
+        (num_tokens, hidden_size), device=DEVICE, dtype=torch.float16
+    ) / 10
+    if quant_kind == "int8":
+        weight_dtype = torch.int8
+        w1 = torch.randint(
+            -127,
+            128,
+            (num_experts, w1_out, hidden_size),
+            device=DEVICE,
+            dtype=weight_dtype,
+        )
+        w2 = torch.randint(
+            -127,
+            128,
+            (num_experts, hidden_size, intermediate_size),
+            device=DEVICE,
+            dtype=weight_dtype,
+        )
+    else:
+        weight_dtype = torch.float8_e4m3fn
+        w1 = (
+            torch.randn(
+                (num_experts, w1_out, hidden_size), device=DEVICE
+            )
+            / 3
+        ).to(weight_dtype)
+        w2 = (
+            torch.randn(
+                (num_experts, hidden_size, intermediate_size), device=DEVICE
+            )
+            / 3
+        ).to(weight_dtype)
+
+    w1_scale = torch.rand(
+        (num_experts, w1_out), device=DEVICE, dtype=torch.float32
+    ) * 1e-2
+    w2_scale = torch.rand(
+        (num_experts, hidden_size), device=DEVICE, dtype=torch.float32
+    ) * 1e-2
+    topk_weights, topk_ids = _routing(num_tokens, num_experts, topk)
+    kwargs = {
+        "output_dtype": hidden_states.dtype,
+        "use_int8_w8a8": quant_kind == "int8",
+        "use_fp8_w8a8": quant_kind == "fp8",
+        "per_channel_quant": True,
+        "global_num_experts": num_experts,
+        "w1_scale": w1_scale,
+        "w2_scale": w2_scale,
+        "activation": activation,
+        "is_gated": is_gated,
+    }
+
+    real_fused_activation_quant = fused_moe_module.triton_activation_quant
+    fused_activation_quant_calls = 0
+
+    def tracked_fused_activation_quant(*args, **quant_kwargs):
+        nonlocal fused_activation_quant_calls
+        fused_activation_quant_calls += 1
+        return real_fused_activation_quant(*args, **quant_kwargs)
+
+    monkeypatch.setattr(
+        fused_moe_module,
+        "triton_activation_quant",
+        tracked_fused_activation_quant,
+    )
+    fused_output = fused_moe_module.fused_experts_impl(
+        hidden_states,
+        w1,
+        w2,
+        topk_weights,
+        topk_ids,
+        **kwargs,
+    )
+    assert fused_activation_quant_calls == 1
+
+    monkeypatch.setattr(
+        fused_moe_module,
+        "is_fused_activation_quant_supported",
+        lambda *args, **kwargs: False,
+    )
+    fused_activation_quant_calls = 0
+    fallback_output = fused_moe_module.fused_experts_impl(
+        hidden_states,
+        w1,
+        w2,
+        topk_weights,
+        topk_ids,
+        **kwargs,
+    )
+    assert fused_activation_quant_calls == 0
+    assert torch.equal(fused_output, fallback_output)
+
+
+def test_fused_activation_quant_weight_mode_policy():
+    common = {
+        "use_int8_w8a8": True,
+        "use_fp8_w8a8": False,
+        "use_int4_w4a8": False,
+        "per_channel_quant": True,
+        "has_expert_map": False,
+        "activation": "silu",
+        "is_gated": True,
+        "output_dim": 128,
+        "gemm1_alpha": None,
+        "gemm1_limit": None,
+        "activation_situ_beta": None,
+        "activation_situ_linear_beta": None,
+    }
+    assert fused_moe_module._should_use_fused_activation_quant(**common)
+    assert fused_moe_module._should_use_fused_activation_quant(
+        **dict(common, use_int8_w8a8=False, use_fp8_w8a8=True)
+    )
+    assert not fused_moe_module._should_use_fused_activation_quant(
+        **dict(common, use_int8_w8a8=False)
+    )
+    assert not fused_moe_module._should_use_fused_activation_quant(
+        **dict(common, use_fp8_w8a8=True)
+    )
+    assert not fused_moe_module._should_use_fused_activation_quant(
+        **dict(common, use_int4_w4a8=True)
+    )
+
+
+def test_should_fold_router_weight_policy():
+    common = {
+        "fuse_activation_quant": True,
+        "needs_router_weight": True,
+    }
+    assert fused_moe_module._should_fold_router_weight(**common)
+    for key in common:
+        case = dict(common)
+        case[key] = False
+        assert not fused_moe_module._should_fold_router_weight(**case)
+
+
+def _assert_router_fold_close(
+    folded: torch.Tensor,
+    baseline: torch.Tensor,
+) -> None:
+    reference = baseline.float().abs()
+    error = (folded.float() - baseline.float()).abs()
+    reference_max = reference.max().item()
+    reference_mean = reference.mean().item()
+    assert reference_max > 1e-2
+    assert reference_mean > 1e-4
+    assert error.max().item() <= reference_max * 2e-2 + 1e-6
+    assert error.mean().item() <= reference_mean * 1e-2 + 1e-7
+
+
+def _run_router_fold_pair(
+    monkeypatch,
+    hidden_states,
+    w1,
+    w2,
+    topk_weights,
+    topk_ids,
+    kwargs,
+):
+    monkeypatch.setattr(
+        fused_moe_module,
+        "_should_fold_router_weight",
+        lambda **predicate_kwargs: True,
+    )
+    folded = fused_moe_module.fused_experts_impl(
+        hidden_states, w1, w2, topk_weights, topk_ids, **kwargs
+    )
+    monkeypatch.setattr(
+        fused_moe_module,
+        "_should_fold_router_weight",
+        lambda **predicate_kwargs: False,
+    )
+    baseline = fused_moe_module.fused_experts_impl(
+        hidden_states, w1, w2, topk_weights, topk_ids, **kwargs
+    )
+    _assert_router_fold_close(folded, baseline)
+
+
+def _make_router_fold_case(
+    *,
+    seed: int,
+    quant_kind: str,
+    num_tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    topk: int,
+    activation: str,
+    is_gated: bool,
+    scale_max: Optional[float] = None,
+    with_bias: bool = False,
+):
+    torch.manual_seed(seed)
+    w1_out = intermediate_size * (2 if is_gated else 1)
+    hidden_states = torch.randn(
+        (num_tokens, hidden_size), device=DEVICE, dtype=torch.bfloat16
+    ) / 10
+    if quant_kind == "int8":
+        w1 = torch.randint(
+            -127,
+            128,
+            (num_experts, w1_out, hidden_size),
+            device=DEVICE,
+            dtype=torch.int8,
+        )
+        w2 = torch.randint(
+            -127,
+            128,
+            (num_experts, hidden_size, intermediate_size),
+            device=DEVICE,
+            dtype=torch.int8,
+        )
+        default_scale_max = 1e-2
+    else:
+        if quant_kind != "fp8":
+            raise ValueError(f"unsupported quant_kind: {quant_kind}")
+        w1 = (
+            torch.randn(
+                (num_experts, w1_out, hidden_size), device=DEVICE
+            ) / 3
+        ).to(torch.float8_e4m3fn)
+        w2 = (
+            torch.randn(
+                (num_experts, hidden_size, intermediate_size), device=DEVICE
+            ) / 3
+        ).to(torch.float8_e4m3fn)
+        default_scale_max = 0.5
+
+    scale_max = default_scale_max if scale_max is None else scale_max
+    w1_scale = torch.rand(
+        (num_experts, w1_out), device=DEVICE, dtype=torch.float32
+    ) * scale_max
+    w2_scale = torch.rand(
+        (num_experts, hidden_size), device=DEVICE, dtype=torch.float32
+    ) * scale_max
+    topk_weights, topk_ids = _routing(num_tokens, num_experts, topk)
+    kwargs = {
+        "output_dtype": hidden_states.dtype,
+        "use_int8_w8a8": quant_kind == "int8",
+        "use_fp8_w8a8": quant_kind == "fp8",
+        "per_channel_quant": True,
+        "global_num_experts": num_experts,
+        "w1_scale": w1_scale,
+        "w2_scale": w2_scale,
+        "activation": activation,
+        "is_gated": is_gated,
+    }
+    if with_bias:
+        kwargs["b2"] = torch.randn(
+            (num_experts, hidden_size),
+            device=DEVICE,
+            dtype=torch.bfloat16,
+        ) / 100
+    return hidden_states, w1, w2, topk_weights, topk_ids, kwargs
+
+
+def test_naive_block_assignment_policy():
+    common = {
+        "num_routes": 64,
+        "global_num_experts": 256,
+        "has_expert_map": False,
+        "bottom_a_sorted": False,
+        "use_int8_w8a16": False,
+        "use_int4_w4a16": False,
+        "use_int4_w4a8": False,
+        "use_block_quant": False,
+    }
+    assert fused_moe_module._should_use_naive_block_assignment(**common)
+    assert not fused_moe_module._should_use_naive_block_assignment(
+        **dict(common, num_routes=65)
+    )
+    assert not fused_moe_module._should_use_naive_block_assignment(
+        **dict(common, use_block_quant=True)
+    )
+    assert fused_moe_module._should_use_naive_block_assignment(
+        **dict(common, use_block_quant=True, num_routes=32)
+    )
+    for key in (
+        "has_expert_map",
+        "bottom_a_sorted",
+        "use_int8_w8a16",
+        "use_int4_w4a16",
+        "use_int4_w4a8",
+    ):
+        assert not fused_moe_module._should_use_naive_block_assignment(
+            **dict(common, **{key: True})
+        )
+
+
+@GPU_REQUIRED
+@torch.inference_mode()
+@pytest.mark.parametrize("quant_kind", ["int8", "fp8"])
+@pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
+def test_naive_block_assignment_matches_sorted_metadata(
+    monkeypatch, quant_kind, id_dtype
+):
+    case = _make_router_fold_case(
+        seed=99,
+        quant_kind=quant_kind,
+        num_tokens=2,
+        hidden_size=128,
+        intermediate_size=128,
+        num_experts=64,
+        topk=8,
+        activation="silu",
+        is_gated=True,
+    )
+    hidden_states, w1, w2, topk_weights, topk_ids, kwargs = case
+    topk_ids = topk_ids.to(id_dtype)
+    monkeypatch.setattr(
+        fused_moe_module,
+        "_bottom_a_uses_sorted_layout",
+        lambda _config, _use_int4: False,
+    )
+    monkeypatch.setattr(
+        fused_moe_module,
+        "_bottom_a_uses_mls",
+        lambda _config, _use_int4: False,
+    )
+
+    direct = fused_moe_module.fused_experts_impl(
+        hidden_states, w1, w2, topk_weights, topk_ids, **kwargs
+    )
+    monkeypatch.setattr(
+        fused_moe_module,
+        "_should_use_naive_block_assignment",
+        lambda **predicate_kwargs: False,
+    )
+    baseline = fused_moe_module.fused_experts_impl(
+        hidden_states, w1, w2, topk_weights, topk_ids, **kwargs
+    )
+
+    torch.testing.assert_close(direct, baseline, rtol=2e-2, atol=1e-6)
+
+
+@GPU_REQUIRED
+@torch.inference_mode()
+def test_naive_block_assignment_bf16_matches_sorted_metadata(monkeypatch):
+    torch.manual_seed(100)
+    num_tokens, hidden_size = 2, 128
+    intermediate_size, num_experts, topk = 128, 64, 8
+    hidden_states = torch.randn(
+        (num_tokens, hidden_size), device=DEVICE, dtype=torch.bfloat16
+    ) / 10
+    w1 = torch.randn(
+        (num_experts, 2 * intermediate_size, hidden_size),
+        device=DEVICE,
+        dtype=torch.bfloat16,
+    ) / 10
+    w2 = torch.randn(
+        (num_experts, hidden_size, intermediate_size),
+        device=DEVICE,
+        dtype=torch.bfloat16,
+    ) / 10
+    topk_weights, topk_ids = _routing(num_tokens, num_experts, topk)
+    monkeypatch.setattr(
+        fused_moe_module,
+        "_bottom_a_uses_sorted_layout",
+        lambda _config, _use_int4: False,
+    )
+    monkeypatch.setattr(
+        fused_moe_module,
+        "_bottom_a_uses_mls",
+        lambda _config, _use_int4: False,
+    )
+
+    direct = fused_moe_module.fused_experts_impl(
+        hidden_states,
+        w1,
+        w2,
+        topk_weights,
+        topk_ids,
+        activation="silu",
+        is_gated=True,
+        global_num_experts=num_experts,
+    )
+    monkeypatch.setattr(
+        fused_moe_module,
+        "_should_use_naive_block_assignment",
+        lambda **predicate_kwargs: False,
+    )
+    baseline = fused_moe_module.fused_experts_impl(
+        hidden_states,
+        w1,
+        w2,
+        topk_weights,
+        topk_ids,
+        activation="silu",
+        is_gated=True,
+        global_num_experts=num_experts,
+    )
+
+    torch.testing.assert_close(direct, baseline, rtol=3e-2, atol=2e-2)
+
+
+@GPU_REQUIRED
+@BLOCK_PINGPONG_REQUIRED
+@torch.inference_mode()
+@pytest.mark.parametrize("quant_kind", ["int8", "fp8"])
+def test_router_weight_fold_all_activations(monkeypatch, quant_kind):
+    torch.manual_seed(93)
+    num_tokens, hidden_size = 1024, 256
+    intermediate_size = 128 if quant_kind == "int8" else 320
+    num_experts, topk = 256, 8
+    hidden_states = torch.randn(
+        (num_tokens, hidden_size), device=DEVICE, dtype=torch.bfloat16
+    ) / 10
+    weight_dtype = (
+        torch.int8 if quant_kind == "int8" else torch.float8_e4m3fn
+    )
+    if quant_kind == "int8":
+        gated_w1 = torch.randint(
+            -127,
+            128,
+            (num_experts, 2 * intermediate_size, hidden_size),
+            device=DEVICE,
+            dtype=weight_dtype,
+        )
+        w2 = torch.randint(
+            -127,
+            128,
+            (num_experts, hidden_size, intermediate_size),
+            device=DEVICE,
+            dtype=weight_dtype,
+        )
+    else:
+        gated_w1 = (
+            torch.randn(
+                (num_experts, 2 * intermediate_size, hidden_size),
+                device=DEVICE,
+            ) / 3
+        ).to(weight_dtype)
+        w2 = (
+            torch.randn(
+                (num_experts, hidden_size, intermediate_size), device=DEVICE
+            ) / 3
+        ).to(weight_dtype)
+    nongated_w1 = gated_w1[:, :intermediate_size].contiguous()
+    scale_max = 1e-2 if quant_kind == "int8" else 0.5
+    gated_w1_scale = torch.rand(
+        (num_experts, 2 * intermediate_size),
+        device=DEVICE,
+        dtype=torch.float32,
+    ) * scale_max
+    nongated_w1_scale = gated_w1_scale[:, :intermediate_size].contiguous()
+    w2_scale = torch.rand(
+        (num_experts, hidden_size), device=DEVICE, dtype=torch.float32
+    ) * scale_max
+    topk_weights, topk_ids = _routing(num_tokens, num_experts, topk)
+
+    for activation, is_gated, activation_kwargs in ROUTER_FOLD_ACT_CASES:
+        kwargs = {
+            "output_dtype": hidden_states.dtype,
+            "use_int8_w8a8": quant_kind == "int8",
+            "use_fp8_w8a8": quant_kind == "fp8",
+            "per_channel_quant": True,
+            "global_num_experts": num_experts,
+            "w1_scale": (
+                gated_w1_scale if is_gated else nongated_w1_scale
+            ),
+            "w2_scale": w2_scale,
+            "activation": activation,
+            "is_gated": is_gated,
+            **activation_kwargs,
+        }
+        w1 = gated_w1 if is_gated else nongated_w1
+        _run_router_fold_pair(
+            monkeypatch,
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            kwargs,
+        )
+
+
+@GPU_REQUIRED
+@torch.inference_mode()
+@pytest.mark.parametrize("quant_kind", ["int8", "fp8"])
+@pytest.mark.parametrize(
+    ("activation", "is_gated", "num_tokens", "topk"),
+    [
+        ("gelu", True, 64, 4),
+        ("relu2_no_mul", False, 64, 4),
+        ("silu", True, 4, 8),
+    ],
+)
+def test_router_weight_fold_unsorted_activation_with_bias(
+    monkeypatch, activation, is_gated, num_tokens, topk, quant_kind
+):
+    case = _make_router_fold_case(
+        seed=94,
+        quant_kind=quant_kind,
+        num_tokens=num_tokens,
+        hidden_size=128,
+        intermediate_size=128,
+        num_experts=8,
+        topk=topk,
+        activation=activation,
+        is_gated=is_gated,
+        with_bias=True,
+    )
+    monkeypatch.setattr(fused_moe_module, "_bottom_moe_use_mls", lambda: False)
+    _run_router_fold_pair(monkeypatch, *case)
+
+
+@GPU_REQUIRED
+@torch.inference_mode()
+@pytest.mark.parametrize("quant_kind", ["int8", "fp8"])
+@pytest.mark.parametrize("num_tokens", [1, 2, 4, 8])
+@pytest.mark.parametrize(
+    ("activation", "is_gated"),
+    [("silu", True), ("gelu_tanh_no_mul", False)],
+)
+def test_router_weight_fold_small_m(
+    monkeypatch, quant_kind, num_tokens, activation, is_gated
+):
+    case = _make_router_fold_case(
+        seed=96,
+        quant_kind=quant_kind,
+        num_tokens=num_tokens,
+        hidden_size=128,
+        intermediate_size=128,
+        num_experts=8,
+        topk=8,
+        activation=activation,
+        is_gated=is_gated,
+        # Keep tiny FP8 cases safely above the nontrivial-output threshold.
+        scale_max=1.0 if quant_kind == "fp8" else None,
+    )
+    _run_router_fold_pair(monkeypatch, *case)
+
+
+@GPU_REQUIRED
+@torch.inference_mode()
+def test_router_weight_fold_multiple_chunks(monkeypatch):
+    case = _make_router_fold_case(
+        seed=97,
+        quant_kind="int8",
+        num_tokens=16385,
+        hidden_size=128,
+        intermediate_size=128,
+        num_experts=8,
+        topk=2,
+        activation="silu",
+        is_gated=True,
+    )
+    _run_router_fold_pair(monkeypatch, *case)
+
+
+@GPU_REQUIRED
+@BLOCK_PINGPONG_REQUIRED
+@torch.inference_mode()
+def test_router_weight_fold_persistent_mls(monkeypatch):
+    """The persistent bottom kernel must accept pre-folded router weights."""
+    case = _make_router_fold_case(
+        seed=98,
+        quant_kind="int8",
+        num_tokens=1024,
+        hidden_size=256,
+        intermediate_size=128,
+        num_experts=256,
+        topk=8,
+        activation="silu",
+        is_gated=True,
+    )
+    monkeypatch.setattr(moe_op_module, "_USE_MOE_PERSISTENT_KERNEL", True)
+    _run_router_fold_pair(monkeypatch, *case)

@@ -1305,9 +1305,11 @@ def fused_moe_kernel(
     use_int8_w8a16: tl.constexpr,
     per_channel_quant: tl.constexpr,
     c_sorted: tl.constexpr,
+    a_sorted: tl.constexpr,
     bottom_a_use_mls_load: tl.constexpr,
     ck_sorting: tl.constexpr,
     ck_topk: tl.constexpr,
+    naive_block_assignment: tl.constexpr,
     NUM_XCDS: tl.constexpr,
     SCALE_BIAS_WITH_ROUTED_WEIGHT: tl.constexpr,
     ADD_BIAS: tl.constexpr,
@@ -1350,9 +1352,10 @@ def fused_moe_kernel(
     tl.assume(stride_bsk >= 0)
     tl.assume(stride_bsn >= 0)
 
-    # to notify the compiler that sorted_token_ids_ptr is a pointer to the memory,
-    # and all value in the memory is non-negative.
-    tl.assume(sorted_token_ids_ptr.to(tl.int64) >= 0)
+    if not naive_block_assignment:
+        # Notify the compiler that sorted_token_ids_ptr is a pointer to memory
+        # and all values in the memory are non-negative.
+        tl.assume(sorted_token_ids_ptr.to(tl.int64) >= 0)
 
     if group_k > 0:
         tl.static_assert(BLOCK_SIZE_K <= group_k and group_k % BLOCK_SIZE_K == 0,
@@ -1370,15 +1373,18 @@ def fused_moe_kernel(
         tl.static_assert(block_k_diviable == True and block_n_diviable == True,
             "USE_MLS_LOAD must require block_k_diviable and block_n_diviable(maybe exceed 2M Page)!")
     if bottom_a_use_mls_load:
-        tl.static_assert(MUL_ROUTED_WEIGHT == True and c_sorted == False,
-                         "bottom_a_use_mls_load true must when MUL_ROUTED_WEIGHT == True and c_sorted == False!")
+        tl.static_assert(a_sorted and c_sorted == False,
+                         "bottom_a_use_mls_load requires sorted A and unsorted C!")
 
 
     # -----------------------------------------------------------
     # Map program ids `pid` to the block of C it should compute.
     # This is done in a grouped ordering to promote L2 data reuse.
     pid = tl.program_id(axis=0)
-    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    if naive_block_assignment:
+        num_tokens_post_padded = num_valid_tokens * BLOCK_SIZE_M
+    else:
+        num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
 
     num_pid_m = tl.cdiv(num_tokens_post_padded, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
@@ -1401,12 +1407,16 @@ def fused_moe_kernel(
         #                       BLOCK_SIZE_N, compute_type)
         return
 
-    offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(
-        tl.int32)
-    offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
+    offs = tl.arange(0, BLOCK_SIZE_M).to(tl.int32)
+    offs_token_id = pid_m * BLOCK_SIZE_M + offs
+    if naive_block_assignment:
+        offs_token = tl.where(offs == 0, pid_m, num_valid_tokens)
+    else:
+        offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
 
     offs_token = decode_sorted_token_id(offs_token, ck_sorting, ck_topk)
     source_token = source_token_id(offs_token, top_k)
+    a_row = offs_token_id if a_sorted else source_token
 
     token_mask = offs_token < num_valid_tokens
 
@@ -1417,10 +1427,10 @@ def fused_moe_kernel(
 
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     if USE_ADDR_OFFSET_INT64_A:
-        a_ptrs = a_ptr + (source_token[:, None].to(tl.int64) * stride_am +
+        a_ptrs = a_ptr + (a_row[:, None].to(tl.int64) * stride_am +
                  offs_k[None, :].to(tl.int64) * stride_ak)
     else:
-        a_ptrs = a_ptr + (source_token[:, None] * stride_am +
+        a_ptrs = a_ptr + (a_row[:, None] * stride_am +
                  offs_k[None, :] * stride_ak).to(tl.int32)
 
     if USE_ADDR_OFFSET_INT64_B:
@@ -1453,7 +1463,7 @@ def fused_moe_kernel(
                 b_scale_ptrs = (b_scale_ptr + off_experts * stride_bse +
                                 offs_bsn[:, None] * stride_bsn)
             else:
-                if bottom_a_use_mls_load: # top_k is 1
+                if a_sorted: # top_k is 1
                     a_scale_ptrs = a_scale_ptr + offs_token_id * stride_asm
                 else:
                     a_scale_ptrs = a_scale_ptr + source_token * stride_asm
@@ -1467,7 +1477,7 @@ def fused_moe_kernel(
                 None, :] * stride_bsn
             b_scale = tl.load(b_scale_ptrs)
             # Load per-token scale for activations
-            if bottom_a_use_mls_load:  # top_k is 1 and A is laid out in sorted MLS order
+            if a_sorted:  # top_k is 1 and A is laid out in expert-sorted order
                 a_scale_ptrs = a_scale_ptr + offs_token_id * stride_asm
             else:
                 a_scale_ptrs = a_scale_ptr + source_token * stride_asm
@@ -1578,13 +1588,24 @@ def fused_moe_kernel(
             # Load the next block of A and B, generate a mask by checking the
             # K dimension.
             if not block_k_diviable:
-                a = tl.load(a_ptrs,
-                            mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
-                            other=0.0)
-                b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+                k_mask = offs_k < K - k * BLOCK_SIZE_K
+                if a_sorted:
+                    a = tl.load(a_ptrs, mask=k_mask[None, :], other=0.0)
+                else:
+                    a = tl.load(
+                        a_ptrs,
+                        mask=token_mask[:, None] & k_mask[None, :],
+                        other=0.0)
+                b = tl.load(b_ptrs, mask=k_mask[:, None], other=0.0)
             else:
                 if not bottom_a_use_mls_load:
-                    a = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
+                    # The sorted bridge is physically padded to full M blocks,
+                    # so its padding rows are safe to load. They are discarded
+                    # by the token_mask on the final store, just like MLS.
+                    if a_sorted:
+                        a = tl.load(a_ptrs)
+                    else:
+                        a = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
                 else:
                     a = tl.matrix_load(
                             a_ptr,
@@ -1774,6 +1795,7 @@ def fused_moe_splitk_kernel(
     use_int8_w8a16: tl.constexpr,
     per_channel_quant: tl.constexpr,
     c_sorted: tl.constexpr,
+    a_sorted: tl.constexpr,
     bottom_a_use_mls_load: tl.constexpr,
     ck_sorting: tl.constexpr,
     ck_topk: tl.constexpr,
@@ -1838,8 +1860,8 @@ def fused_moe_splitk_kernel(
         tl.static_assert(block_k_diviable == True and block_n_diviable == True,
             "USE_MLS_LOAD must require block_k_diviable and block_n_diviable(maybe exceed 2M Page)!")
     if bottom_a_use_mls_load:
-        tl.static_assert(MUL_ROUTED_WEIGHT == True and c_sorted == False,
-                         "bottom_a_use_mls_load true must when MUL_ROUTED_WEIGHT == True and c_sorted == False!")
+        tl.static_assert(MUL_ROUTED_WEIGHT and a_sorted and c_sorted == False,
+                         "bottom_a_use_mls_load requires Gemm2, sorted A and unsorted C!")
 
     if SPLIT_K != 1:
         tl.static_assert((use_int8_w8a8 == False and use_int8_w8a16 == False) and use_fp8_w8a8 == False,
@@ -1886,6 +1908,7 @@ def fused_moe_splitk_kernel(
 
     offs_token = decode_sorted_token_id(offs_token, ck_sorting, ck_topk)
     source_token = source_token_id(offs_token, top_k)
+    a_row = offs_token_id if a_sorted else source_token
 
     token_mask = offs_token < num_valid_tokens
 
@@ -1896,10 +1919,10 @@ def fused_moe_splitk_kernel(
 
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     if USE_ADDR_OFFSET_INT64_A:
-        a_ptrs = a_ptr + (source_token[:, None].to(tl.int64) * stride_am +
+        a_ptrs = a_ptr + (a_row[:, None].to(tl.int64) * stride_am +
                  (offs_k[None, :] + k_start).to(tl.int64) * stride_ak)
     else:
-        a_ptrs = a_ptr + (source_token[:, None] * stride_am +
+        a_ptrs = a_ptr + (a_row[:, None] * stride_am +
                  (offs_k[None, :] + k_start) * stride_ak).to(tl.int32)
 
     if USE_ADDR_OFFSET_INT64_B:
@@ -1932,7 +1955,7 @@ def fused_moe_splitk_kernel(
                 b_scale_ptrs = (b_scale_ptr + off_experts * stride_bse +
                                 offs_bsn[:, None] * stride_bsn)
             else:
-                if bottom_a_use_mls_load: # top_k is 1
+                if a_sorted: # top_k is 1
                     a_scale_ptrs = a_scale_ptr + offs_token_id * stride_asm
                 else:
                     a_scale_ptrs = a_scale_ptr + source_token * stride_asm
@@ -1946,7 +1969,7 @@ def fused_moe_splitk_kernel(
                 None, :] * stride_bsn
             b_scale = tl.load(b_scale_ptrs)
             # Load per-token scale for activations
-            if bottom_a_use_mls_load:  # top_k is 1 and A is laid out in sorted MLS order
+            if a_sorted:  # top_k is 1 and A is laid out in expert-sorted order
                 a_scale_ptrs = a_scale_ptr + offs_token_id * stride_asm
             else:
                 a_scale_ptrs = a_scale_ptr + source_token * stride_asm
@@ -2051,13 +2074,21 @@ def fused_moe_splitk_kernel(
             # Load the next block of A and B, generate a mask by checking the
             # K dimension.
             if not block_k_diviable:
-                a = tl.load(a_ptrs,
-                            mask=token_mask[:, None] & (offs_k[None, :] < (k_per_split) - k * BLOCK_SIZE_K),
-                            other=0.0)
-                b = tl.load(b_ptrs, mask=offs_k[:, None] < (k_per_split) - k * BLOCK_SIZE_K, other=0.0)
+                k_mask = offs_k < (k_per_split) - k * BLOCK_SIZE_K
+                if a_sorted:
+                    a = tl.load(a_ptrs, mask=k_mask[None, :], other=0.0)
+                else:
+                    a = tl.load(
+                        a_ptrs,
+                        mask=token_mask[:, None] & k_mask[None, :],
+                        other=0.0)
+                b = tl.load(b_ptrs, mask=k_mask[:, None], other=0.0)
             else:
                 if not bottom_a_use_mls_load:
-                    a = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
+                    if a_sorted:
+                        a = tl.load(a_ptrs)
+                    else:
+                        a = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
                 else:
                     a = tl.matrix_load(
                             a_ptr,
@@ -2223,6 +2254,7 @@ def fused_moe_persistent_kernel(
     use_int8_w8a16: tl.constexpr,
     per_channel_quant: tl.constexpr,
     c_sorted: tl.constexpr,
+    a_sorted: tl.constexpr,
     bottom_a_use_mls_load: tl.constexpr,
     ck_sorting: tl.constexpr,
     ck_topk: tl.constexpr,
@@ -2288,8 +2320,8 @@ def fused_moe_persistent_kernel(
         tl.static_assert(block_k_diviable == True and block_n_diviable == True,
             "USE_MLS_LOAD must require block_k_diviable and block_n_diviable(maybe exceed 2M Page)!")
     if bottom_a_use_mls_load:
-        tl.static_assert(MUL_ROUTED_WEIGHT == True and c_sorted == False,
-                         "bottom_a_use_mls_load true must when MUL_ROUTED_WEIGHT == True and c_sorted == False!")
+        tl.static_assert(a_sorted and c_sorted == False,
+                         "bottom_a_use_mls_load requires sorted A and unsorted C!")
 
 
     # -----------------------------------------------------------
@@ -2329,6 +2361,7 @@ def fused_moe_persistent_kernel(
 
             offs_token = decode_sorted_token_id(offs_token, ck_sorting, ck_topk)
             source_token = source_token_id(offs_token, top_k)
+            a_row = offs_token_id if a_sorted else source_token
 
             token_mask = offs_token < num_valid_tokens
 
@@ -2338,10 +2371,10 @@ def fused_moe_persistent_kernel(
 
             offs_k = tl.arange(0, BLOCK_SIZE_K)
             if USE_ADDR_OFFSET_INT64_A:
-                a_ptrs = a_ptr + (source_token[:, None].to(tl.int64) * stride_am +
+                a_ptrs = a_ptr + (a_row[:, None].to(tl.int64) * stride_am +
                         offs_k[None, :].to(tl.int64) * stride_ak)
             else:
-                a_ptrs = a_ptr + (source_token[:, None] * stride_am +
+                a_ptrs = a_ptr + (a_row[:, None] * stride_am +
                         offs_k[None, :] * stride_ak).to(tl.int32)
 
             if USE_ADDR_OFFSET_INT64_B:
@@ -2374,7 +2407,7 @@ def fused_moe_persistent_kernel(
                         b_scale_ptrs = (b_scale_ptr + off_experts * stride_bse +
                                         offs_bsn[:, None] * stride_bsn)
                     else:
-                        if bottom_a_use_mls_load: # top_k is 1
+                        if a_sorted: # top_k is 1
                             a_scale_ptrs = a_scale_ptr + offs_token_id * stride_asm
                         else:
                             a_scale_ptrs = a_scale_ptr + source_token * stride_asm
@@ -2388,7 +2421,7 @@ def fused_moe_persistent_kernel(
                         None, :] * stride_bsn
                     b_scale = tl.load(b_scale_ptrs)
                     # Load per-token scale for activations
-                    if bottom_a_use_mls_load:  # top_k is 1 and A is laid out in sorted MLS order
+                    if a_sorted:  # top_k is 1 and A is laid out in expert-sorted order
                         a_scale_ptrs = a_scale_ptr + offs_token_id * stride_asm
                     else:
                         a_scale_ptrs = a_scale_ptr + source_token * stride_asm
@@ -2492,13 +2525,23 @@ def fused_moe_persistent_kernel(
                     # Load the next block of A and B, generate a mask by checking the
                     # K dimension.
                     if not block_k_diviable:
-                        a = tl.load(a_ptrs,
-                                    mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
-                                    other=0.0)
-                        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+                        k_mask = offs_k < K - k * BLOCK_SIZE_K
+                        if a_sorted:
+                            a = tl.load(
+                                a_ptrs, mask=k_mask[None, :], other=0.0)
+                        else:
+                            a = tl.load(
+                                a_ptrs,
+                                mask=token_mask[:, None] & k_mask[None, :],
+                                other=0.0)
+                        b = tl.load(
+                            b_ptrs, mask=k_mask[:, None], other=0.0)
                     else:
                         if not bottom_a_use_mls_load:
-                            a = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
+                            if a_sorted:
+                                a = tl.load(a_ptrs)
+                            else:
+                                a = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
                         else:
                             a = tl.matrix_load(
                                     a_ptr,
@@ -2628,8 +2671,10 @@ def fused_moe(
     block_shape: Optional[List[int]] = None,
     c_sorted: bool = False,
     bottom_a_use_mls_load: bool = False,
+    a_sorted: bool = False,
     ck_sorting: bool = False,
     ck_topk: int = 8,
+    naive_block_assignment: bool = False,
     scale_bias_with_routed_weight: bool = False,
     B_bias: Optional[torch.Tensor] = None,
     config: Optional[Dict[str, Any]] = None,
@@ -2637,6 +2682,8 @@ def fused_moe(
     assert topk_weights is not None or not mul_routed_weight
     assert topk_weights is None or topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
+    if naive_block_assignment:
+        assert not a_sorted and not c_sorted and not ck_sorting
 
     if use_fp8_w8a8 or use_int8_w8a8:
         assert B_scale is not None
@@ -2673,9 +2720,19 @@ def fused_moe(
     if config["USE_MLS_LOAD"] == True and capMLS == False:
         logger.warning("USE_MLS_LOAD is not supported for this architecture!!!")
         config["USE_MLS_LOAD"] = False
+    # Keep the expert-sorted bridge layout even when this architecture cannot
+    # lower A through tl.matrix_load. The kernel will use regular tl.load from
+    # the same contiguous offs_token_id rows instead.
+    if bottom_a_use_mls_load:
+        a_sorted = True
+        if not capMLS:
+            bottom_a_use_mls_load = False
 
-    EM = sorted_token_ids.size(0)
-    if A.size(0) < config["BLOCK_SIZE_M"]:
+    if naive_block_assignment:
+        EM = num_tokens * config["BLOCK_SIZE_M"]
+    else:
+        EM = sorted_token_ids.size(0)
+    if not naive_block_assignment and A.size(0) < config["BLOCK_SIZE_M"]:
         # optimize for small batch_size.
         # We assume that top_ids of each token is unique, so
         # so num_valid_experts <= batch_size <= BLOCK_SIZE_M,
@@ -2863,7 +2920,7 @@ def fused_moe(
         if mul_routed_weight:
             SPLIT_K = 0
 
-        if _USE_MOE_PERSISTENT_KERNEL:
+        if _USE_MOE_PERSISTENT_KERNEL and not naive_block_assignment:
             # Note: the sms count is irrelevant to occupancy(lds and regs).
             NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count * 2
 
@@ -2921,6 +2978,7 @@ def fused_moe(
                 use_int8_w8a16=use_int8_w8a16,
                 per_channel_quant=per_channel_quant,
                 c_sorted=c_sorted,
+                a_sorted=a_sorted,
                 bottom_a_use_mls_load=bottom_a_use_mls_load,
                 ck_sorting=ck_sorting,
                 ck_topk=ck_topk,
@@ -2930,7 +2988,7 @@ def fused_moe(
                 COMBINE_SCALE_LOAD=config.pop("COMBINE_SCALE_LOAD", None),
                 **config,
             )
-        elif SPLIT_K > 1:
+        elif SPLIT_K > 1 and not naive_block_assignment:
             if B_bias is not None:
                 raise ValueError("B_bias is not supported in fused_moe_splitk_kernel yet")
 
@@ -2990,6 +3048,7 @@ def fused_moe(
                 use_int8_w8a16=use_int8_w8a16,
                 per_channel_quant=per_channel_quant,
                 c_sorted=c_sorted,
+                a_sorted=a_sorted,
                 bottom_a_use_mls_load=bottom_a_use_mls_load,
                 ck_sorting=ck_sorting,
                 ck_topk=ck_topk,
@@ -3051,9 +3110,11 @@ def fused_moe(
                 use_int8_w8a16=use_int8_w8a16,
                 per_channel_quant=per_channel_quant,
                 c_sorted=c_sorted,
+                a_sorted=a_sorted,
                 bottom_a_use_mls_load=bottom_a_use_mls_load,
                 ck_sorting=ck_sorting,
                 ck_topk=ck_topk,
+                naive_block_assignment=naive_block_assignment,
                 NUM_XCDS=1,
                 SCALE_BIAS_WITH_ROUTED_WEIGHT=scale_bias_with_routed_weight,
                 ADD_BIAS=B_bias is not None,

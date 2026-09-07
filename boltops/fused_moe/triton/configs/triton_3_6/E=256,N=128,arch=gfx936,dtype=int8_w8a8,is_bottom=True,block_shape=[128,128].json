@@ -246,7 +246,7 @@
         "GROUP_SIZE_M": 1,
         "COMBINE_SCALE_LOAD": false,
         "USE_MLS_LOAD": false,
-        "bottom_a_use_mls_load": false,
+        "bottom_a_use_mls_load": true,
         "schedule_hint": "none",
         "sched_latency": "none",
         "kpack": 2,

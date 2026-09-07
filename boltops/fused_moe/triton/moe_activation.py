@@ -8,11 +8,53 @@ Terminology:
   same last-dimension size (typically [..., D] -> [..., D]).
 """
 
-from typing import Optional, Tuple
+from enum import IntEnum
+from typing import NamedTuple, Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
+
+
+class _FusedActivationQuantKind(IntEnum):
+    GATED_SILU = 0
+    GATED_GELU = 1
+    GATED_GELU_TANH = 2
+    GATED_SILU_LIMIT = 3
+    GATED_SITU = 4
+    GATED_SWIGLU_STEP = 5
+    SILU = 6
+    GELU = 7
+    GELU_TANH = 8
+    RELU2 = 9
+
+
+# Triton JIT functions can only capture globals instantiated as tl.constexpr.
+_FUSED_ACT_GATED_SILU = tl.constexpr(
+    _FusedActivationQuantKind.GATED_SILU.value
+)
+_FUSED_ACT_GATED_GELU = tl.constexpr(
+    _FusedActivationQuantKind.GATED_GELU.value
+)
+_FUSED_ACT_GATED_GELU_TANH = tl.constexpr(
+    _FusedActivationQuantKind.GATED_GELU_TANH.value
+)
+_FUSED_ACT_GATED_SILU_LIMIT = tl.constexpr(
+    _FusedActivationQuantKind.GATED_SILU_LIMIT.value
+)
+_FUSED_ACT_GATED_SITU = tl.constexpr(
+    _FusedActivationQuantKind.GATED_SITU.value
+)
+_FUSED_ACT_GATED_SWIGLU_STEP = tl.constexpr(
+    _FusedActivationQuantKind.GATED_SWIGLU_STEP.value
+)
+_FUSED_ACT_SILU = tl.constexpr(_FusedActivationQuantKind.SILU.value)
+_FUSED_ACT_GELU = tl.constexpr(_FusedActivationQuantKind.GELU.value)
+_FUSED_ACT_GELU_TANH = tl.constexpr(
+    _FusedActivationQuantKind.GELU_TANH.value
+)
+_FUSED_ACT_RELU2 = tl.constexpr(_FusedActivationQuantKind.RELU2.value)
 
 
 @triton.heuristics(
@@ -238,6 +280,140 @@ def _gelu_tanh(x):
     x_cube = x * x * x
     inner = BETA * (x + KAPPA * x_cube)
     return 0.5 * x * (1.0 + _tanh(inner))
+
+
+@triton.jit
+def activation_quant_kernel(
+    q_ptr,
+    scale_ptr,
+    in_ptr,
+    row_multiplier_ptr,
+    M,
+    D: tl.constexpr,
+    ACT: tl.constexpr,
+    IS_GATED: tl.constexpr,
+    LIMIT: tl.constexpr,
+    BETA: tl.constexpr,
+    LINEAR_BETA: tl.constexpr,
+    HAS_LINEAR_BETA: tl.constexpr,
+    DTYPE_MAX: tl.constexpr,
+    QUANT_INT8: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    EVEN_M: tl.constexpr,
+    EVEN_D: tl.constexpr,
+    APPLY_ROW_MULTIPLIER: tl.constexpr,
+):
+    """Fuse a whitelisted MoE activation with per-token INT8/FP8 quant."""
+    pid = tl.program_id(0)
+    rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    cols = tl.arange(0, BLOCK_D)
+    row_mask = rows < M
+    col_mask = cols < D
+    input_width = 2 * D if IS_GATED else D
+    input_offs = rows[:, None] * input_width + cols[None, :]
+
+    if EVEN_M and EVEN_D:
+        x = tl.load(in_ptr + input_offs)
+    elif EVEN_D:
+        x = tl.load(
+            in_ptr + input_offs,
+            mask=row_mask[:, None],
+            other=0.0,
+        )
+    else:
+        x = tl.load(
+            in_ptr + input_offs,
+            mask=row_mask[:, None] & col_mask[None, :],
+            other=0.0,
+        )
+
+    xf = x.to(tl.float32)
+    # ACT values are private implementation details of the explicit Python
+    # whitelist below. Compile-time branches keep each generated kernel small.
+    if ACT == _FUSED_ACT_GATED_SILU:
+        y = xf * (1.0 / (1.0 + tl.exp(-xf)))
+    elif ACT == _FUSED_ACT_GATED_GELU:
+        y = xf * 0.5 * (1.0 + tl.erf(xf * 0.7071067811865476))
+    elif ACT == _FUSED_ACT_GATED_GELU_TANH:
+        y = _gelu_tanh(xf)
+    elif ACT == _FUSED_ACT_GATED_SILU_LIMIT:
+        gate = tl.minimum(xf, LIMIT)
+        y = gate * (1.0 / (1.0 + tl.exp(-gate)))
+    elif ACT == _FUSED_ACT_GATED_SITU:
+        y = BETA * _tanh(xf / BETA) * tl.sigmoid(xf)
+    elif ACT == _FUSED_ACT_GATED_SWIGLU_STEP:
+        silu = xf * (1.0 / (1.0 + tl.exp(-xf)))
+        y = tl.minimum(silu, LIMIT)
+    elif ACT == _FUSED_ACT_SILU:
+        y = xf * (1.0 / (1.0 + tl.exp(-xf)))
+    elif ACT == _FUSED_ACT_GELU:
+        y = xf * 0.5 * (1.0 + tl.erf(xf * 0.7071067811865476))
+    elif ACT == _FUSED_ACT_GELU_TANH:
+        y = _gelu_tanh(xf)
+    else:  # _FUSED_ACT_RELU2
+        y = tl.where(xf > 0.0, xf * xf, 0.0)
+
+    if IS_GATED:
+        up_offs = input_offs + D
+        if EVEN_M and EVEN_D:
+            up = tl.load(in_ptr + up_offs)
+        elif EVEN_D:
+            up = tl.load(
+                in_ptr + up_offs,
+                mask=row_mask[:, None],
+                other=0.0,
+            )
+        else:
+            up = tl.load(
+                in_ptr + up_offs,
+                mask=row_mask[:, None] & col_mask[None, :],
+                other=0.0,
+            )
+        upf = up.to(tl.float32)
+        if (
+            ACT == _FUSED_ACT_GATED_SILU_LIMIT
+            or ACT == _FUSED_ACT_GATED_SWIGLU_STEP
+        ):
+            upf = tl.minimum(tl.maximum(upf, -LIMIT), LIMIT)
+        elif ACT == _FUSED_ACT_GATED_SITU and HAS_LINEAR_BETA:
+            upf = LINEAR_BETA * _tanh(upf / LINEAR_BETA)
+        y *= upf
+
+    # Match the unfused path: activation stores to the GEMM output dtype,
+    # then per-token quantization reloads that rounded value.
+    y = y.to(x.dtype)
+    absmax = tl.max(tl.abs(y), axis=-1)
+    scale = tl.maximum(absmax.to(tl.float32), 1.0e-10) / DTYPE_MAX
+    quantized = y * (1.0 / scale)[:, None]
+    if QUANT_INT8:
+        quantized = libdevice.nearbyint(quantized)
+    q = quantized.to(q_ptr.dtype.element_ty)
+
+    if APPLY_ROW_MULTIPLIER:
+        multiplier = tl.load(
+            row_multiplier_ptr + rows,
+            mask=row_mask,
+            other=0.0,
+        ).to(tl.float32)
+        scale *= multiplier
+
+    q_offs = rows[:, None] * D + cols[None, :]
+    if EVEN_M and EVEN_D:
+        tl.store(q_ptr + q_offs, q, cache_modifier=".cs")
+        tl.store(scale_ptr + rows, scale)
+    elif EVEN_D:
+        tl.store(
+            q_ptr + q_offs,
+            q,
+            mask=row_mask[:, None],
+            cache_modifier=".cs",
+        )
+        tl.store(scale_ptr + rows, scale, mask=row_mask)
+    else:
+        mask = row_mask[:, None] & col_mask[None, :]
+        tl.store(q_ptr + q_offs, q, mask=mask, cache_modifier=".cs")
+        tl.store(scale_ptr + rows, scale, mask=row_mask)
 
 
 def get_triton_gelu_tanh_and_mul_config(M, _N):
@@ -869,27 +1045,286 @@ _ACTIVATION_ALIASES = {
     "gelu_pytorch_tanh": "gelu_tanh",
     "gelu_pytorch_tanh_no_mul": "gelu_tanh_no_mul",
 }
-_NO_MUL_ACTIVATIONS = {
-    "silu_no_mul",
-    "gelu_no_mul",
-    "gelu_tanh_no_mul",
-    "relu2_no_mul",
-    "relu2",
+
+
+class _ActivationSpec(NamedTuple):
+    default_gated: bool
+    supported_gated_modes: Tuple[bool, ...]
+    # Indexed by int(is_gated): (non-gated kind, gated kind).
+    fused_quant_kinds: Tuple[
+        Optional[_FusedActivationQuantKind],
+        Optional[_FusedActivationQuantKind],
+    ]
+
+
+_ACTIVATION_SPECS = {
+    "silu": _ActivationSpec(
+        True,
+        (False, True),
+        (
+            _FusedActivationQuantKind.SILU,
+            _FusedActivationQuantKind.GATED_SILU,
+        ),
+    ),
+    "gelu": _ActivationSpec(
+        True,
+        (False, True),
+        (
+            _FusedActivationQuantKind.GELU,
+            _FusedActivationQuantKind.GATED_GELU,
+        ),
+    ),
+    "gelu_tanh": _ActivationSpec(
+        True,
+        (False, True),
+        (
+            _FusedActivationQuantKind.GELU_TANH,
+            _FusedActivationQuantKind.GATED_GELU_TANH,
+        ),
+    ),
+    "situ": _ActivationSpec(
+        True,
+        (True,),
+        (None, _FusedActivationQuantKind.GATED_SITU),
+    ),
+    "swigluoai": _ActivationSpec(True, (True,), (None, None)),
+    "swiglustep": _ActivationSpec(
+        True,
+        (True,),
+        (None, _FusedActivationQuantKind.GATED_SWIGLU_STEP),
+    ),
+    "silu_no_mul": _ActivationSpec(
+        False, (False,), (_FusedActivationQuantKind.SILU, None)
+    ),
+    "gelu_no_mul": _ActivationSpec(
+        False, (False,), (_FusedActivationQuantKind.GELU, None)
+    ),
+    "gelu_tanh_no_mul": _ActivationSpec(
+        False, (False,), (_FusedActivationQuantKind.GELU_TANH, None)
+    ),
+    "relu2": _ActivationSpec(
+        False, (False,), (_FusedActivationQuantKind.RELU2, None)
+    ),
+    "relu2_no_mul": _ActivationSpec(
+        False, (False,), (_FusedActivationQuantKind.RELU2, None)
+    ),
 }
-_GATED_ONLY_ACTIVATIONS = {"situ", "swigluoai", "swiglustep"}
-_SUPPORTED_ACTIVATIONS = {
-    "silu",
-    "gelu",
-    "gelu_tanh",
-    "situ",
-    "swigluoai",
-    "swiglustep",
-    "silu_no_mul",
-    "gelu_no_mul",
-    "gelu_tanh_no_mul",
-    "relu2_no_mul",
-    "relu2",
-}
+
+# Publicly inspectable allowlist requested by the MoE integration. It is
+# derived from the canonical registry so a new activation cannot drift between
+# normalization and fused-quant dispatch.
+FUSED_ACTIVATION_QUANT_ACTIVATIONS = frozenset(
+    (name, is_gated)
+    for name, spec in _ACTIVATION_SPECS.items()
+    for is_gated in spec.supported_gated_modes
+    if spec.fused_quant_kinds[int(is_gated)] is not None
+)
+
+# A per-token scale needs a reduction over the whole output row. All current
+# model widths fit in one Triton block up to this limit; larger future widths
+# safely retain the existing activation-then-quant path.
+_MAX_FUSED_ACTIVATION_QUANT_D = 8192
+
+
+def _resolve_fused_activation_quant_kind(
+    activation: str,
+    is_gated: bool,
+    quant_dtype: torch.dtype,
+    output_dim: int,
+    *,
+    gemm1_alpha: Optional[float] = None,
+    gemm1_limit: Optional[float] = None,
+    activation_situ_beta: Optional[float] = None,
+    activation_situ_linear_beta: Optional[float] = None,
+) -> Optional[_FusedActivationQuantKind]:
+    """Resolve an allowlisted public activation to its internal kernel kind."""
+    activation = _ACTIVATION_ALIASES.get(
+        activation.lower(), activation.lower()
+    )
+    spec = _ACTIVATION_SPECS.get(activation)
+    if spec is None or is_gated not in spec.supported_gated_modes:
+        return None
+    if quant_dtype not in (torch.int8, torch.float8_e4m3fn):
+        return None
+    if output_dim <= 0 or output_dim > _MAX_FUSED_ACTIVATION_QUANT_D:
+        return None
+
+    kind = spec.fused_quant_kinds[int(is_gated)]
+    if kind is None:
+        return None
+
+    if not is_gated:
+        return kind
+    if kind == _FusedActivationQuantKind.GATED_SILU:
+        # Exclude the GPT-OSS alpha+limit formula. The limit-only variant is
+        # allowlisted and has separate compile-time formula selection below.
+        if gemm1_alpha is not None:
+            return None
+        if gemm1_limit is not None:
+            return _FusedActivationQuantKind.GATED_SILU_LIMIT
+    elif kind in {
+        _FusedActivationQuantKind.GATED_GELU,
+        _FusedActivationQuantKind.GATED_GELU_TANH,
+        _FusedActivationQuantKind.GATED_SITU,
+    }:
+        if gemm1_alpha is not None or gemm1_limit is not None:
+            return None
+    if kind == _FusedActivationQuantKind.GATED_SITU:
+        if activation_situ_beta is None or activation_situ_beta <= 0:
+            return None
+        if (
+            activation_situ_linear_beta is not None
+            and activation_situ_linear_beta <= 0
+        ):
+            return None
+    if (
+        kind == _FusedActivationQuantKind.GATED_SWIGLU_STEP
+        and gemm1_alpha is not None
+    ):
+        return None
+    return kind
+
+
+def is_fused_activation_quant_supported(
+    activation: str,
+    is_gated: bool,
+    quant_dtype: torch.dtype,
+    output_dim: int,
+    *,
+    gemm1_alpha: Optional[float] = None,
+    gemm1_limit: Optional[float] = None,
+    activation_situ_beta: Optional[float] = None,
+    activation_situ_linear_beta: Optional[float] = None,
+) -> bool:
+    """Return whether this exact activation/quant parameter set is allowlisted."""
+    return _resolve_fused_activation_quant_kind(
+        activation,
+        is_gated,
+        quant_dtype,
+        output_dim,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_limit=gemm1_limit,
+        activation_situ_beta=activation_situ_beta,
+        activation_situ_linear_beta=activation_situ_linear_beta,
+    ) is not None
+
+
+def _get_fused_activation_quant_config(
+    output_dim: int,
+) -> dict:
+    block_d = triton.next_power_of_2(output_dim)
+    if output_dim == 128:
+        block_m = 8
+    else:
+        block_m = max(1, min(4, 512 // block_d))
+    if block_d <= 512:
+        num_warps = 1
+    elif block_d <= 2048:
+        num_warps = 2
+    else:
+        num_warps = 4
+    return {
+        "BLOCK_M": block_m,
+        "BLOCK_D": block_d,
+        "num_warps": num_warps,
+        "num_stages": 1,
+    }
+
+
+def triton_activation_quant(
+    input: torch.Tensor,
+    activation: str,
+    is_gated: bool,
+    quant_dtype: torch.dtype,
+    *,
+    gemm1_alpha: Optional[float] = None,
+    gemm1_limit: Optional[float] = None,
+    activation_situ_beta: Optional[float] = None,
+    activation_situ_linear_beta: Optional[float] = None,
+    row_multiplier: Optional[torch.Tensor] = None,
+):
+    """Fuse an explicitly allowlisted MoE activation and per-token quant."""
+    if input.ndim != 2 or not input.is_contiguous():
+        raise ValueError("input must be a contiguous 2D tensor")
+    if is_gated and input.shape[-1] % 2:
+        raise ValueError("gated input last dimension must be even")
+
+    activation = _ACTIVATION_ALIASES.get(activation.lower(), activation.lower())
+    output_dim = adjust_N_for_activation(input.shape[-1], is_gated)
+    act = _resolve_fused_activation_quant_kind(
+        activation,
+        is_gated,
+        quant_dtype,
+        output_dim,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_limit=gemm1_limit,
+        activation_situ_beta=activation_situ_beta,
+        activation_situ_linear_beta=activation_situ_linear_beta,
+    )
+    if act is None:
+        raise ValueError(
+            "activation/quant parameters are not supported by the fused kernel"
+        )
+
+    rows = input.shape[0]
+    if rows <= 0:
+        raise ValueError("input must contain at least one row")
+    if row_multiplier is not None:
+        if row_multiplier.device != input.device:
+            raise ValueError("row_multiplier must be on the input device")
+        if not row_multiplier.dtype.is_floating_point:
+            raise ValueError("row_multiplier must have a floating-point dtype")
+        if (
+            row_multiplier.ndim != 1
+            or not row_multiplier.is_contiguous()
+            or row_multiplier.numel() < rows
+        ):
+            raise ValueError(
+                "row_multiplier must be a contiguous vector containing every input row"
+            )
+    limit = 0.0
+    if act == _FusedActivationQuantKind.GATED_SWIGLU_STEP:
+        limit = 7.0 if gemm1_limit is None else float(gemm1_limit)
+    elif act == _FusedActivationQuantKind.GATED_SILU_LIMIT:
+        limit = float(gemm1_limit)
+
+    q = torch.empty(
+        (rows, output_dim), dtype=quant_dtype, device=input.device
+    )
+    scale = torch.empty((rows, 1), dtype=torch.float32, device=input.device)
+    config = _get_fused_activation_quant_config(output_dim)
+    block_m = config["BLOCK_M"]
+    activation_quant_kernel[(triton.cdiv(rows, block_m),)](
+        q,
+        scale,
+        input,
+        row_multiplier if row_multiplier is not None else input,
+        rows,
+        D=output_dim,
+        ACT=int(act),
+        IS_GATED=is_gated,
+        LIMIT=limit,
+        BETA=(
+            0.0 if activation_situ_beta is None else float(activation_situ_beta)
+        ),
+        LINEAR_BETA=(
+            0.0
+            if activation_situ_linear_beta is None
+            else float(activation_situ_linear_beta)
+        ),
+        HAS_LINEAR_BETA=activation_situ_linear_beta is not None,
+        DTYPE_MAX=(
+            torch.finfo(quant_dtype).max
+            if quant_dtype.is_floating_point
+            else torch.iinfo(quant_dtype).max
+        ),
+        QUANT_INT8=quant_dtype == torch.int8,
+        EVEN_M=rows % block_m == 0,
+        EVEN_D=output_dim == config["BLOCK_D"],
+        APPLY_ROW_MULTIPLIER=row_multiplier is not None,
+        **config,
+    )
+    return q, scale
 
 
 def _normalize_activation_and_gate(
@@ -900,15 +1335,18 @@ def _normalize_activation_and_gate(
     # 1) validate string, 2) infer is_gated when not explicitly given,
     # 3) validate gated/non-gated constraints.
     activation_name = _ACTIVATION_ALIASES.get(activation.lower(), activation.lower())
-    if activation_name not in _SUPPORTED_ACTIVATIONS:
+    spec = _ACTIVATION_SPECS.get(activation_name)
+    if spec is None:
         raise ValueError(f"Unsupported activation: {activation}")
 
     if is_gated is None:
-        is_gated = activation_name not in _NO_MUL_ACTIVATIONS
+        is_gated = spec.default_gated
 
-    if is_gated and activation_name in _NO_MUL_ACTIVATIONS:
-        raise ValueError(f"Activation '{activation}' is non-gated but is_gated=True")
-    if (not is_gated) and activation_name in _GATED_ONLY_ACTIVATIONS:
+    if is_gated not in spec.supported_gated_modes:
+        if spec.supported_gated_modes == (False,):
+            raise ValueError(
+                f"Activation '{activation}' is non-gated but is_gated=True"
+            )
         raise ValueError(f"Activation '{activation}' requires gated mode")
 
     return activation_name, is_gated

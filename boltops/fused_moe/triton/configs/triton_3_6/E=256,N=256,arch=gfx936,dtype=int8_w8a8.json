@@ -226,17 +226,17 @@
     },
     "16384": {
         "BLOCK_SIZE_M": 128,
-        "BLOCK_SIZE_N": 128,
-        "BLOCK_SIZE_K": 256,
+        "BLOCK_SIZE_N": 256,
+        "BLOCK_SIZE_K": 128,
         "GROUP_SIZE_M": 1,
         "COMBINE_SCALE_LOAD": false,
         "USE_MLS_LOAD": false,
         "schedule_hint": "none",
         "sched_latency": "none",
         "kpack": 2,
-        "use_block_pingpong": false,
-        "buffer_cache_swizzle": false,
-        "num_warps": 4,
+        "use_block_pingpong": true,
+        "buffer_cache_swizzle": true,
+        "num_warps": 8,
         "num_stages": 1
     }
 }

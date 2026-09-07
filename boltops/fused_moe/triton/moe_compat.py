@@ -50,6 +50,11 @@ def per_token_quant_triton(
     return output, scale
 
 
+# Keep the former exported name for downstream users while using the more
+# accurate Triton-specific name internally.
+per_token_quant_hip = per_token_quant_triton
+
+
 def per_block_quant_wrapper(block_shape=(1, 128)):
     def decorator(per_token_quant_func):
         def wrapper(x, scale=None, quant_dtype=torch.int8):
@@ -97,6 +102,7 @@ moe_align_block_size = _align_with_local_triton
 __all__ = [
     "moe_align_block_size",
     "per_block_quant_wrapper",
+    "per_token_quant_hip",
     "per_token_quant_triton",
     "pertoken_quant",
     "sgl_moe_align_block_size",
