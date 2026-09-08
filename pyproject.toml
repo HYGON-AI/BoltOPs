@@ -103,6 +103,7 @@ boltops = [
     "mqa_logits/triton/SOURCE.md",
     "mqa_logits/triton/configs/triton_*/*.json",
     "step4_dsa/triton/SOURCE.md",
+    "step4_dsa/triton/config/*/*.json",
     "fla/gdn/triton/configs/*/*.json",
     "tools/fused_moe_triton_tune/*.sh",
     "tools/fused_moe_triton_tune/*.md",
