@@ -16,6 +16,7 @@ from boltops.mla import flash_mla_sparse_fwd
 from boltops.mla.triton.flash_mla_sparse import (
     _config_match_score,
     _device_model,
+    _supports_matrix_load,
 )
 
 
@@ -141,3 +142,31 @@ def test_tuned_config_range_matching_and_specificity():
 def test_device_model_excludes_platform_description():
     assert _device_model("BW200, UBB BW1000") == "BW200"
     assert _device_model("Product Name") == "Product_Name"
+
+
+@GPU_REQUIRED
+def test_flash_mla_sparse_matrix_load_q_matches_reference():
+    if not _supports_matrix_load(torch.device("cuda")):
+        pytest.skip("matrix_load is not supported on this device")
+    torch.manual_seed(7)
+    s_q, s_kv, h_q, h_kv, d_qk, d_v, topk = 2, 80, 16, 1, 576, 512, 33
+    q = torch.randn(s_q, h_q, d_qk, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(s_kv, h_kv, d_qk, device="cuda", dtype=torch.bfloat16)
+    indices = torch.randint(
+        0, s_kv, (s_q, h_kv, topk), device="cuda", dtype=torch.int32
+    )
+    scale = 1.0 / math.sqrt(d_qk)
+    config = {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 64,
+        "num_warps": 4,
+        "num_stages": 1,
+        "USE_MATRIX_LOAD_Q": True,
+    }
+    actual = flash_mla_sparse_fwd(
+        q, kv, indices, scale, d_v=d_v, config=config
+    )
+    expected = _reference(q, kv, indices, scale, d_v, None)
+    for lhs, rhs in zip(actual, expected):
+        torch.testing.assert_close(lhs.float(), rhs.float(), atol=2e-2, rtol=2e-2)

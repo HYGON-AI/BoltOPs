@@ -15,6 +15,7 @@ import triton
 from boltops.mla import flash_mla_sparse_fwd
 from boltops.mla.triton.flash_mla_sparse import (
     _device_identity,
+    _supports_matrix_load,
 )
 
 DTYPE = torch.bfloat16
@@ -26,23 +27,29 @@ DEFAULT_SHAPES = (
 )
 
 
-def _structural_candidates(quick: bool) -> list[dict]:
+def _structural_candidates(quick: bool, matrix_load: bool) -> list[dict]:
     block_ns = (8, 16, 32) if quick else (8, 16, 32, 64)
     block_hs = (8, 16) if quick else (4, 8, 16)
     block_ds = (64, 128) if quick else (64, 128, 256)
     warps = (4,) if quick else (2, 4, 8)
-    return [
-        {
+    candidates = []
+    for block_n, block_h, block_d, num_warps in itertools.product(
+        block_ns, block_hs, block_ds, warps
+    ):
+        base = {
             "BLOCK_N": block_n,
             "BLOCK_H": block_h,
             "BLOCK_DMODEL": block_d,
             "num_warps": num_warps,
             "num_stages": 1,
+            "USE_MATRIX_LOAD_Q": False,
         }
-        for block_n, block_h, block_d, num_warps in itertools.product(
-            block_ns, block_hs, block_ds, warps
-        )
-    ]
+        candidates.append(base)
+        # The HCU matrix-load/MFMA lowering requires both output tile
+        # dimensions to be at least one 16x16 instruction tile.
+        if matrix_load and block_n >= 16 and block_h >= 16:
+            candidates.append({**base, "USE_MATRIX_LOAD_Q": True})
+    return candidates
 
 
 def _compiler_candidates(base: dict, quick: bool) -> list[dict]:
@@ -118,6 +125,7 @@ def tune_shape(
         "BLOCK_DMODEL": 128,
         "num_warps": 4,
         "num_stages": 1,
+        "USE_MATRIX_LOAD_Q": False,
     }
     reference = tuple(t.detach().clone() for t in run(baseline_config))
     baseline_ms = float(
@@ -156,9 +164,25 @@ def tune_shape(
             raise RuntimeError(f"all candidates failed for shape {shape}")
         return best_config, best_ms
 
-    structural, _ = sweep(_structural_candidates(quick))
-    compiler, _ = sweep(_compiler_candidates(structural, quick))
-    best_config, best_ms = sweep(_optimization_candidates(compiler, quick))
+    structural_candidates = _structural_candidates(
+        quick, _supports_matrix_load(q.device)
+    )
+    branch_results = []
+    for use_matrix_load_q in (False, True):
+        branch = [
+            config
+            for config in structural_candidates
+            if config["USE_MATRIX_LOAD_Q"] is use_matrix_load_q
+        ]
+        if not branch:
+            continue
+        print(f"  BRANCH USE_MATRIX_LOAD_Q={use_matrix_load_q}", flush=True)
+        structural, _ = sweep(branch)
+        compiler, _ = sweep(_compiler_candidates(structural, quick))
+        branch_results.append(
+            sweep(_optimization_candidates(compiler, quick))
+        )
+    best_config, best_ms = min(branch_results, key=lambda result: result[1])
     del q, kv, indices, lengths, reference
     torch.cuda.empty_cache()
     return best_config, best_ms, baseline_ms, tested
