@@ -7,6 +7,13 @@
 Default output is
 ``decode-k{width}-s{splits}-b{batch}-ctx{context}-hpg{hpg}-d{dim}-r{region}_{dtype}_{device}.json``.
 ``kv_seqlens`` must be a single context; otherwise the script exits.
+
+Candidates include HIP ``waves_per_eu``; ``sparse_attention_decode`` forwards it
+at launch with ``num_warps`` / ``num_stages``.
+
+``--splits 1`` times the production fast path (auto KV-split + merge) and still
+writes the ``s1`` occupancy JSON. Pass ``--splits N`` with N>1 to tune an
+explicit split count.
 """
 
 from __future__ import annotations
@@ -31,6 +38,7 @@ from step4_dsa.benchmark_cases import BenchmarkCase, tp8_geometry  # noqa: E402
 
 from boltops.step4_dsa import triton_decode_sparse_meta  # noqa: E402
 from boltops.step4_dsa.triton.decode import (  # noqa: E402
+    choose_decode_kv_splits,
     sparse_attention_decode,
     sparse_attn_decode_config_path,
 )
@@ -224,6 +232,14 @@ def main() -> None:
         f"packed={packed_width} hpg={heads_per_group} D={head_dim}",
         flush=True,
     )
+    if args.splits == 1:
+        launched = choose_decode_kv_splits(args.batch, args.groups, packed_width)
+        print(
+            f"  num_splits=1 fast path launches {launched}-way "
+            f"(grid B={args.batch}, G={args.groups}, splits={launched}); "
+            f"JSON still named s{args.splits}",
+            flush=True,
+        )
     cfg, ms = tune_shape(
         data,
         num_splits=args.splits,
@@ -231,6 +247,9 @@ def main() -> None:
         rep_ms=args.rep_ms,
     )
     print(f"BEST: {ms:.6f} ms {cfg}", flush=True)
+    missing = [key for key in ("num_warps", "num_stages", "waves_per_eu") if key not in cfg]
+    if missing:
+        raise RuntimeError(f"tuned config omitted launch keys {missing}: {cfg}")
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(cfg, indent=4) + "\n")
     timing_path.write_text(json.dumps({"ms": ms, "config": cfg}, indent=4) + "\n")

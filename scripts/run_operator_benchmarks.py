@@ -16,7 +16,6 @@ BENCHMARK_ROOT = ROOT / "scripts" / "benchmarks"
 BENCHMARK_KERNELS = (
     "triton/batched_gemm_bf16",
     "triton/flash_mla_sparse",
-    "triton/step4_dsa",
 )
 
 

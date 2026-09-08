@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from boltops.step4_dsa import triton_merge_split_states
@@ -51,3 +52,10 @@ def test_merge_all_empty_is_zero_neg_inf():
     torch.cuda.synchronize()
     assert torch.equal(out, torch.zeros_like(out))
     assert torch.isneginf(lse).all()
+
+
+def test_merge_split_states_rejects_strided_head_dim():
+    partial_out = torch.randn(2, 1, 8, 16)
+    partial_lse = torch.randn(2, 1, 8)
+    with pytest.raises(ValueError, match="last dimension"):
+        triton_merge_split_states(C.strided_last_dim(partial_out), partial_lse)

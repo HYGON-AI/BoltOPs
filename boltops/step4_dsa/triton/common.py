@@ -88,6 +88,17 @@ def _fit_block_regions(
     return block_regions
 
 
+def _require_contiguous_last_dim(tensor: torch.Tensor, name: str) -> None:
+    """Sparse attention kernels address the last axis as ``base + d``, not ``d * stride``.
+
+    Token and head strides are kernel arguments; the innermost dimension is not.
+    A legal shape with ``stride(-1) != 1`` (permute, stepped slice) would otherwise
+    be silently mis-addressed. Callers may still pad token/head strides.
+    """
+    if tensor.stride(-1) != 1:
+        raise ValueError(f"{name} must be contiguous in the last dimension")
+
+
 def shared_table_stride(block_table: torch.Tensor) -> int:
     """Row stride to pass for a block table, zero when the table is shared.
 

@@ -2,7 +2,11 @@
 # Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # SPDX-License-Identifier: MIT
 
-"""Autotune BoltOps per-query sparse prefill for selected production shapes."""
+"""Autotune BoltOps per-query sparse prefill for selected production shapes.
+
+Candidates include HIP ``waves_per_eu``; ``sparse_attention_prefill`` forwards it
+at launch with ``num_warps`` / ``num_stages``.
+"""
 
 from __future__ import annotations
 
@@ -181,6 +185,9 @@ def main() -> None:
     )
     cfg, ms = tune_shape(data, args.warmup_ms, args.rep_ms)
     print(f"BEST: {ms:.6f} ms {cfg}", flush=True)
+    missing = [key for key in ("num_warps", "num_stages", "waves_per_eu") if key not in cfg]
+    if missing:
+        raise RuntimeError(f"tuned config omitted launch keys {missing}: {cfg}")
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(cfg, indent=4) + "\n")
     timing_path.write_text(json.dumps({"ms": ms, "config": cfg}, indent=4) + "\n")

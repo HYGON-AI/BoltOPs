@@ -15,6 +15,32 @@ GPU_REQUIRED = pytest.mark.skipif(
 )
 
 
+def last_dim_padded_view(src: torch.Tensor, pad: int, poison: float) -> torch.Tensor:
+    """Same logical values as ``src``, larger leading strides, last dim still contiguous."""
+    padded = torch.empty(
+        (*src.shape[:-1], src.shape[-1] + pad),
+        device=src.device,
+        dtype=src.dtype,
+    )
+    padded[..., : src.shape[-1]] = src
+    padded[..., src.shape[-1] :] = poison
+    view = padded[..., : src.shape[-1]]
+    assert view.shape == src.shape
+    assert view.stride(-1) == 1
+    assert view.stride(0) != src.stride(0)
+    return view
+
+
+def strided_last_dim(src: torch.Tensor) -> torch.Tensor:
+    """Same shape as ``src`` with ``stride(-1) != 1``, via a stepped last-dim slice."""
+    expanded = src.new_empty(*src.shape[:-1], src.shape[-1] * 2)
+    expanded[..., ::2] = src
+    view = expanded[..., ::2]
+    assert view.shape == src.shape
+    assert view.stride(-1) != 1
+    return view
+
+
 def make_norm_inputs(
     geo: Step4Geometry,
     *,
