@@ -3,6 +3,6 @@
     "BLOCK_H": 16,
     "BLOCK_D": 256,
     "num_warps": 2,
-    "num_stages": 2,
+    "num_stages": 3,
     "waves_per_eu": 2
 }

@@ -1,8 +1,8 @@
 {
-    "BLOCK_R": 2,
+    "BLOCK_R": 8,
     "BLOCK_H": 16,
     "BLOCK_D": 256,
     "num_warps": 4,
-    "num_stages": 3,
+    "num_stages": 2,
     "waves_per_eu": 2
 }

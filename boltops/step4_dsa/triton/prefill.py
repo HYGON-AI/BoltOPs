@@ -20,6 +20,7 @@ from boltops.step4_dsa.triton.common import (
     _device_name_for_config,
     _dtype_tag,
     _fit_block_regions,
+    _require_contiguous_last_dim,
 )
 
 REGION_VALID_SHIFT = tl.constexpr(24)
@@ -214,6 +215,7 @@ def _sparse_attn_prefill_tiled_kernel(
     softmax_scale,
     total_q,
     num_tiles,
+    num_kv_groups,
     heads_per_group: tl.constexpr,
     head_dim: tl.constexpr,
     region_size: tl.constexpr,
@@ -224,14 +226,15 @@ def _sparse_attn_prefill_tiled_kernel(
     """Query-tiled sparse prefill over a per-tile union of selected regions.
 
     The selector produces one region list per query, but neighbouring queries usually
-    select nearly the same regions. This kernel loads each union region once per query
-    tile and uses a bitset to decide which query owns each token. Tiles are never allowed
-    to cross a request boundary by :func:`_build_prefill_tiles`, so a logical region id
-    maps to one physical cache region within a tile.
+    select nearly the same regions. This kernel loads each union region once per
+    (query-tile, KV group) and uses a bitset to decide which query owns each token.
+    Tiles are never allowed to cross a request boundary by :func:`_build_prefill_tiles`,
+    so a logical region id maps to one physical cache region within a tile.
     """
     tile = tl.program_id(0)
     group = tl.program_id(1)
     head = tl.program_id(2)
+    group_tile = tile * num_kv_groups + group
 
     q_local = tl.arange(0, BLOCK_Q)
     q_start = tl.load(q_start_ptr + tile).to(tl.int32)
@@ -263,24 +266,26 @@ def _sparse_attn_prefill_tiled_kernel(
     words_of_q = q_local // 32
     bits_of_q = q_local % 32
     offsets_in_region = tl.arange(0, region_size)
-    union_count = tl.load(lengths_ptr + tile).to(tl.int32)
+    union_count = tl.load(lengths_ptr + group_tile).to(tl.int32)
 
     for base in tl.range(0, union_count, BLOCK_R):
         slots = base + tl.arange(0, BLOCK_R)
         slot_ok = slots < union_count
         physical = tl.load(
-            list_ptr + tile * stride_list_tile + slots * stride_list_slot,
+            list_ptr + group_tile * stride_list_tile + slots * stride_list_slot,
             mask=slot_ok,
             other=0,
         ).to(tl.int32)
         logical = tl.load(
-            logical_list_ptr + tile * stride_logical_tile + slots * stride_logical_slot,
+            logical_list_ptr
+            + group_tile * stride_logical_tile
+            + slots * stride_logical_slot,
             mask=slot_ok,
             other=0,
         ).to(tl.int32)
         words = tl.load(
             mask_ptr
-            + tile * stride_mask_tile
+            + group_tile * stride_mask_tile
             + words_of_q[:, None] * stride_mask_word
             + slots[None, :] * stride_mask_slot,
             mask=q_ok[:, None] & slot_ok[None, :],
@@ -357,6 +362,28 @@ def _sparse_attn_prefill_tiled_kernel(
     )
 
 
+def _as_query_space(
+    values: torch.Tensor,
+    *,
+    total_q: int,
+    num_kv_groups: int,
+    name: str,
+) -> torch.Tensor:
+    """Accept length ``Q`` or group-major ``G*Q`` (identical per group) as query ids."""
+    count = int(values.numel())
+    expected_rows = num_kv_groups * total_q
+    if count == total_q:
+        return values.reshape(total_q)
+    if count != expected_rows:
+        raise ValueError(f"expected {total_q} or {expected_rows} {name}, got {count}")
+    viewed = values.reshape(num_kv_groups, total_q)
+    if num_kv_groups > 1 and not torch.equal(viewed, viewed[0].expand_as(viewed)):
+        raise ValueError(
+            f"{name} must repeat the same query-space values across KV groups"
+        )
+    return viewed[0].contiguous()
+
+
 def _build_prefill_tiles(
     logical_regions: torch.Tensor,
     packed_regions: torch.Tensor,
@@ -370,10 +397,13 @@ def _build_prefill_tiles(
 ) -> tuple[torch.Tensor, ...]:
     """Build physical union lists and per-query membership masks for tiled prefill.
 
-    A tile is cut at every request boundary before it is split into ``block_q`` queries.
-    That invariant is important: a logical region number is meaningful only within one
-    request, while the physical cache region is request-specific. The returned tensors are
-    all on the input device and can be passed directly to the Triton kernel.
+    Tiles are cut in query space: at every request boundary, then into ``block_q``
+    queries. Union lists / bitsets are stored group-major inside each tile as
+    ``group_tile = tile * num_kv_groups + group``, matching the kernel grid
+    ``(num_tiles, num_kv_groups, heads_per_group)``. A logical region number is
+    meaningful only within one request, while the physical cache region is
+    request-specific. The returned tensors are all on the input device and can be
+    passed directly to the Triton kernel.
     """
     rows, slots = logical_regions.shape
     expected_rows = num_kv_groups * total_q
@@ -384,56 +414,64 @@ def _build_prefill_tiles(
         )
     if rows != expected_rows:
         raise ValueError(f"expected {expected_rows} metadata rows, got {rows}")
-    if q_positions.numel() == total_q:
-        q_positions = q_positions.repeat(num_kv_groups)
-    if q_positions.numel() != rows:
-        raise ValueError(f"expected {rows} query positions, got {q_positions.numel()}")
-    if request_indices.numel() != rows:
-        raise ValueError(f"expected {rows} request indices, got {request_indices.numel()}")
+    if q_positions.numel() not in (total_q, expected_rows):
+        raise ValueError(
+            f"expected {total_q} or {expected_rows} query positions, "
+            f"got {q_positions.numel()}"
+        )
     if block_q <= 0 or block_q & (block_q - 1):
         raise ValueError(f"block_q must be a positive power of two, got {block_q}")
 
-    # vLLM lays prefill rows out contiguously by request. Read only this small vector on
-    # the host to make tile boundaries; all large metadata construction stays on device.
-    request_cpu = request_indices.to(device="cpu", dtype=torch.int64).tolist()
+    # vLLM lays prefill queries out contiguously by request. Request ids may be
+    # length Q or a group-major G*Q repeat; tile cuts always follow query space.
+    request_query = _as_query_space(
+        request_indices,
+        total_q=total_q,
+        num_kv_groups=num_kv_groups,
+        name="request indices",
+    )
+    request_cpu = request_query.to(device="cpu", dtype=torch.int64).tolist()
     q_starts: list[int] = []
     q_counts: list[int] = []
-    for group in range(num_kv_groups):
-        group_start = group * total_q
-        group_end = group_start + total_q
-        run_start = group_start
-        while run_start < group_end:
-            request = request_cpu[run_start]
-            run_end = run_start + 1
-            while run_end < group_end and request_cpu[run_end] == request:
-                run_end += 1
-            for start in range(run_start, run_end, block_q):
-                q_starts.append(start)
-                q_counts.append(min(block_q, run_end - start))
-            run_start = run_end
+    run_start = 0
+    while run_start < total_q:
+        request = request_cpu[run_start]
+        run_end = run_start + 1
+        while run_end < total_q and request_cpu[run_end] == request:
+            run_end += 1
+        for start in range(run_start, run_end, block_q):
+            q_starts.append(start)
+            q_counts.append(min(block_q, run_end - start))
+        run_start = run_end
     if not q_starts:
         raise ValueError("cannot build prefill tiles for an empty query batch")
 
     device = logical_regions.device
     num_tiles = len(q_starts)
+    num_group_tiles = num_tiles * num_kv_groups
     q_starts_d = torch.tensor(q_starts, device=device, dtype=torch.int32)
     q_counts_d = torch.tensor(q_counts, device=device, dtype=torch.int32)
     tile_ids = torch.arange(num_tiles, device=device, dtype=torch.int64)
-    tile_of_row = torch.repeat_interleave(tile_ids, q_counts_d.to(torch.int64))
-    if tile_of_row.numel() != rows:
-        raise ValueError("request boundaries do not cover all prefill rows")
+    tile_of_query = torch.repeat_interleave(tile_ids, q_counts_d.to(torch.int64))
+    if tile_of_query.numel() != total_q:
+        raise ValueError("request boundaries do not cover all prefill queries")
+
+    row_ids = torch.arange(rows, device=device, dtype=torch.int64)
+    query_of_row = row_ids % total_q
+    group_of_row = torch.div(row_ids, total_q, rounding_mode="floor")
+    tile_of_row = tile_of_query[query_of_row]
+    group_tile = tile_of_row * num_kv_groups + group_of_row
 
     live = (logical_regions >= 0) & (packed_regions >= 0)
-    row_ids = torch.arange(rows, device=device, dtype=torch.int64)
-    tile_of = tile_of_row[:, None].expand(rows, slots)[live]
+    tile_of = group_tile[:, None].expand(rows, slots)[live]
     q_local = (
-        row_ids - q_starts_d[tile_of_row].to(torch.int64)
+        query_of_row - q_starts_d[tile_of_row].to(torch.int64)
     )[:, None].expand(rows, slots)[live]
     logical = logical_regions[live].to(torch.int64)
     physical = (packed_regions[live].to(torch.int64) & ((1 << 24) - 1)).to(torch.int32)
 
     num_regions = int(logical.max().item()) + 1 if logical.numel() else 1
-    present = torch.zeros((num_tiles, num_regions), device=device, dtype=torch.bool)
+    present = torch.zeros((num_group_tiles, num_regions), device=device, dtype=torch.bool)
     present[tile_of, logical] = True
     lengths = present.sum(dim=1).to(torch.int32)
     union = max(1, int(lengths.max().item()))
@@ -442,20 +480,20 @@ def _build_prefill_tiles(
     # keeps the temporary bitmap proportional to sequence length rather than to the
     # allocator's (potentially very sparse) physical block ids.
     physical_by_logical = torch.zeros(
-        (num_tiles, num_regions), device=device, dtype=torch.int32
+        (num_group_tiles, num_regions), device=device, dtype=torch.int32
     )
     physical_by_logical[tile_of, logical] = physical
     tile, logical_slot = present.nonzero(as_tuple=True)
     slot_of = present.cumsum(dim=1).to(torch.int64) - 1
-    tile_phys = torch.zeros((num_tiles, union), device=device, dtype=torch.int32)
-    tile_logical = torch.zeros((num_tiles, union), device=device, dtype=torch.int32)
+    tile_phys = torch.zeros((num_group_tiles, union), device=device, dtype=torch.int32)
+    tile_logical = torch.zeros((num_group_tiles, union), device=device, dtype=torch.int32)
     tile_phys[tile, slot_of[tile, logical_slot]] = physical_by_logical[
         tile, logical_slot
     ]
     tile_logical[tile, slot_of[tile, logical_slot]] = logical_slot.to(torch.int32)
 
     words = (block_q + 31) // 32
-    mask64 = torch.zeros((num_tiles, words, union), device=device, dtype=torch.int64)
+    mask64 = torch.zeros((num_group_tiles, words, union), device=device, dtype=torch.int64)
     entry_slots = slot_of[tile_of, logical]
     mask64.index_put_(
         (tile_of, q_local // 32, entry_slots),
@@ -694,13 +732,32 @@ def _run_tiled_prefill(
     total_q, num_heads, head_dim = query.shape
     if num_heads % num_kv_groups:
         raise ValueError(f"{num_heads} heads do not divide into {num_kv_groups} groups")
+    _require_contiguous_last_dim(query, "query")
+    _require_contiguous_last_dim(key_cache, "key_cache")
+    _require_contiguous_last_dim(value_cache, "value_cache")
     heads_per_group = num_heads // num_kv_groups
     if out is None:
         out = torch.empty_like(query)
+    _require_contiguous_last_dim(out, "out")
     if lse is None:
         lse = torch.empty((total_q, num_heads), device=query.device, dtype=torch.float32)
     block_d = triton.next_power_of_2(head_dim)
     num_tiles = int(q_starts.numel())
+    group_tiles = num_tiles * num_kv_groups
+    if int(tile_phys.shape[0]) != group_tiles:
+        raise ValueError(
+            "tile union lists are laid out as (query_tile, kv_group); expected "
+            f"{group_tiles} rows, got {tile_phys.shape[0]}"
+        )
+    if q_positions.numel() == num_kv_groups * total_q:
+        q_positions = q_positions.reshape(num_kv_groups, total_q)[0].contiguous()
+    elif q_positions.numel() != total_q:
+        raise ValueError(
+            f"expected {total_q} or {num_kv_groups * total_q} query positions, "
+            f"got {q_positions.numel()}"
+        )
+    else:
+        q_positions = q_positions.reshape(total_q).contiguous()
     union = int(tile_phys.shape[1])
     launch = config
     if launch is None:
@@ -761,6 +818,7 @@ def _run_tiled_prefill(
         softmax_scale,
         total_q,
         num_tiles,
+        num_kv_groups,
         heads_per_group=heads_per_group,
         head_dim=head_dim,
         region_size=region_size,
@@ -796,20 +854,25 @@ def sparse_attention_prefill(
     """Sparse attention over per-query selected regions.
 
     Args:
-        query: ``[total_q, num_heads, head_dim]``.
+        query: ``[total_q, num_heads, head_dim]``. Last dim must be contiguous
+            (``stride(-1) == 1``); token/head strides are passed through. The
+            kernel addresses ``head_dim`` as ``base + d``.
         key_cache, value_cache: ``[tokens, num_kv_groups, head_dim]``, i.e. the paged
             cache already flattened across pages. Flattening is safe because a region's
             tokens are contiguous in the physical token space by construction.
+            Same last-dim rule as ``query``. Allocated ``out`` (and a tiled
+            launcher ``out`` buffer) is checked the same way.
         packed_regions: ``[num_kv_groups * total_q, topk]`` int32 from the selector,
             each slot ``phys_region | (valid_tokens << 24)``, ``-1`` padding the tail.
         region_counts: ``[num_kv_groups * total_q]`` int32, how many slots to read. This
             truncates *positionally* -- it does not re-select by score.
         logical_regions: optional logical ids parallel to ``packed_regions``. When supplied,
             the query-tiled implementation is used and ``q_positions`` is required.
-        q_positions: absolute positions parallel to the prefill query rows (or one vector
-            of length ``total_q`` shared by all KV groups).
-        request_indices: request id parallel to metadata rows; tiles are split at changes
-            in this vector so per-request logical ids never alias.
+        q_positions: absolute positions of each query (length ``total_q``), or the
+            same vector repeated group-major as ``[G * total_q]``.
+        request_indices: request id per query (length ``total_q``), or the same ids
+            repeated group-major. Tiles are split at changes in this vector so
+            per-request logical ids never alias.
         block_q: query tile width for the tiled implementation; must be a power of two.
         config: launch override. ``None`` loads a path-specific JSON. Per-query uses
             ``prefill-k{width}-hpg{hpg}-d{dim}-r{region}_{dtype}_{device}.json``. Tiled
@@ -843,6 +906,9 @@ def sparse_attention_prefill(
         raise ValueError(
             f"key/value cache shape mismatch: {tuple(key_cache.shape)} vs {tuple(value_cache.shape)}"
         )
+    _require_contiguous_last_dim(query, "query")
+    _require_contiguous_last_dim(key_cache, "key_cache")
+    _require_contiguous_last_dim(value_cache, "value_cache")
 
     heads_per_group = num_heads // num_kv_groups
     topk = int(packed_regions.shape[1])
@@ -853,14 +919,17 @@ def sparse_attention_prefill(
             raise ValueError("q_positions is required for tiled sparse prefill")
         if request_indices is None:
             request_indices = torch.zeros(
-                (num_kv_groups * total_q,), device=query.device, dtype=torch.int32
+                (total_q,), device=query.device, dtype=torch.int32
             )
-        q_positions = q_positions.to(device=query.device, dtype=torch.int32).contiguous()
+        q_positions = _as_query_space(
+            q_positions.to(device=query.device, dtype=torch.int32).contiguous(),
+            total_q=total_q,
+            num_kv_groups=num_kv_groups,
+            name="query positions",
+        )
         request_indices = request_indices.to(
             device=query.device, dtype=torch.int32
         ).contiguous()
-        if q_positions.numel() == total_q:
-            q_positions = q_positions.repeat(num_kv_groups)
         if logical_regions.shape != packed_regions.shape:
             raise ValueError(
                 "logical_regions and packed_regions must have identical shapes"
@@ -876,6 +945,7 @@ def sparse_attention_prefill(
             block_q=block_q,
         )
         out = torch.empty_like(query)
+        _require_contiguous_last_dim(out, "out")
         lse = torch.empty((total_q, num_heads), device=query.device, dtype=torch.float32)
         return _run_tiled_prefill(
             query,
@@ -916,6 +986,7 @@ def sparse_attention_prefill(
     out = torch.empty(
         (num_splits, total_q, num_heads, head_dim), device=query.device, dtype=query.dtype
     )
+    _require_contiguous_last_dim(out, "out")
     lse = torch.empty((num_splits, total_q, num_heads), device=query.device, dtype=torch.float32)
     launch = config
     if launch is None:
@@ -940,11 +1011,7 @@ def sparse_attention_prefill(
         block_h = int(launch.get("BLOCK_H", default_h))
         block_d = int(launch.get("BLOCK_D", default_d))
         block_r = int(launch["BLOCK_R"])
-        extra = {
-            key: launch[key]
-            for key in _GRID_KEYS
-            if key in launch and key != "waves_per_eu"
-        }
+        extra = {key: launch[key] for key in _GRID_KEYS if key in launch}
     else:
         block_h, block_d, block_r = default_h, default_d, default_r
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from boltops.step4_dsa import triton_csa_prefill
+from boltops.step4_dsa import triton_csa_compress_regions, triton_csa_prefill
 from boltops.step4_dsa.geometry import STEP4
 
 from . import _common as C
@@ -123,3 +123,83 @@ def test_csa_prefill_matches_ref(seq_lens: tuple[int, ...]):
             f"region {region}: CSA e4m3 store is not a tie-flip "
             f"(faithful={faithful}, adjacent={adjacent})"
         )
+
+
+def _last_dim_padded_view(src: torch.Tensor, pad: int, poison: float) -> torch.Tensor:
+    """Same logical values as ``src``, larger token/head stride, poison in the pad."""
+    padded = torch.empty(
+        (*src.shape[:-1], src.shape[-1] + pad),
+        device=src.device,
+        dtype=src.dtype,
+    )
+    padded[..., : src.shape[-1]] = src
+    padded[..., src.shape[-1] :] = poison
+    view = padded[..., : src.shape[-1]]
+    assert view.shape == src.shape
+    assert view.stride(2) == 1
+    assert view.stride(0) != src.stride(0)
+    return view
+
+
+@C.GPU_REQUIRED
+def test_csa_prefill_independent_k_z_strides():
+    """index_k / index_z may share a shape without sharing a stride."""
+    device = torch.device(C.DEVICE)
+    geo = STEP4
+    seq_lens = (64, 8)
+    regions_per_request = max(-(-length // geo.region_block_size) for length in seq_lens)
+    metadata = make_csa_prefill_inputs(
+        geo,
+        seq_lens=seq_lens,
+        regions_per_request=regions_per_request,
+        device=device,
+        seed=20260908,
+    )
+    index_k = _last_dim_padded_view(metadata.index_k, pad=16, poison=3.0)
+    index_z = _last_dim_padded_view(metadata.index_z, pad=48, poison=-9.0)
+    assert index_k.stride() != index_z.stride()
+
+    summary, mean = triton_csa_prefill(
+        index_k,
+        index_z,
+        metadata.seq_lens,
+        regions_per_request=regions_per_request,
+        region_size=geo.region_block_size,
+    )
+    torch.cuda.synchronize()
+
+    valid = metadata.token_valid & (metadata.flat_slot >= 0)
+    slots = metadata.flat_slot[valid]
+    rows = valid.nonzero(as_tuple=False).flatten()
+    grouped: dict[int, list[int]] = {}
+    for slot, row in zip(slots.cpu().tolist(), rows.cpu().tolist()):
+        grouped.setdefault(int(slot), []).append(int(row))
+
+    for region, token_rows in grouped.items():
+        idx = torch.tensor(token_rows, device=device, dtype=torch.long)
+        ref = ref_csa_region_summary(index_k[idx, 0], index_z[idx, 0])
+        torch.testing.assert_close(
+            summary[region, 0].cpu(), ref.cpu(), atol=ATOL, rtol=RTOL
+        )
+        actual_bytes = mean[region, 0].view(torch.uint8)
+        expected_bytes = quantize_summary_e4m3(ref)
+        if torch.equal(actual_bytes, expected_bytes):
+            continue
+        faithful, adjacent = _classify_byte_diffs(
+            summary[region, 0], actual_bytes, expected_bytes
+        )
+        assert faithful and adjacent, (
+            f"region {region}: CSA e4m3 store is not a tie-flip "
+            f"(faithful={faithful}, adjacent={adjacent})"
+        )
+
+
+def test_csa_compress_rejects_strided_proxy_dim():
+    compact = torch.randn(8, 1, 16)
+    strided = torch.randn(8, 1, 32)[..., ::2]
+    token_start = torch.zeros(1, dtype=torch.int32)
+    token_count = torch.tensor([8], dtype=torch.int32)
+    with pytest.raises(ValueError, match="proxy dimension"):
+        triton_csa_compress_regions(strided, compact, token_start, token_count)
+    with pytest.raises(ValueError, match="proxy dimension"):
+        triton_csa_compress_regions(compact, strided, token_start, token_count)

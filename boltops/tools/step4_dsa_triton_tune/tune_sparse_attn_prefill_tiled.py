@@ -2,7 +2,11 @@
 # Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # SPDX-License-Identifier: MIT
 
-"""Autotune BoltOps query-tiled sparse prefill for selected production shapes."""
+"""Autotune BoltOps query-tiled sparse prefill for selected production shapes.
+
+Candidates include HIP ``waves_per_eu``; ``_run_tiled_prefill`` forwards it at
+launch with ``num_warps`` / ``num_stages``.
+"""
 
 from __future__ import annotations
 
@@ -65,12 +69,13 @@ def bench(fn, warmup_ms: int, rep_ms: int) -> float:
 
 def _prepared_q_positions(data: dict) -> torch.Tensor:
     query = data["query"]
+    total_q = int(query.shape[0])
     q_positions = data["q_positions"].to(
         device=query.device, dtype=torch.int32
     ).contiguous()
-    if q_positions.numel() == int(query.shape[0]):
-        q_positions = q_positions.repeat(data["groups"])
-    return q_positions
+    if q_positions.numel() == total_q:
+        return q_positions
+    return q_positions.reshape(data["groups"], total_q)[0].contiguous()
 
 
 def _launch_kwargs(data: dict, tiles: tuple[torch.Tensor, ...], *, block_q: int) -> dict:
@@ -258,6 +263,9 @@ def main() -> None:
         rep_ms=args.rep_ms,
     )
     print(f"BEST: {ms:.6f} ms {cfg}", flush=True)
+    missing = [key for key in ("num_warps", "num_stages", "waves_per_eu") if key not in cfg]
+    if missing:
+        raise RuntimeError(f"tuned config omitted launch keys {missing}: {cfg}")
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(cfg, indent=4) + "\n")
     timing_path.write_text(json.dumps({"ms": ms, "config": cfg}, indent=4) + "\n")

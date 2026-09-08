@@ -264,6 +264,7 @@ def triton_sparse_attention_prefill(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Sparse GQA prefill. Tiled path needs logical ids, positions, and request ids.
 
+    Q / K / V / ``out`` last dim must be contiguous (``stride(-1) == 1``).
     Per-query path auto KV-splits when ``Q * G`` underfills the device, then
     merges with :func:`triton_merge_split_states`.
     """
@@ -304,7 +305,11 @@ def triton_sparse_attention_decode(
     config: Optional[dict] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Sparse GQA decode. ``num_splits==1`` auto KV-splits to fill CUs and returns
-    merged states. ``num_splits > 1`` returns partial states for merge."""
+    merged states. ``num_splits > 1`` returns partial states for the caller to merge.
+
+    Same calling convention as vLLM ``Step4DSAImpl`` / handoff
+    ``sparse_attention_decode``. Q / K / V / ``out`` last dim must be contiguous
+    (``stride(-1) == 1``)."""
     from boltops.step4_dsa.triton.decode import sparse_attention_decode as impl
 
     return impl(
@@ -317,10 +322,9 @@ def triton_sparse_attention_decode(
         num_kv_groups=num_kv_groups,
         region_size=region_size,
         softmax_scale=softmax_scale,
-        num_splits=None if num_splits == 1 else num_splits,
+        num_splits=num_splits,
         block_regions=block_regions,
         config=config,
-        return_partials=num_splits > 1,
     )
 
 
@@ -328,7 +332,10 @@ def triton_merge_split_states(
     partial_out: torch.Tensor,
     partial_lse: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Merge split-KV partial outputs by softmax over partial LSE."""
+    """Merge split-KV partial outputs by softmax over partial LSE.
+
+    ``partial_out`` / ``out`` last dim must be contiguous (``stride(-1) == 1``).
+    """
     from boltops.step4_dsa.triton.merge import merge_split_states as impl
 
     return impl(partial_out, partial_lse)

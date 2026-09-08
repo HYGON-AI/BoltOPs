@@ -19,8 +19,10 @@ def _csa_compress_regions_kernel(
     token_count_ptr,
     summary_ptr,
     mean_ptr,
-    stride_token,
-    stride_head,
+    stride_k_token,
+    stride_k_head,
+    stride_z_token,
+    stride_z_head,
     stride_summary_region,
     stride_summary_head,
     num_heads: tl.constexpr,
@@ -52,13 +54,11 @@ def _csa_compress_regions_kernel(
     dim_ok = dims < proxy_dim
     mask = token_ok[:, None] & dim_ok[None, :]
 
-    offsets = (
-        (start + tokens.to(tl.int64))[:, None] * stride_token
-        + head * stride_head
-        + dims[None, :]
-    )
-    logits = tl.load(index_z_ptr + offsets, mask=mask, other=float("-inf")).to(tl.float32)
-    values = tl.load(index_k_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    token_ids = (start + tokens.to(tl.int64))[:, None]
+    k_offsets = token_ids * stride_k_token + head * stride_k_head + dims[None, :]
+    z_offsets = token_ids * stride_z_token + head * stride_z_head + dims[None, :]
+    logits = tl.load(index_z_ptr + z_offsets, mask=mask, other=float("-inf")).to(tl.float32)
+    values = tl.load(index_k_ptr + k_offsets, mask=mask, other=0.0).to(tl.float32)
 
     shift = tl.max(tl.where(mask, logits, float("-inf")))
     weights = tl.where(mask, tl.exp(logits - shift), 0.0)
@@ -110,8 +110,10 @@ def csa_compress_regions(
     """Compress packed tokens into per-region summaries.
 
     Args:
-        index_k: ``[tokens, heads, proxy_dim]`` proxy keys.
-        index_z: ``[tokens, heads, proxy_dim]`` per-dimension softmax logits.
+        index_k: ``[tokens, heads, proxy_dim]`` proxy keys. Last dim must be contiguous;
+            token/head strides may differ from ``index_z``.
+        index_z: ``[tokens, heads, proxy_dim]`` per-dimension softmax logits. Last dim
+            must be contiguous; token/head strides are passed separately from ``index_k``.
         token_start: ``[regions]`` int32, first token of each region.
         token_count: ``[regions]`` int32, tokens present in each region; 0 = skip.
 
@@ -130,6 +132,8 @@ def csa_compress_regions(
         raise ValueError(f"index_k must be [tokens, heads, proxy_dim], got {tuple(index_k.shape)}")
     if index_k.stride(2) != 1:
         raise ValueError("index_k must be contiguous in the proxy dimension")
+    if index_z.stride(2) != 1:
+        raise ValueError("index_z must be contiguous in the proxy dimension")
 
     regions = int(token_start.numel())
     _, heads, proxy_dim = index_k.shape
@@ -145,6 +149,8 @@ def csa_compress_regions(
         mean,
         index_k.stride(0),
         index_k.stride(1),
+        index_z.stride(0),
+        index_z.stride(1),
         summary.stride(0),
         summary.stride(1),
         num_heads=heads,

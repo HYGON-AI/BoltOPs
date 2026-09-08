@@ -9,6 +9,8 @@ import torch
 import triton
 import triton.language as tl
 
+from boltops.step4_dsa.triton.common import _require_contiguous_last_dim
+
 NEGATIVE_INFINITY = tl.constexpr(float("-inf"))
 
 @triton.jit
@@ -85,6 +87,10 @@ def merge_split_states(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Reduce ``[splits, tokens, heads, dim]`` partial states to ``[tokens, heads, dim]``.
 
+    ``partial_out`` and the allocated ``out`` must be contiguous in the last
+    dimension (``stride(-1) == 1``); the kernel addresses ``head_dim`` as
+    ``base + d``.
+
     Semantics follow ``merge_variable_split_nat_lse_states_sm90_gqa`` -- "nat" being the
     natural-log lse the sparse kernels emit. The upstream kernel additionally supports a
     *variable* split plan, where the first ``n_split4`` requests are split four ways, the
@@ -93,7 +99,9 @@ def merge_split_states(
     uniform split and pays a little occupancy for a much simpler contract.
     """
     num_splits, tokens, num_heads, head_dim = partial_out.shape
+    _require_contiguous_last_dim(partial_out, "partial_out")
     out = torch.empty((tokens, num_heads, head_dim), device=partial_out.device, dtype=partial_out.dtype)
+    _require_contiguous_last_dim(out, "out")
     lse = torch.empty((tokens, num_heads), device=partial_out.device, dtype=torch.float32)
     _merge_split_states_kernel[(tokens, num_heads)](
         partial_out,

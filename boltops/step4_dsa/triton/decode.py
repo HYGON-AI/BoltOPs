@@ -1,8 +1,10 @@
 """Sparse GQA decode attention over selected regions, with optional split-KV.
 
 Vendored from Step-4 DSA handoff ``inference/kernel.py`` (``sparse_attn`` decode).
-``num_splits is None`` chooses occupancy from device CU count; split windows are
-disjoint (``slots < window_end``).
+Matches the vLLM / handoff caller: ``num_splits==1`` auto-splits to fill CUs and
+returns merged states; ``num_splits>1`` returns partials for the caller to merge.
+Split windows are disjoint (``slots < window_end``). Tuner / occupancy JSON
+measurement opts out with ``auto_kv_split=False``.
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ from boltops.step4_dsa.triton.common import (
     _device_name_for_config,
     _dtype_tag,
     _fit_block_regions,
+    _require_contiguous_last_dim,
 )
 
 DECODE_PHYS_SHIFT = tl.constexpr(32)
@@ -370,28 +373,37 @@ def sparse_attention_decode(
     num_kv_groups: int,
     region_size: int = 8,
     softmax_scale: float | None = None,
-    num_splits: int | None = None,
+    num_splits: int | None = 1,
     block_regions: int = 16,
     config: dict[str, Any] | None = None,
     kv_split_target_programs: int | None = None,
     min_slots_per_split: int = 8,
-    return_partials: bool = False,
+    auto_kv_split: bool | None = None,
+    return_partials: bool | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Sparse attention for one query token per request.
 
     Args:
-        query: ``[num_reqs, num_heads, head_dim]``.
+        query: ``[num_reqs, num_heads, head_dim]``. Last dim must be contiguous
+            (``stride(-1) == 1``); token/head strides are passed through. The
+            kernel addresses ``head_dim`` as ``base + d``.
         key_cache, value_cache: ``[tokens, num_kv_groups, head_dim]``, pages flattened.
+            Same last-dim rule as ``query``. Allocated ``out`` is checked the same way.
         packed_regions: ``[num_kv_groups * num_reqs, topk]`` **int64**, each slot
             ``start_token | (phys_region << 32)``. Note this is a different packing from
             prefill's int32 ``phys_region | (valid_tokens << 24)``: decode carries the
             logical start token and derives the visible length from ``kv_seqlens``.
         region_counts: ``[num_kv_groups * num_reqs]`` int32, slots to read per row.
         kv_seqlens: ``[num_reqs]`` int32, context length including the current token.
-        num_splits: ``None`` picks a split count from device CU count and ``B * G``.
-            An explicit value is used as-is. With more than one split the default is
-            to merge to ``[num_reqs, heads, dim]``; pass ``return_partials=True``
-            to keep the leading split axis for :func:`merge_split_states`.
+        num_splits: vLLM / handoff contract. ``1`` (and ``None``) means "return
+            final states": occupancy-split to fill CUs, then merge. ``>1`` is an
+            explicit split count and returns partials with a leading split axis
+            for :func:`merge_split_states`. Launch JSON is keyed by this
+            caller-facing value (``s1`` is the fast path, even if launch is 18-way).
+        auto_kv_split: ``None`` follows the contract above. ``False`` uses
+            ``num_splits`` as-is (true 1-way when it is 1).
+        return_partials: ``None`` follows the contract (partials only when the
+            caller asked for ``num_splits>1``). ``True`` / ``False`` overrides.
         config: launch override. ``None`` loads
             ``config/sparse_attn_decode/decode-k{width}-s{splits}-b{batch}-ctx{context}-hpg{hpg}-d{dim}-r{region}_{dtype}_{device}.json``
             using ``batch=num_reqs`` and ``context=kv_seqlens[0]``. Missing that
@@ -400,9 +412,9 @@ def sparse_attention_decode(
             skips lookup and keeps the built-in defaults.
 
     Returns:
-        Merged ``(out [num_reqs, num_heads, head_dim], lse [num_reqs, num_heads])``
-        unless ``return_partials`` is set, in which case both have a leading split
-        axis.
+        ``num_splits==1``: merged ``(out [num_reqs, num_heads, head_dim],
+        lse [num_reqs, num_heads])``. ``num_splits>1``: the same with a leading
+        split axis, unless ``return_partials=False``.
 
     As in prefill, the selected regions must be distinct. The upstream decode reference is
     stricter about this than the prefill one: it concatenates the gathered spans with no
@@ -421,11 +433,17 @@ def sparse_attention_decode(
         raise ValueError(f"decode metadata must be int64, got {packed_regions.dtype}")
     if kv_seqlens.shape[0] != num_reqs:
         raise ValueError(f"expected {num_reqs} kv_seqlens, got {kv_seqlens.shape[0]}")
+    _require_contiguous_last_dim(query, "query")
+    _require_contiguous_last_dim(key_cache, "key_cache")
+    _require_contiguous_last_dim(value_cache, "value_cache")
 
     heads_per_group = num_heads // num_kv_groups
     topk = int(packed_regions.shape[1])
     scale = softmax_scale if softmax_scale is not None else head_dim**-0.5
-    if num_splits is None:
+    if auto_kv_split is None:
+        auto_kv_split = num_splits is None or int(num_splits) == 1
+    if auto_kv_split:
+        config_splits = 1
         num_splits = choose_decode_kv_splits(
             num_reqs,
             num_kv_groups,
@@ -434,18 +452,25 @@ def sparse_attention_decode(
             min_slots_per_split=min_slots_per_split,
             device=query.device,
         )
-    num_splits = max(int(num_splits), 1)
+    else:
+        num_splits = max(int(num_splits if num_splits is not None else 1), 1)
+        config_splits = num_splits
+    if return_partials is None:
+        return_partials = (not auto_kv_split) and num_splits > 1
     slots_per_split = -(-topk // num_splits)
 
     out = torch.empty(
         (num_splits, num_reqs, num_heads, head_dim), device=query.device, dtype=query.dtype
     )
+    _require_contiguous_last_dim(out, "out")
     lse = torch.empty((num_splits, num_reqs, num_heads), device=query.device, dtype=torch.float32)
     launch = config
     if launch is None:
+        # JSON is named by the caller-facing num_splits (s1 = fast path), not
+        # the occupancy launch count.
         launch = _load_sparse_attn_decode_config(
             topk,
-            num_splits,
+            config_splits,
             heads_per_group,
             head_dim,
             region_size,
@@ -454,9 +479,7 @@ def sparse_attention_decode(
             num_reqs,
             int(kv_seqlens[0].item()),
         )
-        # Occupancy JSON is keyed by splits; auto-split usually has no s{N} file.
-        # Reuse the s1 tile rather than a larger default BLOCK_R.
-        if not launch and num_splits != 1:
+        if not launch and config_splits != 1:
             launch = _load_sparse_attn_decode_config(
                 topk,
                 1,
@@ -481,11 +504,7 @@ def sparse_attention_decode(
         block_h = int(launch.get("BLOCK_H", default_h))
         block_d = int(launch.get("BLOCK_D", default_d))
         block_r = int(launch["BLOCK_R"])
-        extra = {
-            key: launch[key]
-            for key in _GRID_KEYS
-            if key in launch and key != "waves_per_eu"
-        }
+        extra = {key: launch[key] for key in _GRID_KEYS if key in launch}
     else:
         block_h, block_d, block_r = default_h, default_d, default_r
 
