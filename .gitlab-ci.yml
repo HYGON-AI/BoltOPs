@@ -9,6 +9,8 @@ variables:
   PIP_INDEX_URL: "http://10.16.1.201:9929/nightly/dtk2604/+simple/"
   PIP_TRUSTED_HOST: "10.16.1.201"
   DTK_PKG: "/ArchivedFile/dtk-pkg/dtk26.04/DTK-26.04-rc4-centos8-x86_64.tar.gz"
+  AICC_INSTALLER_URL: "http://42.228.13.241:18000/ai_cc/Nightly/hcu_llvm_installer.sh"
+  AICC_MAJOR_VERSION: "1.0.0"
   DEVPI_URL: "http://10.16.1.201:9929/"
   CISMI_TIMEOUT: "3600"
   # These two must be set as protected CI/CD secret variables in GitLab project settings.
@@ -25,21 +27,14 @@ variables:
     - cp -f ${DTK_PKG} /opt/
     - cd /opt && tar -xzf $(basename ${DTK_PKG}) && mv dtk-* dtk
     - source /opt/dtk/env.sh && cd ${CI_PROJECT_DIR}
-    - src_dir="/ArchivedFile/ai_cc/nightly"
-    - latest_run=$(cd "$src_dir" && ls dtk_llvm_*.run 2>/dev/null | sed 's/\.run$//' | sort -t '_' -k4 -nr | head -n1)
-    - 'echo "AICC installer: ${src_dir}/${latest_run}.run"'
-    - test -n "${latest_run}"
-    - cp "${src_dir}/${latest_run}.run" ./
-    - chmod +x "${latest_run}.run"
     - |
-      yes | bash "${latest_run}.run" || {
-        exit_code=$?
-        # 1: installer "already installed"; 141: SIGPIPE from yes (expected on normal exit)
-        if [ "${exit_code}" -ne 1 ] && [ "${exit_code}" -ne 141 ]; then
-          echo "AICC installer failed with exit code ${exit_code}" >&2
-          exit "${exit_code}"
-        fi
-      }
+      curl -fsSL --retry 3 --retry-delay 2 \
+        -o /tmp/hcu_llvm_installer.sh "${AICC_INSTALLER_URL}"
+      bash /tmp/hcu_llvm_installer.sh \
+        --major "${AICC_MAJOR_VERSION}" \
+        --dtk-dir /opt/dtk
+      test -f /opt/dtk/hcu_llvm.info
+      cat /opt/dtk/hcu_llvm.info
 
 .git-auth:
   before_script:
