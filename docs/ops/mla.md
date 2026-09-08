@@ -47,8 +47,25 @@ python scripts/benchmarks/triton/benchmark_flash_mla_sparse.py -h
 | 32 | 16384 | 16/1 | 2048 | 0.68560 | 0.48208 | 1.422x | 4.73 |
 | 4 | 32768 | 16/1 | 4096 | 1.34880 | 0.93360 | 1.445x | 0.61 |
 
-每个 size 的完整调优包含 108 个结构候选、48 个编译/launch 候选和 16 个
-调度优化组合，调节
+BW1100（gfx938）使用 Triton 3.6.0、HIP 6.3，以 `20 ms warmup + 100 ms
+repeat` 完整调优后的结果如下：
+
+| S_q | S_kv | H_q/H_kv | top-k | baseline (ms) | tuned (ms) | speedup |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 16384 | 16/1 | 2048 | 0.93840 | 0.49152 | 1.909x |
+| 4 | 16384 | 16/1 | 2048 | 0.96480 | 0.49440 | 1.951x |
+| 32 | 16384 | 16/1 | 2048 | 0.91896 | 0.48816 | 1.882x |
+| 4 | 32768 | 16/1 | 4096 | 1.85312 | 0.96720 | 1.916x |
+
+完整调优分别保留普通 Q load 和 `matrix_load` Q-to-LDS 分支，各自完成结构、
+编译器和调度参数搜索后再比较最终延迟。gfx938 上的 `matrix_load` 分支只搜索
+满足 16x16 MFMA tile 约束的 `BLOCK_H/BLOCK_N` 组合。Sparse K/V 是按任意
+token index gather，不能合并成连续的 matrix load；连续的 Q 和 RoPE Q tile
+可以启用该路径。BW1100 的四个默认 shape 各有 245 个有效候选，实测最终均由
+普通 Q load 胜出，因此正式配置保留 `USE_MATRIX_LOAD_Q=false`；其他 shape 或
+设备仍可通过调优结果选择该路径。
+
+调优参数包括
 `BLOCK_N`、`BLOCK_H`、`BLOCK_DMODEL`、`num_warps`、`num_stages`、
 `waves_per_eu`、`kpack`、max-ILP、MachineScheduler register-pressure、
 optimized epilogue 和 BlockPingpong。运行方式：
@@ -58,18 +75,17 @@ python boltops/tools/tune_flash_mla_sparse.py \
   --output /tmp/flash_mla_sparse.json
 ```
 
-当前四个典型 size 的调度优化最优项一致为 max-ILP off、
+上方 BW200 的四个典型 size 的调度优化最优项一致为 max-ILP off、
 register-pressure-aware scheduling on、optimized epilogue off、BlockPingpong off。
 
 配置按 Triton major/minor、gfx arch、完整设备名定位文件，再按 dtype、关键
 shape 和可选的 `_min`/`_max` 范围匹配；多个配置同时命中时优先选择更具体、
 范围更窄的配置，未命中时自动使用安全默认值。`s_kv` 仅参与运行时索引边界
-检查，不影响 kernel 循环结构，因此不作为当前配置的过滤条件。当前配置文件是
-`boltops/mla/triton/configs/triton_3_6/flash_mla_sparse_gfx936_BW200.json`。
+检查。当前随包提供 BW200/gfx936 和 BW1100/gfx938 两份 Triton 3.6 配置。
 
-文件定位只使用产品型号 `BW200`，不使用设备名中逗号后的 `UBB BW1000`
-平台描述。JSON metadata 仅保留实际 Triton 版本、完整设备名和 gfx arch 用于
-结果追溯；版本目录、文件名 slug 和 dtype 等重复信息不再保存。
+文件定位只使用产品型号，例如从 `BW200, UBB BW1000` 中取 `BW200`，不使用
+逗号后的平台描述。JSON metadata 仅保留实际 Triton 版本、完整设备名和 gfx
+arch 用于结果追溯；版本目录、文件名 slug 和 dtype 等重复信息不再保存。
 
 溯源见 `boltops/mla/triton/SOURCE.md`。
 

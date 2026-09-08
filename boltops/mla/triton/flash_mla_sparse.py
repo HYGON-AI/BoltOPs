@@ -48,6 +48,12 @@ def _device_identity(device: torch.device) -> tuple[str, str]:
     return arch, str(props.name)
 
 
+def _supports_matrix_load(device: torch.device) -> bool:
+    """Return whether the active HCU can use global-to-LDS matrix loads."""
+    arch, _ = _device_identity(device)
+    return hasattr(tl, "matrix_load") and arch in {"gfx92a", "gfx938", "gfx946"}
+
+
 @functools.lru_cache(maxsize=None)
 def _load_device_configs(version_tag: str, arch: str, device_name: str) -> dict:
     filename = f"flash_mla_sparse_{arch}_{_device_model(device_name)}.json"
@@ -155,6 +161,7 @@ def _flash_mla_sparse_fwd_kernel(
     H_KV: tl.constexpr,
     Lk: tl.constexpr,
     Lv: tl.constexpr,
+    USE_MATRIX_LOAD_Q: tl.constexpr,
 ):
     """One program handles a query token and a group of query heads."""
     q_idx = tl.program_id(0)
@@ -177,22 +184,45 @@ def _flash_mla_sparse_fwd_kernel(
     offs_d = tl.arange(0, BLOCK_DMODEL)
     offs_v = tl.arange(0, BLOCK_DV)
     mask_v = offs_v < Lv
+    head_start = head_block * heads_per_program
 
     if BLOCK_DMODEL_SPLITS == 1:
         mask_d = offs_d < Lk
-        q = tl.load(
-            Q + q_idx * stride_qs + heads[:, None] * stride_qh + offs_d[None, :],
-            mask=head_mask[:, None] & mask_d[None, :],
-            other=0.0,
-        )
+        if USE_MATRIX_LOAD_Q:
+            q = tl.matrix_load(
+                Q + q_idx * stride_qs,
+                # Padding the logical head dimension avoids the gfx938
+                # full-dimension matrix-load filter hardware issue.
+                shape=[H_Q + BLOCK_H, Lk],
+                strides=[stride_qh, 1],
+                block_shape=[BLOCK_H, BLOCK_DMODEL],
+                offsets=[head_start, 0],
+                mask=head_mask[:, None] & mask_d[None, :],
+            )
+        else:
+            q = tl.load(
+                Q + q_idx * stride_qs + heads[:, None] * stride_qh + offs_d[None, :],
+                mask=head_mask[:, None] & mask_d[None, :],
+                other=0.0,
+            )
     if BLOCK_DPE > 0:
         offs_pe = BLOCK_DMODEL * BLOCK_DMODEL_SPLITS + tl.arange(0, BLOCK_DPE)
         mask_pe = offs_pe < Lk
-        q_pe = tl.load(
-            Q + q_idx * stride_qs + heads[:, None] * stride_qh + offs_pe[None, :],
-            mask=head_mask[:, None] & mask_pe[None, :],
-            other=0.0,
-        )
+        if USE_MATRIX_LOAD_Q:
+            q_pe = tl.matrix_load(
+                Q + q_idx * stride_qs,
+                shape=[H_Q + BLOCK_H, Lk],
+                strides=[stride_qh, 1],
+                block_shape=[BLOCK_H, BLOCK_DPE],
+                offsets=[head_start, BLOCK_DMODEL * BLOCK_DMODEL_SPLITS],
+                mask=head_mask[:, None] & mask_pe[None, :],
+            )
+        else:
+            q_pe = tl.load(
+                Q + q_idx * stride_qs + heads[:, None] * stride_qh + offs_pe[None, :],
+                mask=head_mask[:, None] & mask_pe[None, :],
+                other=0.0,
+            )
 
     row_max = tl.zeros([BLOCK_H], dtype=tl.float32) - float("inf")
     row_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
@@ -226,14 +256,24 @@ def _flash_mla_sparse_fwd_kernel(
             ):
                 split_d = start_d + tl.arange(0, BLOCK_DMODEL)
                 split_mask = split_d < Lk
-                q_part = tl.load(
-                    Q
-                    + q_idx * stride_qs
-                    + heads[:, None] * stride_qh
-                    + split_d[None, :],
-                    mask=head_mask[:, None] & split_mask[None, :],
-                    other=0.0,
-                )
+                if USE_MATRIX_LOAD_Q:
+                    q_part = tl.matrix_load(
+                        Q + q_idx * stride_qs,
+                        shape=[H_Q + BLOCK_H, Lk],
+                        strides=[stride_qh, 1],
+                        block_shape=[BLOCK_H, BLOCK_DMODEL],
+                        offsets=[head_start, start_d],
+                        mask=head_mask[:, None] & split_mask[None, :],
+                    )
+                else:
+                    q_part = tl.load(
+                        Q
+                        + q_idx * stride_qs
+                        + heads[:, None] * stride_qh
+                        + split_d[None, :],
+                        mask=head_mask[:, None] & split_mask[None, :],
+                        other=0.0,
+                    )
                 k_part = tl.load(
                     KV
                     + safe_token[None, :] * stride_kvs
@@ -370,6 +410,8 @@ def flash_mla_sparse_fwd(
     num_stages = int(
         tuned.get("num_stages", 1 if torch.version.hip is not None else 2)
     )
+    use_matrix_load_q = bool(tuned.get("USE_MATRIX_LOAD_Q", False))
+    use_matrix_load_q = use_matrix_load_q and _supports_matrix_load(q.device)
     heads_per_program = min(block_h, h_q // h_kv)
     grid = (s_q, triton.cdiv(h_q, heads_per_program))
 
@@ -422,6 +464,7 @@ def flash_mla_sparse_fwd(
         H_KV=h_kv,
         Lk=d_qk,
         Lv=d_v,
+        USE_MATRIX_LOAD_Q=use_matrix_load_q,
         **launch_options,
     )
 
