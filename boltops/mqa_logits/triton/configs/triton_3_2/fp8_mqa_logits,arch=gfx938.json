@@ -1,0 +1,91 @@
+{
+  "meta": {
+    "arch": "gfx938",
+    "source": "fp8_mqa_logits_tune.json",
+    "note": "Buckets by seq_len_kv (LEQ); includes kpack/schedule_hint."
+  },
+  "default": {
+    "main": {
+      "block_kv": 256,
+      "num_warps": 4,
+      "num_stages": 1,
+      "waves_per_eu": 0,
+      "matrix_instr_nonkdim": 16,
+      "kpack": 2,
+      "schedule_hint": "none"
+    },
+    "clear": {
+      "clear_block_kv": 512,
+      "clear_num_warps": 8,
+      "clear_num_stages": 2,
+      "clear_waves_per_eu": 0,
+      "clear_kpack": 2,
+      "clear_schedule_hint": "none"
+    }
+  },
+  "by_seq_kv": [
+    {
+      "seq_kv_leq": 2048,
+      "label": "mid-fast-causal",
+      "main": {
+        "block_kv": 128,
+        "num_warps": 4,
+        "num_stages": 2,
+        "waves_per_eu": 2,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+        "schedule_hint": "none"
+      },
+      "clear": {
+        "clear_block_kv": 512,
+        "clear_num_warps": 8,
+        "clear_num_stages": 1,
+        "clear_waves_per_eu": 2,
+        "clear_kpack": 2,
+        "clear_schedule_hint": "none"
+      }
+    },
+    {
+      "seq_kv_leq": 4096,
+      "label": "long-fast-causal",
+      "main": {
+        "block_kv": 256,
+        "num_warps": 4,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+        "schedule_hint": "none"
+      },
+      "clear": {
+        "clear_block_kv": 1024,
+        "clear_num_warps": 4,
+        "clear_num_stages": 2,
+        "clear_waves_per_eu": 0,
+        "clear_kpack": 1,
+        "clear_schedule_hint": "none"
+      }
+    },
+    {
+      "seq_kv_leq": 16384,
+      "label": "xl-fast-causal",
+      "main": {
+        "block_kv": 256,
+        "num_warps": 4,
+        "num_stages": 1,
+        "waves_per_eu": 0,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 2,
+        "schedule_hint": "none"
+      },
+      "clear": {
+        "clear_block_kv": 512,
+        "clear_num_warps": 8,
+        "clear_num_stages": 2,
+        "clear_waves_per_eu": 0,
+        "clear_kpack": 2,
+        "clear_schedule_hint": "none"
+      }
+    }
+  ]
+}
