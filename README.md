@@ -71,6 +71,9 @@ from boltops.mla import (
     decode_attention_fwd,
     compute_num_kv_splits,
 )
+from boltops.mqa_logits import (
+    fp8_mqa_logits,
+)
 from boltops.fla.kda import (
     chunk_gla_fwd_o_gk,
     chunk_kda_fwd_intra,

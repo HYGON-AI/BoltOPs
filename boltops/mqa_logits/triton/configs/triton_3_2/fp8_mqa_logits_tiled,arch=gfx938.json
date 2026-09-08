@@ -1,0 +1,63 @@
+{
+  "meta": {
+    "arch": "gfx938",
+    "source": "fp8_mqa_logits_tiled_tune_gfx938.json (fangzx_triton3.2)",
+    "note": "Prefer block_n=128 when competitive; HIP knobs from 3.2 sweep (no Gluon)."
+  },
+  "default": {
+    "main": {
+      "block_m": 32,
+      "block_n": 128,
+      "num_warps": 8,
+      "num_stages": 2,
+      "waves_per_eu": 4,
+      "matrix_instr_nonkdim": 16,
+      "kpack": 1,
+      "schedule_hint": "none"
+    }
+  },
+  "by_seq_kv": [
+    {
+      "seq_kv_leq": 4096,
+      "label": "long-fast-causal",
+      "main": {
+        "block_m": 16,
+        "block_n": 128,
+        "num_warps": 4,
+        "num_stages": 2,
+        "waves_per_eu": 4,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 2,
+        "schedule_hint": "none"
+      }
+    },
+    {
+      "seq_kv_leq": 5000,
+      "label": "long-slow-causal",
+      "main": {
+        "block_m": 16,
+        "block_n": 128,
+        "num_warps": 4,
+        "num_stages": 1,
+        "waves_per_eu": 4,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+        "schedule_hint": "none"
+      }
+    },
+    {
+      "seq_kv_leq": 16384,
+      "label": "xl-fast-causal",
+      "main": {
+        "block_m": 32,
+        "block_n": 128,
+        "num_warps": 8,
+        "num_stages": 2,
+        "waves_per_eu": 4,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+        "schedule_hint": "none"
+      }
+    }
+  ]
+}

@@ -1,0 +1,31 @@
+{
+  "meta": {
+    "arch": "gfx938",
+    "source": "ship defaults: Q double-buf + W_GROUP ping-pong (former q_db=2/w_cache=3)",
+    "note": "Prefer w_group=16 on H=64; host clamps to divide HEAD_CHUNK. kv via LDS."
+  },
+  "default": {
+    "main": {
+      "w_group": 16,
+      "kv_tiles_n": 2
+    }
+  },
+  "by_seq_kv": [
+    {
+      "seq_kv_leq": 4096,
+      "label": "long",
+      "main": {
+        "w_group": 16,
+        "kv_tiles_n": 2
+      }
+    },
+    {
+      "seq_kv_leq": 16384,
+      "label": "xl",
+      "main": {
+        "w_group": 16,
+        "kv_tiles_n": 2
+      }
+    }
+  ]
+}
