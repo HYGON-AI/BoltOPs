@@ -125,6 +125,43 @@ def test_sparse_decode_matches_ref(empty_rows: bool):
 
 
 @C.GPU_REQUIRED
+@pytest.mark.parametrize("num_splits", [1, 16])
+@pytest.mark.parametrize("context_len", [512, 8192])
+def test_sparse_decode_ragged_live_windows(num_splits, context_len):
+    from boltops.step4_dsa.triton.decode import sparse_attention_decode
+
+    data = _make_decode_case(
+        num_reqs=4, topk=513, context_len=context_len, empty_rows=False, seed=67
+    )
+    # Cross tile and split boundaries, including entirely empty split windows.
+    counts = torch.tensor(
+        [0, 1, 33, 513], device=data["counts"].device, dtype=torch.int32
+    ).clamp(max=context_len // 8).repeat(data["groups"])
+    data["counts"].copy_(counts)
+    kwargs = dict(
+        query=data["query"], key_cache=data["key_cache"],
+        value_cache=data["value_cache"], packed_regions=data["packed"],
+        region_counts=data["counts"], kv_seqlens=data["kv_seqlens"],
+        num_kv_groups=data["groups"], region_size=data["region_size"],
+        softmax_scale=data["scale"],
+    )
+    out, lse = sparse_attention_decode(
+        **kwargs, num_splits=num_splits,
+        config={"BALANCE_LIVE": True, "BLOCK_R": 2},
+    )
+    if num_splits > 1:
+        assert out.shape[0] == num_splits
+        original = sparse_attention_decode(**kwargs, num_splits=num_splits,
+                                           config={"BLOCK_R": 2})
+        torch.testing.assert_close(out, original[0], rtol=0, atol=0)
+        torch.testing.assert_close(lse, original[1], rtol=0, atol=0)
+        out, lse = triton_merge_split_states(out, lse)
+    ref_out, ref_lse = ref_sparse_attention_decode(**kwargs)
+    torch.testing.assert_close(out, ref_out.to(out.dtype), rtol=OUT_RTOL, atol=OUT_ATOL)
+    torch.testing.assert_close(lse, ref_lse, rtol=LSE_RTOL, atol=LSE_ATOL)
+
+
+@C.GPU_REQUIRED
 def test_sparse_decode_split_overlap_window_matches_ref():
     """packed_width not divisible by splits*BLOCK_R used to double-count slots.
 
