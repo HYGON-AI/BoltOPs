@@ -28,6 +28,8 @@ from boltops.step4_dsa.triton.common import (
 DECODE_PHYS_SHIFT = tl.constexpr(32)
 DECODE_LOW_MASK = tl.constexpr((1 << 32) - 1)
 NEGATIVE_INFINITY = tl.constexpr(float("-inf"))
+LOG2E = tl.constexpr(1.4426950408889634)
+LN2 = tl.constexpr(0.6931471805599453)
 
 @triton.jit
 def _sparse_attn_decode_kernel(
@@ -83,6 +85,11 @@ def _sparse_attn_decode_kernel(
     K is loaded as ``[BLOCK_D, tokens]`` so QK is ``tl.dot(Q, K)`` without
     ``tl.trans``. V stays ``[tokens, BLOCK_D]`` for ``P @ V``. Launch tiles come
     from ``config/sparse_attn_decode``.
+
+    Online softmax is in the log2 domain: ``log2(e)`` is folded into the softmax
+    scale and ``exp2`` replaces ``exp``. Stored LSE is converted back to natural
+    log (``running_max * ln2 + log(sum)``), so the merge-kernel contract is
+    unchanged.
     """
     request = tl.program_id(0)
     group = tl.program_id(1)
@@ -106,6 +113,7 @@ def _sparse_attn_decode_kernel(
         other=0.0,
     )
 
+    scale = softmax_scale * LOG2E
     running_max = tl.full((BLOCK_H,), NEGATIVE_INFINITY, dtype=tl.float32)
     running_sum = tl.zeros((BLOCK_H,), dtype=tl.float32)
     accumulator = tl.zeros((BLOCK_H, BLOCK_D), dtype=tl.float32)
@@ -154,15 +162,15 @@ def _sparse_attn_decode_kernel(
             other=0.0,
         )
 
-        scores = tl.dot(queries, keys, out_dtype=tl.float32) * softmax_scale
+        scores = tl.dot(queries, keys, out_dtype=tl.float32) * scale
         scores = tl.where(token_ok[None, :] & head_ok[:, None], scores, NEGATIVE_INFINITY)
 
         tile_max = tl.maximum(running_max, tl.max(scores, axis=1))
         empty = tile_max == NEGATIVE_INFINITY
         shift = tl.where(empty, 0.0, tile_max)
-        rescale = tl.where(empty, 1.0, tl.exp(running_max - shift))
+        rescale = tl.where(empty, 1.0, tl.math.exp2(running_max - shift))
 
-        probabilities = tl.exp(scores - shift[:, None])
+        probabilities = tl.math.exp2(scores - shift[:, None])
         running_sum = running_sum * rescale + tl.sum(probabilities, axis=1)
         accumulator = accumulator * rescale[:, None] + tl.dot(
             probabilities.to(values.dtype), values, out_dtype=tl.float32
@@ -188,9 +196,194 @@ def _sparse_attn_decode_kernel(
         + request * stride_lse_token
         + group * heads_per_group
         + heads,
-        tl.where(selected, running_max + tl.log(running_sum), NEGATIVE_INFINITY),
+        tl.where(selected, running_max * LN2 + tl.log(running_sum), NEGATIVE_INFINITY),
         mask=head_ok,
     )
+
+
+@triton.jit
+def _sparse_attn_decode_dsplit_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    packed_ptr,
+    counts_ptr,
+    seqlens_ptr,
+    out_ptr,
+    lse_ptr,
+    stride_q_token,
+    stride_q_head,
+    stride_k_token,
+    stride_k_group,
+    stride_v_token,
+    stride_v_group,
+    stride_packed_row,
+    stride_out_split,
+    stride_out_token,
+    stride_out_head,
+    stride_lse_split,
+    stride_lse_token,
+    softmax_scale,
+    num_reqs,
+    topk: tl.constexpr,
+    heads_per_group: tl.constexpr,
+    head_dim: tl.constexpr,
+    region_size: tl.constexpr,
+    slots_per_split: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_D1: tl.constexpr,
+    BLOCK_D2: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    BALANCE_LIVE: tl.constexpr = False,
+) -> None:
+    """Same contract as ``_sparse_attn_decode_kernel``; non-pow2 ``head_dim`` fast path.
+
+    Two differences, both performance-only (bit-level output differs by fp
+    rounding order, not semantics):
+
+    - ``head_dim`` is covered by two pow2 chunks ``BLOCK_D1 + BLOCK_D2 ==
+      head_dim`` (e.g. 192 = 128 + 64) instead of one padded ``BLOCK_D =
+      next_pow2(head_dim)``. QK is ``dot(q1, k1) + dot(q2, k2)`` and the PV
+      accumulator is split the same way. This removes the padding share of the
+      K/V LDS tiles, the MMACs and the accumulator rescale (25% for 192), and
+      the ``dims < head_dim`` mask disappears because the chunks cover the head
+      exactly.
+    - The online softmax runs in the log2 domain: ``log2(e)`` is folded into
+      the softmax scale and ``exp2`` replaces ``exp``. The stored LSE is
+      converted back to natural log (``running_max * ln2 + log(sum)``), so the
+      merge-kernel contract is unchanged.
+
+    Launched by :func:`sparse_attention_decode` when ``head_dim`` splits into
+    two pow2 chunks of at least 16; otherwise the original kernel runs.
+    Occupancy JSONs omit ``BLOCK_D`` / ``BLOCK_D1`` / ``BLOCK_D2`` on this path;
+    the chunks are derived from ``head_dim``. A leftover ``BLOCK_D`` is ignored.
+    """
+    tl.static_assert(BLOCK_D1 + BLOCK_D2 == head_dim)
+    request = tl.program_id(0)
+    group = tl.program_id(1)
+    split = tl.program_id(2)
+    row = group * num_reqs + request
+    count = tl.load(counts_ptr + row).to(tl.int32)
+    kv_seqlen = tl.load(seqlens_ptr + request).to(tl.int64)
+
+    heads = tl.arange(0, BLOCK_H)
+    dims1 = tl.arange(0, BLOCK_D1)
+    dims2 = BLOCK_D1 + tl.arange(0, BLOCK_D2)
+    head_ok = heads < heads_per_group
+
+    q_base = (
+        q_ptr
+        + request * stride_q_token
+        + (group * heads_per_group + heads)[:, None] * stride_q_head
+    )
+    queries1 = tl.load(q_base + dims1[None, :], mask=head_ok[:, None], other=0.0)
+    queries2 = tl.load(q_base + dims2[None, :], mask=head_ok[:, None], other=0.0)
+
+    scale = softmax_scale * LOG2E
+
+    running_max = tl.full((BLOCK_H,), NEGATIVE_INFINITY, dtype=tl.float32)
+    running_sum = tl.zeros((BLOCK_H,), dtype=tl.float32)
+    acc1 = tl.zeros((BLOCK_H, BLOCK_D1), dtype=tl.float32)
+    acc2 = tl.zeros((BLOCK_H, BLOCK_D2), dtype=tl.float32)
+
+    offsets_in_region = tl.arange(0, region_size)
+    if BALANCE_LIVE:
+        # Balance device-resident row lengths without a host read or metadata copy.
+        slots_per_split = tl.cdiv(tl.minimum(count, topk), tl.num_programs(2))
+    window_begin = split * slots_per_split
+    window_end = window_begin + slots_per_split
+    for base in tl.range(window_begin, window_end, BLOCK_R):
+        slots = base + tl.arange(0, BLOCK_R)
+        slot_ok = (slots < count) & (slots < topk) & (slots < window_end)
+        meta = tl.load(
+            packed_ptr + row * stride_packed_row + slots, mask=slot_ok, other=-1
+        )
+        physical = (meta >> DECODE_PHYS_SHIFT) & DECODE_LOW_MASK
+        start_token = meta & DECODE_LOW_MASK
+        valid = tl.minimum(tl.maximum(kv_seqlen - start_token, 0), region_size)
+        live = slot_ok & (valid > 0)
+
+        safe_physical = tl.where(live, physical, 0)
+        tokens = tl.reshape(
+            safe_physical[:, None] * region_size + offsets_in_region[None, :],
+            (BLOCK_R * region_size,),
+        )
+        token_ok = tl.reshape(
+            live[:, None] & (offsets_in_region[None, :] < valid[:, None]),
+            (BLOCK_R * region_size,),
+        )
+
+        k_base = k_ptr + tokens[None, :] * stride_k_token + group * stride_k_group
+        keys1 = tl.load(k_base + dims1[:, None], mask=token_ok[None, :], other=0.0)
+        keys2 = tl.load(k_base + dims2[:, None], mask=token_ok[None, :], other=0.0)
+        v_base = v_ptr + tokens[:, None] * stride_v_token + group * stride_v_group
+        values1 = tl.load(v_base + dims1[None, :], mask=token_ok[:, None], other=0.0)
+        values2 = tl.load(v_base + dims2[None, :], mask=token_ok[:, None], other=0.0)
+
+        scores = (
+            tl.dot(queries1, keys1, out_dtype=tl.float32)
+            + tl.dot(queries2, keys2, out_dtype=tl.float32)
+        ) * scale
+        scores = tl.where(
+            token_ok[None, :] & head_ok[:, None], scores, NEGATIVE_INFINITY
+        )
+
+        tile_max = tl.maximum(running_max, tl.max(scores, axis=1))
+        empty = tile_max == NEGATIVE_INFINITY
+        shift = tl.where(empty, 0.0, tile_max)
+        rescale = tl.where(empty, 1.0, tl.math.exp2(running_max - shift))
+        probabilities = tl.math.exp2(scores - shift[:, None])
+        running_sum = running_sum * rescale + tl.sum(probabilities, axis=1)
+        p = probabilities.to(values1.dtype)
+        acc1 = acc1 * rescale[:, None] + tl.dot(p, values1, out_dtype=tl.float32)
+        acc2 = acc2 * rescale[:, None] + tl.dot(p, values2, out_dtype=tl.float32)
+        running_max = tile_max
+
+    selected = running_sum > 0
+    # Reuse one reciprocal per head instead of dividing every output element.
+    inv_sum = tl.div_rn(1.0, tl.where(selected, running_sum, 1.0))
+    output1 = tl.where(selected[:, None], acc1 * inv_sum[:, None], 0.0)
+    output2 = tl.where(selected[:, None], acc2 * inv_sum[:, None], 0.0)
+    out_base = (
+        out_ptr
+        + split * stride_out_split
+        + request * stride_out_token
+        + (group * heads_per_group + heads)[:, None] * stride_out_head
+    )
+    tl.store(
+        out_base + dims1[None, :],
+        output1.to(out_ptr.dtype.element_ty),
+        mask=head_ok[:, None],
+    )
+    tl.store(
+        out_base + dims2[None, :],
+        output2.to(out_ptr.dtype.element_ty),
+        mask=head_ok[:, None],
+    )
+    tl.store(
+        lse_ptr
+        + split * stride_lse_split
+        + request * stride_lse_token
+        + group * heads_per_group
+        + heads,
+        tl.where(selected, running_max * LN2 + tl.log(running_sum), NEGATIVE_INFINITY),
+        mask=head_ok,
+    )
+
+
+def _decode_head_dim_split(head_dim: int) -> tuple[int, int] | None:
+    """``(D1, D2)`` pow2 chunks covering ``head_dim`` exactly, or ``None``.
+
+    ``None`` (pow2 ``head_dim``, or a remainder below ``tl.dot``'s minimum of
+    16) keeps the original single-``BLOCK_D`` kernel.
+    """
+    if head_dim <= 0 or head_dim & (head_dim - 1) == 0:
+        return None
+    d1 = 1 << (head_dim.bit_length() - 1)
+    d2 = head_dim - d1
+    if d2 >= 16 and d2 & (d2 - 1) == 0:
+        return d1, d2
+    return None
 
 
 _CONFIG_DIR = os.path.join(
@@ -198,17 +391,19 @@ _CONFIG_DIR = os.path.join(
     "config",
     "sparse_attn_decode",
 )
-_LAUNCH_KEYS = frozenset(
+# Shared by both kernels. ``BLOCK_D`` is only in the padded-kernel JSON;
+# dsplit occupancy files omit it (and never carry ``BLOCK_D1`` / ``BLOCK_D2``).
+_COMMON_LAUNCH_KEYS = frozenset(
     {
         "BLOCK_R",
         "BLOCK_H",
-        "BLOCK_D",
         "BALANCE_LIVE",
         "num_warps",
         "num_stages",
         "waves_per_eu",
     }
 )
+_LAUNCH_KEYS = _COMMON_LAUNCH_KEYS | {"BLOCK_D"}
 _GRID_KEYS = ("num_warps", "num_stages", "waves_per_eu")
 
 
@@ -270,18 +465,26 @@ def sparse_attn_decode_config_path(
     )
 
 
-def _filter_launch_config(config: dict[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in config.items() if key in _LAUNCH_KEYS}
+def _filter_launch_config(config: dict[str, Any], *, head_dim: int) -> dict[str, Any]:
+    """Keep launch keys for the kernel ``head_dim`` selects.
+
+    ``_sparse_attn_decode_dsplit_kernel``: no ``BLOCK_D`` (chunks come from
+    ``head_dim``). Leftover ``BLOCK_D`` / ``BLOCK_D1`` / ``BLOCK_D2`` are dropped.
+    ``_sparse_attn_decode_kernel``: keep ``BLOCK_D`` when the JSON has it.
+    """
+    dsplit = _decode_head_dim_split(head_dim) is not None
+    allowed = _COMMON_LAUNCH_KEYS if dsplit else _LAUNCH_KEYS
+    return {key: value for key, value in config.items() if key in allowed}
 
 
-def _read_launch_config(path: str) -> dict[str, Any] | None:
+def _read_launch_config(path: str, *, head_dim: int) -> dict[str, Any] | None:
     if not os.path.exists(path):
         return None
     with open(path) as handle:
         payload = json.load(handle)
     if not isinstance(payload, dict):
         return None
-    filtered = _filter_launch_config(payload)
+    filtered = _filter_launch_config(payload, head_dim=head_dim)
     if "BLOCK_R" not in filtered:
         return None
     return filtered
@@ -312,7 +515,8 @@ def _load_sparse_attn_decode_config(
             device,
             batch=batch,
             context=context,
-        )
+        ),
+        head_dim=head_dim,
     )
 
 
@@ -417,6 +621,10 @@ def sparse_attention_decode(
             file retries the ``s1`` occupancy JSON, then the built-in default tile.
             A mapping is used as-is (no shared-memory shrink). An empty mapping
             skips lookup and keeps the built-in defaults.
+            Occupancy JSON for ``_sparse_attn_decode_kernel`` includes ``BLOCK_D``;
+            the dsplit kernel (non-pow2 ``head_dim``) omits it and derives
+            ``BLOCK_D1`` / ``BLOCK_D2`` from ``head_dim``. Leftover ``BLOCK_D`` /
+            ``BLOCK_D1`` / ``BLOCK_D2`` on that path are ignored.
             ``BALANCE_LIVE`` balances valid slots across automatic splits. It is
             ignored for explicit splits or partial outputs to preserve their windows.
 
@@ -509,15 +717,15 @@ def sparse_attention_decode(
         element_size=key_cache.element_size(),
     )
     extra: dict[str, Any] = {}
+    d_split = _decode_head_dim_split(head_dim)
     if launch:
         block_h = int(launch.get("BLOCK_H", default_h))
-        block_d = int(launch.get("BLOCK_D", default_d))
         block_r = int(launch["BLOCK_R"])
         extra = {key: launch[key] for key in _GRID_KEYS if key in launch}
     else:
-        block_h, block_d, block_r = default_h, default_d, default_r
+        block_h, block_r = default_h, default_r
 
-    _sparse_attn_decode_kernel[(num_reqs, num_kv_groups, num_splits)](
+    common_args = (
         query,
         key_cache,
         value_cache,
@@ -540,18 +748,37 @@ def sparse_attention_decode(
         lse.stride(1),
         scale,
         num_reqs,
+    )
+    common_meta = dict(
         topk=topk,
         heads_per_group=heads_per_group,
         head_dim=head_dim,
         region_size=region_size,
         slots_per_split=slots_per_split,
         BLOCK_H=block_h,
-        BLOCK_D=block_d,
         BLOCK_R=block_r,
         BALANCE_LIVE=bool(launch and launch.get("BALANCE_LIVE", False))
         and auto_kv_split and not return_partials and num_splits > 1,
-        **extra,
     )
+    if d_split is not None:
+        # Non-pow2 head_dim (e.g. 192): padding-free two-chunk kernel.
+        # Occupancy JSON omits ``BLOCK_D``; chunks come from ``head_dim``.
+        _sparse_attn_decode_dsplit_kernel[(num_reqs, num_kv_groups, num_splits)](
+            *common_args,
+            **common_meta,
+            BLOCK_D1=d_split[0],
+            BLOCK_D2=d_split[1],
+            **extra,
+        )
+    else:
+        # Padded-kernel JSON still has ``BLOCK_D``; missing it uses the default tile.
+        block_d = int(launch.get("BLOCK_D", default_d)) if launch else default_d
+        _sparse_attn_decode_kernel[(num_reqs, num_kv_groups, num_splits)](
+            *common_args,
+            **common_meta,
+            BLOCK_D=block_d,
+            **extra,
+        )
     if num_splits == 1:
         return out[0], lse[0]
     if return_partials:

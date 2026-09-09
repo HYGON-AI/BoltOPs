@@ -133,6 +133,56 @@ SQTT 已对 B=4/context=512 的前后版本采集（`sqtt status: enabled`）。
 不是动态执行次数或流水周期。SQTT 分析仍受上述分析器限制，收益以不带
 profiler 的独立 Graph replay 计时为准。
 
+### Decode 非 2 次幂 head_dim 分块 + occupancy 重调（2026-09-09）
+
+`head_dim=192` 不再 pad 到 `BLOCK_D=256`，而是切成两个 pow2 块
+`128+64`（`_sparse_attn_decode_dsplit_kernel`）。QK 为
+`dot(q1,k1)+dot(q2,k2)`，PV 同样分块，去掉 padding 的 LDS / MMAC /
+accumulator rescale（192 上约 25%）以及 `dims < head_dim` mask。
+online softmax 改到 log2 域：`log2(e)` 折进 scale，`exp2` 替换 `exp`，
+写出的 LSE 再乘 `ln2` 转回自然对数，merge 合同不变。occupancy JSON
+不再写 `BLOCK_D`（块大小由 `head_dim` 推导），并按 dsplit kernel 重
+tune `BALANCE_LIVE` / `BLOCK_R` / warps / stages / waves。
+
+以下基线为 BoltOps `8bbee9b`（含 BALANCE_LIVE 与共享倒数，仍走
+padded `BLOCK_D=256`）。计时方式和环境与上节相同：BW1100/gfx938/72 CU，
+`HIP_VISIBLE_DEVICES=2`，`AMDGCN_USE_BUFFER_OPS=1`，显式传 config，
+metadata 预先生成，三轮正/逆/正顺序 `do_bench_cudagraph(rep=30)`
+中位数，计时包含 decode + merge。两次独立进程、相同输入种子，不是
+同进程切 kernel。GPU 未锁频。
+
+覆盖全部 18 个已落地 decode occupancy JSON（`splits=1` 快路径）。
+小 batch / 短上下文上两段 `tl.dot` 的额外开销盖过 padding 节省，
+出现回退，不把大 batch 比例外推到这些点。
+
+| B | context | HEAD 基线 us | 优化 us | 加速比 |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 512 | 14.69 | 20.21 | 0.73x |
+| 1 | 16384 | 20.32 | 21.65 | 0.94x |
+| 2 | 16384 | 27.18 | 27.03 | 1.01x |
+| 4 | 512 | 15.10 | 15.81 | 0.95x |
+| 4 | 2048 | 30.63 | 34.31 | 0.89x |
+| 4 | 4096 | 44.13 | 39.34 | 1.12x |
+| 4 | 8192 | 44.17 | 37.38 | 1.18x |
+| 4 | 16384 | 44.40 | 31.90 | 1.39x |
+| 4 | 31929 | 44.69 | 44.30 | 1.01x |
+| 4 | 32768 | 44.40 | 44.26 | 1.00x |
+| 4 | 65536 | 44.52 | 40.53 | 1.10x |
+| 8 | 16384 | 72.48 | 51.48 | 1.41x |
+| 8 | 31929 | 75.07 | 53.86 | 1.39x |
+| 16 | 16384 | 152.20 | 117.91 | 1.29x |
+| 32 | 16384 | 240.74 | 184.17 | 1.31x |
+| 64 | 16384 | 336.46 | 271.23 | 1.24x |
+| 128 | 16384 | 650.33 | 516.65 | 1.26x |
+| 128 | 65536 | 660.13 | 518.28 | 1.27x |
+
+`B=4 ctx=16384` 的 occupancy 在 2026-09-10 重 tune 为 `num_warps=4` /
+`num_stages=2`（原 `8/3`），同一套 cudagraph 计时从 39.02 us 降到
+31.90 us（两独立进程 31.90 / 31.96）。稳定收益集中在 `B>=8`，以及
+`B=4` 且 `context>=4096`（`ctx=31929/32768` 接近持平）。`B=1 ctx=512`
+与 `B=4 ctx=2048` 明显变慢，保留 dsplit occupancy JSON 是因为其它
+shape 的收益来自同一 kernel，不是因为这两点更快。
+
 decode 在 **width=513 + `num_splits=16`** 上，旧 kernel 会让相邻 split 的最后一个 `BLOCK_R` tile 重叠（`ceil(513/16)=33`）。2026-09-04 已用 `slots < window_end` 修掉；这些 case 仍留在 production bench 里，不要删。occupancy 性能表只覆盖已落地 JSON 的 `splits=1` 入口（公开 API 会自动再切 KV）。
 
 ---
