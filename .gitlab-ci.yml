@@ -8,9 +8,13 @@ variables:
   GIT_DEPTH: "0"
   PIP_INDEX_URL: "http://10.16.1.201:9929/nightly/dtk2604/+simple/"
   PIP_TRUSTED_HOST: "10.16.1.201"
+  # Torch wheels are larger than 1 GB. Tolerate transient stalls and let pip
+  # resume partial downloads instead of restarting the whole transfer.
+  PIP_DEFAULT_TIMEOUT: "600"
+  PIP_RETRIES: "10"
+  PIP_RESUME_RETRIES: "10"
   DTK_PKG: "/ArchivedFile/dtk-pkg/dtk26.04/DTK-26.04-rc4-centos8-x86_64.tar.gz"
   AICC_INSTALLER_URL: "http://42.228.13.241:18000/ai_cc/Nightly/hcu_llvm_installer.sh"
-  AICC_MAJOR_VERSION: "1.0.0"
   DEVPI_URL: "http://10.16.1.201:9929/"
   CISMI_TIMEOUT: "3600"
   # These two must be set as protected CI/CD secret variables in GitLab project settings.
@@ -28,6 +32,15 @@ variables:
     - cd /opt && tar -xzf $(basename ${DTK_PKG}) && mv dtk-* dtk
     - source /opt/dtk/env.sh && cd ${CI_PROJECT_DIR}
     - |
+      case "${DTK_PKG,,}" in
+        *dtk26.04.2*|*dtk26042*) AICC_MAJOR_VERSION="2.0.0" ;;
+        *dtk26.04*|*dtk2604*) AICC_MAJOR_VERSION="1.0.0" ;;
+        *)
+          echo "Unsupported DTK package for AICC selection: ${DTK_PKG}" >&2
+          exit 1
+          ;;
+      esac
+      echo "Installing AICC ${AICC_MAJOR_VERSION} for ${DTK_PKG}"
       curl -fsSL --retry 3 --retry-delay 2 \
         -o /tmp/hcu_llvm_installer.sh "${AICC_INSTALLER_URL}"
       bash /tmp/hcu_llvm_installer.sh \
@@ -289,6 +302,7 @@ publish:
           --devpi_user "${devpi_nightly_user}" \
           --devpi_password "${devpi_nightly_password}" \
           --dtk_pkg_name "$(basename "${DTK_PKG}")" \
+          --record \
           -f "${wheel}"
       done
   artifacts:
