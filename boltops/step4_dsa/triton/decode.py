@@ -61,6 +61,7 @@ def _sparse_attn_decode_kernel(
     BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_R: tl.constexpr,
+    BALANCE_LIVE: tl.constexpr = False,
 ) -> None:
     """One decode query against one KV group's selected regions, over one slot window.
 
@@ -110,6 +111,9 @@ def _sparse_attn_decode_kernel(
     accumulator = tl.zeros((BLOCK_H, BLOCK_D), dtype=tl.float32)
 
     offsets_in_region = tl.arange(0, region_size)
+    if BALANCE_LIVE:
+        # Balance device-resident row lengths without a host read or metadata copy.
+        slots_per_split = tl.cdiv(tl.minimum(count, topk), tl.num_programs(2))
     window_begin = split * slots_per_split
     window_end = window_begin + slots_per_split
     for base in tl.range(window_begin, window_end, BLOCK_R):
@@ -166,7 +170,9 @@ def _sparse_attn_decode_kernel(
         running_max = tile_max
 
     selected = running_sum > 0
-    output = tl.where(selected[:, None], accumulator / running_sum[:, None], 0.0)
+    # Reuse one reciprocal per head instead of dividing every output element.
+    inv_sum = tl.div_rn(1.0, tl.where(selected, running_sum, 1.0))
+    output = tl.where(selected[:, None], accumulator * inv_sum[:, None], 0.0)
     tl.store(
         out_ptr
         + split * stride_out_split
@@ -197,6 +203,7 @@ _LAUNCH_KEYS = frozenset(
         "BLOCK_R",
         "BLOCK_H",
         "BLOCK_D",
+        "BALANCE_LIVE",
         "num_warps",
         "num_stages",
         "waves_per_eu",
@@ -410,6 +417,8 @@ def sparse_attention_decode(
             file retries the ``s1`` occupancy JSON, then the built-in default tile.
             A mapping is used as-is (no shared-memory shrink). An empty mapping
             skips lookup and keeps the built-in defaults.
+            ``BALANCE_LIVE`` balances valid slots across automatic splits. It is
+            ignored for explicit splits or partial outputs to preserve their windows.
 
     Returns:
         ``num_splits==1``: merged ``(out [num_reqs, num_heads, head_dim],
@@ -539,6 +548,8 @@ def sparse_attention_decode(
         BLOCK_H=block_h,
         BLOCK_D=block_d,
         BLOCK_R=block_r,
+        BALANCE_LIVE=bool(launch and launch.get("BALANCE_LIVE", False))
+        and auto_kv_split and not return_partials and num_splits > 1,
         **extra,
     )
     if num_splits == 1:

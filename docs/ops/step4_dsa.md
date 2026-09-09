@@ -77,6 +77,62 @@ python3 scripts/benchmarks/triton/step4_dsa/benchmark_sparse_attn_decode.py \
 
 ## 已知问题
 
+### BW1100 短上下文 decode 有效槽位分区（2026-09-09）
+
+Decode launch 配置支持 `BALANCE_LIVE`（默认 false）。开启时，自动 split
+按每个 metadata row 的设备端 `region_counts` 分配窗口：
+`slots_per_split = ceil(min(count, packed_width) / num_splits)`。
+无需 host scalar 读取或 metadata 拷贝；grid 和 merge 输出形状保持不变。
+显式 split、返回 partial states、单 split 均忽略此选项，保持原窗口合同。
+
+仅以下三个 BW1100 JSON 开启，其他配置保持原路径。动态窗口在长上下文
+没有稳定收益，不应全局启用。`config={}` 仍使用原默认策略。
+
+| B | context | HEAD 基线 us | 优化 us | 加速比 |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 512 | 23.62 | 17.74 | 1.33x |
+| 4 | 512 | 44.50 | 18.25 | 2.44x |
+| 4 | 2048 | 46.62 | 34.48 | 1.35x |
+
+环境：BW1100/gfx938/72 CU，Triton Hygon release/3.6.x `4e013043f`，
+`AMDGCN_USE_BUFFER_OPS=1`。基线为 BoltOps `734417d`；同进程、相同输入和
+原 launch tile，三轮正/逆/正顺序 `do_bench_cudagraph(rep=30)` 中位数，
+计时包含 decode + merge。显式传 config，metadata 预先生成；不包含 Python
+配置查找同步，不能视为完整 Python API 的端到端收益。GPU 未锁频，其他
+size 有明显测量波动，未将其计为收益。18 个已有 decode 配置均对 FP32
+Torch oracle 检查；额外测试覆盖空行、混合有效长度和显式 partial 窗口。
+
+XCU 最初的 SIGABRT 已定位为 profiler 不支持 `launch_statistics`，
+移除该 section 后计数器和 SQTT 均能采集。XCU 4.4.4 分析器仍报告
+`v_fmac_f32` 指令识别警告，部分流水统计为 N/A，不据此量化 stall 比例。
+
+### Decode 归一化共享倒数（2026-09-09）
+
+最终输出由 `accumulator / running_sum` 改为每 head 计算一次 FP32
+`tl.div_rn(1.0, safe_sum)`，再广播乘以 accumulator。空行使用分母 1
+并输出零，LSE 仍为负无穷。不改变 QK/PV 的 MMAC 路径；倒数与乘法有
+额外一次 FP32 舍入，因此正确性继续按 FP32 Torch oracle 的原容差验证。
+
+以下基线包含上一节 BALANCE_LIVE 优化，计时方式和环境与上节相同：
+
+| B | context | 上一版 us | 共享倒数 us | 加速比 |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 512 | 17.72 | 14.70 | 1.21x |
+| 1 | 16384 | 23.53 | 20.48 | 1.15x |
+| 4 | 512 | 18.30 | 15.18 | 1.21x |
+| 4 | 2048 | 35.10 | 32.09 | 1.09x |
+| 4 | 16384 | 49.10 | 45.89 | 1.07x |
+
+18 个已有 decode 配置通过 FP32 oracle。`ctx=31929` 首轮结果波动，
+追加八轮交替测量：B=4 为 47.94 -> 44.68 us；B=8 仍有显著时间漂移，
+不据此宣称稳定收益。大 batch 的收益较小，不将小 batch 比例外推。
+
+SQTT 已对 B=4/context=512 的前后版本采集（`sqtt status: enabled`）。
+静态汇编中 `v_div*` 从 256 条降到 4 条，`v_rcp*` 从 65 条降到 2 条，
+`v_fmac*` 从 133 条降到 7 条，`v_mmac*` 保持 96 条；这是静态指令数量，
+不是动态执行次数或流水周期。SQTT 分析仍受上述分析器限制，收益以不带
+profiler 的独立 Graph replay 计时为准。
+
 decode 在 **width=513 + `num_splits=16`** 上，旧 kernel 会让相邻 split 的最后一个 `BLOCK_R` tile 重叠（`ceil(513/16)=33`）。2026-09-04 已用 `slots < window_end` 修掉；这些 case 仍留在 production bench 里，不要删。occupancy 性能表只覆盖已落地 JSON 的 `splits=1` 入口（公开 API 会自动再切 KV）。
 
 ---
@@ -313,4 +369,3 @@ out, lse = triton_sparse_attention_decode(
 
 实现：`triton/decode.py`（`sparse_attention_decode`）。溯源：Step-4 DSA
 handoff `sparse_attn.py`。
-

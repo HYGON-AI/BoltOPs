@@ -1,4 +1,5 @@
 {
+    "BALANCE_LIVE": true,
     "BLOCK_R": 2,
     "BLOCK_H": 16,
     "BLOCK_D": 256,
