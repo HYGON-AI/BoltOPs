@@ -100,6 +100,130 @@
     },
     {
       "match": {
+        "s_q": 8,
+        "s_kv": 16384,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 2048,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "config": {
+        "BLOCK_N": 32,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 128,
+        "num_warps": 4,
+        "num_stages": 2,
+        "USE_MATRIX_LOAD_Q": false,
+        "waves_per_eu": 2,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 2,
+        "amdgpu_enable_max_ilp_scheduling_strategy": true,
+        "misched_regpressure": false,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false
+      },
+      "baseline_ms": 0.9287194907665253,
+      "latency_ms": 0.4902400076389313,
+      "speedup": 1.8944179917901363,
+      "valid_candidates": 245
+    },
+    {
+      "match": {
+        "s_q": 16,
+        "s_kv": 16384,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 2048,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "config": {
+        "BLOCK_N": 32,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 128,
+        "num_warps": 4,
+        "num_stages": 2,
+        "USE_MATRIX_LOAD_Q": false,
+        "waves_per_eu": 2,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 2,
+        "amdgpu_enable_max_ilp_scheduling_strategy": true,
+        "misched_regpressure": false,
+        "optimize_epilogue": false,
+        "use_block_pingpong": true
+      },
+      "baseline_ms": 0.9239194989204407,
+      "latency_ms": 0.4896000027656555,
+      "speedup": 1.8870904691613533,
+      "valid_candidates": 245
+    },
+    {
+      "match": {
+        "s_q": 64,
+        "s_kv": 16384,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 2048,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "config": {
+        "BLOCK_N": 32,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 128,
+        "num_warps": 4,
+        "num_stages": 2,
+        "USE_MATRIX_LOAD_Q": false,
+        "waves_per_eu": 2,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 2,
+        "amdgpu_enable_max_ilp_scheduling_strategy": true,
+        "misched_regpressure": false,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false
+      },
+      "baseline_ms": 0.923039972782135,
+      "latency_ms": 0.49295949935913086,
+      "speedup": 1.8724458580920498,
+      "valid_candidates": 245
+    },
+    {
+      "match": {
+        "s_q": 1,
+        "s_kv": 32768,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 4096,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "config": {
+        "BLOCK_N": 32,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 128,
+        "num_warps": 4,
+        "num_stages": 2,
+        "USE_MATRIX_LOAD_Q": false,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 2,
+        "amdgpu_enable_max_ilp_scheduling_strategy": true,
+        "misched_regpressure": false,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false
+      },
+      "baseline_ms": 1.875439465045929,
+      "latency_ms": 0.9753590226173401,
+      "speedup": 1.9228196198085665,
+      "valid_candidates": 245
+    },
+    {
+      "match": {
         "s_q": 4,
         "s_kv": 32768,
         "h_q": 16,
@@ -127,6 +251,37 @@
       "baseline_ms": 1.8531190156936646,
       "latency_ms": 0.9671995043754578,
       "speedup": 1.915963570401398,
+      "valid_candidates": 245
+    },
+    {
+      "match": {
+        "s_q": 16,
+        "s_kv": 32768,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 4096,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "config": {
+        "BLOCK_N": 32,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 128,
+        "num_warps": 4,
+        "num_stages": 2,
+        "USE_MATRIX_LOAD_Q": false,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 2,
+        "amdgpu_enable_max_ilp_scheduling_strategy": true,
+        "misched_regpressure": false,
+        "optimize_epilogue": false,
+        "use_block_pingpong": true
+      },
+      "baseline_ms": 1.848639965057373,
+      "latency_ms": 0.9694395065307617,
+      "speedup": 1.9069162671871296,
       "valid_candidates": 245
     }
   ]
