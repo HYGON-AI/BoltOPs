@@ -1420,6 +1420,18 @@ def fused_moe_kernel(
 
     token_mask = offs_token < num_valid_tokens
 
+    safe_scale_gather: tl.constexpr = (
+        COMBINE_SCALE_LOAD and use_int8_w8a8 and group_k > 0 and group_n > 0
+        and not MUL_ROUTED_WEIGHT and not a_sorted)
+    if safe_scale_gather:
+        # Padding rows never reach C. Hoist their scale-address selection while
+        # retaining the original masked A data loads and their scheduling.
+        a_scale_row = tl.where(token_mask, a_row, 0)
+        a_scale_mask = tl.full((BLOCK_SIZE_M,), True, tl.int1)
+    else:
+        a_scale_row = a_row
+        a_scale_mask = token_mask
+
     offs_bn = (pid_n * BLOCK_SIZE_N +
                tl.arange(0, BLOCK_SIZE_N).to(tl.int32))
     if not block_n_diviable:
@@ -1458,7 +1470,7 @@ def fused_moe_kernel(
         # block-wise
         if group_k > 0 and group_n > 0:
             if COMBINE_SCALE_LOAD:
-                a_scale_ptrs = a_scale_ptr + a_row[:, None] * stride_asm
+                a_scale_ptrs = a_scale_ptr + a_scale_row[:, None] * stride_asm
                 offs_bsn = offs_bn // group_n
                 b_scale_ptrs = (b_scale_ptr + off_experts * stride_bse +
                                 offs_bsn[:, None] * stride_bsn)
@@ -1532,7 +1544,7 @@ def fused_moe_kernel(
                     k_start = k * BLOCK_SIZE_K
                     offs_ks = k_start // group_k + tl.arange(0, 2)
                     a_scale = tl.load(a_scale_ptrs + offs_ks[None, :] * stride_ask,
-                                    mask=token_mask[:, None],
+                                    mask=a_scale_mask[:, None],
                                     other=0.0)
                     b_scale = tl.load(b_scale_ptrs + offs_ks[None, :] * stride_bsk)
                     a_scale_0, a_scale_1 = tl.split(a_scale)
