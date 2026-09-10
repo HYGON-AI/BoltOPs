@@ -1458,7 +1458,7 @@ def fused_moe_kernel(
         # block-wise
         if group_k > 0 and group_n > 0:
             if COMBINE_SCALE_LOAD:
-                a_scale_ptrs = a_scale_ptr + source_token[:, None] * stride_asm
+                a_scale_ptrs = a_scale_ptr + a_row[:, None] * stride_asm
                 offs_bsn = offs_bn // group_n
                 b_scale_ptrs = (b_scale_ptr + off_experts * stride_bse +
                                 offs_bsn[:, None] * stride_bsn)
@@ -1950,7 +1950,7 @@ def fused_moe_splitk_kernel(
         # block-wise
         if group_k > 0 and group_n > 0:
             if COMBINE_SCALE_LOAD:
-                a_scale_ptrs = a_scale_ptr + source_token[:, None] * stride_asm
+                a_scale_ptrs = a_scale_ptr + a_row[:, None] * stride_asm
                 offs_bsn = offs_bn // group_n
                 b_scale_ptrs = (b_scale_ptr + off_experts * stride_bse +
                                 offs_bsn[:, None] * stride_bsn)
@@ -2402,7 +2402,7 @@ def fused_moe_persistent_kernel(
                 # block-wise
                 if group_k > 0 and group_n > 0:
                     if COMBINE_SCALE_LOAD:
-                        a_scale_ptrs = a_scale_ptr + source_token[:, None] * stride_asm
+                        a_scale_ptrs = a_scale_ptr + a_row[:, None] * stride_asm
                         offs_bsn = offs_bn // group_n
                         b_scale_ptrs = (b_scale_ptr + off_experts * stride_bse +
                                         offs_bsn[:, None] * stride_bsn)
@@ -2860,6 +2860,16 @@ def fused_moe(
         if block_shape is not None:
             BLOCK_SIZE_K = min(BLOCK_SIZE_K, min(block_shape[0],
                                                  block_shape[1]))
+
+        if config.get("COMBINE_SCALE_LOAD", False) and (
+            use_int8_w8a8 or use_fp8_w8a8
+        ):
+            k = B.size(2)
+            if k % (2 * BLOCK_SIZE_K) != 0:
+                raise ValueError(
+                    "COMBINE_SCALE_LOAD requires K divisible by 2 * BLOCK_SIZE_K, "
+                    f"got K={k}, BLOCK_SIZE_K={BLOCK_SIZE_K}"
+                )
 
         if use_int4_w4a8 and per_channel_quant:
             if B_bias is not None:
