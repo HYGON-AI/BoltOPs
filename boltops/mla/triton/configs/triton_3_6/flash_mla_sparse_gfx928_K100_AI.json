@@ -10,10 +10,1474 @@
       "validation_atol": 0.02,
       "validation_rtol": 0.02,
       "main_config_max_regret_pct": 1.301,
-      "main_config_max_regret_outside_override_pct": 0.282
+      "main_config_max_regret_outside_override_pct": 0.282,
+      "selection": "static_ranges",
+      "static_range_entries": 43
     }
   },
   "configs": [
+    {
+      "match": {
+        "s_q_min": 1,
+        "s_q_max": 3,
+        "s_kv_min": 1024,
+        "s_kv_max": 131072,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 128,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "evidence": {
+        "kind": "static_range_materialization",
+        "source": "K100 multi-size and boundary sweeps, 2026-09-10"
+      },
+      "config": {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 512,
+        "num_warps": 4,
+        "num_stages": 1,
+        "USE_MATRIX_LOAD_Q": false,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+        "amdgpu_enable_max_ilp_scheduling_strategy": false,
+        "misched_regpressure": true,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false,
+        "SPLIT_KV": 8
+      }
+    },
+    {
+      "match": {
+        "s_q_min": 4,
+        "s_q_max": 7,
+        "s_kv_min": 1024,
+        "s_kv_max": 131072,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 128,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "evidence": {
+        "kind": "static_range_materialization",
+        "source": "K100 multi-size and boundary sweeps, 2026-09-10"
+      },
+      "config": {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 512,
+        "num_warps": 4,
+        "num_stages": 1,
+        "USE_MATRIX_LOAD_Q": false,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+        "amdgpu_enable_max_ilp_scheduling_strategy": false,
+        "misched_regpressure": true,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false,
+        "SPLIT_KV": 8
+      }
+    },
+    {
+      "match": {
+        "s_q_min": 8,
+        "s_q_max": 14,
+        "s_kv_min": 1024,
+        "s_kv_max": 131072,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 128,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "evidence": {
+        "kind": "static_range_materialization",
+        "source": "K100 multi-size and boundary sweeps, 2026-09-10"
+      },
+      "config": {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 512,
+        "num_warps": 4,
+        "num_stages": 1,
+        "USE_MATRIX_LOAD_Q": false,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+        "amdgpu_enable_max_ilp_scheduling_strategy": false,
+        "misched_regpressure": true,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false,
+        "SPLIT_KV": 8
+      }
+    },
+    {
+      "match": {
+        "s_q_min": 15,
+        "s_q_max": 29,
+        "s_kv_min": 1024,
+        "s_kv_max": 131072,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 128,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "evidence": {
+        "kind": "static_range_materialization",
+        "source": "K100 multi-size and boundary sweeps, 2026-09-10"
+      },
+      "config": {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 512,
+        "num_warps": 4,
+        "num_stages": 1,
+        "USE_MATRIX_LOAD_Q": false,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+        "amdgpu_enable_max_ilp_scheduling_strategy": false,
+        "misched_regpressure": true,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false,
+        "SPLIT_KV": 8
+      }
+    },
+    {
+      "match": {
+        "s_q_min": 30,
+        "s_q_max": 48,
+        "s_kv_min": 1024,
+        "s_kv_max": 131072,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 128,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "evidence": {
+        "kind": "static_range_materialization",
+        "source": "K100 multi-size and boundary sweeps, 2026-09-10"
+      },
+      "config": {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 256,
+        "num_warps": 4,
+        "num_stages": 1,
+        "USE_MATRIX_LOAD_Q": false,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+        "amdgpu_enable_max_ilp_scheduling_strategy": false,
+        "misched_regpressure": true,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false,
+        "SPLIT_KV": 4
+      }
+    },
+    {
+      "match": {
+        "s_q_min": 49,
+        "s_q_max": 90,
+        "s_kv_min": 1024,
+        "s_kv_max": 131072,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 128,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "evidence": {
+        "kind": "static_range_materialization",
+        "source": "K100 multi-size and boundary sweeps, 2026-09-10"
+      },
+      "config": {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 256,
+        "num_warps": 4,
+        "num_stages": 1,
+        "USE_MATRIX_LOAD_Q": false,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+        "amdgpu_enable_max_ilp_scheduling_strategy": false,
+        "misched_regpressure": true,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false,
+        "SPLIT_KV": 2
+      }
+    },
+    {
+      "match": {
+        "s_q_min": 91,
+        "s_q_max": 128,
+        "s_kv_min": 1024,
+        "s_kv_max": 131072,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 128,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "evidence": {
+        "kind": "static_range_materialization",
+        "source": "K100 multi-size and boundary sweeps, 2026-09-10"
+      },
+      "config": {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 256,
+        "num_warps": 4,
+        "num_stages": 1,
+        "USE_MATRIX_LOAD_Q": false,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+        "amdgpu_enable_max_ilp_scheduling_strategy": false,
+        "misched_regpressure": true,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false,
+        "SPLIT_KV": 1
+      }
+    },
+    {
+      "match": {
+        "s_q_min": 1,
+        "s_q_max": 3,
+        "s_kv_min": 1024,
+        "s_kv_max": 131072,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 256,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "evidence": {
+        "kind": "static_range_materialization",
+        "source": "K100 multi-size and boundary sweeps, 2026-09-10"
+      },
+      "config": {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 512,
+        "num_warps": 4,
+        "num_stages": 1,
+        "USE_MATRIX_LOAD_Q": false,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+        "amdgpu_enable_max_ilp_scheduling_strategy": false,
+        "misched_regpressure": true,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false,
+        "SPLIT_KV": 16
+      }
+    },
+    {
+      "match": {
+        "s_q_min": 4,
+        "s_q_max": 7,
+        "s_kv_min": 1024,
+        "s_kv_max": 131072,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 256,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "evidence": {
+        "kind": "static_range_materialization",
+        "source": "K100 multi-size and boundary sweeps, 2026-09-10"
+      },
+      "config": {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 512,
+        "num_warps": 4,
+        "num_stages": 1,
+        "USE_MATRIX_LOAD_Q": false,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+        "amdgpu_enable_max_ilp_scheduling_strategy": false,
+        "misched_regpressure": true,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false,
+        "SPLIT_KV": 16
+      }
+    },
+    {
+      "match": {
+        "s_q_min": 8,
+        "s_q_max": 14,
+        "s_kv_min": 1024,
+        "s_kv_max": 131072,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 256,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "evidence": {
+        "kind": "static_range_materialization",
+        "source": "K100 multi-size and boundary sweeps, 2026-09-10"
+      },
+      "config": {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 512,
+        "num_warps": 4,
+        "num_stages": 1,
+        "USE_MATRIX_LOAD_Q": false,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+        "amdgpu_enable_max_ilp_scheduling_strategy": false,
+        "misched_regpressure": true,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false,
+        "SPLIT_KV": 16
+      }
+    },
+    {
+      "match": {
+        "s_q_min": 15,
+        "s_q_max": 29,
+        "s_kv_min": 1024,
+        "s_kv_max": 131072,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 256,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "evidence": {
+        "kind": "static_range_materialization",
+        "source": "K100 multi-size and boundary sweeps, 2026-09-10"
+      },
+      "config": {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 256,
+        "num_warps": 4,
+        "num_stages": 1,
+        "USE_MATRIX_LOAD_Q": false,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+        "amdgpu_enable_max_ilp_scheduling_strategy": false,
+        "misched_regpressure": true,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false,
+        "SPLIT_KV": 8
+      }
+    },
+    {
+      "match": {
+        "s_q_min": 30,
+        "s_q_max": 48,
+        "s_kv_min": 1024,
+        "s_kv_max": 131072,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 256,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "evidence": {
+        "kind": "static_range_materialization",
+        "source": "K100 multi-size and boundary sweeps, 2026-09-10"
+      },
+      "config": {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 256,
+        "num_warps": 4,
+        "num_stages": 1,
+        "USE_MATRIX_LOAD_Q": false,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+        "amdgpu_enable_max_ilp_scheduling_strategy": false,
+        "misched_regpressure": true,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false,
+        "SPLIT_KV": 4
+      }
+    },
+    {
+      "match": {
+        "s_q_min": 49,
+        "s_q_max": 90,
+        "s_kv_min": 1024,
+        "s_kv_max": 131072,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 256,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "evidence": {
+        "kind": "static_range_materialization",
+        "source": "K100 multi-size and boundary sweeps, 2026-09-10"
+      },
+      "config": {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 256,
+        "num_warps": 4,
+        "num_stages": 1,
+        "USE_MATRIX_LOAD_Q": false,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+        "amdgpu_enable_max_ilp_scheduling_strategy": false,
+        "misched_regpressure": true,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false,
+        "SPLIT_KV": 2
+      }
+    },
+    {
+      "match": {
+        "s_q_min": 91,
+        "s_q_max": 128,
+        "s_kv_min": 1024,
+        "s_kv_max": 131072,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 256,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "evidence": {
+        "kind": "static_range_materialization",
+        "source": "K100 multi-size and boundary sweeps, 2026-09-10"
+      },
+      "config": {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 256,
+        "num_warps": 4,
+        "num_stages": 1,
+        "USE_MATRIX_LOAD_Q": false,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+        "amdgpu_enable_max_ilp_scheduling_strategy": false,
+        "misched_regpressure": true,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false,
+        "SPLIT_KV": 1
+      }
+    },
+    {
+      "match": {
+        "s_q_min": 1,
+        "s_q_max": 3,
+        "s_kv_min": 1024,
+        "s_kv_max": 131072,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 512,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "evidence": {
+        "kind": "static_range_materialization",
+        "source": "K100 multi-size and boundary sweeps, 2026-09-10"
+      },
+      "config": {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 512,
+        "num_warps": 4,
+        "num_stages": 1,
+        "USE_MATRIX_LOAD_Q": false,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+        "amdgpu_enable_max_ilp_scheduling_strategy": false,
+        "misched_regpressure": true,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false,
+        "SPLIT_KV": 32
+      }
+    },
+    {
+      "match": {
+        "s_q_min": 4,
+        "s_q_max": 7,
+        "s_kv_min": 1024,
+        "s_kv_max": 131072,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 512,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "evidence": {
+        "kind": "static_range_materialization",
+        "source": "K100 multi-size and boundary sweeps, 2026-09-10"
+      },
+      "config": {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 512,
+        "num_warps": 4,
+        "num_stages": 1,
+        "USE_MATRIX_LOAD_Q": false,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+        "amdgpu_enable_max_ilp_scheduling_strategy": false,
+        "misched_regpressure": true,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false,
+        "SPLIT_KV": 32
+      }
+    },
+    {
+      "match": {
+        "s_q_min": 8,
+        "s_q_max": 14,
+        "s_kv_min": 1024,
+        "s_kv_max": 131072,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 512,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "evidence": {
+        "kind": "static_range_materialization",
+        "source": "K100 multi-size and boundary sweeps, 2026-09-10"
+      },
+      "config": {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 256,
+        "num_warps": 4,
+        "num_stages": 1,
+        "USE_MATRIX_LOAD_Q": false,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+        "amdgpu_enable_max_ilp_scheduling_strategy": false,
+        "misched_regpressure": true,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false,
+        "SPLIT_KV": 16
+      }
+    },
+    {
+      "match": {
+        "s_q_min": 15,
+        "s_q_max": 29,
+        "s_kv_min": 1024,
+        "s_kv_max": 131072,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 512,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "evidence": {
+        "kind": "static_range_materialization",
+        "source": "K100 multi-size and boundary sweeps, 2026-09-10"
+      },
+      "config": {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 256,
+        "num_warps": 4,
+        "num_stages": 1,
+        "USE_MATRIX_LOAD_Q": false,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+        "amdgpu_enable_max_ilp_scheduling_strategy": false,
+        "misched_regpressure": true,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false,
+        "SPLIT_KV": 8
+      }
+    },
+    {
+      "match": {
+        "s_q_min": 30,
+        "s_q_max": 48,
+        "s_kv_min": 1024,
+        "s_kv_max": 131072,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 512,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "evidence": {
+        "kind": "static_range_materialization",
+        "source": "K100 multi-size and boundary sweeps, 2026-09-10"
+      },
+      "config": {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 256,
+        "num_warps": 4,
+        "num_stages": 1,
+        "USE_MATRIX_LOAD_Q": false,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+        "amdgpu_enable_max_ilp_scheduling_strategy": false,
+        "misched_regpressure": true,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false,
+        "SPLIT_KV": 4
+      }
+    },
+    {
+      "match": {
+        "s_q_min": 49,
+        "s_q_max": 90,
+        "s_kv_min": 1024,
+        "s_kv_max": 131072,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 512,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "evidence": {
+        "kind": "static_range_materialization",
+        "source": "K100 multi-size and boundary sweeps, 2026-09-10"
+      },
+      "config": {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 256,
+        "num_warps": 4,
+        "num_stages": 1,
+        "USE_MATRIX_LOAD_Q": false,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+        "amdgpu_enable_max_ilp_scheduling_strategy": false,
+        "misched_regpressure": true,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false,
+        "SPLIT_KV": 2
+      }
+    },
+    {
+      "match": {
+        "s_q_min": 91,
+        "s_q_max": 128,
+        "s_kv_min": 1024,
+        "s_kv_max": 131072,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 512,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "evidence": {
+        "kind": "static_range_materialization",
+        "source": "K100 multi-size and boundary sweeps, 2026-09-10"
+      },
+      "config": {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 256,
+        "num_warps": 4,
+        "num_stages": 1,
+        "USE_MATRIX_LOAD_Q": false,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+        "amdgpu_enable_max_ilp_scheduling_strategy": false,
+        "misched_regpressure": true,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false,
+        "SPLIT_KV": 1
+      }
+    },
+    {
+      "match": {
+        "s_q_min": 1,
+        "s_q_max": 3,
+        "s_kv_min": 1024,
+        "s_kv_max": 131072,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 1024,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "evidence": {
+        "kind": "static_range_materialization",
+        "source": "K100 multi-size and boundary sweeps, 2026-09-10"
+      },
+      "config": {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 512,
+        "num_warps": 4,
+        "num_stages": 1,
+        "USE_MATRIX_LOAD_Q": false,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+        "amdgpu_enable_max_ilp_scheduling_strategy": false,
+        "misched_regpressure": true,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false,
+        "SPLIT_KV": 64
+      }
+    },
+    {
+      "match": {
+        "s_q_min": 4,
+        "s_q_max": 7,
+        "s_kv_min": 1024,
+        "s_kv_max": 131072,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 1024,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "evidence": {
+        "kind": "static_range_materialization",
+        "source": "K100 multi-size and boundary sweeps, 2026-09-10"
+      },
+      "config": {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 256,
+        "num_warps": 4,
+        "num_stages": 1,
+        "USE_MATRIX_LOAD_Q": false,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+        "amdgpu_enable_max_ilp_scheduling_strategy": false,
+        "misched_regpressure": true,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false,
+        "SPLIT_KV": 32
+      }
+    },
+    {
+      "match": {
+        "s_q_min": 8,
+        "s_q_max": 14,
+        "s_kv_min": 1024,
+        "s_kv_max": 131072,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 1024,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "evidence": {
+        "kind": "static_range_materialization",
+        "source": "K100 multi-size and boundary sweeps, 2026-09-10"
+      },
+      "config": {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 256,
+        "num_warps": 4,
+        "num_stages": 1,
+        "USE_MATRIX_LOAD_Q": false,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+        "amdgpu_enable_max_ilp_scheduling_strategy": false,
+        "misched_regpressure": true,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false,
+        "SPLIT_KV": 16
+      }
+    },
+    {
+      "match": {
+        "s_q_min": 15,
+        "s_q_max": 29,
+        "s_kv_min": 1024,
+        "s_kv_max": 131072,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 1024,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "evidence": {
+        "kind": "static_range_materialization",
+        "source": "K100 multi-size and boundary sweeps, 2026-09-10"
+      },
+      "config": {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 256,
+        "num_warps": 4,
+        "num_stages": 1,
+        "USE_MATRIX_LOAD_Q": false,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+        "amdgpu_enable_max_ilp_scheduling_strategy": false,
+        "misched_regpressure": true,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false,
+        "SPLIT_KV": 8
+      }
+    },
+    {
+      "match": {
+        "s_q_min": 30,
+        "s_q_max": 48,
+        "s_kv_min": 1024,
+        "s_kv_max": 131072,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 1024,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "evidence": {
+        "kind": "static_range_materialization",
+        "source": "K100 multi-size and boundary sweeps, 2026-09-10"
+      },
+      "config": {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 256,
+        "num_warps": 4,
+        "num_stages": 1,
+        "USE_MATRIX_LOAD_Q": false,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+        "amdgpu_enable_max_ilp_scheduling_strategy": false,
+        "misched_regpressure": true,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false,
+        "SPLIT_KV": 4
+      }
+    },
+    {
+      "match": {
+        "s_q_min": 49,
+        "s_q_max": 90,
+        "s_kv_min": 1024,
+        "s_kv_max": 131072,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 1024,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "evidence": {
+        "kind": "static_range_materialization",
+        "source": "K100 multi-size and boundary sweeps, 2026-09-10"
+      },
+      "config": {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 256,
+        "num_warps": 4,
+        "num_stages": 1,
+        "USE_MATRIX_LOAD_Q": false,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+        "amdgpu_enable_max_ilp_scheduling_strategy": false,
+        "misched_regpressure": true,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false,
+        "SPLIT_KV": 2
+      }
+    },
+    {
+      "match": {
+        "s_q_min": 91,
+        "s_q_max": 128,
+        "s_kv_min": 1024,
+        "s_kv_max": 131072,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 1024,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "evidence": {
+        "kind": "static_range_materialization",
+        "source": "K100 multi-size and boundary sweeps, 2026-09-10"
+      },
+      "config": {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 256,
+        "num_warps": 4,
+        "num_stages": 2,
+        "USE_MATRIX_LOAD_Q": false,
+        "waves_per_eu": 2,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 2,
+        "amdgpu_enable_max_ilp_scheduling_strategy": false,
+        "misched_regpressure": true,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false,
+        "SPLIT_KV": 1
+      }
+    },
+    {
+      "match": {
+        "s_q_min": 1,
+        "s_q_max": 3,
+        "s_kv_min": 1024,
+        "s_kv_max": 131072,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 2048,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "evidence": {
+        "kind": "static_range_materialization",
+        "source": "K100 multi-size and boundary sweeps, 2026-09-10"
+      },
+      "config": {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 256,
+        "num_warps": 4,
+        "num_stages": 1,
+        "USE_MATRIX_LOAD_Q": false,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+        "amdgpu_enable_max_ilp_scheduling_strategy": false,
+        "misched_regpressure": true,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false,
+        "SPLIT_KV": 64
+      }
+    },
+    {
+      "match": {
+        "s_q_min": 4,
+        "s_q_max": 7,
+        "s_kv_min": 1024,
+        "s_kv_max": 131072,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 2048,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "evidence": {
+        "kind": "static_range_materialization",
+        "source": "K100 multi-size and boundary sweeps, 2026-09-10"
+      },
+      "config": {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 256,
+        "num_warps": 4,
+        "num_stages": 1,
+        "USE_MATRIX_LOAD_Q": false,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+        "amdgpu_enable_max_ilp_scheduling_strategy": false,
+        "misched_regpressure": true,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false,
+        "SPLIT_KV": 32
+      }
+    },
+    {
+      "match": {
+        "s_q_min": 8,
+        "s_q_max": 14,
+        "s_kv_min": 1024,
+        "s_kv_max": 131072,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 2048,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "evidence": {
+        "kind": "static_range_materialization",
+        "source": "K100 multi-size and boundary sweeps, 2026-09-10"
+      },
+      "config": {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 256,
+        "num_warps": 4,
+        "num_stages": 1,
+        "USE_MATRIX_LOAD_Q": false,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+        "amdgpu_enable_max_ilp_scheduling_strategy": false,
+        "misched_regpressure": true,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false,
+        "SPLIT_KV": 16
+      }
+    },
+    {
+      "match": {
+        "s_q_min": 15,
+        "s_q_max": 29,
+        "s_kv_min": 1024,
+        "s_kv_max": 131072,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 2048,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "evidence": {
+        "kind": "static_range_materialization",
+        "source": "K100 multi-size and boundary sweeps, 2026-09-10"
+      },
+      "config": {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 256,
+        "num_warps": 4,
+        "num_stages": 1,
+        "USE_MATRIX_LOAD_Q": false,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+        "amdgpu_enable_max_ilp_scheduling_strategy": false,
+        "misched_regpressure": true,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false,
+        "SPLIT_KV": 8
+      }
+    },
+    {
+      "match": {
+        "s_q_min": 30,
+        "s_q_max": 48,
+        "s_kv_min": 1024,
+        "s_kv_max": 131072,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 2048,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "evidence": {
+        "kind": "static_range_materialization",
+        "source": "K100 multi-size and boundary sweeps, 2026-09-10"
+      },
+      "config": {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 256,
+        "num_warps": 4,
+        "num_stages": 1,
+        "USE_MATRIX_LOAD_Q": false,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+        "amdgpu_enable_max_ilp_scheduling_strategy": false,
+        "misched_regpressure": true,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false,
+        "SPLIT_KV": 4
+      }
+    },
+    {
+      "match": {
+        "s_q_min": 49,
+        "s_q_max": 90,
+        "s_kv_min": 1024,
+        "s_kv_max": 131072,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 2048,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "evidence": {
+        "kind": "static_range_materialization",
+        "source": "K100 multi-size and boundary sweeps, 2026-09-10"
+      },
+      "config": {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 256,
+        "num_warps": 4,
+        "num_stages": 1,
+        "USE_MATRIX_LOAD_Q": false,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+        "amdgpu_enable_max_ilp_scheduling_strategy": false,
+        "misched_regpressure": true,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false,
+        "SPLIT_KV": 2
+      }
+    },
+    {
+      "match": {
+        "s_q_min": 91,
+        "s_q_max": 128,
+        "s_kv_min": 1024,
+        "s_kv_max": 131072,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 2048,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "evidence": {
+        "kind": "static_range_materialization",
+        "source": "K100 multi-size and boundary sweeps, 2026-09-10"
+      },
+      "config": {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 256,
+        "num_warps": 4,
+        "num_stages": 2,
+        "USE_MATRIX_LOAD_Q": false,
+        "waves_per_eu": 2,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 2,
+        "amdgpu_enable_max_ilp_scheduling_strategy": false,
+        "misched_regpressure": true,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false,
+        "SPLIT_KV": 1
+      }
+    },
+    {
+      "match": {
+        "s_q_min": 1,
+        "s_q_max": 3,
+        "s_kv_min": 1024,
+        "s_kv_max": 131072,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 16384,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "evidence": {
+        "kind": "static_range_materialization",
+        "source": "K100 multi-size and boundary sweeps, 2026-09-10"
+      },
+      "config": {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 256,
+        "num_warps": 4,
+        "num_stages": 1,
+        "USE_MATRIX_LOAD_Q": false,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+        "amdgpu_enable_max_ilp_scheduling_strategy": false,
+        "misched_regpressure": true,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false,
+        "SPLIT_KV": 64
+      }
+    },
+    {
+      "match": {
+        "s_q_min": 4,
+        "s_q_max": 7,
+        "s_kv_min": 1024,
+        "s_kv_max": 131072,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 16384,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "evidence": {
+        "kind": "static_range_materialization",
+        "source": "K100 multi-size and boundary sweeps, 2026-09-10"
+      },
+      "config": {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 256,
+        "num_warps": 4,
+        "num_stages": 1,
+        "USE_MATRIX_LOAD_Q": false,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+        "amdgpu_enable_max_ilp_scheduling_strategy": false,
+        "misched_regpressure": true,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false,
+        "SPLIT_KV": 32
+      }
+    },
+    {
+      "match": {
+        "s_q_min": 8,
+        "s_q_max": 14,
+        "s_kv_min": 1024,
+        "s_kv_max": 131072,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 16384,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "evidence": {
+        "kind": "static_range_materialization",
+        "source": "K100 multi-size and boundary sweeps, 2026-09-10"
+      },
+      "config": {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 256,
+        "num_warps": 4,
+        "num_stages": 1,
+        "USE_MATRIX_LOAD_Q": false,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+        "amdgpu_enable_max_ilp_scheduling_strategy": false,
+        "misched_regpressure": true,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false,
+        "SPLIT_KV": 16
+      }
+    },
+    {
+      "match": {
+        "s_q_min": 15,
+        "s_q_max": 29,
+        "s_kv_min": 1024,
+        "s_kv_max": 131072,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 16384,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "evidence": {
+        "kind": "static_range_materialization",
+        "source": "K100 multi-size and boundary sweeps, 2026-09-10"
+      },
+      "config": {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 256,
+        "num_warps": 4,
+        "num_stages": 1,
+        "USE_MATRIX_LOAD_Q": false,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+        "amdgpu_enable_max_ilp_scheduling_strategy": false,
+        "misched_regpressure": true,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false,
+        "SPLIT_KV": 8
+      }
+    },
+    {
+      "match": {
+        "s_q_min": 30,
+        "s_q_max": 48,
+        "s_kv_min": 1024,
+        "s_kv_max": 131072,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 16384,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "evidence": {
+        "kind": "static_range_materialization",
+        "source": "K100 multi-size and boundary sweeps, 2026-09-10"
+      },
+      "config": {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 256,
+        "num_warps": 4,
+        "num_stages": 1,
+        "USE_MATRIX_LOAD_Q": false,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+        "amdgpu_enable_max_ilp_scheduling_strategy": false,
+        "misched_regpressure": true,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false,
+        "SPLIT_KV": 4
+      }
+    },
+    {
+      "match": {
+        "s_q_min": 49,
+        "s_q_max": 90,
+        "s_kv_min": 1024,
+        "s_kv_max": 131072,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 16384,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "evidence": {
+        "kind": "static_range_materialization",
+        "source": "K100 multi-size and boundary sweeps, 2026-09-10"
+      },
+      "config": {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 256,
+        "num_warps": 4,
+        "num_stages": 1,
+        "USE_MATRIX_LOAD_Q": false,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+        "amdgpu_enable_max_ilp_scheduling_strategy": false,
+        "misched_regpressure": true,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false,
+        "SPLIT_KV": 2
+      }
+    },
+    {
+      "match": {
+        "s_q_min": 91,
+        "s_q_max": 128,
+        "s_kv_min": 1024,
+        "s_kv_max": 131072,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 16384,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "evidence": {
+        "kind": "static_range_materialization",
+        "source": "K100 multi-size and boundary sweeps, 2026-09-10"
+      },
+      "config": {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 256,
+        "num_warps": 4,
+        "num_stages": 2,
+        "USE_MATRIX_LOAD_Q": false,
+        "waves_per_eu": 2,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 2,
+        "amdgpu_enable_max_ilp_scheduling_strategy": false,
+        "misched_regpressure": true,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false,
+        "SPLIT_KV": 1
+      }
+    },
+    {
+      "match": {
+        "s_q_min": 10,
+        "s_q_max": 16,
+        "s_kv_min": 1024,
+        "s_kv_max": 131072,
+        "h_q": 48,
+        "h_kv": 1,
+        "topk": 16384,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "evidence": {
+        "kind": "static_range_materialization",
+        "source": "K100 multi-size and boundary sweeps, 2026-09-10"
+      },
+      "config": {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 256,
+        "num_warps": 4,
+        "num_stages": 1,
+        "USE_MATRIX_LOAD_Q": false,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+        "amdgpu_enable_max_ilp_scheduling_strategy": false,
+        "misched_regpressure": true,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false,
+        "SPLIT_KV": 4
+      }
+    },
     {
       "match": {
         "s_q_min": 65,
@@ -44,7 +1508,8 @@
         "amdgpu_enable_max_ilp_scheduling_strategy": false,
         "misched_regpressure": true,
         "optimize_epilogue": false,
-        "use_block_pingpong": false
+        "use_block_pingpong": false,
+        "SPLIT_KV": 1
       }
     },
     {
@@ -77,7 +1542,8 @@
         "amdgpu_enable_max_ilp_scheduling_strategy": false,
         "misched_regpressure": true,
         "optimize_epilogue": false,
-        "use_block_pingpong": false
+        "use_block_pingpong": false,
+        "SPLIT_KV": 1
       }
     }
   ]

@@ -59,32 +59,6 @@ def _device_identity(device: torch.device) -> tuple[str, str]:
     return arch, str(props.name)
 
 
-def _select_num_kv_splits(
-    base_ctas: int,
-    topk: int,
-    block_n: int,
-    compute_units: int,
-) -> int:
-    """Choose a bounded power-of-two split for low-occupancy launches.
-
-    The launch target and cutoffs are a finite K100_AI policy derived from
-    multi-size measurements. ``topk`` also caps the split so every partition
-    owns at least one ``BLOCK_N`` tile.
-    """
-    if base_ctas <= 0 or topk <= 0 or block_n <= 0 or compute_units <= 0:
-        return 1
-    if base_ctas * 5 <= compute_units * 2:
-        target = (compute_units + base_ctas - 1) // base_ctas
-        desired = min(64, 1 << (target - 1).bit_length())
-    elif base_ctas * 4 <= compute_units * 3:
-        desired = 2
-    else:
-        desired = 1
-    full_tiles = max(1, topk // block_n)
-    max_split = 1 << (full_tiles.bit_length() - 1)
-    return min(desired, max_split)
-
-
 def _supports_matrix_load(device: torch.device) -> bool:
     """Return whether the active HCU can use global-to-LDS matrix loads."""
     arch, _ = _device_identity(device)
@@ -549,8 +523,16 @@ def flash_mla_sparse_fwd(
     lse = torch.empty_like(max_logits)
 
     tuned = _get_tuned_config(q, kv, indices, d_v) if config is None else dict(config)
-    # Splitting the 512-dimensional content part keeps register use practical.
-    # The final 64 dimensions of the common 576 layout are RoPE.
+    block_dv = triton.next_power_of_2(d_v)
+    default_block_n = 16 if torch.version.hip is not None and d_qk >= 576 else 32
+    block_n = int(tuned.get("BLOCK_N", default_block_n))
+    block_h = int(tuned.get("BLOCK_H", 16))
+    heads_per_program = min(block_h, h_q // h_kv)
+    num_kv_splits = int(tuned.get("SPLIT_KV", 1))
+    if num_kv_splits not in (1, 2, 4, 8, 16, 32, 64, 128):
+        raise ValueError("SPLIT_KV must be a power of two from 1 through 128")
+    # The final 64 dimensions of the common 576 layout are RoPE. Device-specific
+    # QK tiling is selected statically by the finite config registry.
     if d_qk == 576:
         block_dmodel = int(tuned.get("BLOCK_DMODEL", 128))
         if block_dmodel not in (64, 128, 256, 512) or 512 % block_dmodel:
@@ -558,37 +540,10 @@ def flash_mla_sparse_fwd(
         dmodel_splits, block_dpe = 512 // block_dmodel, 64
     else:
         block_dmodel, dmodel_splits, block_dpe = triton.next_power_of_2(d_qk), 1, 0
-    block_dv = triton.next_power_of_2(d_v)
-    default_block_n = 16 if torch.version.hip is not None and d_qk >= 576 else 32
-    block_n = int(tuned.get("BLOCK_N", default_block_n))
-    block_h = int(tuned.get("BLOCK_H", 16))
-    heads_per_program = min(block_h, h_q // h_kv)
-    base_ctas = s_q * triton.cdiv(h_q, heads_per_program)
-    if "SPLIT_KV" in tuned:
-        num_kv_splits = int(tuned["SPLIT_KV"])
-        auto_split = False
-    else:
-        arch, device_name = _device_identity(q.device)
-        if arch == "gfx928" and _device_model(device_name) == "K100_AI":
-            props = torch.cuda.get_device_properties(q.device)
-            num_kv_splits = _select_num_kv_splits(
-                base_ctas,
-                indices.shape[2],
-                block_n,
-                int(props.multi_processor_count),
-            )
-        else:
-            num_kv_splits = 1
-        auto_split = True
-    if num_kv_splits not in (1, 2, 4, 8, 16, 32, 64, 128):
-        raise ValueError("SPLIT_KV must be a power of two from 1 through 128")
     num_warps = int(tuned.get("num_warps", 4))
-    if auto_split and num_kv_splits > 1:
-        num_stages = int(tuned.get("SPLIT_NUM_STAGES", 1))
-    else:
-        num_stages = int(
-            tuned.get("num_stages", 1 if torch.version.hip is not None else 2)
-        )
+    num_stages = int(
+        tuned.get("num_stages", 1 if torch.version.hip is not None else 2)
+    )
     use_matrix_load_q = bool(tuned.get("USE_MATRIX_LOAD_Q", False))
     use_matrix_load_q = use_matrix_load_q and _supports_matrix_load(q.device)
     grid = (s_q, triton.cdiv(h_q, heads_per_program), num_kv_splits)
@@ -621,11 +576,6 @@ def flash_mla_sparse_fwd(
         )
         for name in compiler_options:
             value = tuned.get(name)
-            if auto_split and num_kv_splits > 1:
-                split_defaults = {"waves_per_eu": 1, "kpack": 1}
-                value = tuned.get(
-                    f"SPLIT_{name.upper()}", split_defaults.get(name, value)
-                )
             if value is not None and capabilities.supports(name):
                 launch_options[name] = int(value)
     _flash_mla_sparse_fwd_kernel[grid](
