@@ -44,6 +44,7 @@ PRESET_CONFIGS: dict[str, dict[str, object]] = {
     }
 }
 DEFAULT_BATCH_SIZES = "1,2,4,8,16,24,32,64,128,256,512,1024,2048,4096,8192,16384,32768"
+DEFAULT_TOP_K = 8
 TEST_TYPES_SUPPORT_SHARED_EXPERTS = {"bf16", "fp8", "fp8_channel", "int8", "int8_channel"}
 TEST_TYPES_SUPPORT_BLOCK_SHAPE = {"fp8", "int8"}
 FIXED_GROUP_SIZE_BY_TEST: dict[str, int] = {
@@ -207,6 +208,8 @@ def build_expected_config_json_paths(
     num_shared_experts: int,
     ep_size: int,
     hidden_size_default: int,
+    ffn_hidden_size: int,
+    top_k: int,
     block_shape: tuple[int, int] | None,
 ) -> list[str]:
     paths: list[str] = []
@@ -222,6 +225,8 @@ def build_expected_config_json_paths(
                 test_type=test_type,
                 local_e=local_e,
                 local_n=local_n,
+                K=ffn_hidden_size,
+                top_k=top_k,
                 block_shape=block_shape,
             )
         except ValueError as exc:
@@ -526,6 +531,8 @@ def expected_json_names(
     test_type: str,
     local_e: int,
     local_n: int,
+    K: int,
+    top_k: int,
     block_shape: tuple[int, int] | None = None,
 ) -> tuple[str, str]:
     arch = DEVICE_ARCH_MAP[device_name]
@@ -558,7 +565,7 @@ def expected_json_names(
     else:  # pragma: no cover
         raise ValueError(f"未知 test_type: {test_type}")
 
-    base = f"E={local_e},N={local_n},arch={arch}"
+    base = f"E={local_e},N={local_n},K={K},topk={top_k},arch={arch}"
     return f"{base}{suffix0}.json", f"{base}{suffix1}.json"
 
 
@@ -956,6 +963,12 @@ def main() -> int:
         )
         return 1
 
+    effective_ffn_hidden_size = (
+        args.ffn_hidden_size
+        if args.ffn_hidden_size is not None
+        else DEFAULT_FFN_HIDDEN_SIZE_BY_TEST[args.test_type]
+    )
+    effective_top_k = args.top_k if args.top_k is not None else DEFAULT_TOP_K
     expected_config_jsons = build_expected_config_json_paths(
         log_root_dir=log_root_dir,
         device_name=args.device_name,
@@ -965,6 +978,8 @@ def main() -> int:
         num_shared_experts=args.num_shared_experts if supports_shared_experts else 0,
         ep_size=args.ep_size,
         hidden_size_default=args.hidden_size_default,
+        ffn_hidden_size=effective_ffn_hidden_size,
+        top_k=effective_top_k,
         block_shape=resolved_block_shape,
     )
 
@@ -1140,6 +1155,8 @@ def main() -> int:
             test_type=args.test_type,
             local_e=local_e,
             local_n=local_n,
+            K=current_ffn_hidden_size,
+            top_k=effective_top_k,
             block_shape=resolved_block_shape,
         )
         out_json0 = log_dir / expected_json0

@@ -1,50 +1,26 @@
 # Fused MoE 性能报告：BoltOPs vs Aiter
 
-> 更新于 2026-09-10：仅重测 BoltOPs，BMZ 7 组、NMZ 7 组，共 230 个 M 点，使用近期优化代码与更新后的 Triton 3.6 JSON。ASM、ASM Shuffle、HIPC/MOE_C 的耗时保留历史原值，未重跑；逐行提升与总览按新 BoltOPs 耗时重新计算。这些对比是跨日期参考，不是本轮同机同环境的成对测试。
+## 测试环境与口径
 
-> 原全量测试时间：2026-09-06。当时在 BMZ25 和 NMZ27 显式加载 `/zhenxin/triton3-moe-gemm1-opt` 的 `d2d4cc362079590b93a16acae41fbe6ff30425ad`，基于 `/zhenxin/BoltOPs` 的 `b0dc1ae8a336b40a259602075149b84c1a248b2b`，在两台机器上用 8 卡并行重新实测报告保留的全部 9 个 case。
+| 项目 | BMZ | NMZ |
+|---|---|---|
+| 机器 / 架构 | bmz25 / gfx936 | nmz27 / gfx938 |
+| BoltOPs 复测日期 | 2026-09-10 | 2026-09-10 |
+| Triton | 3.6，源码 `e770cbd31c32167ac7c8177174c57f0fcb0b3ecf` | 同左 |
+| Torch | 2.10.0 | 2.9.0 |
+| Aiter wheel | `aiter-0.1.5+das185.dtk2604.torch2100.2608131714.gb0979d` | 同左；部分补充结果使用 Torch 2.10 |
+| Routing | 真实 fused_topk，topk=8，无 shared expert | 同左 |
+| 计时 | CUDA Graph，5 次采样取中位数；JIT、输入准备、routing、weight shuffle 不计时 | 同左 |
 
-> 原全量测试的 BoltOPs HEAD 为 `b0dc1ae8a336b40a259602075149b84c1a248b2b`：先 cherry-pick `b67e520`，再 cherry-pick `b0dc1ae`。回归在 BMZ/gfx936 与 NMZ/gfx938 均为 `189 passed, 3 skipped`。
+- 测试 shape 取自 Aiter `op_tests/ci_tests` 的 fused-MoE 用例；N 表示 intermediate width，gated GEMM1 输出为 2N。
+- BoltOPs 使用真实 Triton 3.6 JSON 加载路径，两次 GEMM 的 `BLOCK_SIZE_M` 相同；M=32768 使用 chunk=32768。
+- 报告共包含 BMZ、NMZ 230 个 M 点。ASM、ASM Shuffle、HIPC/MOE_C 为历史实测值，因此跨日期结果仅作性能参考。
+- 正提升表示 BoltOPs 更快，计算公式为 `(Aiter - BoltOPs) / BoltOPs * 100%`。
+- Aiter block-wise MOE_C generic fallback 不符合 block-scale GEMM 语义，不纳入性能列。
 
-> 原全量测试版本的 Triton 包含 review 后的 8-wave BPP 扩展，BoltOPs 包含 large-M Triton 3.6 配置重训结果。BPP 候选只有在 GEMM1 胜出，并且 GEMM2 使用相同 `BLOCK_SIZE_M` 后的总时间仍胜出时才写入 config；默认 chunk 维持 32768。
+## Aiter backend 可用性
 
-本报告按机器整理：BMZ 7 个 case，NMZ 7 个 case。原有 9 组各覆盖 M=1、2、4、8、16、24、32、64、128、256、512、1024、2048、4096、8192、16384、32768；补充的 NMZ FP8 channel N128/N256 各覆盖至 M=16384；本轮再加入 BMZ 两组 INT8 block（各 17 点）与 NMZ 一组 INT8 block（11 点），共 230 点。
-其中 M=32768 使用新的默认 chunk=32768，其余 M 的执行口径不受该默认值变化影响。
-
-测试 shape 取自 Aiter `op_tests/ci_tests` 的 fused-MoE 用例；Aiter backend 查询、weight shuffle 与 `aiter_moe` 调用沿用 CI 路径。历史成对测试为保证同输入，报告 harness 生成一次真实 `fused_topk` routing，并同时交给 BoltOPs、ASM、ASM Shuffle 和 HIPC/MOE_C；CUDA Graph 只计 kernel，预处理与 shuffle 不计时。
-
-2026-09-06 的 NMZ 采样使用 Torch 2.9，而指定 wheel 标记为 Torch 2.10；当时为避免替换 NMZ 的 Torch，从该 wheel 自带源码一次性 JIT 重建了与 Torch 2.9 ABI 兼容的 Aiter 扩展，native config、CSV 与 HSACO 仍来自同一指定 wheel。BMZ 的历史 Aiter 测试直接使用 wheel 的预编译扩展。本轮仅运行 BoltOPs，原始 JSON 记录 BMZ 为 Torch 2.10、NMZ 为 Torch 2.9，不加载这些 Aiter provider，也没有替换 Torch。
-
-正提升表示 BoltOPs 更快，公式为 `(Aiter - BoltOPs) / BoltOPs * 100%`。ASM、ASM Shuffle、HIPC/MOE_C 分列展示；只要 provider 实际执行并返回有效时长就纳入性能统计，正确性诊断保留在原始 JSON 中，不用于隐藏可运行 provider。
-Aiter 的 block-wise MOE_C generic fallback 不符合 block-scale GEMM 语义，因此只保留在原始 JSON 作诊断，不纳入报告性能列。
-
-
-## 2026-09-10 BoltOPs 单独复测口径
-
-- 测试时的代码基线为 `BoltOPs-int8-block-bmz-opt` 的 `dafc179a3fdaa6062af6c053391348c0dc35522d`，叠加本轮已验证的 JSON 修改；测试后配置与报告合入该优化提交。使用真实配置加载路径，未在 benchmark 内强行替换已选 tile；两次 GEMM 的 BLOCK_SIZE_M 相同。
-- 使用与前一轮 config 定点复测一致的系统 Triton 3.6：源码 HEAD `e770cbd31c32167ac7c8177174c57f0fcb0b3ecf`，导入路径仍为 `triton3-staging`，没有修改系统路径或重新编译。实际动态库 SHA256、GPU 型号/UUID、物理卡号和逐 M 的配置均记录在原始 JSON。
-- 注意：这不是 9 月 9 日 BF16 专项测试使用的独立 `1e610c41` 编译器；因此新旧日期的差值不能全部归因于此次 BoltOPs/config 优化。NMZ 本轮为 Torch 2.9；9 月 7 日补充 FP8 N128/N256 的历史 Aiter 测试为 Torch 2.10。
-- N 表示 intermediate width，gated GEMM1 的输出为 2N、GEMM2 的 K=N。保持标准权重布局、SiLU、topk=8、无 shared expert、chunk=32768。BF16 输入/权重与 INT8/FP8 的输入/scale 生成沿用报告 helper；权重 seed=17，输入与 routing seed=1000+M。
-- routing 在计时外用 BoltOPs 的 Torch topk(softmax) + 归一化 helper 生成，未调用 Aiter MoE。对比历史数值时不声称输入/routing 与旧 Aiter 逐位一致。
-- 计时为完整 fused MoE 的 GPU 耗时：每个 CUDA Graph 10 次 workload，5 个采样取中位数；每样本 replay 数 M≤512 为 20，1024～4096 为 8，8192～32768 为 3。JIT、输入准备、routing 与正确性检查均在计时外。
-- 230 点均检查有限输出及重复执行一致性；配置变化的点另与旧 JSON 的当前代码输出比较，满足 abs(diff)≤0.1+0.02×abs(ref)、relative L2<0.002。此前 config/复用回归为 103 passed。本轮没有重新验证 Aiter 正确性。
-- ASM/Aiter 耗时列逐字保留：BMZ BF16 来自 2026-09-09；原报告其他组来自 2026-09-06；补充 FP8 N128/N256 来自 2026-09-07。FP8 N128 的历史 Aiter 在 NMZ19，本轮 BoltOPs 在 NMZ27，属于跨机器参考。
-
-[本轮逐 M 原始数据、配置、TTGIR/AMDGcn 与复测脚本](../../../../temp/moe_report_boltops_refresh_20260910.gq6oSS/)。[此前同代码、旧新 JSON 的独立 A/B 证据](../../../../temp/moe_config36_narrow_recheck_20260910.mApngV/results.md)。
-
-全目录检查后，报告中受新增配置改动影响的 BMZ BF16 E256/N256/K3072、M8 已再次刷新；其他已有行的配置未再变化。[该行最终配置复测](../../../../temp/moe_report_after_full_config_20260910.t0VPxe/)。E257 FP8 block 的真实 shape 与最终选型以[全目录最终结果](../../../../temp/moe_config36_full_coverage_20260910.TQ2VmA/results.md)为准，替代前一轮 K/topk 不匹配的结论。
-
-### INT8 block 补充口径
-
-BMZ 的 E256/N128、N256/K7168 使用 block [128,128]，各测 M=1～32768 的 17 点；NMZ E256/N256/K7168 按配置文件实际覆盖的 11 个 M 点（1～1024）测试，未把继承配置写成已训练条目。本轮只运行优化工作树的 BoltOPs，真实加载该工作树的 Triton 3.6 JSON；不调用 Aiter，不重新调优 ASM。
-
-BMZ 的 ASM/ASM Shuffle 沿用 2026-09-06 同 shape、topk=8 的实测中位数；这是跨日期参考，不是本轮同环境成对测试。历史正确性诊断使用较宽容差（atol=100、rtol=0.01），不能当作本轮严格正确性验证。MOE_C generic fallback 不符合 block-scale 语义，不列入性能对比。NMZ 未找到同 shape 的历史 Aiter 实测，因此记为“未测”，不解释成硬件或 backend 不支持。
-
-[INT8 block 本轮数据、配置和 TTGIR/AMDGcn](../../../../temp/moe_int8_block_report_20260910.vUfVHf/)；[BMZ 历史 Aiter 原始数据](../../../../BoltOPs/.tune_runs/performance_report_sparse_decode_20260906/bmz/)。
-
-## Aiter native backend 支持概览（历史测试 wheel）
-
-Aiter 先按数据/量化类型和 channel-wise/block-wise 布局选择 backend，再按 GPU 架构、E/N/K、topk 和 M 查找 native config。下表的“支持*”表示存在该 backend 路径，不保证报告中的每个具体 shape 都有 config。
+“支持*”表示存在对应 backend，不保证每个具体 shape 都有 native config。
 
 | 数据类型 | 量化/布局 | ASM（原始权重） | ASM Shuffle Weight | HIPC/MOE_C | MOE_C 权重布局 |
 |---|---|---:|---:|---:|---|
@@ -54,38 +30,9 @@ Aiter 先按数据/量化类型和 channel-wise/block-wise 布局选择 backend�
 | INT8 | W8A8 block [128,128] | BMZ 两组有实测 | BMZ 两组有实测 | generic fallback 语义不匹配，不纳入 | — |
 | FP8 | W8A8 block [128,128] | 支持* | 支持*（独立 shuffle CSV） | 当前 wheel 的 block-wise 策略不支持 | — |
 
-ASM 与 ASM Shuffle 使用独立 solution table。HIPC/MOE_C 只有预 Shuffle 口径；报告不包含 INT4。
+ASM 与 ASM Shuffle 使用独立 solution table；HIPC/MOE_C 只有预 Shuffle 口径。本报告不包含 INT4。
 
 ## BMZ（BW200）
-
-- 机器：bw25（BW200, UBB BW1000）
-- BoltOPs：2026-09-10 复测；代码/编译器与配置版本见上方本轮口径。
-- Aiter 历史耗时：BF16 为 2026-09-09，INT8 为 2026-09-06。
-- Aiter wheel：`aiter-0.1.5+das185.dtk2604.torch2100.2608131714.gb0979d`
-- Aiter CI 源码 commit：`304c9419ef552debb18e0ab9c9dc80d6df1a2a13`
-- Torch：2.10.0
-- Routing：真实 fused_topk routing，topk=8，不带 shared expert
-- 计时：CUDA Graph，每个 provider 采样 5 次并取中位数；weight shuffle 在计时外
-
-### 历史记录：2026-09-09 BF16 数据刷新口径
-
-本轮仅刷新下面 3 组 BF16，M 仍覆盖 1～32768 的全部 17 点。表中均为**完整 fused MoE 的 GPU 耗时**，不是单独 GEMM1 或 GEMM2，也不包含 Python/JIT 开销；N 表示中间维度，gated GEMM1 的实际输出宽度为 2N。INT8 的现有 FP16 输出口径不走本次软件 BF16 转换，未重测。
-
-- BMZ25/gfx936，80 CU；物理 GPU 0、2、1 分别执行 E128/N384、E256/N128、E256/N256。每组在同一张卡先测旧编译器，再测新编译器；系统 Triton 导入路径和正式 config JSON 均未修改。
-- 新编译器只增加 FP32→BF16 RTNE 成对打包；对照使用其父版本 `e770cbd31`。两边加载同一份最新 BoltOPs，未启用先前已撤回的 mask、内联转换、Gluon 或转置实验。
-- 原报告入口引用的辅助目录已删除，本轮用现存 helper 恢复测试入口。明确固定 BF16 标准权重，weight seed=17、正态标准差 0.1；输入 seed=1000+M、标准差 0.1；真实 fused_topk、topk=8、renormalize=True。每次比较的 BoltOPs 与 Aiter 共用输入和 routing。
-- 保留原 JSON 逐 M 的 Aiter solution ID/配置，shuffle 在计时外；每个 CUDA Graph 包含 10 次 workload，每个 provider 采样 5 次取中位数。每次采样 replay 数：M≤512 为 20，1024～4096 为 8，8192～32768 为 3。默认 chunk=32768；两次 GEMM 的 BLOCK_SIZE_M 一致。
-- 51/51 点的新旧编译器输入、routing 与完整输出 SHA256 一致；本轮可运行 Aiter provider 的正确性检查均通过。跨日期旧表与本轮的差值不能全部归因于该编译器提交；评价本次优化应看下面的同日 A/B。
-
-同日 A/B 的 M=8192 摘要（us，正值表示新编译器更快，公式 `旧/新 - 1`；小幅变化仍可能含计时波动）：
-
-| Case | 旧编译器 BoltOPs | 新编译器 BoltOPs | 加速比提升 |
-|---|---:|---:|---:|
-| BF16 / E128 / N384 / K4096 | 4707.4025 | 4636.0641 | +1.54% |
-| BF16 / E256 / N128 / K7168 | 5018.2261 | 4918.3965 | +2.03% |
-| BF16 / E256 / N256 / K3072 | 3270.9938 | 3216.3595 | +1.70% |
-
-[本轮原始 JSON、测试入口和 TTGIR/LLVM IR/AMDGcn 产物](../../../../temp/bmz_bf16_report_refresh_20260909/)。这里的编译器同日 A/B 摘要作为历史记录保留；下方逐 M 表与 BMZ 总览现已更新为 2026-09-10 的 BoltOPs 实测。
 
 ### BMZ 总览
 
@@ -225,8 +172,6 @@ HIPC/MOE_C 不可用：`no native config`。
 
 #### 6. INT8 block [128,128] / E256 / N128 / K7168
 
-完整 fused MoE GPU 耗时，不是 GEMM1 单独耗时。GEMM1/GEMM2 的 BLOCK_SIZE_M 一致。
-
 | M | BoltOPs (us) | ASM (us) | vs ASM | ASM Shuffle (us) | vs ASM Shuffle |
 |---:|---:|---:|---:|---:|---:|
 | 1 | 39.1496 | 51.4248 | +31.35% | 50.6936 | +29.49% |
@@ -247,16 +192,7 @@ HIPC/MOE_C 不可用：`no native config`。
 | 16384 | 7178.3254 | 7466.1748 | +4.01% | 7356.5481 | +2.48% |
 | 32768 | 13770.9015 | 14336.0474 | +4.10% | 14137.9720 | +2.67% |
 
-当前 M=8192 的已选配置（其余 M 的完整配置见原始 JSON）：
-
-| 阶段 | BM×BN×BK | waves / stages | COMBINE_SCALE_LOAD | N_TILES_PER_CTA |
-|---|---|---|---|---:|
-| GEMM1 | 64×256×128 | 4 / 1 | false | 1 |
-| GEMM2 | 64×128×128 | 4 / 1 | false | 2 |
-
 #### 7. INT8 block [128,128] / E256 / N256 / K7168
-
-完整 fused MoE GPU 耗时，不是 GEMM1 单独耗时。GEMM1/GEMM2 的 BLOCK_SIZE_M 一致。
 
 | M | BoltOPs (us) | ASM (us) | vs ASM | ASM Shuffle (us) | vs ASM Shuffle |
 |---:|---:|---:|---:|---:|---:|
@@ -278,24 +214,7 @@ HIPC/MOE_C 不可用：`no native config`。
 | 16384 | 11139.4257 | 9894.9107 | -11.17% | 9526.2085 | -14.48% |
 | 32768 | 21427.6957 | 18831.2154 | -12.12% | 18198.4172 | -15.07% |
 
-当前 M=8192 的已选配置（其余 M 的完整配置见原始 JSON）：
-
-| 阶段 | BM×BN×BK | waves / stages | COMBINE_SCALE_LOAD | N_TILES_PER_CTA |
-|---|---|---|---|---:|
-| GEMM1 | 64×256×128 | 4 / 1 | false | 1 |
-| GEMM2 | 64×128×128 | 4 / 1 | false | 1 |
-
 ## NMZ（BW1100）
-
-- 机器：nmz27（BW1100）
-- BoltOPs：2026-09-10 复测；代码/编译器与配置版本见上方本轮口径。
-- Aiter 历史耗时：原有 4 组为 2026-09-06，补充 FP8 N128/N256 为 2026-09-07。
-- Aiter wheel：`aiter-0.1.5+das185.dtk2604.torch2100.2608131714.gb0979d`
-- Aiter CI 源码 commit：`304c9419ef552debb18e0ab9c9dc80d6df1a2a13`
-- Torch：本轮 BoltOPs 为 2.9.0（以原始 JSON 为准）；补充 FP8 N128/N256 的历史 Aiter 测试为 2.10.0。
-- Routing：真实 fused_topk routing，topk=8，不带 shared expert
-- 计时：CUDA Graph，每个 provider 采样 5 次并取中位数；weight shuffle 在计时外
-
 
 ### NMZ 总览
 
@@ -412,9 +331,8 @@ ASM 不可用：`no native config`。
 
 ### FP8 channel N128/N256 补充结果
 
-2026-09-07 新增 `E=256,K=7168,N=128/256` 两组 Triton 3.6 配置，均按 M=1、2、4、8、16、24、32、64、128、256、512、1024、2048、4096、8192、16384 共 16 点训练，不训练 M=32768。训练和测试均显式使用 `/zhenxin/triton3-staging`（commit `9009a1e50246a6d8f3f8d3720d2fb06fc6680290`）、普通 JIT（`TRITON_FAST_JIT=0`）、Torch 2.10 和指定的 Aiter wheel；未使用源码版 Aiter。
-
-N=128 在 NMZ19 完成训练与成对测试；N=256 在 NMZ27 完成训练与成对测试。每个 provider 采样 5 次并取中位数，weight shuffle 在计时外。原始 JSON 保留当时各 provider 的正确性诊断。下表 BoltOPs 已于 2026-09-10 在 NMZ27 重测，Aiter 历史值未变；N128 为 NMZ19 历史 Aiter 与 NMZ27 当前 BoltOPs 的跨机器参考。
+两组均覆盖 M=1～16384 的 16 个点。N128 的 BoltOPs 在 NMZ27、Aiter 在
+NMZ19，属于跨机器参考；N256 均在 NMZ27。
 
 | Config | M 范围 | vs ASM 胜出 | vs ASM 平均提升 | vs ASM Shuffle 胜出 | vs ASM Shuffle 平均提升 | vs HIPC/MOE_C（预 Shuffle）胜出 | vs HIPC/MOE_C（预 Shuffle）平均提升 |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -468,8 +386,6 @@ N=128 在 NMZ19 完成训练与成对测试；N=256 在 NMZ27 完成训练与成
 
 #### INT8 block [128,128] / E256 / N256 / K7168
 
-完整 fused MoE GPU 耗时，不是 GEMM1 单独耗时。GEMM1/GEMM2 的 BLOCK_SIZE_M 一致。
-
 Aiter：未重跑，未找到该 shape 的历史实测，不能给出加速比。
 
 | M | BoltOPs (us) | Aiter |
@@ -486,28 +402,22 @@ Aiter：未重跑，未找到该 shape 的历史实测，不能给出加速比�
 | 512 | 1289.0932 | 未测 |
 | 1024 | 1731.0623 | 未测 |
 
-当前 M=1024 的已选配置（其余 M 的完整配置见原始 JSON）：
-
-| 阶段 | BM×BN×BK | waves / stages | COMBINE_SCALE_LOAD | N_TILES_PER_CTA |
-|---|---|---|---|---:|
-| GEMM1 | 64×64×128 | 8 / 2 | true | 1 |
-| GEMM2 | 64×128×128 | 4 / 1 | false | 1 |
-
 ## 全目录配置检查结果
 
-本报告与优化代码、配置修改一同维护在 `BoltOPs-int8-block-bmz-opt` 工作树。检查范围不限于报告中的 case：原有 64 个 Triton 3.6 JSON，加从主目录纳入本提交的 4 个 JSON，工作树现共 68 个。已完成原有 149 点之外的 301 个 M 点定点 PK，共 450 点；候选只围绕 COMBINE、single-K、N_TILES_PER_CTA，非全空间 autotune。
+| 检查项 | 结果 |
+|---|---|
+| Triton 3.6 配置文件 | 132 个：68 个精确 K/topk，64 个 `KMin/KMod` 模糊配置 |
+| Triton 3.2 配置文件 | 122 个低优先级 `KMin/KMod` 模糊配置 |
+| K selector | 不使用 `KMax`；精确匹配优先；K=1232/topk=1 仅精确匹配 |
+| 配置 JSON 与 Gemm1/Gemm2 配对 | 通过 |
+| 原 68 个 Triton 3.6 配置定点性能检查 | 450 个 M 点；累计修改 11 个 JSON、66 个 M 条目 |
+| 不纳入定点性能检查 | 82 个非候选点；17 个 gfx936 FP8 点 |
+| 配置相关回归 | 103 passed |
+| fused-MoE 完整测试 | 411 passed，33 skipped |
 
-另有 82 个 M 点不在此次相关候选范围内（N768/N1536，未扩展到 BK>512 的新 tile 搜索），17 个属于 gfx936 不支持的 FP8 配置；这些只完成适用性检查，不计作性能实测。
+### `--benchmark` CLI 回归
 
-本轮新增 16 个条目通过两份 routing 的真实 JSON 加载、correctness 和完整 MoE A/B，均 >1% 且每份至少 9/11 样本胜出。E257 FP8 block 按真实 K6144/topk8 复核：M2048 撤回此前关闭 COMBINE 的修改；M4096 经独立复测确认 true 有收益，保留 true。两轮累计修改 11 个 JSON、66 个 M 条目。所有 BM 保持不变，两次 GEMM 的 BM 一致；相关回归 103 passed。配置与报告随优化代码统一提交。
-
-报告中受影响的行已按最终配置更新，ASM/Aiter 历史值未动。[最终配置变化和逐 M A/B](../../../../temp/moe_config36_full_coverage_20260910.TQ2VmA/results.md)；[完整目录、逐 M 候选与训练记录来源](../../../../temp/moe_config36_full_coverage_20260910.TQ2VmA/coverage.md)。
-
-### 纳入主目录原有的两组配置
-
-- BMZ BF16：E128/N192/K4096、topk=8，对应 GEMM1/GEMM2 两个 JSON。
-- NMZ INT8 channel：E160/N320/K3072、topk=8，对应 GEMM1/GEMM2 两个 JSON。
-
-两组均覆盖 M=1～32768 的 17 个已训练点，已计入上述全目录定点 PK；没有候选达到落盘条件，保留主目录原配置值，不新增调参结论。本次将这 4 个 JSON 纳入同一优化提交，便于 cherry-pick，未修改主目录原文件。前述“11 个 JSON、66 个 M 条目”是已有配置的调优修改，不包含这 4 个原值导入文件。
-
-导入后在 BMZ25、NMZ27 各通过正式 JSON 加载路径复测 17 点：34/34 点输出有限、重复执行一致，且与原已测快照强制选型的输出逐位一致；所有 GEMM1/GEMM2 的 BLOCK_SIZE_M 匹配。仅运行 BoltOPs，未重跑 ASM/Aiter，未更换系统 Triton。[导入验证、配置快照与 TTGIR/AMDGcn](../../../../temp/moe_config36_import_extra4_20260910.PJTaER/)。
+| 机器 | Shape | M 范围 | 配置加载 | 结果 |
+|---|---|---|---|---|
+| BMZ/gfx936 | BF16 E128/N192/K4096/topk8 | 1～32768（17 个） | Triton 3.6 精确配置 | 17 passed |
+| NMZ/gfx938 | FP8 channel E256/N320/K7168/topk8 | 1～32768（17 个） | Triton 3.6 精确配置 | 17 passed |

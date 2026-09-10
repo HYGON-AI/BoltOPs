@@ -286,8 +286,8 @@ def resolve_boltops_moe_config_dir() -> Path:
 def main():
     # 默认使用autotune_v5.log作为日志文件和默认输出JSON文件名
     log_file = "autotune_v5.log"
-    output_json1 = "E=256,N=256,arch=gfx936.json"
-    output_json2 = "E=256,N=256,arch=gfx936,is_bottom=True.json"
+    output_json1 = "E=256,N=256,K=7168,topk=8,arch=gfx936.json"
+    output_json2 = "E=256,N=256,K=7168,topk=8,arch=gfx936,is_bottom=True.json"
 
     # 解析命令行参数
     if len(sys.argv) > 1:

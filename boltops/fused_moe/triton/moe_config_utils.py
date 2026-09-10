@@ -23,13 +23,171 @@ def get_config_file_name(E: int,
                          N: int,
                          dtype: Optional[str],
                          block_shape: Optional[list[int]] = None,
-			 is_bottom: bool = False) -> str:
+                         is_bottom: bool = False,
+                         K: Optional[int] = None,
+                         top_k: Optional[int] = None) -> str:
+    if (K is None) != (top_k is None):
+        raise ValueError("K and top_k must be specified together")
     arch = arch_info.get_arch()
+    shape_selector = "" if K is None else f",K={K},topk={top_k}"
     dtype_selector = "" if not dtype else f",dtype={dtype}"
     is_bottom_selector = ("" if is_bottom == False else ",is_bottom=True")
     block_shape_selector = ("" if not block_shape or not all(block_shape) else
                             f",block_shape={block_shape}").replace(" ", "")
-    return f"E={E},N={N},arch={arch}{dtype_selector}{is_bottom_selector}{block_shape_selector}.json"  # noqa: E501
+    return f"E={E},N={N}{shape_selector},arch={arch}{dtype_selector}{is_bottom_selector}{block_shape_selector}.json"  # noqa: E501
+
+
+def _config_file_suffix(
+    dtype: Optional[str],
+    block_shape: Optional[list[int]],
+    is_bottom: bool,
+) -> str:
+    arch = arch_info.get_arch()
+    dtype_selector = "" if not dtype else f",dtype={dtype}"
+    is_bottom_selector = "" if not is_bottom else ",is_bottom=True"
+    block_shape_selector = (
+        ""
+        if not block_shape or not all(block_shape)
+        else f",block_shape={block_shape}"
+    ).replace(" ", "")
+    return f",arch={arch}{dtype_selector}{is_bottom_selector}{block_shape_selector}.json"
+
+
+def _parse_selector_set(value: str) -> Optional[tuple[int, ...]]:
+    try:
+        values = tuple(sorted({int(item) for item in value.split("-")}))
+    except ValueError:
+        return None
+    return values or None
+
+
+def _parse_dimension_selector(
+    fields: dict[str, str],
+    key: str,
+) -> Optional[tuple[str, tuple[int, ...]]]:
+    exact_key = key
+    set_key = f"{key}Set"
+    min_key = f"{key}Min"
+    max_key = f"{key}Max"
+    mod_key = f"{key}Mod"
+
+    modes = sum(
+        (
+            exact_key in fields,
+            set_key in fields,
+            any(item in fields for item in (min_key, max_key, mod_key)),
+        )
+    )
+    if modes != 1:
+        return None
+
+    try:
+        if exact_key in fields:
+            value = int(fields[exact_key])
+            return ("exact", (value,)) if value > 0 else None
+        if set_key in fields:
+            values = _parse_selector_set(fields[set_key])
+            return ("set", values) if values and all(v > 0 for v in values) else None
+
+        if min_key not in fields:
+            return None
+        minimum = int(fields[min_key])
+        modulus = int(fields.get(mod_key, "1"))
+        if minimum <= 0 or modulus <= 0:
+            return None
+
+        # K fuzzy matching intentionally has no upper bound: KMin/KMod names
+        # a reusable arithmetic family rather than one closed interval.
+        if key == "K":
+            if max_key in fields or mod_key not in fields:
+                return None
+            return "lower_mod", (minimum, modulus)
+
+        if max_key not in fields:
+            return None
+        maximum = int(fields[max_key])
+        if maximum < minimum:
+            return None
+        first_multiple = ((minimum + modulus - 1) // modulus) * modulus
+        if first_multiple > maximum:
+            return None
+        return "range", (minimum, maximum, modulus)
+    except ValueError:
+        return None
+
+
+def _parse_config_selector(fragment: str) -> Optional[dict[str, Any]]:
+    fields: dict[str, str] = {}
+    allowed = {
+        "K", "KSet", "KMin", "KMod",
+        "topk", "topkSet", "topkMin", "topkMax", "topkMod",
+    }
+    for item in fragment.split(","):
+        if "=" not in item:
+            return None
+        key, value = item.split("=", 1)
+        if key not in allowed or key in fields or not value:
+            return None
+        fields[key] = value
+
+    k_selector = _parse_dimension_selector(fields, "K")
+    topk_selector = _parse_dimension_selector(fields, "topk")
+    if k_selector is None or topk_selector is None:
+        return None
+    return {"K": k_selector, "topk": topk_selector}
+
+
+def _selector_matches(selector: tuple[str, tuple[int, ...]], value: int) -> bool:
+    kind, values = selector
+    if kind == "exact":
+        return value == values[0]
+    if kind == "set":
+        return value in values
+    if kind == "lower_mod":
+        minimum, modulus = values
+        return value >= minimum and value % modulus == 0
+    minimum, maximum, modulus = values
+    return minimum <= value <= maximum and value % modulus == 0
+
+
+def _selector_specificity(selector: dict[str, Any]) -> tuple[int, ...]:
+    kind_rank = {"exact": 4, "set": 3, "range": 2, "lower_mod": 1}
+
+    def dimension_score(item: tuple[str, tuple[int, ...]]) -> tuple[int, int, int]:
+        kind, values = item
+        if kind == "exact":
+            cardinality = 1
+            lower_bound = values[0]
+        elif kind == "set":
+            cardinality = len(values)
+            lower_bound = min(values)
+        elif kind == "lower_mod":
+            minimum, modulus = values
+            # Prefer the more restrictive modulus and then the higher lower
+            # bound if custom selector families overlap.
+            return kind_rank[kind], modulus, minimum
+        else:
+            minimum, maximum, modulus = values
+            first_multiple = ((minimum + modulus - 1) // modulus) * modulus
+            cardinality = (maximum - first_multiple) // modulus + 1
+            lower_bound = minimum
+        return kind_rank[kind], -cardinality, lower_bound
+
+    k_rank, k_cardinality, k_lower_bound = dimension_score(selector["K"])
+    topk_rank, topk_cardinality, topk_lower_bound = dimension_score(
+        selector["topk"]
+    )
+    # K changes both GEMM shapes, so use it as the tie-breaker when two
+    # overlapping selectors have the same total specificity.
+    return (
+        k_rank + topk_rank,
+        k_rank,
+        topk_rank,
+        k_cardinality,
+        topk_cardinality,
+        k_lower_bound,
+        topk_lower_bound,
+    )
 
 def get_config_dtype_str(
         dtype: torch.dtype,
@@ -163,6 +321,8 @@ def get_moe_configs(
     block_n: Optional[int] = None,
     block_k: Optional[int] = None,
     is_bottom: bool = False,
+    K: Optional[int] = None,
+    top_k: Optional[int] = None,
 ) -> Optional[dict[int, Any]]:
     """
     Return optimized configurations for the fused MoE kernel.
@@ -173,14 +333,27 @@ def get_moe_configs(
     be picked and the associated configuration chosen to invoke the kernel.
     """
 
-    # First look up if an optimized configuration is available in the current
-    # Triton capability directory, then fall back to lower capabilities.
+    if (K is None) != (top_k is None):
+        raise ValueError("K and top_k must be specified together")
+
+    # Prefer an exact K/topk match, then a validated fuzzy selector, and only
+    # then a legacy file without either selector.  Within each match tier the
+    # current Triton capability remains preferred over lower capabilities.
     block_shape = [block_n, block_k] if block_n and block_k else None
-    json_file_name = get_config_file_name(E, N, dtype, block_shape, is_bottom)
+    legacy_json_file_name = get_config_file_name(
+        E, N, dtype, block_shape, is_bottom
+    )
     config_dirs = get_compatible_triton_config_dirs(
         _TRITON_CONFIGS_DIR, get_triton_capabilities()
     )
-    config_file_path = config_dirs[0] / json_file_name
+    requested_json_file_name = (
+        get_config_file_name(
+            E, N, dtype, block_shape, is_bottom, K=K, top_k=top_k
+        )
+        if K is not None and top_k is not None
+        else legacy_json_file_name
+    )
+    config_file_path = config_dirs[0] / requested_json_file_name
 
     def _load_config(config_path: Path) -> Optional[dict[int, Any]]:
         try:
@@ -202,29 +375,120 @@ def get_moe_configs(
             return None
         return {int(key): val for key, val in config_data.items()}
 
-    candidate_names = [json_file_name]
-    if is_bottom:
-        # Preserve the existing bottom -> top config fallback within each
-        # capability directory.
-        candidate_names.append(get_config_file_name(E, N, dtype, block_shape))
-
-    # For EP mode, local experts may not match a config file. Try the nearest
-    # supported power-of-two expert count within each capability directory.
-    nearestE = closest_power_of_two(E, dtype)
-    if nearestE != E:
-        candidate_names.append(
-            get_config_file_name(nearestE, N, dtype, block_shape, is_bottom)
+    def _load_selector_pair(
+        config_dir: Path,
+        candidate_e: int,
+        selector_fragment: str,
+    ) -> Optional[dict[int, Any]]:
+        prefix = f"E={candidate_e},N={N},{selector_fragment}"
+        top_path = config_dir / (
+            prefix + _config_file_suffix(dtype, block_shape, False)
         )
-
-    for config_dir in config_dirs:
-        for candidate_name in candidate_names:
-            candidate_path = config_dir / candidate_name
+        # New selector families are anchored by the Gemm1 file.  Ignoring a
+        # bottom-only family prevents Gemm1/Gemm2 from selecting different
+        # K/topk families and then violating their shared BLOCK_SIZE_M rule.
+        if not top_path.exists():
+            return None
+        paths = [top_path]
+        if is_bottom:
+            bottom_path = config_dir / (
+                prefix + _config_file_suffix(dtype, block_shape, True)
+            )
+            paths = [bottom_path, top_path]
+        for candidate_path in paths:
             if not candidate_path.exists():
                 continue
             logger.info("Using configuration from %s for MoE layer.", candidate_path)
             loaded_cfg = _load_config(candidate_path)
             if loaded_cfg is not None:
                 return loaded_cfg
+        return None
+
+    def _fuzzy_selectors(
+        config_dir: Path,
+        candidate_e: int,
+    ) -> list[tuple[tuple[int, ...], str]]:
+        prefix = f"E={candidate_e},N={N},"
+        suffix = _config_file_suffix(dtype, block_shape, False)
+        matches: list[tuple[tuple[int, ...], str]] = []
+        for candidate_path in config_dir.glob(f"E={candidate_e},N={N},*.json"):
+            name = candidate_path.name
+            if not name.startswith(prefix) or not name.endswith(suffix):
+                continue
+            fragment = name[len(prefix):-len(suffix)]
+            selector = _parse_config_selector(fragment)
+            if selector is None:
+                continue
+            if not _selector_matches(selector["K"], K):
+                continue
+            if not _selector_matches(selector["topk"], top_k):
+                continue
+            # The exact/exact spelling has already been checked directly.
+            if selector["K"][0] == "exact" and selector["topk"][0] == "exact":
+                continue
+            matches.append((_selector_specificity(selector), fragment))
+        matches.sort(reverse=True)
+        return matches
+
+    # For EP mode, local experts may not match a config file. Try the nearest
+    # supported power-of-two expert count after all exact-E choices.
+    nearestE = closest_power_of_two(E, dtype)
+    expert_counts = [E] + ([nearestE] if nearestE != E else [])
+
+    for candidate_e in expert_counts:
+        if K is not None and top_k is not None:
+            exact_fragment = f"K={K},topk={top_k}"
+            for config_dir in config_dirs:
+                loaded_cfg = _load_selector_pair(
+                    config_dir, candidate_e, exact_fragment
+                )
+                if loaded_cfg is not None:
+                    return loaded_cfg
+
+            fuzzy_candidates: list[
+                tuple[tuple[int, ...], int, Path, str]
+            ] = []
+            for capability_index, config_dir in enumerate(config_dirs):
+                for specificity, fragment in _fuzzy_selectors(
+                    config_dir, candidate_e
+                ):
+                    fuzzy_candidates.append(
+                        (specificity, -capability_index, config_dir, fragment)
+                    )
+            fuzzy_candidates.sort(
+                key=lambda item: (item[1], item[0], item[3]), reverse=True
+            )
+            for _, _, config_dir, fragment in fuzzy_candidates:
+                loaded_cfg = _load_selector_pair(
+                    config_dir, candidate_e, fragment
+                )
+                if loaded_cfg is not None:
+                    return loaded_cfg
+
+        # Legacy files remain a compatibility fallback.  They carry no claim
+        # that the original tune covered the caller's K or topk.
+        legacy_names = [
+            get_config_file_name(
+                candidate_e, N, dtype, block_shape, is_bottom
+            )
+        ]
+        if is_bottom:
+            legacy_names.append(
+                get_config_file_name(candidate_e, N, dtype, block_shape)
+            )
+        for config_dir in config_dirs:
+            for candidate_name in legacy_names:
+                candidate_path = config_dir / candidate_name
+                if not candidate_path.exists():
+                    continue
+                logger.info(
+                    "Using legacy configuration without K/topk selector from %s "
+                    "for MoE layer.",
+                    candidate_path,
+                )
+                loaded_cfg = _load_config(candidate_path)
+                if loaded_cfg is not None:
+                    return loaded_cfg
 
     # If no optimized configuration is available, we will use the default
     # configuration
@@ -260,9 +524,25 @@ def try_get_optimal_moe_config(
         if is_gated:
             N = N // 2
 
+    # K in the config selector is the model hidden size used by the tune CLI.
+    # Gemm1 INT4 weights pack two logical K values into each storage element;
+    # Gemm2 keeps the model hidden size in w2.shape[1].
+    config_k = K
+    if not is_bottom and dtype in ("int4_w4a16", "int4_w4a8"):
+        config_k *= 2
+
     block_n = block_shape[0] if block_shape else 0
     block_k = block_shape[1] if block_shape else 0
-    configs = get_moe_configs(E, N, dtype, block_n, block_k, is_bottom)
+    configs = get_moe_configs(
+        E,
+        N,
+        dtype,
+        block_n,
+        block_k,
+        is_bottom,
+        K=config_k,
+        top_k=top_k,
+    )
 
     if configs and dtype == "int4_w4a8" and block_k > 0:
         configs = {

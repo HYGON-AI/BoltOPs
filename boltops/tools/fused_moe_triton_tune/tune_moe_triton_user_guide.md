@@ -70,7 +70,8 @@
 > | `yy` | `gfx92a` |
 >
 > 例：`boltops-fused-moe-tune-cli nmz bf16` → 生成/期望
-> `E=...,N=...,arch=gfx938.json`；日志目录仍为 `logs_nmz_bf16_tp*`。
+> `E=...,N=...,K=...,topk=...,arch=gfx938.json`；日志目录仍为
+> `logs_nmz_bf16_tp*`。
 
 ### 2.1 Triton capability
 
@@ -148,9 +149,8 @@ boltops-fused-moe-tune-cli nmz int8_channel
 在框架运行日志中，先检查是否命中已存在的 MoE config：
 
 ```text
-[boltops] Using default MoE config. Performance might be sub-optimal! Config file not found at /usr/local/lib/python3.10/dist-packages/boltops/fused_moe/triton/configs/triton_3_6/E=512,N=168,arch=gfx936.json
-[2026-04-20 17:44:46 TP7] Using default MoE config. Performance might be sub-optimal! Config file not found at /usr/local/lib/python3.10/dist-packages/boltops/fused_moe/triton/configs/triton_3_6/E=512,N=168,arch=gfx936.json
-[boltops] Using configuration from /usr/local/lib/python3.10/dist-packages/boltops/fused_moe/triton/configs/triton_3_2/E=512,N=336,arch=gfx936,is_bottom=True.json for MoE layer.
+[boltops] Using default MoE config. Performance might be sub-optimal! Config file not found at /usr/local/lib/python3.10/dist-packages/boltops/fused_moe/triton/configs/triton_3_6/E=512,N=168,K=4096,topk=8,arch=gfx936.json
+[boltops] Using configuration from /usr/local/lib/python3.10/dist-packages/boltops/fused_moe/triton/configs/triton_3_2/E=512,N=336,KMin=2048,KMod=1024,topk=8,arch=gfx936,is_bottom=True.json for MoE layer.
 ```
 
 判断规则：
@@ -315,8 +315,8 @@ boltops-fused-moe-tune-cli nmz int8 --kill
 
 配置 JSON 文件名使用 `arch=`（由站点码映射，见 §2），例如：
 
-- `E=256,N=384,arch=gfx938.json`
-- `E=256,N=384,arch=gfx938,is_bottom=True.json`
+- `E=256,N=384,K=4096,topk=8,arch=gfx938.json`
+- `E=256,N=384,K=4096,topk=8,arch=gfx938,is_bottom=True.json`
 
 启动时会打印 `Effective Config`，包括：
 
@@ -346,7 +346,9 @@ boltops-fused-moe-tune-cli nmz int8 --kill
 ### Q4：如何判断训练参数与运行时配置是否一致
 
 > **重点检查**
-> `log.training` / `log.training_tp*` 中打印的 `expected_config_jsons`（例如 `E=...,N=...,arch=...json` 和 `...,is_bottom=True.json`）就是本次将生成并供框架运行时使用的配置文件名。
+> `log.training` / `log.training_tp*` 中打印的 `expected_config_jsons`（例如
+> `E=...,N=...,K=...,topk=...,arch=...json` 和 `...,is_bottom=True.json`）
+> 就是本次将生成并供框架运行时使用的精确配置文件名。
 >
 > **如果这组名字与运行时实际加载的配置名不一致，通常说明训练参数（如 `test_type/TP/N/block_shape`）设置不匹配，应先对齐参数再训练。**
 
