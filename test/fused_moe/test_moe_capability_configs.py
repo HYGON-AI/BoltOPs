@@ -1,5 +1,6 @@
 import json
 import importlib
+import re
 from pathlib import Path
 
 import pytest
@@ -8,6 +9,7 @@ from triton.runtime.errors import HSACOError
 from boltops.fused_moe.triton import moe_config_utils
 from boltops.tools.fused_moe_triton_tune import moe_log_parser
 from boltops.tools.fused_moe_triton_tune import autotune_patches
+from boltops.tools.fused_moe_triton_tune import tune_moe_cli
 from boltops.utility.triton_capability import TritonCapabilities
 
 
@@ -66,6 +68,139 @@ def test_lower_capability_never_reads_higher_config(monkeypatch, tmp_path):
     _write_config(config_root, "3.6", file_name, "higher")
 
     assert moe_config_utils.get_moe_configs(256, 256, None) is None
+
+
+def test_exact_k_topk_match_precedes_newer_legacy_config(monkeypatch, tmp_path):
+    config_root = _load_configs(monkeypatch, tmp_path, "3.6")
+    legacy_name = "E=256,N=128,arch=gfx936,dtype=int8_w8a8.json"
+    exact_name = (
+        "E=256,N=128,K=7168,topk=8,arch=gfx936,dtype=int8_w8a8.json"
+    )
+    _write_config(config_root, "3.6", legacy_name, "newer-legacy")
+    _write_config(config_root, "3.2", exact_name, "lower-exact")
+
+    loaded = moe_config_utils.get_moe_configs(
+        256, 128, "int8_w8a8", K=7168, top_k=8
+    )
+    assert loaded == {1: {"marker": "lower-exact"}}
+
+
+def test_fuzzy_k_topk_selector_and_legacy_fallback(monkeypatch, tmp_path):
+    config_root = _load_configs(monkeypatch, tmp_path, "3.6")
+    fuzzy_name = (
+        "E=256,N=128,KMin=4096,KMod=1024,topkSet=4-8,"
+        "arch=gfx936,dtype=int8_w8a8.json"
+    )
+    legacy_name = "E=256,N=128,arch=gfx936,dtype=int8_w8a8.json"
+    _write_config(config_root, "3.6", fuzzy_name, "fuzzy")
+    _write_config(config_root, "3.6", legacy_name, "legacy")
+
+    assert moe_config_utils.get_moe_configs(
+        256, 128, "int8_w8a8", K=7168, top_k=8
+    ) == {1: {"marker": "fuzzy"}}
+    assert moe_config_utils.get_moe_configs(
+        256, 128, "int8_w8a8", K=7168, top_k=4
+    ) == {1: {"marker": "fuzzy"}}
+    assert moe_config_utils.get_moe_configs(
+        256, 128, "int8_w8a8", K=3584, top_k=8
+    ) == {1: {"marker": "legacy"}}
+    assert moe_config_utils.get_moe_configs(
+        256, 128, "int8_w8a8", K=7168, top_k=2
+    ) == {1: {"marker": "legacy"}}
+
+
+def test_newer_fuzzy_config_precedes_more_specific_old_fuzzy(monkeypatch, tmp_path):
+    config_root = _load_configs(monkeypatch, tmp_path, "3.6")
+    newer = (
+        "E=256,N=128,KMin=4096,KMod=1024,topkSet=4-8,"
+        "arch=gfx936,dtype=int8_w8a8.json"
+    )
+    older = (
+        "E=256,N=128,KSet=6144-7168,topk=8,"
+        "arch=gfx936,dtype=int8_w8a8.json"
+    )
+    _write_config(config_root, "3.6", newer, "newer-broad")
+    _write_config(config_root, "3.2", older, "older-narrow")
+
+    loaded = moe_config_utils.get_moe_configs(
+        256, 128, "int8_w8a8", K=7168, top_k=8
+    )
+    assert loaded == {1: {"marker": "newer-broad"}}
+
+
+@pytest.mark.parametrize(
+    "fragment",
+    (
+        "KMin=4096,topk=8",
+        "KMin=1,KMod=0,topk=8",
+        "KMin=4096,KMax=8192,KMod=1024,topk=8",
+        "K=4096,KSet=4096-7168,topk=8",
+    ),
+)
+def test_invalid_shape_selector_is_rejected(fragment):
+    assert moe_config_utils._parse_config_selector(fragment) is None
+
+
+def test_kmin_kmod_selector_has_no_upper_bound():
+    selector = moe_config_utils._parse_config_selector(
+        "KMin=4096,KMod=1024,topk=8"
+    )
+    assert selector is not None
+    assert moe_config_utils._selector_matches(selector["K"], 4096)
+    assert moe_config_utils._selector_matches(selector["K"], 16384)
+    assert not moe_config_utils._selector_matches(selector["K"], 4608)
+
+
+def test_k_topk_are_part_of_config_cache_key(monkeypatch, tmp_path):
+    config_root = _load_configs(monkeypatch, tmp_path, "3.6")
+    for K, marker in ((4096, "k4096"), (7168, "k7168")):
+        name = (
+            f"E=256,N=128,K={K},topk=8,arch=gfx936,"
+            "dtype=int8_w8a8.json"
+        )
+        _write_config(config_root, "3.6", name, marker)
+
+    assert moe_config_utils.get_moe_configs(
+        256, 128, "int8_w8a8", K=4096, top_k=8
+    ) == {1: {"marker": "k4096"}}
+    assert moe_config_utils.get_moe_configs(
+        256, 128, "int8_w8a8", K=7168, top_k=8
+    ) == {1: {"marker": "k7168"}}
+
+
+def test_k1232_topk1_config_is_exact_only(monkeypatch, tmp_path):
+    config_root = _load_configs(monkeypatch, tmp_path, "3.6")
+    exact_name = "E=392,N=1536,K=1232,topk=1,arch=gfx936.json"
+    _write_config(config_root, "3.6", exact_name, "exact-only")
+
+    assert moe_config_utils.get_moe_configs(
+        392, 1536, None, K=1232, top_k=1
+    ) == {1: {"marker": "exact-only"}}
+    assert moe_config_utils.get_moe_configs(
+        392, 1536, None, K=1248, top_k=1
+    ) is None
+    assert moe_config_utils.get_moe_configs(
+        392, 1536, None, K=1232, top_k=2
+    ) is None
+
+
+def test_tune_cli_names_exact_k_and_topk_configs():
+    top, bottom = tune_moe_cli.expected_json_names(
+        device_name="bmz",
+        test_type="int8_channel",
+        local_e=256,
+        local_n=128,
+        K=7168,
+        top_k=8,
+    )
+
+    assert top == (
+        "E=256,N=128,K=7168,topk=8,arch=gfx936,dtype=int8_w8a8.json"
+    )
+    assert bottom == (
+        "E=256,N=128,K=7168,topk=8,arch=gfx936,dtype=int8_w8a8,"
+        "is_bottom=True.json"
+    )
 
 
 def _autotune_log(
@@ -583,6 +718,63 @@ def test_checked_in_triton_3_6_configs_are_sorted_by_batch_size():
             continue
         keys = list(json.loads(path.read_text(encoding="utf-8")))
         assert keys == sorted(keys, key=int), f"{path.name} is not numerically sorted"
+
+
+def test_checked_in_moe_configs_have_explicit_shape_selectors():
+    config_root = (
+        Path(__file__).resolve().parents[2]
+        / "boltops"
+        / "fused_moe"
+        / "triton"
+        / "configs"
+    )
+
+    for version in ("triton_3_2", "triton_3_6"):
+        paths = sorted((config_root / version).glob("*.json"))
+        assert paths
+        selector_kinds = set()
+        top_families = set()
+        bottom_families = set()
+        shapes: dict[str, set[str]] = {}
+        shape_paths: dict[str, list[str]] = {}
+
+        for path in paths:
+            match = re.match(r"^(E=\d+,N=\d+),(.*)(,arch=.*\.json)$", path.name)
+            assert match, f"unexpected MoE config name: {path.name}"
+            selector = moe_config_utils._parse_config_selector(match.group(2))
+            assert selector is not None, f"invalid shape selector: {path.name}"
+            assert "KMax=" not in path.name
+
+            kind = (
+                "exact"
+                if selector["K"][0] == selector["topk"][0] == "exact"
+                else "fuzzy"
+            )
+            selector_kinds.add(kind)
+            if kind == "fuzzy":
+                assert selector["K"][0] == "lower_mod"
+            family = match.group(1) + match.group(3)
+            normalized_family = family.replace(",is_bottom=True", "")
+            if ",is_bottom=True" in family:
+                bottom_families.add(normalized_family)
+            else:
+                top_families.add(normalized_family)
+            shapes.setdefault(normalized_family, set()).add(kind)
+            shape_paths.setdefault(normalized_family, []).append(path.name)
+
+        assert top_families == bottom_families
+        if version == "triton_3_2":
+            assert selector_kinds == {"fuzzy"}
+        else:
+            assert selector_kinds == {"exact", "fuzzy"}
+            for family, kinds in shapes.items():
+                if kinds == {"exact"}:
+                    assert all(
+                        ",K=1232,topk=1," in name
+                        for name in shape_paths[family]
+                    ), f"unexpected exact-only 3.6 config family: {family}"
+                else:
+                    assert kinds == {"exact", "fuzzy"}
 
 
 def test_autotune_skips_unloadable_hip_candidate():

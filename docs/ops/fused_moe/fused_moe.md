@@ -148,6 +148,64 @@ wheel、普通安装和 editable 安装均可在任意目录执行，日志写�
 
 [`tune_moe_triton_user_guide.md`](../../../boltops/tools/fused_moe_triton_tune/tune_moe_triton_user_guide.md)
 
+### 3.1 K/topk 配置选择
+
+新生成的调优文件同时记录模型 hidden size `K` 和路由 `topk`，例如：
+
+```text
+E=256,N=128,K=7168,topk=8,arch=gfx936,dtype=int8_w8a8.json
+```
+
+运行时按以下顺序选择：精确 `K/topk`、经过跨 shape 验证的模糊 selector、
+不带 `K/topk` 的 legacy 配置、默认启发式配置。同一匹配层级内优先使用
+当前 Triton capability，再回退到较低版本。
+
+模糊 selector 必须同时约束 K 和 topk，支持显式集合，以及无上界的
+`KMin/KMod` 算术族：
+
+```text
+# 仅匹配列出的 K 和 topk
+KSet=4096-6144-7168,topkSet=4-8
+
+# 匹配 K >= 4096、K % 1024 == 0，且 topk=8
+KMin=4096,KMod=1024,topk=8
+```
+
+新 tune 结果默认保存为精确 selector。只有在目标 K/topk 集合上完成正确性和
+性能复测后，且相对各自精确最优配置的退化不超过 8%，才应合并为模糊
+selector。精确 selector 始终优先于模糊 selector。
+
+仓库中的 Triton 3.6 配置同时保留精确 selector 和对应的 K 模糊
+selector。K 模糊 selector 从估算并验证过的下界开始，按 `KMod` 向上匹配，
+不设置 `KMax`；当前模糊配置仍把 topk 约束为训练值 `8`。解析器支持
+`topkSet` 和有界 topk
+范围，但只有专项复测满足 8% 门槛后才应使用。特殊的 K=1232/topk=1
+模型不做任何模糊匹配，只保留精确 selector。
+Triton 3.2 的历史配置缺少可靠的训练 shape 元数据，因此仅作为较低优先级的
+K 模糊回退：`KMin=2048,KMod=1024,topk=8`。
+
+当前 Triton 3.6 配置使用的范围如下：
+
+| 精确 K/topk | 对应模糊 K | 对应模糊 topk |
+|---|---|---|
+| 1232/1 | 无，只精确匹配 | 无，只精确匹配 |
+| 3072/8 | `K>=2048`，`KMod=1024` | `8` |
+| 4096/8 | `K>=3072`，`KMod=1024` | `8` |
+| 6144/8 | `K>=5120`，`KMod=1024` | `8` |
+| 7168/8 | `K>=6144`，`KMod=1024` | `8` |
+
+代表性验证使用真实 routing、无 shared expert，并将模糊配置与目标 shape 的
+完整 autotune 精确最优配置逐 M 比较：
+
+| 设备 / 类型 | 配置复用 | 验证 M | 最大退化 | 结论 |
+|---|---|---|---:|---|
+| BMZ gfx936 / BF16 E128 N192 | K4096/topk8 → K3072/topk8 | 1、16、256、2048、8192、16384 | 5.46% | 通过，据此设置 K 模糊下界与步长 |
+| NMZ gfx938 / FP8 channel E256 N320 | K7168/topk8 → K8192/topk4 | 1、16、256、2048、8192、16384 | 21.42%（M=1） | 不通过，不开放 topk4 模糊匹配 |
+
+NMZ 失败项中，除 M=1 外其余各点退化为 4.79%、1.07%、-0.81%、0.37%、
+-1.17%，但范围判定取逐 M 最坏值，因此仍按失败处理。该验证用于控制范围，
+不把临时生成的 K8192/topk4 精确配置提交到仓库。
+
 ## 附录 A. 仓库文件
 
 | 用途              | 文件                                                                                               |
