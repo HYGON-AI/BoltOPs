@@ -212,7 +212,7 @@
         "BLOCK_SIZE_N": 128,
         "BLOCK_SIZE_K": 128,
         "GROUP_SIZE_M": 1,
-        "COMBINE_SCALE_LOAD": false,
+        "COMBINE_SCALE_LOAD": true,
         "USE_MLS_LOAD": true,
         "schedule_hint": "none",
         "sched_latency": "none",
