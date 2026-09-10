@@ -20,7 +20,6 @@ from boltops.mla import flash_mla_sparse_fwd
 from boltops.mla.triton.flash_mla_sparse import (
     _config_match_score,
     _device_model,
-    _select_num_kv_splits,
     _supports_matrix_load,
 )
 
@@ -130,8 +129,15 @@ def test_flash_mla_sparse_tuned_config_schema():
         assert len(matches) == len(set(matches))
         for entry in data["configs"]:
             assert "dtype" in entry["match"]
-            assert entry["latency_ms"] > 0
-            assert entry["speedup"] > 0
+            if "latency_ms" in entry or "speedup" in entry:
+                assert entry["latency_ms"] > 0
+                assert entry["speedup"] > 0
+            else:
+                assert entry["evidence"]["kind"] == "static_range_materialization"
+            if metadata["device_name"] == "K100_AI":
+                assert "SPLIT_KV" in entry["config"]
+                assert "SPLIT_KV_POLICY" not in entry["config"]
+                assert "ONE_TILE_BLOCK_DMODEL" not in entry["config"]
 
 
 def test_tuned_config_range_matching_and_specificity():
@@ -142,6 +148,58 @@ def test_tuned_config_range_matching_and_specificity():
     exact_score = _config_match_score({"s_q": 4, "topk": 2048}, shape)
     assert exact_score is not None and range_score is not None
     assert exact_score > range_score
+
+
+@pytest.mark.parametrize(
+    ("s_q", "h_q", "topk", "split_kv", "block_dmodel"),
+    [
+        (1, 16, 128, 8, 512),
+        (29, 16, 128, 8, 512),
+        (30, 16, 128, 4, 256),
+        (1, 16, 512, 32, 512),
+        (7, 16, 512, 32, 512),
+        (8, 16, 512, 16, 256),
+        (24, 16, 16384, 8, 256),
+        (48, 16, 16384, 4, 256),
+        (49, 16, 16384, 2, 256),
+        (90, 16, 16384, 2, 256),
+        (91, 16, 16384, 1, 256),
+        (16, 48, 16384, 4, 256),
+        (96, 16, 16384, 1, 256),
+    ],
+)
+def test_k100_static_tuned_configs(
+    s_q: int, h_q: int, topk: int, split_kv: int, block_dmodel: int
+):
+    path = (
+        Path(__file__).parents[2]
+        / "boltops"
+        / "mla"
+        / "triton"
+        / "configs"
+        / "triton_3_6"
+        / "flash_mla_sparse_gfx928_K100_AI.json"
+    )
+    entries = json.loads(path.read_text(encoding="utf-8"))["configs"]
+    shape = {
+        "s_q": s_q,
+        "s_kv": 131072,
+        "h_q": h_q,
+        "h_kv": 1,
+        "topk": topk,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16",
+    }
+    matches = [
+        (_config_match_score(entry["match"], shape), entry["config"])
+        for entry in entries
+    ]
+    selected = max(
+        (item for item in matches if item[0] is not None), key=lambda item: item[0]
+    )
+    assert selected[1]["SPLIT_KV"] == split_kv
+    assert selected[1]["BLOCK_DMODEL"] == block_dmodel
 
 
 def test_device_model_excludes_platform_description():
@@ -186,26 +244,6 @@ def test_unmatched_tuned_config_warns_once(monkeypatch):
         sparse_module._get_tuned_config(q, kv, indices, 512)
     assert len(caught) == 1
     assert "does not match the current shape" in str(caught[0].message)
-
-
-@pytest.mark.parametrize(
-    ("base_ctas", "topk", "expected"),
-    [
-        (1, 512, 32),
-        (1, 16384, 64),
-        (2, 16384, 64),
-        (8, 16384, 16),
-        (16, 16384, 8),
-        (32, 16384, 4),
-        (48, 16384, 4),
-        (56, 16384, 2),
-        (88, 16384, 2),
-        (96, 16384, 1),
-        (1, 15, 1),
-    ],
-)
-def test_select_num_kv_splits(base_ctas: int, topk: int, expected: int):
-    assert _select_num_kv_splits(base_ctas, topk, 16, 120) == expected
 
 
 @GPU_REQUIRED

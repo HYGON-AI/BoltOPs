@@ -36,6 +36,9 @@ python scripts/benchmarks/triton/benchmark_flash_mla_sparse.py -h
 
 ### Sparse FlashMLA benchmark 与 autotune
 
+K100_AI sparse MLA 的详细多尺寸性能记录见
+[`mla_sparse_performance.md`](mla_sparse_performance.md)。
+
 测试环境：Triton 3.6.0、HIP 6.3、BW200 UBB BW1000（gfx936）、BF16。
 下表为 `100 ms warmup + 500 ms repeat` 的 median；baseline 使用迁入时的
 默认配置，tuned 使用随包发布的 size-specific config。
