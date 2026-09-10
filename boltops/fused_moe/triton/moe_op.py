@@ -1240,9 +1240,51 @@ def _fused_moe_kernel_repr(specialization):
         return "fused_moe_kernel"
 
 
+def _n_tile_reuse_error(args):
+    """Return the shared launch/autotune rejection reason for two N tiles."""
+    if not 0 < args['K'] <= args['BLOCK_SIZE_K']:
+        return "requires a single K tile (0 < K <= BLOCK_SIZE_K)"
+    if args['N'] <= args['BLOCK_SIZE_N']:
+        return "requires more than one N tile"
+    if args.get('USE_MLS_LOAD') or args.get('bottom_a_use_mls_load'):
+        return "does not support MLS loads"
+    if args.get('COMBINE_SCALE_LOAD'):
+        return "does not support COMBINE_SCALE_LOAD"
+    if args.get('use_block_pingpong'):
+        return "has no pipelined K loop for BlockPingpong"
+    if args.get('SPLIT_K', 0) > 1 or args.get('persistent', False):
+        return "is supported only by the regular non-Split-K kernel"
+    if any(args.get(flag, False) for flag in (
+        'use_fp8_w8a8', 'use_int8_w8a16', 'use_int4_w4a16',
+        'use_int4_w4a8', 'use_mxfp4_w4a4',
+    )):
+        return "supports only INT8 block/channel and weighted BF16"
+    group_n, group_k = args.get('group_n', 0), args.get('group_k', 0)
+    if args.get('use_int8_w8a8'):
+        if group_n > 0 and group_k > 0:
+            if not args.get('MUL_ROUTED_WEIGHT'):
+                return "INT8 block requires MUL_ROUTED_WEIGHT to preserve rounding"
+            if group_k % args['BLOCK_SIZE_K'] != 0:
+                return "requires BLOCK_SIZE_K to divide the quantization group"
+            return None
+        if group_n == 0 and group_k == 0 and args.get('per_channel_quant'):
+            if args.get('num_warps', 4) != 4:
+                return "INT8 channel requires 4 waves to preserve FP16 rounding"
+            return None
+    elif args.get('compute_type') == tl.bfloat16 and args.get('MUL_ROUTED_WEIGHT'):
+        return None
+    return "supports only INT8 block/channel and weighted BF16"
+
+
 @triton.heuristics(values={
     'block_k_diviable': lambda nargs: nargs['K'] % (nargs['BLOCK_SIZE_K']) == 0,
     'block_n_diviable': lambda nargs: nargs['N'] % nargs['BLOCK_SIZE_N'] == 0,
+    # Specialize ordinary one-tile reductions, regardless of dtype or epilogue.
+    # Loop removal can enable scale/conversion or dot/bias fusion; validate
+    # with numerical tolerances rather than bitwise-identical rounding.
+    'single_k_tile': lambda nargs: (
+        not nargs['COMBINE_SCALE_LOAD'] and 0 < nargs['K'] <= nargs['BLOCK_SIZE_K']
+    ),
 })
 @triton.jit(repr=_fused_moe_kernel_repr)
 def fused_moe_kernel(
@@ -1313,6 +1355,8 @@ def fused_moe_kernel(
     NUM_XCDS: tl.constexpr,
     SCALE_BIAS_WITH_ROUTED_WEIGHT: tl.constexpr,
     ADD_BIAS: tl.constexpr,
+    single_k_tile: tl.constexpr,
+    N_TILES_PER_CTA: tl.constexpr = 1,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -1341,6 +1385,8 @@ def fused_moe_kernel(
     multiplication across different blocks processed by the same expert.
     """
 
+    tl.static_assert(N_TILES_PER_CTA == 1 or N_TILES_PER_CTA == 2,
+                     "N_TILES_PER_CTA must be 1 or 2")
     tl.assume(stride_am >= 0)
     tl.assume(stride_ak >= 0)
     tl.assume(stride_be >= 0)
@@ -1387,7 +1433,11 @@ def fused_moe_kernel(
         num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
 
     num_pid_m = tl.cdiv(num_tokens_post_padded, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    REUSE_N_TILES: tl.constexpr = N_TILES_PER_CTA == 2
+    if REUSE_N_TILES:
+        num_pid_n = tl.cdiv(N, 2 * BLOCK_SIZE_N)
+    else:
+        num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
     GRID_MN = num_pid_n * num_pid_m
     if pid < GRID_MN:
@@ -1431,6 +1481,115 @@ def fused_moe_kernel(
     else:
         a_scale_row = a_row
         a_scale_mask = token_mask
+
+    if REUSE_N_TILES:
+        # The short reduction has one A tile. Keep it and the route metadata
+        # across two independent N tiles; sorting and BLOCK_SIZE_M do not change.
+        # Load these shared inputs once, before the N-tile loop.
+        offs_k = tl.arange(0, BLOCK_SIZE_K)
+        if USE_ADDR_OFFSET_INT64_A:
+            a_ptrs = a_ptr + (
+                a_row[:, None].to(tl.int64) * stride_am
+                + offs_k[None, :].to(tl.int64) * stride_ak
+            )
+        else:
+            a_ptrs = a_ptr + (
+                a_row[:, None] * stride_am + offs_k[None, :] * stride_ak
+            ).to(tl.int32)
+        # Sorted A has allocated padding rows; unsorted A needs the token mask.
+        if a_sorted:
+            a_mask = tl.full((BLOCK_SIZE_M, BLOCK_SIZE_K), True, tl.int1)
+        else:
+            a_mask = tl.broadcast_to(token_mask[:, None], (BLOCK_SIZE_M, BLOCK_SIZE_K))
+        if not block_k_diviable:
+            a_mask = a_mask & (offs_k[None, :] < K)
+        a = tl.load(a_ptrs, mask=a_mask, other=0)
+        if use_int8_w8a8:
+            scale_row = offs_token_id if a_sorted else source_token
+            a_scale = tl.load(
+                a_scale_ptr + scale_row * stride_asm, mask=token_mask, other=0.0
+            )
+        if MUL_ROUTED_WEIGHT or (ADD_BIAS and SCALE_BIAS_WITH_ROUTED_WEIGHT):
+            if ck_sorting:
+                route_weight = tl.load(
+                    sorted_weights_ptr + offs_token_id, mask=token_mask, other=0
+                )
+            else:
+                route_weight = tl.load(
+                    topk_weights_ptr + offs_token, mask=token_mask, other=0
+                )
+
+        # Each iteration loads its own B tile and writes a disjoint C column tile.
+        # Keep the ordinary loop: only one tile's accumulator is live at a time.
+        for n_tile in range(0, 2):
+            tile_n = pid_n * 2 + n_tile
+            if tile_n < tl.cdiv(N, BLOCK_SIZE_N):
+                offs_cn = tile_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+                offs_bn = offs_cn if block_n_diviable else offs_cn % N
+                if USE_ADDR_OFFSET_INT64_B:
+                    b_ptrs = b_ptr + (
+                        off_experts.to(tl.int64) * stride_be
+                        + offs_k[:, None].to(tl.int64) * stride_bk
+                        + offs_bn[None, :].to(tl.int64) * stride_bn
+                    )
+                else:
+                    b_ptrs = b_ptr + (
+                        off_experts * stride_be
+                        + offs_k[:, None] * stride_bk
+                        + offs_bn[None, :] * stride_bn
+                    ).to(tl.int32)
+                if block_k_diviable:
+                    b = tl.load(b_ptrs)
+                else:
+                    b = tl.load(b_ptrs, mask=offs_k[:, None] < K, other=0)
+
+                # Preserve rounding order: block scales precede routing weight;
+                # channel scales follow it. Do not reassociate the scale products.
+                if use_int8_w8a8 and group_k > 0 and group_n > 0:
+                    b_scale = tl.load(
+                        b_scale_ptr + off_experts * stride_bse
+                        + (offs_bn // group_n) * stride_bsn
+                    )
+                    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), tl.float32)
+                    if BLOCK_SIZE_N > group_n:
+                        acc += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
+                    else:
+                        acc += tl.dot(a, b) * (a_scale[:, None] * b_scale)
+                else:
+                    # Channel INT8 keeps the dot result in i32; BF16 uses f32.
+                    acc = tl.dot(a, b)
+                if MUL_ROUTED_WEIGHT:
+                    acc = acc * route_weight[:, None]
+                if use_int8_w8a8 and per_channel_quant and group_k == 0 and group_n == 0:
+                    b_scale = tl.load(
+                        b_scale_ptr + off_experts * stride_bse
+                        + offs_bn[None, :] * stride_bsn
+                    )
+                    acc = acc * a_scale[:, None] * b_scale
+
+                # Convert before adding bias, then mask both padding rows and N tails.
+                acc = acc.to(compute_type)
+                if ADD_BIAS:
+                    bias_ptrs = b_bias_ptr + (
+                        off_experts.to(tl.int64) * stride_bbe
+                        + offs_cn[None, :].to(tl.int64) * stride_bbn
+                    )
+                    bias = tl.load(bias_ptrs, mask=offs_cn[None, :] < N, other=0.0)
+                    if SCALE_BIAS_WITH_ROUTED_WEIGHT:
+                        bias = bias * route_weight[:, None]
+                    acc = acc + bias.to(acc.dtype)
+                c_row = offs_token_id if c_sorted else offs_token
+                if USE_ADDR_OFFSET_INT64_C:
+                    c_ptrs = c_ptr + (
+                        c_row[:, None].to(tl.int64) * stride_cm
+                        + offs_cn[None, :].to(tl.int64) * stride_cn
+                    )
+                else:
+                    c_ptrs = c_ptr + (
+                        c_row[:, None] * stride_cm + offs_cn[None, :] * stride_cn
+                    ).to(tl.int32)
+                tl.store(c_ptrs, acc, mask=token_mask[:, None] & (offs_cn[None, :] < N))
+        return
 
     offs_bn = (pid_n * BLOCK_SIZE_N +
                tl.arange(0, BLOCK_SIZE_N).to(tl.int32))
@@ -1595,7 +1754,10 @@ def fused_moe_kernel(
 
     else: # non-COMBINE_SCALE_LOAD
 
-        for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        # A verified one-tile reduction needs no dynamic loop or loop-carried
+        # accumulator. Keep K dynamic for longer reductions and other modes.
+        k_tiles = 1 if single_k_tile else tl.cdiv(K, BLOCK_SIZE_K)
+        for k in range(0, k_tiles):
 
             # Load the next block of A and B, generate a mask by checking the
             # K dimension.
@@ -2727,6 +2889,19 @@ def fused_moe(
             is_bottom=mul_routed_weight)
         config = moe_config_func(M)
 
+    config = config.copy()
+    n_tiles_per_cta = config.pop("N_TILES_PER_CTA", 1)
+    if type(n_tiles_per_cta) is not int or n_tiles_per_cta not in (1, 2):
+        raise ValueError("N_TILES_PER_CTA must be the integer 1 or 2")
+    if n_tiles_per_cta == 2:
+        selected_split_k = 0 if mul_routed_weight else config.get("SPLIT_K", splitk_size)
+        if (
+            use_int4_w4a16 or use_int4_w4a8 or use_int8_w8a16 or use_mxfp4_w4a4
+            or (not naive_block_assignment
+                and (_USE_MOE_PERSISTENT_KERNEL or selected_split_k > 1))
+        ):
+            raise ValueError("N_TILES_PER_CTA=2 is supported only by the regular W8A8/BF16 kernel")
+
     if "USE_MLS_LOAD" not in config:
         config["USE_MLS_LOAD"] = False
     if config["USE_MLS_LOAD"] == True and capMLS == False:
@@ -2752,7 +2927,7 @@ def fused_moe(
         EM = min(sorted_token_ids.size(0),
                  A.size(0) * top_k * config['BLOCK_SIZE_M'])
     grid = lambda META: (triton.cdiv(EM, META['BLOCK_SIZE_M']) * triton.cdiv(
-        B.size(1), META['BLOCK_SIZE_N']), )
+        B.size(1), META['BLOCK_SIZE_N'] * META.get('N_TILES_PER_CTA', 1)), )
 
     input_dtype = str(A.dtype).split('.')[-1]
 
@@ -2872,6 +3047,24 @@ def fused_moe(
         if block_shape is not None:
             BLOCK_SIZE_K = min(BLOCK_SIZE_K, min(block_shape[0],
                                                  block_shape[1]))
+
+        if n_tiles_per_cta == 2:
+            reason = _n_tile_reuse_error({
+                **config,
+                "N": B.size(1), "K": B.size(2), "BLOCK_SIZE_K": BLOCK_SIZE_K,
+                "group_n": 0 if block_shape is None else block_shape[0],
+                "group_k": 0 if block_shape is None else block_shape[1],
+                "MUL_ROUTED_WEIGHT": mul_routed_weight,
+                "use_int8_w8a8": use_int8_w8a8,
+                "use_fp8_w8a8": use_fp8_w8a8,
+                "use_int8_w8a16": use_int8_w8a16,
+                "per_channel_quant": per_channel_quant,
+                "compute_type": compute_type,
+                "bottom_a_use_mls_load": bottom_a_use_mls_load,
+                "SPLIT_K": 0 if mul_routed_weight or naive_block_assignment else selected_split_k,
+            })
+            if reason:
+                raise ValueError(f"N_TILES_PER_CTA=2 {reason}")
 
         if config.get("COMBINE_SCALE_LOAD", False) and (
             use_int8_w8a8 or use_fp8_w8a8
@@ -3142,5 +3335,6 @@ def fused_moe(
                 ADD_BIAS=B_bias is not None,
                 BLOCK_SIZE_K=BLOCK_SIZE_K,
                 COMBINE_SCALE_LOAD=config.pop("COMBINE_SCALE_LOAD", None),
+                N_TILES_PER_CTA=n_tiles_per_cta,
                 **config,
             )

@@ -1,8 +1,8 @@
 {
     "1": {
         "BLOCK_SIZE_M": 16,
-        "BLOCK_SIZE_N": 256,
-        "BLOCK_SIZE_K": 32,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 256,
         "GROUP_SIZE_M": 1,
         "COMBINE_SCALE_LOAD": false,
         "USE_MLS_LOAD": false,
@@ -12,22 +12,24 @@
         "kpack": 1,
         "use_block_pingpong": false,
         "num_warps": 4,
-        "num_stages": 2
+        "num_stages": 1,
+        "N_TILES_PER_CTA": 2
     },
     "2": {
         "BLOCK_SIZE_M": 16,
-        "BLOCK_SIZE_N": 256,
-        "BLOCK_SIZE_K": 64,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 256,
         "GROUP_SIZE_M": 1,
         "COMBINE_SCALE_LOAD": false,
-        "USE_MLS_LOAD": true,
-        "bottom_a_use_mls_load": true,
+        "USE_MLS_LOAD": false,
+        "bottom_a_use_mls_load": false,
         "schedule_hint": "none",
         "sched_latency": "none",
         "kpack": 1,
         "use_block_pingpong": false,
         "num_warps": 4,
-        "num_stages": 1
+        "num_stages": 1,
+        "N_TILES_PER_CTA": 2
     },
     "4": {
         "BLOCK_SIZE_M": 16,

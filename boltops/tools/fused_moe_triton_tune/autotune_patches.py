@@ -290,7 +290,7 @@ elif test_type == "int8_channel" or test_type == "fp8_channel":
     mode_autotune_max_block_size_k1 = 512
     mode_autotune_max_block_size_k  = 128
     mode_autotune_min_block_size_k2 = 32
-    mode_autotune_max_block_size_k2 = 128
+    mode_autotune_max_block_size_k2 = 256
     mode_autotune_min_block_size_n1 = 16
     mode_autotune_max_block_size_n1 = 256
     mode_autotune_min_block_size_n2 = 16
@@ -310,6 +310,16 @@ elif  test_type == "bf16":
     mode_autotune_min_block_size_n2 = 16
     mode_autotune_max_block_size_n2 = 512
 
+def _keep_n_tile_reuse(config, runtime_args, num_warps):
+    args = {**runtime_args, **config, "num_warps": num_warps}
+    # A partial second tile is correct, but not a useful default search point.
+    # Do not hard-code an M cutoff: occupancy/profitability needs measurement.
+    return (
+        args["N"] >= 2 * args["BLOCK_SIZE_N"]
+        and moe_op._n_tile_reuse_error(args) is None
+    )
+
+
 def generate_config2_lists(
     BLOCK_SIZE_M=16,
     N=16,
@@ -320,8 +330,24 @@ def generate_config2_lists(
     num_valid_tokens=None,
     top_k=1,
     num_input_tokens=None,
+    supports_n_tiles=None,
+    runtime_args=None,
 ):
     is_gemm1 = MUL_ROUTED_WEIGHT == False
+    if supports_n_tiles is None:
+        supports_n_tiles = test_type in ("int8", "int8_channel", "bf16", "fp8", "fp8_channel")
+    # Shape-only callers can generate candidates without GPU tensors. The real
+    # launcher supplies actual quantization groups, dtype and kernel flags.
+    reuse_args = {
+        "N": N, "K": K, "MUL_ROUTED_WEIGHT": MUL_ROUTED_WEIGHT,
+        "per_channel_quant": per_channel_quant,
+        "use_int8_w8a8": test_type in ("int8", "int8_channel"),
+        "use_fp8_w8a8": test_type in ("fp8", "fp8_channel"),
+        "group_n": 128 if test_type == "int8" else 0,
+        "group_k": 128 if test_type == "int8" else 0,
+        "compute_type": tl.bfloat16 if test_type == "bf16" else tl.float16,
+        **(runtime_args or {}),
+    }
 
     # BLOCK_SIZE_M :
     block_m = BLOCK_SIZE_M
@@ -502,18 +528,27 @@ def generate_config2_lists(
             ):
                 continue
 
-            config_count += 1
-            if compile_only and (config_count - 1) % num_groups_compile != cur_group:
-                continue
-            cur_group_config_count += 1
-            print(
-                f"Autotune Config for compile_group={cur_group} "
-                f"config_idx:{config_count}: BLOCK_SIZE_M:{BLOCK_SIZE_M} "
-                f"{config} {num_stage} {num_warp}"
-            )
-            configs.append(
-                triton.Config(config, num_stages=num_stage, num_warps=num_warp)
-            )
+            n_tile_options = (None,)
+            if supports_n_tiles:
+                n_tile_options = (
+                    (1, 2) if _keep_n_tile_reuse(config, reuse_args, num_warp) else (1,)
+                )
+            for n_tiles in n_tile_options:
+                candidate = dict(config)
+                if n_tiles is not None:
+                    candidate["N_TILES_PER_CTA"] = n_tiles
+                config_count += 1
+                if compile_only and (config_count - 1) % num_groups_compile != cur_group:
+                    continue
+                cur_group_config_count += 1
+                print(
+                    f"Autotune Config for compile_group={cur_group} "
+                    f"config_idx:{config_count}: BLOCK_SIZE_M:{BLOCK_SIZE_M} "
+                    f"{candidate} {num_stage} {num_warp}"
+                )
+                configs.append(
+                    triton.Config(candidate, num_stages=num_stage, num_warps=num_warp)
+                )
     else:
         # # # tune best config for gemm1 & bs=32
         if test_type == "fp8":
@@ -561,6 +596,9 @@ def generate_config2_lists(
             cur_group_config_count += 1
             configs.append(triton_cfg)
 
+    if mode_best_config_tune and supports_n_tiles:
+        for config in configs:
+            config.kwargs["N_TILES_PER_CTA"] = 1
     print(f"\nBLOCK_SIZE_M: {BLOCK_SIZE_M}, is_gemm1: {is_gemm1}, Autotune Total: {config_count}, cur compile group Total: {cur_group_config_count}")
     return configs
 
@@ -664,6 +702,8 @@ def dynamic_autotune(fn):
                     ),
                     top_k=kwargs.get("top_k", named_args.get("top_k", 1)),
                     num_input_tokens=num_input_tokens,
+                    supports_n_tiles="N_TILES_PER_CTA" in arg_names,
+                    runtime_args={**named_args, **kwargs, "N": N, "K": K},
                 )
                 if "int4" in test_type:
                     for cfg in dynamic_configs:
@@ -672,6 +712,10 @@ def dynamic_autotune(fn):
                     pruned = []
                     for cfg in configs:
                         cfg_kwargs = cfg.kwargs
+                        if cfg_kwargs.get("N_TILES_PER_CTA") == 2 and not _keep_n_tile_reuse(
+                            cfg_kwargs, {**named_args, **_kwargs}, cfg.num_warps
+                        ):
+                            continue
                         cfg_use_mls = bool(cfg_kwargs.get("USE_MLS_LOAD", False))
                         cfg_bottom_mls = bool(cfg_kwargs.get("bottom_a_use_mls_load", False))
                         cfg_block_k = int(cfg_kwargs.get("BLOCK_SIZE_K", 0))
@@ -687,6 +731,8 @@ def dynamic_autotune(fn):
                 launch_kwargs = dict(kwargs)
                 launch_kwargs.pop("a_sorted", None)
                 launch_kwargs.pop("bottom_a_use_mls_load", None)
+                # This field belongs to each candidate, not the outer BM config.
+                launch_kwargs.pop("N_TILES_PER_CTA", None)
                 # 应用autotune装饰器
                 autotuned_fn = triton.autotune(
                     configs=dynamic_configs,
@@ -842,7 +888,7 @@ def fused_moe(
         EM = min(sorted_token_ids.size(0),
                  A.size(0) * top_k * config['BLOCK_SIZE_M'])
     grid = lambda META: (triton.cdiv(EM, META['BLOCK_SIZE_M']) * triton.cdiv(
-        B.size(1), META['BLOCK_SIZE_N']), )
+        B.size(1), META['BLOCK_SIZE_N'] * META.get('N_TILES_PER_CTA', 1)), )
 
     if (use_int8_w8a16 or use_int4_w4a16 or use_int4_w4a8) and \
             block_shape is not None and block_shape[1] > 0:
