@@ -10,6 +10,7 @@ from __future__ import annotations
 import functools
 import json
 import re
+import warnings
 from pathlib import Path
 from typing import Optional
 
@@ -21,6 +22,16 @@ from boltops.utility.triton_capability import get_triton_capabilities
 
 
 _CONFIG_ROOT = Path(__file__).with_name("configs")
+
+
+@functools.lru_cache(maxsize=None)
+def _warn_config_once(issue: str, detail: str) -> None:
+    """Emit a registry fallback warning once per process and issue."""
+    warnings.warn(
+        f"FlashMLA sparse tuned config {issue}: {detail}; using built-in defaults",
+        RuntimeWarning,
+        stacklevel=3,
+    )
 
 
 def _slug(value: str) -> str:
@@ -48,6 +59,32 @@ def _device_identity(device: torch.device) -> tuple[str, str]:
     return arch, str(props.name)
 
 
+def _select_num_kv_splits(
+    base_ctas: int,
+    topk: int,
+    block_n: int,
+    compute_units: int,
+) -> int:
+    """Choose a bounded power-of-two split for low-occupancy launches.
+
+    The launch target and cutoffs are a finite K100_AI policy derived from
+    multi-size measurements. ``topk`` also caps the split so every partition
+    owns at least one ``BLOCK_N`` tile.
+    """
+    if base_ctas <= 0 or topk <= 0 or block_n <= 0 or compute_units <= 0:
+        return 1
+    if base_ctas * 5 <= compute_units * 2:
+        target = (compute_units + base_ctas - 1) // base_ctas
+        desired = min(64, 1 << (target - 1).bit_length())
+    elif base_ctas * 4 <= compute_units * 3:
+        desired = 2
+    else:
+        desired = 1
+    full_tiles = max(1, topk // block_n)
+    max_split = 1 << (full_tiles.bit_length() - 1)
+    return min(desired, max_split)
+
+
 def _supports_matrix_load(device: torch.device) -> bool:
     """Return whether the active HCU can use global-to-LDS matrix loads."""
     arch, _ = _device_identity(device)
@@ -59,12 +96,23 @@ def _load_device_configs(version_tag: str, arch: str, device_name: str) -> dict:
     filename = f"flash_mla_sparse_{arch}_{_device_model(device_name)}.json"
     path = _CONFIG_ROOT / version_tag / filename
     if not path.is_file():
+        _warn_config_once("file is missing", str(path))
         return {}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except OSError as error:
+        _warn_config_once("file could not be read", f"{path} ({error})")
         return {}
-    return data if isinstance(data, dict) else {}
+    except json.JSONDecodeError as error:
+        _warn_config_once(
+            "file contains invalid JSON",
+            f"{path} (line {error.lineno}, column {error.colno})",
+        )
+        return {}
+    if not isinstance(data, dict):
+        _warn_config_once("file schema is invalid", f"{path} root must be an object")
+        return {}
+    return data
 
 
 def _config_match_score(match: dict, shape: dict) -> Optional[tuple[int, int, float]]:
@@ -105,6 +153,9 @@ def _get_tuned_config(
 ) -> dict:
     arch, device_name = _device_identity(q.device)
     data = _load_device_configs(_triton_version_tag(), arch, device_name)
+    if not data:
+        return {}
+    config_identity = f"{_triton_version_tag()}/{arch}/{_device_model(device_name)}"
     shape = {
         "s_q": q.shape[0],
         "s_kv": kv.shape[0],
@@ -117,7 +168,15 @@ def _get_tuned_config(
     }
     selected = None
     selected_score = None
-    for entry in data.get("configs", ()):
+    entries = data.get("configs")
+    if not isinstance(entries, list):
+        _warn_config_once(
+            "file schema is invalid", f"{config_identity} configs must be a list"
+        )
+        return {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
         match = entry.get("match", {})
         if not isinstance(match, dict):
             continue
@@ -126,7 +185,17 @@ def _get_tuned_config(
             selected, selected_score = entry, score
     if selected is not None:
         config = selected.get("config", {})
-        return dict(config) if isinstance(config, dict) else {}
+        if isinstance(config, dict) and config:
+            return dict(config)
+        _warn_config_once(
+            "matched entry is invalid",
+            f"{config_identity} config must be a non-empty object",
+        )
+        return {}
+    _warn_config_once(
+        "does not match the current shape",
+        f"{config_identity} has no matching finite config bucket",
+    )
     return {}
 
 
@@ -139,6 +208,7 @@ def _flash_mla_sparse_fwd_kernel(
     Out,
     MaxLogits,
     Lse,
+    MidOut,
     softmax_scale,
     stride_qs,
     stride_qh,
@@ -148,6 +218,9 @@ def _flash_mla_sparse_fwd_kernel(
     stride_ih,
     stride_os,
     stride_oh,
+    stride_mqs,
+    stride_mqh,
+    stride_mqsplit,
     S_KV,
     TOPK: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
@@ -162,10 +235,13 @@ def _flash_mla_sparse_fwd_kernel(
     Lk: tl.constexpr,
     Lv: tl.constexpr,
     USE_MATRIX_LOAD_Q: tl.constexpr,
+    NUM_KV_SPLITS: tl.constexpr,
+    SPLIT_TOPK: tl.constexpr,
 ):
     """One program handles a query token and a group of query heads."""
     q_idx = tl.program_id(0)
     head_block = tl.program_id(1)
+    split_kv_id = tl.program_id(2)
 
     kv_group_size: tl.constexpr = H_Q // H_KV
     heads_per_program: tl.constexpr = (
@@ -228,9 +304,11 @@ def _flash_mla_sparse_fwd_kernel(
     row_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
     acc = tl.zeros([BLOCK_H, BLOCK_DV], dtype=tl.float32)
 
-    for start_n in range(0, TOPK, BLOCK_N):
-        offs_n = start_n + tl.arange(0, BLOCK_N)
-        prefix_mask = offs_n < valid_topk
+    split_start = split_kv_id * SPLIT_TOPK
+    split_end = tl.minimum(split_start + SPLIT_TOPK, TOPK)
+    for local_start_n in range(0, SPLIT_TOPK, BLOCK_N):
+        offs_n = split_start + local_start_n + tl.arange(0, BLOCK_N)
+        prefix_mask = (offs_n < valid_topk) & (offs_n < split_end)
         token = tl.load(
             Indices + q_idx * stride_is + kv_head * stride_ih + offs_n,
             mask=prefix_mask,
@@ -321,13 +399,91 @@ def _flash_mla_sparse_fwd_kernel(
     safe_sum = tl.where(row_sum > 0, row_sum, 1.0)
     output = acc / safe_sum[:, None]
     lse = tl.where(row_sum > 0, row_max + tl.log(safe_sum), -float("inf"))
-    tl.store(
-        Out + q_idx * stride_os + heads[:, None] * stride_oh + offs_v[None, :],
-        output,
-        mask=head_mask[:, None] & mask_v[None, :],
+    if NUM_KV_SPLITS == 1:
+        tl.store(
+            Out + q_idx * stride_os + heads[:, None] * stride_oh + offs_v[None, :],
+            output,
+            mask=head_mask[:, None] & mask_v[None, :],
+        )
+        tl.store(MaxLogits + q_idx * H_Q + heads, row_max, mask=head_mask)
+        tl.store(Lse + q_idx * H_Q + heads, lse, mask=head_mask)
+    else:
+        mid_base = (
+            MidOut
+            + q_idx * stride_mqs
+            + heads[:, None] * stride_mqh
+            + split_kv_id * stride_mqsplit
+        )
+        tl.store(
+            mid_base + offs_v[None, :],
+            output,
+            mask=head_mask[:, None] & mask_v[None, :],
+        )
+        mid_scalar_base = (
+            MidOut
+            + q_idx * stride_mqs
+            + heads * stride_mqh
+            + split_kv_id * stride_mqsplit
+        )
+        tl.store(mid_scalar_base + Lv, lse, mask=head_mask)
+        tl.store(mid_scalar_base + Lv + 1, row_max, mask=head_mask)
+
+
+@triton.jit
+def _flash_mla_sparse_split_reduce_kernel(
+    MidOut,
+    Out,
+    MaxLogits,
+    Lse,
+    stride_mqs,
+    stride_mqh,
+    stride_mqsplit,
+    stride_os,
+    stride_oh,
+    H_Q: tl.constexpr,
+    NUM_KV_SPLITS: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+    Lv: tl.constexpr,
+):
+    q_idx = tl.program_id(0)
+    head = tl.program_id(1)
+    offs_v = tl.arange(0, BLOCK_DV)
+    mask_v = offs_v < Lv
+    mid_base = MidOut + q_idx * stride_mqs + head * stride_mqh
+
+    global_max = tl.zeros((), dtype=tl.float32) - float("inf")
+    any_valid = tl.zeros((), dtype=tl.int1)
+    for split_id in range(0, NUM_KV_SPLITS):
+        split_base = mid_base + split_id * stride_mqsplit
+        part_max = tl.load(split_base + Lv + 1)
+        part_valid = part_max > -float("inf")
+        global_max = tl.where(part_valid, tl.maximum(global_max, part_max), global_max)
+        any_valid = any_valid | part_valid
+
+    safe_global_max = tl.where(any_valid, global_max, 0.0)
+    merged = tl.zeros([BLOCK_DV], dtype=tl.float32)
+    weight_sum = tl.zeros((), dtype=tl.float32)
+    for split_id in range(0, NUM_KV_SPLITS):
+        split_base = mid_base + split_id * stride_mqsplit
+        part_lse = tl.load(split_base + Lv)
+        part_valid = part_lse > -float("inf")
+        weight = tl.where(part_valid, tl.exp(part_lse - safe_global_max), 0.0)
+        part_out = tl.load(split_base + offs_v, mask=mask_v, other=0.0)
+        merged += part_out * weight
+        weight_sum += weight
+
+    safe_weight_sum = tl.where(weight_sum > 0, weight_sum, 1.0)
+    output = merged / safe_weight_sum
+    merged_lse = tl.where(
+        weight_sum > 0, safe_global_max + tl.log(safe_weight_sum), -float("inf")
     )
-    tl.store(MaxLogits + q_idx * H_Q + heads, row_max, mask=head_mask)
-    tl.store(Lse + q_idx * H_Q + heads, lse, mask=head_mask)
+    tl.store(
+        Out + q_idx * stride_os + head * stride_oh + offs_v,
+        output,
+        mask=mask_v,
+    )
+    tl.store(MaxLogits + q_idx * H_Q + head, global_max)
+    tl.store(Lse + q_idx * H_Q + head, merged_lse)
 
 
 def _validate_inputs(
@@ -406,19 +562,51 @@ def flash_mla_sparse_fwd(
     default_block_n = 16 if torch.version.hip is not None and d_qk >= 576 else 32
     block_n = int(tuned.get("BLOCK_N", default_block_n))
     block_h = int(tuned.get("BLOCK_H", 16))
+    heads_per_program = min(block_h, h_q // h_kv)
+    base_ctas = s_q * triton.cdiv(h_q, heads_per_program)
+    if "SPLIT_KV" in tuned:
+        num_kv_splits = int(tuned["SPLIT_KV"])
+        auto_split = False
+    else:
+        arch, device_name = _device_identity(q.device)
+        if arch == "gfx928" and _device_model(device_name) == "K100_AI":
+            props = torch.cuda.get_device_properties(q.device)
+            num_kv_splits = _select_num_kv_splits(
+                base_ctas,
+                indices.shape[2],
+                block_n,
+                int(props.multi_processor_count),
+            )
+        else:
+            num_kv_splits = 1
+        auto_split = True
+    if num_kv_splits not in (1, 2, 4, 8, 16, 32, 64, 128):
+        raise ValueError("SPLIT_KV must be a power of two from 1 through 128")
     num_warps = int(tuned.get("num_warps", 4))
-    num_stages = int(
-        tuned.get("num_stages", 1 if torch.version.hip is not None else 2)
-    )
+    if auto_split and num_kv_splits > 1:
+        num_stages = int(tuned.get("SPLIT_NUM_STAGES", 1))
+    else:
+        num_stages = int(
+            tuned.get("num_stages", 1 if torch.version.hip is not None else 2)
+        )
     use_matrix_load_q = bool(tuned.get("USE_MATRIX_LOAD_Q", False))
     use_matrix_load_q = use_matrix_load_q and _supports_matrix_load(q.device)
-    heads_per_program = min(block_h, h_q // h_kv)
-    grid = (s_q, triton.cdiv(h_q, heads_per_program))
+    grid = (s_q, triton.cdiv(h_q, heads_per_program), num_kv_splits)
 
     q = q.contiguous()
     kv = kv.contiguous()
     indices = indices.contiguous()
     topk_arg = topk_length.contiguous() if topk_length is not None else indices
+    if num_kv_splits > 1:
+        mid_out = torch.empty(
+            (s_q, h_q, num_kv_splits, d_v + 2),
+            device=q.device,
+            dtype=torch.float32,
+        )
+        stride_mqs, stride_mqh, stride_mqsplit = mid_out.stride()[:3]
+    else:
+        mid_out = output
+        stride_mqs = stride_mqh = stride_mqsplit = 0
     launch_options = {"num_warps": num_warps, "num_stages": num_stages}
     if torch.version.hip is not None:
         capabilities = get_triton_capabilities()
@@ -432,8 +620,14 @@ def flash_mla_sparse_fwd(
             "use_block_pingpong",
         )
         for name in compiler_options:
-            if name in tuned and capabilities.supports(name):
-                launch_options[name] = int(tuned[name])
+            value = tuned.get(name)
+            if auto_split and num_kv_splits > 1:
+                split_defaults = {"waves_per_eu": 1, "kpack": 1}
+                value = tuned.get(
+                    f"SPLIT_{name.upper()}", split_defaults.get(name, value)
+                )
+            if value is not None and capabilities.supports(name):
+                launch_options[name] = int(value)
     _flash_mla_sparse_fwd_kernel[grid](
         q,
         kv,
@@ -442,6 +636,7 @@ def flash_mla_sparse_fwd(
         output,
         max_logits,
         lse,
+        mid_out,
         float(softmax_scale),
         q.stride(0),
         q.stride(1),
@@ -451,6 +646,9 @@ def flash_mla_sparse_fwd(
         indices.stride(1),
         output.stride(0),
         output.stride(1),
+        stride_mqs,
+        stride_mqh,
+        stride_mqsplit,
         kv.shape[0],
         TOPK=indices.shape[2],
         BLOCK_DMODEL=block_dmodel,
@@ -465,8 +663,37 @@ def flash_mla_sparse_fwd(
         Lk=d_qk,
         Lv=d_v,
         USE_MATRIX_LOAD_Q=use_matrix_load_q,
+        NUM_KV_SPLITS=num_kv_splits,
+        SPLIT_TOPK=triton.cdiv(indices.shape[2], num_kv_splits),
         **launch_options,
     )
+
+    if num_kv_splits > 1:
+        reduce_options = {"num_warps": 4, "num_stages": 1}
+        if torch.version.hip is not None:
+            for name, value in (
+                ("waves_per_eu", 1),
+                ("matrix_instr_nonkdim", 16),
+                ("kpack", 2),
+            ):
+                if capabilities.supports(name):
+                    reduce_options[name] = value
+        _flash_mla_sparse_split_reduce_kernel[(s_q, h_q)](
+            mid_out,
+            output,
+            max_logits,
+            lse,
+            stride_mqs,
+            stride_mqh,
+            stride_mqsplit,
+            output.stride(0),
+            output.stride(1),
+            H_Q=h_q,
+            NUM_KV_SPLITS=num_kv_splits,
+            BLOCK_DV=block_dv,
+            Lv=d_v,
+            **reduce_options,
+        )
 
     if attn_sink is not None:
         if attn_sink.numel() != h_q:

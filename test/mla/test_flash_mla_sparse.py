@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import math
+import warnings
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional
 
 import pytest
@@ -12,10 +14,13 @@ import torch
 
 pytest.importorskip("triton")
 
+import boltops.mla.triton.flash_mla_sparse as sparse_module
+
 from boltops.mla import flash_mla_sparse_fwd
 from boltops.mla.triton.flash_mla_sparse import (
     _config_match_score,
     _device_model,
+    _select_num_kv_splits,
     _supports_matrix_load,
 )
 
@@ -142,6 +147,65 @@ def test_tuned_config_range_matching_and_specificity():
 def test_device_model_excludes_platform_description():
     assert _device_model("BW200, UBB BW1000") == "BW200"
     assert _device_model("Product Name") == "Product_Name"
+
+
+def test_missing_tuned_config_warns_once(monkeypatch, tmp_path):
+    sparse_module._load_device_configs.cache_clear()
+    sparse_module._warn_config_once.cache_clear()
+    monkeypatch.setattr(sparse_module, "_CONFIG_ROOT", tmp_path)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        sparse_module._load_device_configs("triton_3_6", "gfx928", "Missing")
+        sparse_module._load_device_configs("triton_3_6", "gfx928", "Missing")
+    assert len(caught) == 1
+    assert "file is missing" in str(caught[0].message)
+
+
+def test_unmatched_tuned_config_warns_once(monkeypatch):
+    sparse_module._warn_config_once.cache_clear()
+    monkeypatch.setattr(
+        sparse_module,
+        "_device_identity",
+        lambda _device: ("gfx928", "K100_AI"),
+    )
+    monkeypatch.setattr(
+        sparse_module,
+        "_load_device_configs",
+        lambda *_args: {
+            "configs": [
+                {"match": {"topk": 1, "dtype": "bfloat16"}, "config": {}}
+            ]
+        },
+    )
+    q = SimpleNamespace(shape=(2, 16, 576), dtype="bfloat16", device=None)
+    kv = SimpleNamespace(shape=(32, 1, 576))
+    indices = SimpleNamespace(shape=(2, 1, 2))
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        sparse_module._get_tuned_config(q, kv, indices, 512)
+        sparse_module._get_tuned_config(q, kv, indices, 512)
+    assert len(caught) == 1
+    assert "does not match the current shape" in str(caught[0].message)
+
+
+@pytest.mark.parametrize(
+    ("base_ctas", "topk", "expected"),
+    [
+        (1, 512, 32),
+        (1, 16384, 64),
+        (2, 16384, 64),
+        (8, 16384, 16),
+        (16, 16384, 8),
+        (32, 16384, 4),
+        (48, 16384, 4),
+        (56, 16384, 2),
+        (88, 16384, 2),
+        (96, 16384, 1),
+        (1, 15, 1),
+    ],
+)
+def test_select_num_kv_splits(base_ctas: int, topk: int, expected: int):
+    assert _select_num_kv_splits(base_ctas, topk, 16, 120) == expected
 
 
 @GPU_REQUIRED
