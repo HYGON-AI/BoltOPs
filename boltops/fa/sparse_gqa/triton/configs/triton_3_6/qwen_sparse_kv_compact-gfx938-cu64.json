@@ -1,0 +1,49 @@
+{
+  "configs": [
+    {
+      "config": {
+        "BLOCK_TOPK": 8,
+        "num_stages": 1,
+        "num_warps": 4
+      },
+      "match": {
+        "batch": 1,
+        "dtype": "float8_e4m3fn_to_bfloat16",
+        "head_dim": 256,
+        "hkv": 1,
+        "page_size": 64,
+        "topk": 2051
+      }
+    },
+    {
+      "config": {
+        "BLOCK_TOPK": 64,
+        "num_stages": 1,
+        "num_warps": 2
+      },
+      "match": {
+        "batch": 32,
+        "dtype": "float8_e4m3fn_to_bfloat16",
+        "head_dim": 256,
+        "hkv": 1,
+        "page_size": 64,
+        "topk": 2051
+      }
+    },
+    {
+      "config": {
+        "BLOCK_TOPK": 8,
+        "num_stages": 2,
+        "num_warps": 2
+      },
+      "match": {
+        "batch": 8,
+        "dtype": "float8_e4m3fn_to_bfloat16",
+        "head_dim": 256,
+        "hkv": 1,
+        "page_size": 64,
+        "topk": 2051
+      }
+    }
+  ]
+}

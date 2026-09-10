@@ -35,6 +35,7 @@ dev = [
 
 [project.scripts]
 boltops-fused-moe-tune-cli = "boltops.tools.fused_moe_triton_tune.tune_moe_cli:main"
+boltops-sparse-gqa-tune-cli = "boltops.tools.sparse_gqa_triton_tune.tune_sparse_gqa:main"
 
 [tool.setuptools]
 packages = [
@@ -57,6 +58,9 @@ packages = [
     "boltops.mla",
     "boltops.mla.triton",
     "boltops.mla.tilelang",
+    "boltops.fa",
+    "boltops.fa.sparse_gqa",
+    "boltops.fa.sparse_gqa.triton",
     "boltops.mqa_logits",
     "boltops.mqa_logits.triton",
     "boltops.mqa_logits.tilelang",
@@ -86,6 +90,7 @@ packages = [
     "boltops.fused_moe.triton.moe_sorting_hipc",
     "boltops.tools",
     "boltops.tools.fused_moe_triton_tune",
+    "boltops.tools.sparse_gqa_triton_tune",
 ]
 
 [tool.setuptools.dynamic]
@@ -100,6 +105,7 @@ boltops = [
     "gemm/triton/SOURCE.md",
     "mla/triton/SOURCE.md",
     "mla/triton/configs/**/*.json",
+    "fa/sparse_gqa/triton/configs/triton_*/*.json",
     "mqa_logits/triton/SOURCE.md",
     "mqa_logits/triton/configs/triton_*/*.json",
     "step4_dsa/triton/SOURCE.md",
@@ -107,6 +113,8 @@ boltops = [
     "fla/gdn/triton/configs/*/*.json",
     "tools/fused_moe_triton_tune/*.sh",
     "tools/fused_moe_triton_tune/*.md",
+    "tools/sparse_gqa_triton_tune/*.sh",
+    "tools/sparse_gqa_triton_tune/*.md",
 ]
 
 [tool.pytest.ini_options]

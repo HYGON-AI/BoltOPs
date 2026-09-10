@@ -29,6 +29,10 @@ from boltops.gemm import (
     w8a8_triton_block_scaled_mm,
 )
 from boltops.mla import decode_attention_fwd, compute_num_kv_splits
+from boltops.fa.sparse_gqa import (
+    qwen_sparse_kv_extraction_compact_hcu_fa_triton,
+    sparse_gqa_packed_decode_triton,
+)
 from boltops.ihc import ihc_head, ihc_post, ihc_pre
 from boltops.step4_dsa import (
     triton_build_rope_cache,
@@ -52,6 +56,9 @@ from boltops.mhc import (
     pre_big_fuse_tilelang,
 )
 from boltops.tools.fused_moe_triton_tune.tune_moe_cli import main as moe_tune_main
+from boltops.tools.sparse_gqa_triton_tune.tune_sparse_gqa import (
+    main as sparse_gqa_tune_main,
+)
 
 
 def test_version():
@@ -88,6 +95,8 @@ def test_operator_package_exports():
     assert callable(ihc_head)
     assert callable(decode_attention_fwd)
     assert callable(compute_num_kv_splits)
+    assert callable(qwen_sparse_kv_extraction_compact_hcu_fa_triton)
+    assert callable(sparse_gqa_packed_decode_triton)
     assert callable(triton_build_rope_cache)
     assert callable(triton_indexer_norm_rope)
     assert callable(triton_csa_region_layout)
@@ -126,3 +135,7 @@ def test_gemm_fp16_not_public():
 
 def test_moe_tune_cli_is_packaged():
     assert callable(moe_tune_main)
+
+
+def test_sparse_gqa_tune_cli_is_packaged():
+    assert callable(sparse_gqa_tune_main)
