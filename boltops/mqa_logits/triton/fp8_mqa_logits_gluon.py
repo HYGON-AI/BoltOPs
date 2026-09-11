@@ -97,6 +97,9 @@ if _GLUON_AVAILABLE:
         # Head split across grid-z. HEAD_CHUNK = NUM_HEADS // NUM_SPLITS.
         NUM_SPLITS: tl.constexpr,
         HEAD_CHUNK: tl.constexpr,
+        # If true (ship default): BN-style epilogue (#mma where + convert out).
+        # If false: store-layout masks + convert only acc.
+        BN_STYLE_EPILOGUE: tl.constexpr,
     ):
         """KV once via LDS; Q double-buf + W_GROUP ping-pong (ship defaults)."""
         pid_n = tl.program_id(0)
@@ -379,59 +382,110 @@ if _GLUON_AVAILABLE:
 
         acc = acc * kv_scales[None, :]
 
-        cu_end_st = gl.amd.cdna3.buffer_load(
-            ptr=cu_end_ptr,
-            offsets=offs_m_st.to(tl.int32),
-            mask=offs_m_st < seq_len,
-        )
-        cu_end_st = tl.minimum(cu_end_st, seq_len_kv)
-        if ASSUME_KS_ZERO:
-            in_window_st = offs_n_st[None, :] < cu_end_st[:, None]
+        if BN_STYLE_EPILOGUE:
+            # Reuse prologue cu_start/cu_end on #mma; convert out once.
+            if ASSUME_KS_ZERO:
+                in_window = offs_n_col[None, :] < cu_end[:, None]
+            else:
+                in_window = (offs_n_col[None, :] >= cu_start[:, None]) & (
+                    offs_n_col[None, :] < cu_end[:, None]
+                )
+            store_ok = m_mask[:, None] & n_mask[None, :]
+            if NUM_SPLITS == 1:
+                if ASSUME_TILE_IN_WINDOW:
+                    out_st = gl.convert_layout(acc, layout_store)
+                else:
+                    neg_inf = gl.full(
+                        [BLOCK_M, BLOCK_N],
+                        float("-inf"),
+                        dtype=tl.float32,
+                        layout=mfma_layout,
+                    )
+                    out = tl.where(in_window & store_ok, acc, neg_inf)
+                    out_st = gl.convert_layout(out, layout_store)
+                if USE_STORE_MASK:
+                    gl.amd.cdna3.buffer_store(
+                        out_st, ptr=logits_ptr, offsets=store_off, mask=store_mask
+                    )
+                else:
+                    gl.amd.cdna3.buffer_store(
+                        out_st, ptr=logits_ptr, offsets=store_off
+                    )
+            else:
+                acc_st = gl.convert_layout(acc, layout_store)
+                in_window_st = gl.convert_layout(in_window, layout_store)
+                store_ok_st = gl.convert_layout(store_ok, layout_store)
+                gl.amd.cdna3.buffer_atomic_add(
+                    logits_ptr, store_off, acc_st, mask=store_ok_st & in_window_st
+                )
+                if split_id == 0:
+                    neg_inf = gl.full(
+                        [BLOCK_M, BLOCK_N],
+                        float("-inf"),
+                        dtype=tl.float32,
+                        layout=layout_store,
+                    )
+                    gl.amd.cdna3.buffer_store(
+                        neg_inf,
+                        ptr=logits_ptr,
+                        offsets=store_off,
+                        mask=store_ok_st & (~in_window_st),
+                    )
         else:
-            cu_start_st = gl.amd.cdna3.buffer_load(
-                ptr=cu_start_ptr,
+            # Store-layout: reload KS/KE, convert only acc.
+            cu_end_st = gl.amd.cdna3.buffer_load(
+                ptr=cu_end_ptr,
                 offsets=offs_m_st.to(tl.int32),
                 mask=offs_m_st < seq_len,
             )
-            cu_start_st = tl.maximum(cu_start_st, 0)
-            in_window_st = (offs_n_st[None, :] >= cu_start_st[:, None]) & (
-                offs_n_st[None, :] < cu_end_st[:, None]
-            )
+            cu_end_st = tl.minimum(cu_end_st, seq_len_kv)
+            if ASSUME_KS_ZERO:
+                in_window_st = offs_n_st[None, :] < cu_end_st[:, None]
+            else:
+                cu_start_st = gl.amd.cdna3.buffer_load(
+                    ptr=cu_start_ptr,
+                    offsets=offs_m_st.to(tl.int32),
+                    mask=offs_m_st < seq_len,
+                )
+                cu_start_st = tl.maximum(cu_start_st, 0)
+                in_window_st = (offs_n_st[None, :] >= cu_start_st[:, None]) & (
+                    offs_n_st[None, :] < cu_end_st[:, None]
+                )
 
-        acc_st = gl.convert_layout(acc, layout_store)
-        if NUM_SPLITS == 1:
-            if ASSUME_TILE_IN_WINDOW:
-                out = acc_st
+            acc_st = gl.convert_layout(acc, layout_store)
+            if NUM_SPLITS == 1:
+                if ASSUME_TILE_IN_WINDOW:
+                    out = acc_st
+                else:
+                    neg_inf = gl.full(
+                        [BLOCK_M, BLOCK_N],
+                        float("-inf"),
+                        dtype=tl.float32,
+                        layout=layout_store,
+                    )
+                    out = tl.where(in_window_st & store_mask, acc_st, neg_inf)
+                if USE_STORE_MASK:
+                    gl.amd.cdna3.buffer_store(
+                        out, ptr=logits_ptr, offsets=store_off, mask=store_mask
+                    )
+                else:
+                    gl.amd.cdna3.buffer_store(out, ptr=logits_ptr, offsets=store_off)
             else:
-                neg_inf = gl.full(
-                    [BLOCK_M, BLOCK_N],
-                    float("-inf"),
-                    dtype=tl.float32,
-                    layout=layout_store,
+                add_mask = store_mask & in_window_st
+                gl.amd.cdna3.buffer_atomic_add(
+                    logits_ptr, store_off, acc_st, mask=add_mask
                 )
-                out = tl.where(in_window_st & store_mask, acc_st, neg_inf)
-            if USE_STORE_MASK:
-                gl.amd.cdna3.buffer_store(
-                    out, ptr=logits_ptr, offsets=store_off, mask=store_mask
-                )
-            else:
-                gl.amd.cdna3.buffer_store(out, ptr=logits_ptr, offsets=store_off)
-        else:
-            add_mask = store_mask & in_window_st
-            gl.amd.cdna3.buffer_atomic_add(
-                logits_ptr, store_off, acc_st, mask=add_mask
-            )
-            if split_id == 0:
-                neg_inf = gl.full(
-                    [BLOCK_M, BLOCK_N],
-                    float("-inf"),
-                    dtype=tl.float32,
-                    layout=layout_store,
-                )
-                oob = store_mask & (~in_window_st)
-                gl.amd.cdna3.buffer_store(
-                    neg_inf, ptr=logits_ptr, offsets=store_off, mask=oob
-                )
+                if split_id == 0:
+                    neg_inf = gl.full(
+                        [BLOCK_M, BLOCK_N],
+                        float("-inf"),
+                        dtype=tl.float32,
+                        layout=layout_store,
+                    )
+                    oob = store_mask & (~in_window_st)
+                    gl.amd.cdna3.buffer_store(
+                        neg_inf, ptr=logits_ptr, offsets=store_off, mask=oob
+                    )
 
 
 
@@ -467,6 +521,7 @@ def fp8_mqa_logits_gluon(
     kv_tiles_n: Optional[int] = None,
     w_group: Optional[int] = None,
     head_split_k: Optional[int] = None,
+    bn_style_epilogue: bool = True,
     D_out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Gluon tiled FP8 MQA logits prefill.
@@ -477,6 +532,8 @@ def fp8_mqa_logits_gluon(
     ``force_gluon_kernel=True``: skip shape dispatch (public ``backend="gluon"``).
     ``w_group`` / ``kv_tiles_n``: ``None`` loads shipped Gluon JSON; ``w_group``
     is clamped to divide ``HEAD_CHUNK``.
+    ``bn_style_epilogue=True`` (default): reuse prologue KS/KE on ``#mma`` then
+    convert out; set False to reload masks on store layout and convert only ``acc``.
     ``D_out``: optional preallocated ``[seq_len, seq_len_kv]`` float32 buffer.
     """
     if not _GLUON_AVAILABLE:
@@ -570,18 +627,40 @@ def fp8_mqa_logits_gluon(
 
     cfg = get_fp8_mqa_tiled_launch_config(seq_len, seq_len_kv)
     gcfg = get_fp8_mqa_gluon_launch_config(seq_len, seq_len_kv, num_heads)
-    block_m = block_m if block_m is not None else tiled_block_m(seq_len)
-    block_n = block_n if block_n is not None else tiled_block_n()
-    num_stages = num_stages if num_stages is not None else int(cfg["num_stages"])
+    block_m = (
+        block_m
+        if block_m is not None
+        else int(gcfg["block_m"]) if "block_m" in gcfg else tiled_block_m(seq_len)
+    )
+    block_n = (
+        block_n
+        if block_n is not None
+        else int(gcfg["block_n"]) if "block_n" in gcfg else tiled_block_n()
+    )
+    num_stages = (
+        num_stages
+        if num_stages is not None
+        else int(gcfg["num_stages"]) if "num_stages" in gcfg else int(cfg["num_stages"])
+    )
     waves_per_eu = (
-        waves_per_eu if waves_per_eu is not None else int(cfg["waves_per_eu"])
+        waves_per_eu
+        if waves_per_eu is not None
+        else (
+            int(gcfg["waves_per_eu"])
+            if "waves_per_eu" in gcfg
+            else int(cfg["waves_per_eu"])
+        )
     )
     matrix_instr_nonkdim = (
         matrix_instr_nonkdim
         if matrix_instr_nonkdim is not None
         else int(cfg["matrix_instr_nonkdim"])
     )
-    kpack = kpack if kpack is not None else int(cfg["kpack"])
+    kpack = (
+        kpack
+        if kpack is not None
+        else int(gcfg["kpack"]) if "kpack" in gcfg else int(cfg["kpack"])
+    )
     schedule_hint = (
         schedule_hint if schedule_hint is not None else str(cfg["schedule_hint"])
     )
@@ -592,11 +671,12 @@ def fp8_mqa_logits_gluon(
     )
     kv_tiles_n = int(gcfg["kv_tiles_n"] if kv_tiles_n is None else kv_tiles_n)
     w_group = int(gcfg["w_group"] if w_group is None else w_group)
-    num_splits = (
-        int(shape_disp.get("head_split_k", 1))
-        if head_split_k is None
-        else int(head_split_k)
-    )
+    if head_split_k is not None:
+        num_splits = int(head_split_k)
+    elif "head_split_k" in gcfg:
+        num_splits = int(gcfg["head_split_k"])
+    else:
+        num_splits = int(shape_disp.get("head_split_k", 1))
     assert num_splits >= 1, f"head_split_k must be >= 1, got {num_splits}"
     while num_splits > 1 and num_heads % num_splits != 0:
         num_splits //= 2
@@ -689,6 +769,7 @@ def fp8_mqa_logits_gluon(
         W_GROUP=w_grp,
         NUM_SPLITS=num_splits,
         HEAD_CHUNK=head_chunk,
+        BN_STYLE_EPILOGUE=bool(bn_style_epilogue),
         **hip,
     )
     return logits
