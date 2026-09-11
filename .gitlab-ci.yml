@@ -298,7 +298,8 @@ publish:
     - ls -l output/*.whl
     - |
       for wheel in output/*.whl; do
-        CIUpload --devpi_url "${DEVPI_URL}" \
+        CIUpload NIGHTLY \
+          --devpi_url "${DEVPI_URL}" \
           --devpi_user "${devpi_nightly_user}" \
           --devpi_password "${devpi_nightly_password}" \
           --dtk_pkg_name "$(basename "${DTK_PKG}")" \
