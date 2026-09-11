@@ -215,6 +215,7 @@ NMZ 失败项中，除 M=1 外其余各点退化为 4.79%、1.07%、-0.81%、0.3
 | 正确性 / 调参 / 测速 | `boltops-fused-moe-tune-cli` → `boltops.tools.fused_moe_triton_tune.tune_moe_cli:main` |
 | Autotune 使用手册 | [`tune_moe_triton_user_guide.md`](../../../boltops/tools/fused_moe_triton_tune/tune_moe_triton_user_guide.md) |
 | 性能实测报告      | [`performance_report.md`](performance_report.md) |
+| 网络 Shape 训练清单 | [`model_shape_training_matrix.md`](model_shape_training_matrix.md) |
 
 ## 附录 B. 溯源
 
