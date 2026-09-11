@@ -7,9 +7,9 @@
         "num_warps": 8,
         "num_stages": 3,
         "use_block_pingpong": true,
-        "waves_per_eu": 1,
+        "waves_per_eu": 2,
         "matrix_instr_nonkdim": 16,
-        "optimize_epilogue": true,
+        "optimize_epilogue": false,
         "amdgpu_enable_max_ilp_scheduling_strategy": false,
         "BATCH_LAST_GRID": true
     }
