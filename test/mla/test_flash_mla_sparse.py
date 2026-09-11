@@ -152,25 +152,30 @@ def test_tuned_config_range_matching_and_specificity():
 
 
 @pytest.mark.parametrize(
-    ("s_q", "h_q", "topk", "split_kv", "block_dmodel"),
+    ("s_q", "h_q", "topk", "split_kv", "block_dmodel", "num_stages"),
     [
-        (1, 16, 128, 8, 512),
-        (29, 16, 128, 8, 512),
-        (30, 16, 128, 4, 256),
-        (1, 16, 512, 32, 512),
-        (7, 16, 512, 32, 512),
-        (8, 16, 512, 16, 256),
-        (24, 16, 16384, 8, 256),
-        (48, 16, 16384, 4, 256),
-        (49, 16, 16384, 2, 256),
-        (90, 16, 16384, 2, 256),
-        (91, 16, 16384, 1, 256),
-        (16, 48, 16384, 4, 256),
-        (96, 16, 16384, 1, 256),
+        (1, 16, 128, 8, 512, 1),
+        (29, 16, 128, 8, 512, 1),
+        (30, 16, 128, 4, 256, 1),
+        (1, 16, 512, 32, 512, 1),
+        (7, 16, 512, 32, 512, 1),
+        (8, 16, 512, 16, 256, 1),
+        (24, 16, 16384, 8, 256, 3),
+        (48, 16, 16384, 16, 256, 3),
+        (49, 16, 16384, 8, 256, 3),
+        (90, 16, 16384, 8, 256, 3),
+        (91, 16, 16384, 8, 256, 3),
+        (16, 48, 16384, 16, 256, 3),
+        (96, 16, 16384, 8, 256, 3),
     ],
 )
 def test_k100_static_tuned_configs(
-    s_q: int, h_q: int, topk: int, split_kv: int, block_dmodel: int
+    s_q: int,
+    h_q: int,
+    topk: int,
+    split_kv: int,
+    block_dmodel: int,
+    num_stages: int,
 ):
     path = (
         Path(__file__).parents[2]
@@ -201,6 +206,7 @@ def test_k100_static_tuned_configs(
     )
     assert selected[1]["SPLIT_KV"] == split_kv
     assert selected[1]["BLOCK_DMODEL"] == block_dmodel
+    assert selected[1]["num_stages"] == num_stages
 
 
 @pytest.mark.parametrize(
@@ -216,8 +222,8 @@ def test_k100_static_tuned_configs(
         (104, 16, 1024, True),
         (29, 16, 2048, False),
         (30, 16, 2048, True),
-        (14, 16, 16384, False),
-        (15, 16, 16384, True),
+        (7, 16, 16384, False),
+        (8, 16, 16384, True),
         (16, 48, 16384, False),
     ],
 )
