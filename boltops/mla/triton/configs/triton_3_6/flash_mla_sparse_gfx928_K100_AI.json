@@ -12,7 +12,11 @@
       "main_config_max_regret_pct": 1.301,
       "main_config_max_regret_outside_override_pct": 0.282,
       "selection": "static_ranges",
-      "static_range_entries": 43
+      "static_range_entries": 46,
+      "sort_indices_screen_shapes": 75,
+      "sort_indices_distribution": "independent_uniform_random",
+      "sort_indices_cost_included": true,
+      "sort_indices_correctness": "passed"
     }
   },
   "configs": [
@@ -47,7 +51,8 @@
         "misched_regpressure": true,
         "optimize_epilogue": false,
         "use_block_pingpong": false,
-        "SPLIT_KV": 8
+        "SPLIT_KV": 8,
+        "SORT_INDICES": false
       }
     },
     {
@@ -81,7 +86,8 @@
         "misched_regpressure": true,
         "optimize_epilogue": false,
         "use_block_pingpong": false,
-        "SPLIT_KV": 8
+        "SPLIT_KV": 8,
+        "SORT_INDICES": false
       }
     },
     {
@@ -115,7 +121,8 @@
         "misched_regpressure": true,
         "optimize_epilogue": false,
         "use_block_pingpong": false,
-        "SPLIT_KV": 8
+        "SPLIT_KV": 8,
+        "SORT_INDICES": false
       }
     },
     {
@@ -149,7 +156,8 @@
         "misched_regpressure": true,
         "optimize_epilogue": false,
         "use_block_pingpong": false,
-        "SPLIT_KV": 8
+        "SPLIT_KV": 8,
+        "SORT_INDICES": false
       }
     },
     {
@@ -183,7 +191,8 @@
         "misched_regpressure": true,
         "optimize_epilogue": false,
         "use_block_pingpong": false,
-        "SPLIT_KV": 4
+        "SPLIT_KV": 4,
+        "SORT_INDICES": false
       }
     },
     {
@@ -217,7 +226,8 @@
         "misched_regpressure": true,
         "optimize_epilogue": false,
         "use_block_pingpong": false,
-        "SPLIT_KV": 2
+        "SPLIT_KV": 2,
+        "SORT_INDICES": false
       }
     },
     {
@@ -251,7 +261,8 @@
         "misched_regpressure": true,
         "optimize_epilogue": false,
         "use_block_pingpong": false,
-        "SPLIT_KV": 1
+        "SPLIT_KV": 1,
+        "SORT_INDICES": false
       }
     },
     {
@@ -285,7 +296,8 @@
         "misched_regpressure": true,
         "optimize_epilogue": false,
         "use_block_pingpong": false,
-        "SPLIT_KV": 16
+        "SPLIT_KV": 16,
+        "SORT_INDICES": false
       }
     },
     {
@@ -319,7 +331,8 @@
         "misched_regpressure": true,
         "optimize_epilogue": false,
         "use_block_pingpong": false,
-        "SPLIT_KV": 16
+        "SPLIT_KV": 16,
+        "SORT_INDICES": false
       }
     },
     {
@@ -353,7 +366,8 @@
         "misched_regpressure": true,
         "optimize_epilogue": false,
         "use_block_pingpong": false,
-        "SPLIT_KV": 16
+        "SPLIT_KV": 16,
+        "SORT_INDICES": false
       }
     },
     {
@@ -387,7 +401,8 @@
         "misched_regpressure": true,
         "optimize_epilogue": false,
         "use_block_pingpong": false,
-        "SPLIT_KV": 8
+        "SPLIT_KV": 8,
+        "SORT_INDICES": false
       }
     },
     {
@@ -421,7 +436,8 @@
         "misched_regpressure": true,
         "optimize_epilogue": false,
         "use_block_pingpong": false,
-        "SPLIT_KV": 4
+        "SPLIT_KV": 4,
+        "SORT_INDICES": false
       }
     },
     {
@@ -455,7 +471,8 @@
         "misched_regpressure": true,
         "optimize_epilogue": false,
         "use_block_pingpong": false,
-        "SPLIT_KV": 2
+        "SPLIT_KV": 2,
+        "SORT_INDICES": false
       }
     },
     {
@@ -489,7 +506,8 @@
         "misched_regpressure": true,
         "optimize_epilogue": false,
         "use_block_pingpong": false,
-        "SPLIT_KV": 1
+        "SPLIT_KV": 1,
+        "SORT_INDICES": false
       }
     },
     {
@@ -523,7 +541,8 @@
         "misched_regpressure": true,
         "optimize_epilogue": false,
         "use_block_pingpong": false,
-        "SPLIT_KV": 32
+        "SPLIT_KV": 32,
+        "SORT_INDICES": false
       }
     },
     {
@@ -557,7 +576,8 @@
         "misched_regpressure": true,
         "optimize_epilogue": false,
         "use_block_pingpong": false,
-        "SPLIT_KV": 32
+        "SPLIT_KV": 32,
+        "SORT_INDICES": false
       }
     },
     {
@@ -591,7 +611,8 @@
         "misched_regpressure": true,
         "optimize_epilogue": false,
         "use_block_pingpong": false,
-        "SPLIT_KV": 16
+        "SPLIT_KV": 16,
+        "SORT_INDICES": false
       }
     },
     {
@@ -625,7 +646,8 @@
         "misched_regpressure": true,
         "optimize_epilogue": false,
         "use_block_pingpong": false,
-        "SPLIT_KV": 8
+        "SPLIT_KV": 8,
+        "SORT_INDICES": false
       }
     },
     {
@@ -659,7 +681,8 @@
         "misched_regpressure": true,
         "optimize_epilogue": false,
         "use_block_pingpong": false,
-        "SPLIT_KV": 4
+        "SPLIT_KV": 4,
+        "SORT_INDICES": false
       }
     },
     {
@@ -693,7 +716,43 @@
         "misched_regpressure": true,
         "optimize_epilogue": false,
         "use_block_pingpong": false,
-        "SPLIT_KV": 2
+        "SPLIT_KV": 2,
+        "SORT_INDICES": false
+      }
+    },
+    {
+      "match": {
+        "s_q_min": 120,
+        "s_q_max": 128,
+        "s_kv_min": 1024,
+        "s_kv_max": 131072,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 512,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "evidence": {
+        "kind": "static_range_materialization",
+        "source": "K100 index-locality sort autotune, 2026-09-11"
+      },
+      "config": {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 256,
+        "num_warps": 4,
+        "num_stages": 1,
+        "USE_MATRIX_LOAD_Q": false,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+        "amdgpu_enable_max_ilp_scheduling_strategy": false,
+        "misched_regpressure": true,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false,
+        "SPLIT_KV": 1,
+        "SORT_INDICES": true
       }
     },
     {
@@ -727,7 +786,8 @@
         "misched_regpressure": true,
         "optimize_epilogue": false,
         "use_block_pingpong": false,
-        "SPLIT_KV": 1
+        "SPLIT_KV": 1,
+        "SORT_INDICES": false
       }
     },
     {
@@ -761,7 +821,8 @@
         "misched_regpressure": true,
         "optimize_epilogue": false,
         "use_block_pingpong": false,
-        "SPLIT_KV": 64
+        "SPLIT_KV": 64,
+        "SORT_INDICES": false
       }
     },
     {
@@ -795,7 +856,8 @@
         "misched_regpressure": true,
         "optimize_epilogue": false,
         "use_block_pingpong": false,
-        "SPLIT_KV": 32
+        "SPLIT_KV": 32,
+        "SORT_INDICES": false
       }
     },
     {
@@ -829,7 +891,8 @@
         "misched_regpressure": true,
         "optimize_epilogue": false,
         "use_block_pingpong": false,
-        "SPLIT_KV": 16
+        "SPLIT_KV": 16,
+        "SORT_INDICES": false
       }
     },
     {
@@ -863,7 +926,8 @@
         "misched_regpressure": true,
         "optimize_epilogue": false,
         "use_block_pingpong": false,
-        "SPLIT_KV": 8
+        "SPLIT_KV": 8,
+        "SORT_INDICES": false
       }
     },
     {
@@ -897,7 +961,43 @@
         "misched_regpressure": true,
         "optimize_epilogue": false,
         "use_block_pingpong": false,
-        "SPLIT_KV": 4
+        "SPLIT_KV": 4,
+        "SORT_INDICES": false
+      }
+    },
+    {
+      "match": {
+        "s_q_min": 72,
+        "s_q_max": 90,
+        "s_kv_min": 1024,
+        "s_kv_max": 131072,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 1024,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "evidence": {
+        "kind": "static_range_materialization",
+        "source": "K100 index-locality sort autotune, 2026-09-11"
+      },
+      "config": {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 256,
+        "num_warps": 4,
+        "num_stages": 1,
+        "USE_MATRIX_LOAD_Q": false,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+        "amdgpu_enable_max_ilp_scheduling_strategy": false,
+        "misched_regpressure": true,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false,
+        "SPLIT_KV": 2,
+        "SORT_INDICES": true
       }
     },
     {
@@ -931,7 +1031,43 @@
         "misched_regpressure": true,
         "optimize_epilogue": false,
         "use_block_pingpong": false,
-        "SPLIT_KV": 2
+        "SPLIT_KV": 2,
+        "SORT_INDICES": false
+      }
+    },
+    {
+      "match": {
+        "s_q_min": 104,
+        "s_q_max": 128,
+        "s_kv_min": 1024,
+        "s_kv_max": 131072,
+        "h_q": 16,
+        "h_kv": 1,
+        "topk": 1024,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16"
+      },
+      "evidence": {
+        "kind": "static_range_materialization",
+        "source": "K100 index-locality sort autotune, 2026-09-11"
+      },
+      "config": {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 256,
+        "num_warps": 4,
+        "num_stages": 2,
+        "USE_MATRIX_LOAD_Q": false,
+        "waves_per_eu": 2,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 2,
+        "amdgpu_enable_max_ilp_scheduling_strategy": false,
+        "misched_regpressure": true,
+        "optimize_epilogue": false,
+        "use_block_pingpong": false,
+        "SPLIT_KV": 1,
+        "SORT_INDICES": true
       }
     },
     {
@@ -965,7 +1101,8 @@
         "misched_regpressure": true,
         "optimize_epilogue": false,
         "use_block_pingpong": false,
-        "SPLIT_KV": 1
+        "SPLIT_KV": 1,
+        "SORT_INDICES": false
       }
     },
     {
@@ -999,7 +1136,8 @@
         "misched_regpressure": true,
         "optimize_epilogue": false,
         "use_block_pingpong": false,
-        "SPLIT_KV": 64
+        "SPLIT_KV": 64,
+        "SORT_INDICES": false
       }
     },
     {
@@ -1033,7 +1171,8 @@
         "misched_regpressure": true,
         "optimize_epilogue": false,
         "use_block_pingpong": false,
-        "SPLIT_KV": 32
+        "SPLIT_KV": 32,
+        "SORT_INDICES": false
       }
     },
     {
@@ -1067,7 +1206,8 @@
         "misched_regpressure": true,
         "optimize_epilogue": false,
         "use_block_pingpong": false,
-        "SPLIT_KV": 16
+        "SPLIT_KV": 16,
+        "SORT_INDICES": false
       }
     },
     {
@@ -1101,7 +1241,8 @@
         "misched_regpressure": true,
         "optimize_epilogue": false,
         "use_block_pingpong": false,
-        "SPLIT_KV": 8
+        "SPLIT_KV": 8,
+        "SORT_INDICES": false
       }
     },
     {
@@ -1135,7 +1276,8 @@
         "misched_regpressure": true,
         "optimize_epilogue": false,
         "use_block_pingpong": false,
-        "SPLIT_KV": 4
+        "SPLIT_KV": 4,
+        "SORT_INDICES": true
       }
     },
     {
@@ -1169,7 +1311,8 @@
         "misched_regpressure": true,
         "optimize_epilogue": false,
         "use_block_pingpong": false,
-        "SPLIT_KV": 2
+        "SPLIT_KV": 2,
+        "SORT_INDICES": true
       }
     },
     {
@@ -1203,7 +1346,8 @@
         "misched_regpressure": true,
         "optimize_epilogue": false,
         "use_block_pingpong": false,
-        "SPLIT_KV": 1
+        "SPLIT_KV": 1,
+        "SORT_INDICES": true
       }
     },
     {
@@ -1237,7 +1381,8 @@
         "misched_regpressure": true,
         "optimize_epilogue": false,
         "use_block_pingpong": false,
-        "SPLIT_KV": 64
+        "SPLIT_KV": 64,
+        "SORT_INDICES": false
       }
     },
     {
@@ -1271,7 +1416,8 @@
         "misched_regpressure": true,
         "optimize_epilogue": false,
         "use_block_pingpong": false,
-        "SPLIT_KV": 32
+        "SPLIT_KV": 32,
+        "SORT_INDICES": false
       }
     },
     {
@@ -1305,7 +1451,8 @@
         "misched_regpressure": true,
         "optimize_epilogue": false,
         "use_block_pingpong": false,
-        "SPLIT_KV": 16
+        "SPLIT_KV": 16,
+        "SORT_INDICES": false
       }
     },
     {
@@ -1339,7 +1486,8 @@
         "misched_regpressure": true,
         "optimize_epilogue": false,
         "use_block_pingpong": false,
-        "SPLIT_KV": 8
+        "SPLIT_KV": 8,
+        "SORT_INDICES": true
       }
     },
     {
@@ -1373,7 +1521,8 @@
         "misched_regpressure": true,
         "optimize_epilogue": false,
         "use_block_pingpong": false,
-        "SPLIT_KV": 4
+        "SPLIT_KV": 4,
+        "SORT_INDICES": true
       }
     },
     {
@@ -1407,7 +1556,8 @@
         "misched_regpressure": true,
         "optimize_epilogue": false,
         "use_block_pingpong": false,
-        "SPLIT_KV": 2
+        "SPLIT_KV": 2,
+        "SORT_INDICES": true
       }
     },
     {
@@ -1441,7 +1591,8 @@
         "misched_regpressure": true,
         "optimize_epilogue": false,
         "use_block_pingpong": false,
-        "SPLIT_KV": 1
+        "SPLIT_KV": 1,
+        "SORT_INDICES": true
       }
     },
     {
@@ -1475,7 +1626,8 @@
         "misched_regpressure": true,
         "optimize_epilogue": false,
         "use_block_pingpong": false,
-        "SPLIT_KV": 4
+        "SPLIT_KV": 4,
+        "SORT_INDICES": false
       }
     },
     {
@@ -1509,7 +1661,8 @@
         "misched_regpressure": true,
         "optimize_epilogue": false,
         "use_block_pingpong": false,
-        "SPLIT_KV": 1
+        "SPLIT_KV": 1,
+        "SORT_INDICES": false
       }
     },
     {
@@ -1543,7 +1696,8 @@
         "misched_regpressure": true,
         "optimize_epilogue": false,
         "use_block_pingpong": false,
-        "SPLIT_KV": 1
+        "SPLIT_KV": 1,
+        "SORT_INDICES": false
       }
     }
   ]

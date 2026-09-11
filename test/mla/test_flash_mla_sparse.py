@@ -136,6 +136,7 @@ def test_flash_mla_sparse_tuned_config_schema():
                 assert entry["evidence"]["kind"] == "static_range_materialization"
             if metadata["device_name"] == "K100_AI":
                 assert "SPLIT_KV" in entry["config"]
+                assert "SORT_INDICES" in entry["config"]
                 assert "SPLIT_KV_POLICY" not in entry["config"]
                 assert "ONE_TILE_BLOCK_DMODEL" not in entry["config"]
 
@@ -200,6 +201,57 @@ def test_k100_static_tuned_configs(
     )
     assert selected[1]["SPLIT_KV"] == split_kv
     assert selected[1]["BLOCK_DMODEL"] == block_dmodel
+
+
+@pytest.mark.parametrize(
+    ("s_q", "h_q", "topk", "sort_indices"),
+    [
+        (119, 16, 512, False),
+        (120, 16, 512, True),
+        (71, 16, 1024, False),
+        (72, 16, 1024, True),
+        (90, 16, 1024, True),
+        (91, 16, 1024, False),
+        (103, 16, 1024, False),
+        (104, 16, 1024, True),
+        (29, 16, 2048, False),
+        (30, 16, 2048, True),
+        (14, 16, 16384, False),
+        (15, 16, 16384, True),
+        (16, 48, 16384, False),
+    ],
+)
+def test_k100_static_sort_indices_buckets(
+    s_q: int, h_q: int, topk: int, sort_indices: bool
+):
+    path = (
+        Path(__file__).parents[2]
+        / "boltops"
+        / "mla"
+        / "triton"
+        / "configs"
+        / "triton_3_6"
+        / "flash_mla_sparse_gfx928_K100_AI.json"
+    )
+    entries = json.loads(path.read_text(encoding="utf-8"))["configs"]
+    shape = {
+        "s_q": s_q,
+        "s_kv": 131072,
+        "h_q": h_q,
+        "h_kv": 1,
+        "topk": topk,
+        "d_qk": 576,
+        "d_v": 512,
+        "dtype": "bfloat16",
+    }
+    matches = [
+        (_config_match_score(entry["match"], shape), entry["config"])
+        for entry in entries
+    ]
+    selected = max(
+        (item for item in matches if item[0] is not None), key=lambda item: item[0]
+    )
+    assert selected[1]["SORT_INDICES"] is sort_indices
 
 
 def test_device_model_excludes_platform_description():
@@ -270,5 +322,40 @@ def test_flash_mla_sparse_matrix_load_q_matches_reference():
         q, kv, indices, scale, d_v=d_v, config=config
     )
     expected = _reference(q, kv, indices, scale, d_v, None)
+    for lhs, rhs in zip(actual, expected):
+        torch.testing.assert_close(lhs.float(), rhs.float(), atol=2e-2, rtol=2e-2)
+
+
+@GPU_REQUIRED
+def test_flash_mla_sparse_sorted_indices_preserve_active_prefix():
+    torch.manual_seed(11)
+    s_q, s_kv, h_q, h_kv, d_qk, d_v, topk = 4, 80, 16, 1, 576, 512, 33
+    q = torch.randn(s_q, h_q, d_qk, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(s_kv, h_kv, d_qk, device="cuda", dtype=torch.bfloat16)
+    indices = torch.randint(
+        0, s_kv, (s_q, h_kv, topk), device="cuda", dtype=torch.int32
+    )
+    indices[1, 0, 1] = -1
+    indices[2, 0, 2] = s_kv + 1
+    lengths = torch.tensor([0, 7, topk, 19], device="cuda", dtype=torch.int32)
+    scale = 1.0 / math.sqrt(d_qk)
+    config = {
+        "BLOCK_N": 16,
+        "BLOCK_H": 16,
+        "BLOCK_DMODEL": 256,
+        "num_warps": 4,
+        "num_stages": 2,
+        "SORT_INDICES": True,
+    }
+    actual = flash_mla_sparse_fwd(
+        q,
+        kv,
+        indices,
+        scale,
+        d_v=d_v,
+        topk_length=lengths,
+        config=config,
+    )
+    expected = _reference(q, kv, indices, scale, d_v, lengths)
     for lhs, rhs in zip(actual, expected):
         torch.testing.assert_close(lhs.float(), rhs.float(), atol=2e-2, rtol=2e-2)
