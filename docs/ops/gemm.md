@@ -176,6 +176,41 @@ y = batched_gemm_bf16(
 
 ### BW200 FFN shape 性能
 
+#### 非 async 默认配置更新（2026-09-11）
+
+本次只更新 `B=56,M=234` 的两组 N/K、TN/TT 四份 batch 专用 JSON，
+不添加 `use_async_copy`、global/LDS prefetch distance，也不修改 kernel 或接口。
+四份配置均关闭 `optimize_epilogue`；只有第二组 TT 保留普通 BlockPingpong。
+这不是启用尚未合入的 planned async 流水。
+
+同轮对比：BW200/gfx936（80 CU）、FP16、Torch 2.10.0 / HIP 6.3.26113，
+`AMDGCN_USE_BUFFER_OPS=1`、`TRITON_BUFFER_CACHE_SWIZZLE=1`。
+使用预分配输出，权重转布局不计时；HIP graph replay，复测 `rep=100 ms`
+三轮取中位数。表中 TFLOPS 是逻辑 FLOP/事件时间估算，不是硬件计数。
+
+| `[B,M,N,K]` | 布局 | 更新前默认 ms | 更新后 ms | 估算 TFLOPS | 加速比 | BM/BN/BK | PP |
+|---|---|---:|---:|---:|---:|---|---|
+| `[56,234,4928,1232]` | TN | 1.3067 | 1.0213 | 155.79 | 1.28x | 256/256/32 | off |
+| 同上 | TT | 1.1634 | 0.8311 | 191.46 | 1.40x | 256/256/32 | off |
+| `[56,234,1232,2464]` | TN | 0.6100 | 0.5034 | 158.04 | 1.21x | 128/256/64 | off |
+| 同上 | TT | 0.4920 | 0.4013 | 198.23 | 1.23x | 256/256/32 | on |
+
+四项均为 async-off 的实测配置，精度阈值 `atol=rtol=0.02`，最终赢家另用
+seed 7/123 验证。第二组 TN 的 PP-on 候选实际回退，与 PP-off 的微小时间差
+不作为收益，因此采用显式 PP-off。第二组 TT 的普通 PP 已确认实际生效。
+
+版本口径：数据来自 BoltOps `8bbee9b1`、Triton `d138b529f` 的同轮调优；
+后者是未合入的开发版本，但上述配置不使用新增 async/G/R 参数。
+这不是已发布 Triton wheel 的性能保证，发布环境需复测。搜索固定
+`optimize_epilogue=False`，表中是完整配置更新的收益，不能全部归因于 PP
+或某个单独开关。原始数据保存在测试机
+`/xukang/hygon_tmp/tune_batched_special_20260911/{bench,baselines}.json`。
+
+历史 0814 rocBLAS 的 wide/narrow 为 0.724457/0.513769 ms（见下方历史记录）；
+库版本及计时方式不同，不与本表计算严格同口径加速比。
+
+#### 历史对比（默认配置更新前）
+
 固定环境为 BW200/gfx936、FP16、`B=56, M=234`。Triton 数字使用 CUDA/HIP
 Event benchmark（warmup 20 ms、rep 100 ms）；rocBLAS 数字使用固定 0814
 rocBLAS，warmup 10 次、测量 50 次。TFLOPS 为按 GEMM FLOP 数计算的逻辑值，
