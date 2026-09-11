@@ -1,30 +1,741 @@
 {
   "meta": {
     "arch": "gfx938",
-    "source": "ship defaults: Q double-buf + W_GROUP ping-pong (former q_db=2/w_cache=3)",
-    "note": "Prefer w_group=16 on H=64; host clamps to divide HEAD_CHUNK. kv via LDS."
+    "triton": "3.6.0",
+    "source": "fp8_mqa_logits_gluon_all_sizes_tune_gfx938.json",
+    "note": "Prefer by_region (seq_len_leq / seq_kv_leq / num_heads_leq); legacy by_shape / by_seq_kv still readable. Coarse Q/KV/H buckets (M in {32,64,128}) aggregated from all-sizes Gluon tune (not exact grid)."
   },
   "default": {
     "main": {
+      "block_m": 32,
+      "block_n": 128,
+      "head_split_k": 1,
       "w_group": 16,
-      "kv_tiles_n": 2
+      "kv_tiles_n": 2,
+      "num_stages": 2,
+      "waves_per_eu": 0,
+      "kpack": 2
     }
   },
-  "by_seq_kv": [
+  "by_region": [
     {
-      "seq_kv_leq": 4096,
-      "label": "long",
+      "seq_len_leq": 32,
+      "seq_kv_leq": 128,
+      "num_heads_leq": 16,
+      "label": "m32-n128-h16",
+      "source_label": "gpu-pick-m32-n128-h16",
+      "best_ms": 0.0305,
       "main": {
-        "w_group": 16,
-        "kv_tiles_n": 2
+        "block_m": 16,
+        "block_n": 128,
+        "head_split_k": 1,
+        "w_group": 4,
+        "kv_tiles_n": 2,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "kpack": 2
       }
     },
     {
-      "seq_kv_leq": 16384,
-      "label": "xl",
+      "seq_len_leq": 64,
+      "seq_kv_leq": 128,
+      "num_heads_leq": 16,
+      "label": "m64-n128-h16",
+      "source_label": "gpu-pick-m64-n128-h16",
+      "best_ms": 0.0162,
       "main": {
+        "block_m": 32,
+        "block_n": 128,
+        "head_split_k": 1,
+        "w_group": 4,
+        "kv_tiles_n": 2,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "kpack": 1
+      }
+    },
+    {
+      "seq_len_leq": 32,
+      "seq_kv_leq": 4096,
+      "num_heads_leq": 16,
+      "label": "m32-n4096-h16",
+      "source_label": "gpu-pick-m32-n4096-h16",
+      "best_ms": 0.0277,
+      "main": {
+        "block_m": 16,
+        "block_n": 128,
+        "head_split_k": 1,
+        "w_group": 8,
+        "kv_tiles_n": 1,
+        "num_stages": 1,
+        "waves_per_eu": 4,
+        "kpack": 1
+      }
+    },
+    {
+      "seq_len_leq": 64,
+      "seq_kv_leq": 4096,
+      "num_heads_leq": 16,
+      "label": "m64-n4096-h16",
+      "source_label": "gpu-pick-m64-n4096-h16",
+      "best_ms": 0.0171,
+      "main": {
+        "block_m": 16,
+        "block_n": 64,
+        "head_split_k": 1,
+        "w_group": 2,
+        "kv_tiles_n": 1,
+        "num_stages": 1,
+        "waves_per_eu": 0,
+        "kpack": 1
+      }
+    },
+    {
+      "seq_len_leq": 128,
+      "seq_kv_leq": 4096,
+      "num_heads_leq": 16,
+      "label": "m128-n4096-h16",
+      "source_label": "gpu-pick-m128-n4096-h16",
+      "best_ms": 0.0198,
+      "main": {
+        "block_m": 16,
+        "block_n": 128,
+        "head_split_k": 1,
+        "w_group": 8,
+        "kv_tiles_n": 1,
+        "num_stages": 1,
+        "waves_per_eu": 0,
+        "kpack": 2
+      }
+    },
+    {
+      "seq_len_leq": 32,
+      "seq_kv_leq": 8192,
+      "num_heads_leq": 16,
+      "label": "m32-n8192-h16",
+      "source_label": "gpu-pick-m32-n8192-h16",
+      "best_ms": 0.0314,
+      "main": {
+        "block_m": 16,
+        "block_n": 128,
+        "head_split_k": 1,
+        "w_group": 2,
+        "kv_tiles_n": 1,
+        "num_stages": 2,
+        "waves_per_eu": 4,
+        "kpack": 1
+      }
+    },
+    {
+      "seq_len_leq": 64,
+      "seq_kv_leq": 8192,
+      "num_heads_leq": 16,
+      "label": "m64-n8192-h16",
+      "source_label": "gpu-pick-m64-n8192-h16",
+      "best_ms": 0.0197,
+      "main": {
+        "block_m": 16,
+        "block_n": 64,
+        "head_split_k": 1,
+        "w_group": 4,
+        "kv_tiles_n": 2,
+        "num_stages": 1,
+        "waves_per_eu": 0,
+        "kpack": 2
+      }
+    },
+    {
+      "seq_len_leq": 128,
+      "seq_kv_leq": 8192,
+      "num_heads_leq": 16,
+      "label": "m128-n8192-h16",
+      "source_label": "gpu-pick-m128-n8192-h16",
+      "best_ms": 0.0304,
+      "main": {
+        "block_m": 32,
+        "block_n": 64,
+        "head_split_k": 1,
+        "w_group": 2,
+        "kv_tiles_n": 1,
+        "num_stages": 1,
+        "waves_per_eu": 0,
+        "kpack": 2
+      }
+    },
+    {
+      "seq_len_leq": 32,
+      "seq_kv_leq": 16384,
+      "num_heads_leq": 16,
+      "label": "m32-n16384-h16",
+      "source_label": "gpu-pick-m32-n16384-h16",
+      "best_ms": 0.0373,
+      "main": {
+        "block_m": 16,
+        "block_n": 64,
+        "head_split_k": 1,
+        "w_group": 4,
+        "kv_tiles_n": 2,
+        "num_stages": 1,
+        "waves_per_eu": 4,
+        "kpack": 1
+      }
+    },
+    {
+      "seq_len_leq": 64,
+      "seq_kv_leq": 16384,
+      "num_heads_leq": 16,
+      "label": "m64-n16384-h16",
+      "source_label": "gpu-pick-m64-n16384-h16",
+      "best_ms": 0.0289,
+      "main": {
+        "block_m": 32,
+        "block_n": 64,
+        "head_split_k": 1,
+        "w_group": 8,
+        "kv_tiles_n": 1,
+        "num_stages": 2,
+        "waves_per_eu": 4,
+        "kpack": 1
+      }
+    },
+    {
+      "seq_len_leq": 128,
+      "seq_kv_leq": 16384,
+      "num_heads_leq": 16,
+      "label": "m128-n16384-h16",
+      "source_label": "gpu-pick-m128-n16384-h16",
+      "best_ms": 0.0369,
+      "main": {
+        "block_m": 32,
+        "block_n": 128,
+        "head_split_k": 1,
+        "w_group": 8,
+        "kv_tiles_n": 2,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "kpack": 1
+      }
+    },
+    {
+      "seq_len_leq": 32,
+      "seq_kv_leq": 32768,
+      "num_heads_leq": 16,
+      "label": "m32-n32768-h16",
+      "source_label": "gpu-pick-m32-n32768-h16",
+      "best_ms": 0.0482,
+      "main": {
+        "block_m": 16,
+        "block_n": 128,
+        "head_split_k": 1,
+        "w_group": 8,
+        "kv_tiles_n": 2,
+        "num_stages": 2,
+        "waves_per_eu": 4,
+        "kpack": 1
+      }
+    },
+    {
+      "seq_len_leq": 64,
+      "seq_kv_leq": 32768,
+      "num_heads_leq": 16,
+      "label": "m64-n32768-h16",
+      "source_label": "gpu-pick-m64-n32768-h16",
+      "best_ms": 0.0374,
+      "main": {
+        "block_m": 32,
+        "block_n": 128,
+        "head_split_k": 1,
+        "w_group": 8,
+        "kv_tiles_n": 2,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "kpack": 1
+      }
+    },
+    {
+      "seq_len_leq": 128,
+      "seq_kv_leq": 32768,
+      "num_heads_leq": 16,
+      "label": "m128-n32768-h16",
+      "source_label": "gpu-pick-m128-n32768-h16",
+      "best_ms": 0.0609,
+      "main": {
+        "block_m": 32,
+        "block_n": 128,
+        "head_split_k": 1,
+        "w_group": 8,
+        "kv_tiles_n": 2,
+        "num_stages": 1,
+        "waves_per_eu": 4,
+        "kpack": 1
+      }
+    },
+    {
+      "seq_len_leq": 32,
+      "seq_kv_leq": 65536,
+      "num_heads_leq": 16,
+      "label": "m32-n65536-h16",
+      "source_label": "gpu-pick-m32-n65536-h16",
+      "best_ms": 0.0767,
+      "main": {
+        "block_m": 16,
+        "block_n": 128,
+        "head_split_k": 1,
+        "w_group": 4,
+        "kv_tiles_n": 2,
+        "num_stages": 2,
+        "waves_per_eu": 4,
+        "kpack": 1
+      }
+    },
+    {
+      "seq_len_leq": 64,
+      "seq_kv_leq": 65536,
+      "num_heads_leq": 16,
+      "label": "m64-n65536-h16",
+      "source_label": "gpu-pick-m64-n65536-h16",
+      "best_ms": 0.0612,
+      "main": {
+        "block_m": 32,
+        "block_n": 128,
+        "head_split_k": 1,
+        "w_group": 8,
+        "kv_tiles_n": 2,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "kpack": 2
+      }
+    },
+    {
+      "seq_len_leq": 128,
+      "seq_kv_leq": 65536,
+      "num_heads_leq": 16,
+      "label": "m128-n65536-h16",
+      "source_label": "gpu-pick-m128-n65536-h16",
+      "best_ms": 0.1079,
+      "main": {
+        "block_m": 32,
+        "block_n": 128,
+        "head_split_k": 1,
+        "w_group": 8,
+        "kv_tiles_n": 2,
+        "num_stages": 1,
+        "waves_per_eu": 4,
+        "kpack": 2
+      }
+    },
+    {
+      "seq_len_leq": 32,
+      "seq_kv_leq": 131072,
+      "num_heads_leq": 16,
+      "label": "m32-n131072-h16",
+      "source_label": "gpu-pick-m32-n131072-h16",
+      "best_ms": 0.121,
+      "main": {
+        "block_m": 16,
+        "block_n": 128,
+        "head_split_k": 1,
+        "w_group": 8,
+        "kv_tiles_n": 2,
+        "num_stages": 2,
+        "waves_per_eu": 4,
+        "kpack": 2
+      }
+    },
+    {
+      "seq_len_leq": 64,
+      "seq_kv_leq": 131072,
+      "num_heads_leq": 16,
+      "label": "m64-n131072-h16",
+      "source_label": "gpu-pick-m64-n131072-h16",
+      "best_ms": 0.1072,
+      "main": {
+        "block_m": 32,
+        "block_n": 128,
+        "head_split_k": 1,
+        "w_group": 8,
+        "kv_tiles_n": 2,
+        "num_stages": 2,
+        "waves_per_eu": 4,
+        "kpack": 2
+      }
+    },
+    {
+      "seq_len_leq": 128,
+      "seq_kv_leq": 131072,
+      "num_heads_leq": 16,
+      "label": "m128-n131072-h16",
+      "source_label": "gpu-pick-m128-n131072-h16",
+      "best_ms": 0.2016,
+      "main": {
+        "block_m": 32,
+        "block_n": 128,
+        "head_split_k": 1,
+        "w_group": 8,
+        "kv_tiles_n": 2,
+        "num_stages": 2,
+        "waves_per_eu": 4,
+        "kpack": 2
+      }
+    },
+    {
+      "seq_len_leq": 32,
+      "seq_kv_leq": 128,
+      "num_heads_leq": 64,
+      "label": "m32-n128-h64",
+      "source_label": "gpu-pick-m32-n128-h64",
+      "best_ms": 0.0748,
+      "main": {
+        "block_m": 16,
+        "block_n": 64,
+        "head_split_k": 1,
+        "w_group": 2,
+        "kv_tiles_n": 1,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "kpack": 1
+      }
+    },
+    {
+      "seq_len_leq": 64,
+      "seq_kv_leq": 128,
+      "num_heads_leq": 64,
+      "label": "m64-n128-h64",
+      "source_label": "gpu-pick-m64-n128-h64",
+      "best_ms": 0.0382,
+      "main": {
+        "block_m": 16,
+        "block_n": 64,
+        "head_split_k": 1,
+        "w_group": 2,
+        "kv_tiles_n": 1,
+        "num_stages": 1,
+        "waves_per_eu": 0,
+        "kpack": 2
+      }
+    },
+    {
+      "seq_len_leq": 32,
+      "seq_kv_leq": 4096,
+      "num_heads_leq": 64,
+      "label": "m32-n4096-h64",
+      "source_label": "gpu-pick-m32-n4096-h64",
+      "best_ms": 0.0669,
+      "main": {
+        "block_m": 16,
+        "block_n": 128,
+        "head_split_k": 4,
         "w_group": 16,
-        "kv_tiles_n": 2
+        "kv_tiles_n": 2,
+        "num_stages": 1,
+        "waves_per_eu": 4,
+        "kpack": 2
+      }
+    },
+    {
+      "seq_len_leq": 64,
+      "seq_kv_leq": 4096,
+      "num_heads_leq": 64,
+      "label": "m64-n4096-h64",
+      "source_label": "gpu-pick-m64-n4096-h64",
+      "best_ms": 0.045,
+      "main": {
+        "block_m": 16,
+        "block_n": 128,
+        "head_split_k": 1,
+        "w_group": 16,
+        "kv_tiles_n": 2,
+        "num_stages": 2,
+        "waves_per_eu": 4,
+        "kpack": 2
+      }
+    },
+    {
+      "seq_len_leq": 128,
+      "seq_kv_leq": 4096,
+      "num_heads_leq": 64,
+      "label": "m128-n4096-h64",
+      "source_label": "gpu-pick-m128-n4096-h64",
+      "best_ms": 0.0652,
+      "main": {
+        "block_m": 16,
+        "block_n": 64,
+        "head_split_k": 1,
+        "w_group": 16,
+        "kv_tiles_n": 2,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "kpack": 2
+      }
+    },
+    {
+      "seq_len_leq": 32,
+      "seq_kv_leq": 8192,
+      "num_heads_leq": 64,
+      "label": "m32-n8192-h64",
+      "source_label": "gpu-pick-m32-n8192-h64",
+      "best_ms": 0.0885,
+      "main": {
+        "block_m": 16,
+        "block_n": 128,
+        "head_split_k": 1,
+        "w_group": 16,
+        "kv_tiles_n": 2,
+        "num_stages": 2,
+        "waves_per_eu": 4,
+        "kpack": 2
+      }
+    },
+    {
+      "seq_len_leq": 64,
+      "seq_kv_leq": 8192,
+      "num_heads_leq": 64,
+      "label": "m64-n8192-h64",
+      "source_label": "gpu-pick-m64-n8192-h64",
+      "best_ms": 0.0646,
+      "main": {
+        "block_m": 16,
+        "block_n": 64,
+        "head_split_k": 1,
+        "w_group": 16,
+        "kv_tiles_n": 2,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "kpack": 2
+      }
+    },
+    {
+      "seq_len_leq": 128,
+      "seq_kv_leq": 8192,
+      "num_heads_leq": 64,
+      "label": "m128-n8192-h64",
+      "source_label": "gpu-pick-m128-n8192-h64",
+      "best_ms": 0.0942,
+      "main": {
+        "block_m": 32,
+        "block_n": 128,
+        "head_split_k": 1,
+        "w_group": 16,
+        "kv_tiles_n": 2,
+        "num_stages": 1,
+        "waves_per_eu": 4,
+        "kpack": 1
+      }
+    },
+    {
+      "seq_len_leq": 32,
+      "seq_kv_leq": 16384,
+      "num_heads_leq": 64,
+      "label": "m32-n16384-h64",
+      "source_label": "gpu-pick-m32-n16384-h64",
+      "best_ms": 0.1114,
+      "main": {
+        "block_m": 16,
+        "block_n": 64,
+        "head_split_k": 1,
+        "w_group": 16,
+        "kv_tiles_n": 2,
+        "num_stages": 1,
+        "waves_per_eu": 4,
+        "kpack": 2
+      }
+    },
+    {
+      "seq_len_leq": 64,
+      "seq_kv_leq": 16384,
+      "num_heads_leq": 64,
+      "label": "m64-n16384-h64",
+      "source_label": "gpu-pick-m64-n16384-h64",
+      "best_ms": 0.0933,
+      "main": {
+        "block_m": 32,
+        "block_n": 128,
+        "head_split_k": 1,
+        "w_group": 16,
+        "kv_tiles_n": 2,
+        "num_stages": 2,
+        "waves_per_eu": 4,
+        "kpack": 1
+      }
+    },
+    {
+      "seq_len_leq": 128,
+      "seq_kv_leq": 16384,
+      "num_heads_leq": 64,
+      "label": "m128-n16384-h64",
+      "source_label": "gpu-pick-m128-n16384-h64",
+      "best_ms": 0.1682,
+      "main": {
+        "block_m": 32,
+        "block_n": 128,
+        "head_split_k": 1,
+        "w_group": 16,
+        "kv_tiles_n": 2,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "kpack": 2
+      }
+    },
+    {
+      "seq_len_leq": 32,
+      "seq_kv_leq": 32768,
+      "num_heads_leq": 64,
+      "label": "m32-n32768-h64",
+      "source_label": "gpu-pick-m32-n32768-h64",
+      "best_ms": 0.1837,
+      "main": {
+        "block_m": 16,
+        "block_n": 64,
+        "head_split_k": 1,
+        "w_group": 16,
+        "kv_tiles_n": 2,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "kpack": 1
+      }
+    },
+    {
+      "seq_len_leq": 64,
+      "seq_kv_leq": 32768,
+      "num_heads_leq": 64,
+      "label": "m64-n32768-h64",
+      "source_label": "gpu-pick-m64-n32768-h64",
+      "best_ms": 0.1681,
+      "main": {
+        "block_m": 32,
+        "block_n": 128,
+        "head_split_k": 1,
+        "w_group": 16,
+        "kv_tiles_n": 2,
+        "num_stages": 2,
+        "waves_per_eu": 4,
+        "kpack": 2
+      }
+    },
+    {
+      "seq_len_leq": 128,
+      "seq_kv_leq": 32768,
+      "num_heads_leq": 64,
+      "label": "m128-n32768-h64",
+      "source_label": "gpu-pick-m128-n32768-h64",
+      "best_ms": 0.2976,
+      "main": {
+        "block_m": 32,
+        "block_n": 128,
+        "head_split_k": 1,
+        "w_group": 16,
+        "kv_tiles_n": 2,
+        "num_stages": 2,
+        "waves_per_eu": 4,
+        "kpack": 2
+      }
+    },
+    {
+      "seq_len_leq": 32,
+      "seq_kv_leq": 65536,
+      "num_heads_leq": 64,
+      "label": "m32-n65536-h64",
+      "source_label": "gpu-pick-m32-n65536-h64",
+      "best_ms": 0.2826,
+      "main": {
+        "block_m": 16,
+        "block_n": 128,
+        "head_split_k": 1,
+        "w_group": 16,
+        "kv_tiles_n": 2,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "kpack": 1
+      }
+    },
+    {
+      "seq_len_leq": 64,
+      "seq_kv_leq": 65536,
+      "num_heads_leq": 64,
+      "label": "m64-n65536-h64",
+      "source_label": "gpu-pick-m64-n65536-h64",
+      "best_ms": 0.2969,
+      "main": {
+        "block_m": 32,
+        "block_n": 128,
+        "head_split_k": 1,
+        "w_group": 16,
+        "kv_tiles_n": 2,
+        "num_stages": 1,
+        "waves_per_eu": 4,
+        "kpack": 2
+      }
+    },
+    {
+      "seq_len_leq": 128,
+      "seq_kv_leq": 65536,
+      "num_heads_leq": 64,
+      "label": "m128-n65536-h64",
+      "source_label": "gpu-pick-m128-n65536-h64",
+      "best_ms": 0.5557,
+      "main": {
+        "block_m": 32,
+        "block_n": 128,
+        "head_split_k": 1,
+        "w_group": 16,
+        "kv_tiles_n": 2,
+        "num_stages": 2,
+        "waves_per_eu": 4,
+        "kpack": 1
+      }
+    },
+    {
+      "seq_len_leq": 32,
+      "seq_kv_leq": 131072,
+      "num_heads_leq": 64,
+      "label": "m32-n131072-h64",
+      "source_label": "gpu-pick-m32-n131072-h64",
+      "best_ms": 0.5043,
+      "main": {
+        "block_m": 16,
+        "block_n": 128,
+        "head_split_k": 1,
+        "w_group": 16,
+        "kv_tiles_n": 2,
+        "num_stages": 1,
+        "waves_per_eu": 4,
+        "kpack": 1
+      }
+    },
+    {
+      "seq_len_leq": 64,
+      "seq_kv_leq": 131072,
+      "num_heads_leq": 64,
+      "label": "m64-n131072-h64",
+      "source_label": "gpu-pick-m64-n131072-h64",
+      "best_ms": 0.5544,
+      "main": {
+        "block_m": 32,
+        "block_n": 128,
+        "head_split_k": 1,
+        "w_group": 16,
+        "kv_tiles_n": 2,
+        "num_stages": 1,
+        "waves_per_eu": 4,
+        "kpack": 1
+      }
+    },
+    {
+      "seq_len_leq": 128,
+      "seq_kv_leq": 131072,
+      "num_heads_leq": 64,
+      "label": "m128-n131072-h64",
+      "source_label": "gpu-pick-m128-n131072-h64",
+      "best_ms": 1.0728,
+      "main": {
+        "block_m": 32,
+        "block_n": 128,
+        "head_split_k": 1,
+        "w_group": 16,
+        "kv_tiles_n": 2,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "kpack": 2
       }
     }
   ]

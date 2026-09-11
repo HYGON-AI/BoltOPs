@@ -413,33 +413,96 @@ def get_fp8_mqa_tiled_launch_config(seq_len: int, seq_len_kv: int) -> dict[str, 
     return out
 
 
+def _find_gluon_by_shape_entry(
+    data: dict[str, Any], seq_len: int, seq_len_kv: int, num_heads: int
+) -> Optional[dict[str, Any]]:
+    """Exact ``(seq_len, seq_kv, num_heads)`` hit in shipped ``by_shape``."""
+    for entry in data.get("by_shape") or []:
+        if (
+            int(entry.get("seq_len", -1)) == int(seq_len)
+            and int(entry.get("seq_kv", -1)) == int(seq_len_kv)
+            and int(entry.get("num_heads", -1)) == int(num_heads)
+        ):
+            return entry
+    return None
+
+
+def _find_gluon_by_region_entry(
+    data: dict[str, Any], seq_len: int, seq_len_kv: int, num_heads: int
+) -> Optional[dict[str, Any]]:
+    """Tightest ``by_region`` hit with ``M/N/H <= *_leq`` upper bounds.
+
+    Among matching regions, prefer smaller ``num_heads_leq``, then
+    ``seq_kv_leq``, then ``seq_len_leq``.
+    """
+    regions = data.get("by_region") or []
+    if not regions:
+        return None
+    best: Optional[dict[str, Any]] = None
+    best_key: Optional[tuple[int, int, int]] = None
+    for entry in regions:
+        m_leq = int(entry.get("seq_len_leq", -1))
+        n_leq = int(entry.get("seq_kv_leq", -1))
+        h_leq = int(entry.get("num_heads_leq", -1))
+        if m_leq < 0 or n_leq < 0 or h_leq < 0:
+            continue
+        if seq_len > m_leq or seq_len_kv > n_leq or num_heads > h_leq:
+            continue
+        key = (h_leq, n_leq, m_leq)
+        if best is None or key < best_key:  # type: ignore[operator]
+            best = entry
+            best_key = key
+    return best
+
+
+def _clamp_gluon_head_split_k(split_k: int, num_heads: int) -> int:
+    """Ensure ``head_split_k`` divides ``num_heads`` (halve while needed)."""
+    sk = max(1, int(split_k))
+    while sk > 1 and int(num_heads) % sk != 0:
+        sk //= 2
+    return sk
+
+
 def get_fp8_mqa_gluon_launch_config(
     seq_len: int, seq_len_kv: int, num_heads: int
 ) -> dict[str, Any]:
-    """Pick Gluon-specific launch knobs (``w_group``, ``kv_tiles_n``).
+    """Pick Gluon launch knobs from ``fp8_mqa_logits_gluon,arch=*.json``.
 
-    Loads ``fp8_mqa_logits_gluon,arch=*.json`` by ``seq_len_kv`` bucket when
-    present; otherwise uses code fallback (prefer ``w_group=16``,
-    ``kv_tiles_n=2``). ``w_group`` is always clamped so it divides ``num_heads``.
+    Preference order:
+      1. tightest ``by_region`` with ``seq_len/seq_kv/num_heads <= *_leq``
+      2. legacy exact ``by_shape`` match on ``(seq_len, seq_kv, num_heads)``
+      3. legacy smallest ``by_seq_kv[].seq_kv_leq >= seq_len_kv``
+      4. ``default`` / code fallback (``w_group=16``, ``kv_tiles_n=2``)
+
+    ``w_group`` is clamped so it divides ``num_heads``; ``head_split_k`` is
+    clamped so it divides ``num_heads``.
     """
-    del seq_len  # reserved for future M-bucketing
     arch = arch_info.get_arch()
     data = _load_gluon_config_file(arch)
     if not data:
         out = copy.deepcopy(_GLUON_FALLBACK_LAUNCH)
     else:
-        buckets = sorted(
-            data.get("by_seq_kv") or [],
-            key=lambda b: int(b["seq_kv_leq"]),
-        )
-        entry = None
-        for bucket in buckets:
-            if seq_len_kv <= int(bucket["seq_kv_leq"]):
-                entry = bucket
-                break
+        entry = _find_gluon_by_region_entry(data, seq_len, seq_len_kv, num_heads)
+        if entry is None:
+            entry = _find_gluon_by_shape_entry(
+                data, seq_len, seq_len_kv, num_heads
+            )
+        if entry is None:
+            buckets = sorted(
+                data.get("by_seq_kv") or [],
+                key=lambda b: int(b["seq_kv_leq"]),
+            )
+            for bucket in buckets:
+                if seq_len_kv <= int(bucket["seq_kv_leq"]):
+                    entry = bucket
+                    break
         if entry is None:
             entry = data.get("default") or {}
         out = _flatten_gluon_entry(entry)
 
     out["w_group"] = clamp_gluon_w_group(int(out["w_group"]), int(num_heads))
+    if "head_split_k" in out:
+        out["head_split_k"] = _clamp_gluon_head_split_k(
+            int(out["head_split_k"]), int(num_heads)
+        )
     return out

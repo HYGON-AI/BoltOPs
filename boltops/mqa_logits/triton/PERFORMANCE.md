@@ -10,7 +10,7 @@ not dominate short shapes.
 | --- | --- | --- |
 | **row** | Tiny KV (`N≤128`) under auto dispatch | Tuned `block_kv` / warps / stages from shipped JSON |
 | **bn** | No Gluon, mid/large | 2D tile `BN∈{64,128}`, optional `head_split_k`; Q prefetch + `W_GROUP` |
-| **gluon** | Gluon available, mid/large | KV LDS + Q double-buf + W_GROUP ping-pong; `w_group` / `kv_tiles_n` from JSON |
+| **gluon** | Gluon available, mid/large | KV LDS + Q double-buf + W_GROUP ping-pong; BN-style epilogue; launch knobs from coarse Q/KV/H ``by_region`` |
 
 Public auto: Gluon → `row|gluon`; else → `row|bn`
 (`get_fp8_mqa_shape_dispatch` in `mqa_config_utils.py`).
@@ -22,7 +22,7 @@ preallocated `D_out`.
 
 | Runtime | Path | ≥0.98× lightop | geo mean | note |
 | --- | --- | --- | --- | --- |
-| Triton 3.6+ (Gluon) | auto `row\|gluon` | **54/54** | **~1.23×** | all points strictly faster |
+| Triton 3.6+ (Gluon) | auto `row\|gluon` | **54/54** | **~1.27×** | BN-style epilogue; Gluon launch via Q/KV/H ``by_region`` |
 | No Gluon (e.g. 3.2) | auto `row\|bn` | **41/54** | **~1.06×** | weaker on some large-`N`+`H=64` / small-`M`+`H=8` |
 
 Forced `backend="gluon"` on tiny shapes (e.g. `16×66 H=64`) can lose to lightop;
@@ -53,8 +53,11 @@ HIP_VISIBLE_DEVICES=0 python3 boltops/mqa_logits/triton/tune_fp8_mqa_logits.py -
 
 ## Other notes
 
-* Gluon algorithm path is fixed; only ``w_group`` / ``kv_tiles_n`` come from
-  JSON (hand-picked). HIP warps/stages come from the tiled JSON. Row launch
+* Gluon launch knobs come from coarse ``by_region`` buckets
+  (``seq_len_leq`` / ``seq_kv_leq`` / ``num_heads_leq``) in
+  ``fp8_mqa_logits_gluon,arch=*.json`` — not an exact lightop-grid shape table.
+  Exact all-sizes tune results stay in ``*_all_sizes_tune_*.json`` only.
+* HIP warps/stages for tiled helpers still come from the tiled JSON. Row launch
   JSON was autotuned via `tune_fp8_mqa_logits.py`.
 * Row JSON tune (Triton 3.2 capability) gave ~1.3× on short-fast / XL vs code
   defaults (not vs lightop).
