@@ -1365,14 +1365,14 @@
       },
       "evidence": {
         "kind": "static_range_materialization",
-        "source": "K100 multi-size and boundary sweeps, 2026-09-10"
+        "source": "K100 wait/LDS multi-size retune and boundary sweeps, 2026-09-11"
       },
       "config": {
         "BLOCK_N": 16,
         "BLOCK_H": 16,
         "BLOCK_DMODEL": 256,
         "num_warps": 4,
-        "num_stages": 1,
+        "num_stages": 3,
         "USE_MATRIX_LOAD_Q": false,
         "waves_per_eu": 1,
         "matrix_instr_nonkdim": 16,
@@ -1400,14 +1400,14 @@
       },
       "evidence": {
         "kind": "static_range_materialization",
-        "source": "K100 multi-size and boundary sweeps, 2026-09-10"
+        "source": "K100 wait/LDS multi-size retune and boundary sweeps, 2026-09-11"
       },
       "config": {
         "BLOCK_N": 16,
         "BLOCK_H": 16,
         "BLOCK_DMODEL": 256,
         "num_warps": 4,
-        "num_stages": 1,
+        "num_stages": 3,
         "USE_MATRIX_LOAD_Q": false,
         "waves_per_eu": 1,
         "matrix_instr_nonkdim": 16,
@@ -1435,14 +1435,14 @@
       },
       "evidence": {
         "kind": "static_range_materialization",
-        "source": "K100 multi-size and boundary sweeps, 2026-09-10"
+        "source": "K100 wait/LDS multi-size retune and boundary sweeps, 2026-09-11"
       },
       "config": {
         "BLOCK_N": 16,
         "BLOCK_H": 16,
         "BLOCK_DMODEL": 256,
         "num_warps": 4,
-        "num_stages": 1,
+        "num_stages": 3,
         "USE_MATRIX_LOAD_Q": false,
         "waves_per_eu": 1,
         "matrix_instr_nonkdim": 16,
@@ -1452,7 +1452,7 @@
         "optimize_epilogue": false,
         "use_block_pingpong": false,
         "SPLIT_KV": 16,
-        "SORT_INDICES": false
+        "SORT_INDICES": true
       }
     },
     {
@@ -1470,14 +1470,14 @@
       },
       "evidence": {
         "kind": "static_range_materialization",
-        "source": "K100 multi-size and boundary sweeps, 2026-09-10"
+        "source": "K100 wait/LDS multi-size retune and boundary sweeps, 2026-09-11"
       },
       "config": {
         "BLOCK_N": 16,
         "BLOCK_H": 16,
         "BLOCK_DMODEL": 256,
         "num_warps": 4,
-        "num_stages": 1,
+        "num_stages": 3,
         "USE_MATRIX_LOAD_Q": false,
         "waves_per_eu": 1,
         "matrix_instr_nonkdim": 16,
@@ -1505,14 +1505,14 @@
       },
       "evidence": {
         "kind": "static_range_materialization",
-        "source": "K100 multi-size and boundary sweeps, 2026-09-10"
+        "source": "K100 wait/LDS multi-size retune and boundary sweeps, 2026-09-11"
       },
       "config": {
         "BLOCK_N": 16,
         "BLOCK_H": 16,
         "BLOCK_DMODEL": 256,
         "num_warps": 4,
-        "num_stages": 1,
+        "num_stages": 3,
         "USE_MATRIX_LOAD_Q": false,
         "waves_per_eu": 1,
         "matrix_instr_nonkdim": 16,
@@ -1521,7 +1521,7 @@
         "misched_regpressure": true,
         "optimize_epilogue": false,
         "use_block_pingpong": false,
-        "SPLIT_KV": 4,
+        "SPLIT_KV": 16,
         "SORT_INDICES": true
       }
     },
@@ -1540,14 +1540,14 @@
       },
       "evidence": {
         "kind": "static_range_materialization",
-        "source": "K100 multi-size and boundary sweeps, 2026-09-10"
+        "source": "K100 wait/LDS multi-size retune and boundary sweeps, 2026-09-11"
       },
       "config": {
         "BLOCK_N": 16,
         "BLOCK_H": 16,
         "BLOCK_DMODEL": 256,
         "num_warps": 4,
-        "num_stages": 1,
+        "num_stages": 3,
         "USE_MATRIX_LOAD_Q": false,
         "waves_per_eu": 1,
         "matrix_instr_nonkdim": 16,
@@ -1556,7 +1556,7 @@
         "misched_regpressure": true,
         "optimize_epilogue": false,
         "use_block_pingpong": false,
-        "SPLIT_KV": 2,
+        "SPLIT_KV": 8,
         "SORT_INDICES": true
       }
     },
@@ -1575,14 +1575,14 @@
       },
       "evidence": {
         "kind": "static_range_materialization",
-        "source": "K100 multi-size and boundary sweeps, 2026-09-10"
+        "source": "K100 wait/LDS multi-size retune and boundary sweeps, 2026-09-11"
       },
       "config": {
         "BLOCK_N": 16,
         "BLOCK_H": 16,
         "BLOCK_DMODEL": 256,
         "num_warps": 4,
-        "num_stages": 2,
+        "num_stages": 3,
         "USE_MATRIX_LOAD_Q": false,
         "waves_per_eu": 2,
         "matrix_instr_nonkdim": 16,
@@ -1591,7 +1591,7 @@
         "misched_regpressure": true,
         "optimize_epilogue": false,
         "use_block_pingpong": false,
-        "SPLIT_KV": 1,
+        "SPLIT_KV": 8,
         "SORT_INDICES": true
       }
     },
@@ -1610,14 +1610,14 @@
       },
       "evidence": {
         "kind": "static_range_materialization",
-        "source": "K100 multi-size and boundary sweeps, 2026-09-10"
+        "source": "K100 wait/LDS multi-size retune and boundary sweeps, 2026-09-11"
       },
       "config": {
         "BLOCK_N": 16,
         "BLOCK_H": 16,
         "BLOCK_DMODEL": 256,
         "num_warps": 4,
-        "num_stages": 1,
+        "num_stages": 3,
         "USE_MATRIX_LOAD_Q": false,
         "waves_per_eu": 1,
         "matrix_instr_nonkdim": 16,
@@ -1626,7 +1626,7 @@
         "misched_regpressure": true,
         "optimize_epilogue": false,
         "use_block_pingpong": false,
-        "SPLIT_KV": 4,
+        "SPLIT_KV": 16,
         "SORT_INDICES": false
       }
     },
