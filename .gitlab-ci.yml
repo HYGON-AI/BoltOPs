@@ -68,7 +68,6 @@ select:source:
     - nmz
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"'
-    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_REF_NAME == "main"'
   before_script:
     - !reference [.git-auth, before_script]
   script:
@@ -98,7 +97,6 @@ build:test-wheel:
       artifacts: true
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"'
-    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_REF_NAME == "main"'
   parallel:
     matrix:
       - TORCH_VERSION: ["2.10.0", "2.11.0"]
@@ -188,7 +186,6 @@ performance:optest:
       artifacts: true
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"'
-    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_REF_NAME == "main"'
   parallel:
     matrix:
       - RUNNER_TAG: [nmz, bw]
@@ -285,23 +282,24 @@ publish:
   stage: publish
   tags:
     - nmz
-  needs:
-    - job: build:test-wheel
-      artifacts: true
-    - job: performance:optest
-      artifacts: false
   rules:
     - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_REF_NAME == "main"'
+  parallel:
+    matrix:
+      - TORCH_VERSION: ["2.10.0", "2.11.0"]
   before_script:
-    - python -m pip install ciupload
+    - python -m pip install build wheel ciupload
   script:
+    - DTK_VER=$(echo ${DTK_PKG} | grep -oP 'dtk\K[0-9]+\.[0-9]+' | tr -d '.')
+    - GIT_COMMIT=$(git rev-parse --short=6 HEAD)
+    - python -m build --wheel
+    - CIUpload REPAIR --dtk_version ${DTK_VER} --torch_version ${TORCH_VERSION} --git_commit ${GIT_COMMIT} --outputdir output -f dist/*.whl
     - ls -l output/*.whl
     - |
       for wheel in output/*.whl; do
         CIUpload NIGHTLY \
           --devpi_url "${DEVPI_URL}" \
-          --devpi_user "${devpi_nightly_user}" \
-          --devpi_password "${devpi_nightly_password}" \
+          --password "${devpi_nightly_password}" \
           --dtk_pkg_name "$(basename "${DTK_PKG}")" \
           --record \
           -f "${wheel}"
