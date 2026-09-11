@@ -496,6 +496,22 @@ def _validate_inputs(
             raise TypeError("topk_length must have dtype torch.int32 or torch.int64")
 
 
+def _sort_indices_for_locality(
+    indices: torch.Tensor,
+    topk_length: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Sort each active index prefix without changing sparse-attention semantics."""
+    if topk_length is None:
+        return indices.sort(dim=-1).values
+    positions = torch.arange(indices.shape[2], device=indices.device)
+    active = positions[None, None, :] < topk_length[:, None, None].clamp(
+        min=0, max=indices.shape[2]
+    )
+    sentinel = torch.iinfo(indices.dtype).max
+    sort_keys = torch.where(active, indices, sentinel)
+    return sort_keys.sort(dim=-1).values
+
+
 def flash_mla_sparse_fwd(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -529,6 +545,7 @@ def flash_mla_sparse_fwd(
     block_h = int(tuned.get("BLOCK_H", 16))
     heads_per_program = min(block_h, h_q // h_kv)
     num_kv_splits = int(tuned.get("SPLIT_KV", 1))
+    sort_indices = bool(tuned.get("SORT_INDICES", False))
     if num_kv_splits not in (1, 2, 4, 8, 16, 32, 64, 128):
         raise ValueError("SPLIT_KV must be a power of two from 1 through 128")
     # The final 64 dimensions of the common 576 layout are RoPE. Device-specific
@@ -552,6 +569,10 @@ def flash_mla_sparse_fwd(
     kv = kv.contiguous()
     indices = indices.contiguous()
     topk_arg = topk_length.contiguous() if topk_length is not None else indices
+    if sort_indices:
+        indices = _sort_indices_for_locality(
+            indices, topk_arg if topk_length is not None else None
+        )
     if num_kv_splits > 1:
         mid_out = torch.empty(
             (s_q, h_q, num_kv_splits, d_v + 2),
