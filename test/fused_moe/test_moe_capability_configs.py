@@ -302,7 +302,7 @@ def test_log_parser_preserves_bottom_a_mls_only_for_gemm2(tmp_path):
     assert json.loads(bottom.read_text())["1"]["bottom_a_use_mls_load"] is True
 
 
-def test_log_parser_saves_sorted_buffer_bridge_under_legacy_key(tmp_path):
+def test_log_parser_preserves_sorted_bridge_with_ordinary_load(tmp_path):
     results = moe_log_parser.parse_log_file(
         _autotune_log("False", bottom_a_use_mls_load="False", a_sorted="True")
     )
@@ -312,8 +312,9 @@ def test_log_parser_saves_sorted_buffer_bridge_under_legacy_key(tmp_path):
     moe_log_parser.save_results_to_json(results, top, bottom)
 
     assert "a_sorted" not in json.loads(top.read_text())["1"]
-    assert "a_sorted" not in json.loads(bottom.read_text())["1"]
-    assert json.loads(bottom.read_text())["1"]["bottom_a_use_mls_load"] is True
+    config = json.loads(bottom.read_text())["1"]
+    assert config["a_sorted"] is True
+    assert config["bottom_a_use_mls_load"] is False
 
 
 def test_log_parser_uses_logged_batch_key_and_sorts_output(tmp_path):
@@ -535,11 +536,16 @@ def test_bottom_a_mls_does_not_prune_gemm1_load_options(monkeypatch, tune_type):
         num_input_tokens=8192,
     )
     assert gemm2_configs
+    mls_configs = [c for c in gemm2_configs if
+                   c.kwargs["USE_MLS_LOAD"] or c.kwargs["bottom_a_use_mls_load"]]
+    assert mls_configs
     assert not any(
         c.kwargs.get("kpack") == 2
         or c.kwargs.get("use_block_pingpong", False)
-        for c in gemm2_configs
+        for c in mls_configs
     )
+    assert any(c.kwargs.get("kpack") == 2 for c in gemm2_configs)
+    assert all(c.kwargs["a_sorted"] for c in gemm2_configs)
 
 
 def test_bottom_a_sorted_buffer_load_keeps_gemm2_load_options(monkeypatch):
@@ -650,7 +656,8 @@ def test_gemm2_inner_search_keeps_outer_bottom_a_mls_choice(monkeypatch):
     )
 
     assert configs
-    assert all(c.kwargs["bottom_a_use_mls_load"] is True for c in configs)
+    assert all(c.kwargs["a_sorted"] is True for c in configs)
+    assert {c.kwargs["bottom_a_use_mls_load"] for c in configs} == {False, True}
 
 
 def test_bottom_a_mls_config_is_explicit(monkeypatch):
@@ -836,3 +843,11 @@ def test_small_fp8_channel_autotune_searches_cross_region_mmac_cluster(
 
     assert cluster_values(4) == {0, 2}
     assert cluster_values(2048) == {0}
+
+
+def test_sorted_bridge_does_not_force_mls(monkeypatch):
+    monkeypatch.setattr(fused_moe_impl, "_bottom_moe_use_mls", lambda: True)
+    config = {"a_sorted": True, "bottom_a_use_mls_load": False, "N_TILES_PER_CTA": 2}
+    assert fused_moe_impl._bottom_a_uses_sorted_layout(config, False)
+    assert not fused_moe_impl._bottom_a_uses_mls(config, False)
+    assert not fused_moe_impl._bottom_a_uses_sorted_layout(config, True)

@@ -398,12 +398,13 @@ def generate_config2_lists(
 
     use_mls_load_options = [False, True] if test_type in ["fp8", "fp8_channel", "int8", "int8_channel", "bf16"] and capMLS == True else [False]
     # The outer fused-MoE search selects the bridge layout because it changes
-    # Gemm1 output, padding and Gemm2 addressing. The inner Gemm2 search only
-    # turns that layout into matrix_load when the target supports MLS.
+    # Gemm1 output, padding and Gemm2 addressing. The inner Gemm2 search
+    # can use ordinary buffer loads or matrix_load on MLS-capable targets.
+    # A sorted bridge remains legal when K has a tail, even though MLS does not.
     bottom_a_sorted = bool(bottom_a_use_mls_load)
-    bottom_a_use_mls_load_options = [
-        bottom_a_sorted and capMLS and not is_gemm1
-    ]
+    bottom_a_use_mls_load_options = (
+        [False, True] if bottom_a_sorted and capMLS and not is_gemm1 else [False]
+    )
 
     # warp 1 no selected, so no need to tune
     num_warp_options = [2, 4, 8, 16]
@@ -708,6 +709,16 @@ def dynamic_autotune(fn):
                 if "int4" in test_type:
                     for cfg in dynamic_configs:
                         cfg.kwargs.pop("bottom_a_use_mls_load", None)
+                        cfg.kwargs.pop("a_sorted", None)
+                if not dynamic_configs:
+                    if compile_only:
+                        # A compile shard can legitimately receive no candidates.
+                        return []
+                    raise RuntimeError(
+                        f"No legal autotune candidates for {kernel_name}: "
+                        f"N={N}, K={K}, BLOCK_SIZE_M={BLOCK_SIZE_M}, "
+                        f"a_sorted={bottom_a_sorted}"
+                    )
                 def _prune_configs_by_runtime_constraints(configs, named_args, **_kwargs):
                     pruned = []
                     for cfg in configs:

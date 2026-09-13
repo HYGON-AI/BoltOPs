@@ -731,13 +731,14 @@ def _bottom_a_uses_sorted_layout(config, use_int4_w4a8):
     """
     if use_int4_w4a8 or config is None:
         return False
-    return config.get("bottom_a_use_mls_load", False)
+    return config.get("a_sorted", config.get("bottom_a_use_mls_load", False))
 
 
 def _bottom_a_uses_mls(config, use_int4_w4a8):
     return (
         _bottom_moe_use_mls()
         and _bottom_a_uses_sorted_layout(config, use_int4_w4a8)
+        and config.get("bottom_a_use_mls_load", False)
     )
 
 
@@ -944,6 +945,7 @@ def fused_experts_impl(hidden_states: torch.Tensor,
     bottom_moe_a_use_mls = _bottom_a_uses_mls(config2, use_int4_w4a8)
     config2_kernel = config2.copy()
     config2_kernel.pop("bottom_a_use_mls_load", None)
+    config2_kernel.pop("a_sorted", None)
 
     max_padded_tokens = (
         min(M * topk, E + 1) * (max_block_m - 1) if bottom_moe_a_sorted else 0
@@ -1005,6 +1007,7 @@ def fused_experts_impl(hidden_states: torch.Tensor,
             )
             config2_kernel = config2.copy()
             config2_kernel.pop("bottom_a_use_mls_load", None)
+            config2_kernel.pop("a_sorted", None)
             intermediate_cache3 = intermediate_cache3[:tokens_in_chunk]
 
         padded_tokens = (

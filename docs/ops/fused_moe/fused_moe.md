@@ -176,30 +176,30 @@ KMin=4096,KMod=1024,topk=8
 selector。精确 selector 始终优先于模糊 selector。
 
 仓库中的 Triton 3.6 配置同时保留精确 selector 和对应的 K 模糊
-selector。K 模糊 selector 从估算并验证过的下界开始，按 `KMod` 向上匹配，
-不设置 `KMax`；当前模糊配置仍把 topk 约束为训练值 `8`。解析器支持
-`topkSet` 和有界 topk
-范围，但只有专项复测满足 8% 门槛后才应使用。特殊的 K=1232/topk=1
-模型不做任何模糊匹配，只保留精确 selector。
+selector。历史配置保留已经验证过的模糊下界，不因本次新增训练而改写；
+本次新增配置采用更保守的 `KMin=训练 K,KMod=1024`，topk 固定为训练值，
+且不设置 `KMax`。解析器也支持 `topkSet` 和有界 topk 范围，但只有专项复测
+满足 8% 门槛后才应使用。特殊的 K=1232/topk=1 模型不做任何模糊匹配，
+只保留精确 selector。
 Triton 3.2 的历史配置缺少可靠的训练 shape 元数据，因此仅作为较低优先级的
 K 模糊回退：`KMin=2048,KMod=1024,topk=8`。
 
-当前 Triton 3.6 配置使用的范围如下：
+本次新增 Triton 3.6 配置使用的范围如下：
 
 | 精确 K/topk | 对应模糊 K | 对应模糊 topk |
 |---|---|---|
-| 1232/1 | 无，只精确匹配 | 无，只精确匹配 |
-| 3072/8 | `K>=2048`，`KMod=1024` | `8` |
-| 4096/8 | `K>=3072`，`KMod=1024` | `8` |
-| 6144/8 | `K>=5120`，`KMod=1024` | `8` |
-| 7168/8 | `K>=6144`，`KMod=1024` | `8` |
+| 2048/8 | `K>=2048`，`KMod=1024` | `8` |
+| 3072/8 | `K>=3072`，`KMod=1024` | `8` |
+| 4096/6、4096/8、4096/10 | `K>=4096`，`KMod=1024` | 各自训练的 topk |
+| 6144/8 | `K>=6144`，`KMod=1024` | `8` |
+| 7168/8 | `K>=7168`，`KMod=1024` | `8` |
 
 代表性验证使用真实 routing、无 shared expert，并将模糊配置与目标 shape 的
 完整 autotune 精确最优配置逐 M 比较：
 
 | 设备 / 类型 | 配置复用 | 验证 M | 最大退化 | 结论 |
 |---|---|---|---:|---|
-| BMZ gfx936 / BF16 E128 N192 | K4096/topk8 → K3072/topk8 | 1、16、256、2048、8192、16384 | 5.46% | 通过，据此设置 K 模糊下界与步长 |
+| BMZ gfx936 / BF16 E128 N192 | K4096/topk8 → K3072/topk8 | 1、16、256、2048、8192、16384 | 5.46% | 历史实验通过；本次重训后仍采用保守的 KMin=4096 |
 | NMZ gfx938 / FP8 channel E256 N320 | K7168/topk8 → K8192/topk4 | 1、16、256、2048、8192、16384 | 21.42%（M=1） | 不通过，不开放 topk4 模糊匹配 |
 
 NMZ 失败项中，除 M=1 外其余各点退化为 4.79%、1.07%、-0.81%、0.37%、
@@ -215,7 +215,7 @@ NMZ 失败项中，除 M=1 外其余各点退化为 4.79%、1.07%、-0.81%、0.3
 | 正确性 / 调参 / 测速 | `boltops-fused-moe-tune-cli` → `boltops.tools.fused_moe_triton_tune.tune_moe_cli:main` |
 | Autotune 使用手册 | [`tune_moe_triton_user_guide.md`](../../../boltops/tools/fused_moe_triton_tune/tune_moe_triton_user_guide.md) |
 | 性能实测报告      | [`performance_report.md`](performance_report.md) |
-| 网络 Shape 训练清单 | [`model_shape_training_matrix.md`](model_shape_training_matrix.md) |
+| 网络 Shape 训练清单 | [`model_matrix.md`](model_matrix.md) |
 
 ## 附录 B. 溯源
 

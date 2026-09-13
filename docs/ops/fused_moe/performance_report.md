@@ -406,18 +406,17 @@ Aiter：未重跑，未找到该 shape 的历史实测，不能给出加速比�
 
 | 检查项 | 结果 |
 |---|---|
-| Triton 3.6 配置文件 | 132 个：68 个精确 K/topk，64 个 `KMin/KMod` 模糊配置 |
+| Triton 3.6 配置文件 | 260 个：132 个精确 K/topk，128 个 `KMin/KMod` 模糊配置 |
 | Triton 3.2 配置文件 | 122 个低优先级 `KMin/KMod` 模糊配置 |
-| K selector | 不使用 `KMax`；精确匹配优先；K=1232/topk=1 仅精确匹配 |
-| 配置 JSON 与 Gemm1/Gemm2 配对 | 通过 |
-| 原 68 个 Triton 3.6 配置定点性能检查 | 450 个 M 点；累计修改 11 个 JSON、66 个 M 条目 |
-| 不纳入定点性能检查 | 82 个非候选点；17 个 gfx936 FP8 点 |
-| 配置相关回归 | 103 passed |
-| fused-MoE 完整测试 | 411 passed，33 skipped |
+| K selector | 不使用 `KMax`；精确匹配优先；新增模糊配置从训练 K 起按 1024 匹配；K=1232/topk=1 仅精确匹配 |
+| 配置 JSON | 260 个均非空且可解析；无 `waves_per_eu`；精确/模糊副本内容一致 |
+| Gemm1/Gemm2 配对 | 66 组精确配置和 64 组模糊配置均成对；共同 M 的 `BLOCK_SIZE_M` 一致 |
+| 配置相关回归 | BMZ 40 passed；NMZ 40 passed |
+| fused-MoE 完整测试 | BMZ 412 passed、33 skipped；NMZ 442 passed、3 skipped |
 
 ### `--benchmark` CLI 回归
 
 | 机器 | Shape | M 范围 | 配置加载 | 结果 |
 |---|---|---|---|---|
-| BMZ/gfx936 | BF16 E128/N192/K4096/topk8 | 1～32768（17 个） | Triton 3.6 精确配置 | 17 passed |
-| NMZ/gfx938 | FP8 channel E256/N320/K7168/topk8 | 1～32768（17 个） | Triton 3.6 精确配置 | 17 passed |
+| BMZ/gfx936 | BF16 E128/N192/K4096/topk8 | 1～32768（16 个） | Triton 3.6 精确配置 | 16 passed |
+| NMZ/gfx938 | FP8 channel E256/N320/K7168/topk8 | 1～32768（16 个） | Triton 3.6 精确配置 | 16 passed |
