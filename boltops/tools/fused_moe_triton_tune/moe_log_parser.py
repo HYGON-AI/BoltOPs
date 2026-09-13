@@ -250,14 +250,15 @@ def save_results_to_json(results, k1_filename, k2_filename):
             "BLOCK_SIZE_M": block_size_m,
             **{key: value for key, value in k2_params.items() if key != "a_sorted"},
         }
-        bottom_a_sorted = config_dict.get(
-            "bottom_a_use_mls_load",
-            k2_params.get("a_sorted", k2_params.get("bottom_a_use_mls_load")),
+        # Keep the bridge layout and the actual Gemm2 load choice separate.
+        # Legacy configs without a_sorted still use bottom_a_use_mls_load
+        # for both; new configs preserve the independently tuned switches.
+        bottom_a_sorted = k2_params.get(
+            "a_sorted", config_dict.get("bottom_a_use_mls_load")
         )
         if bottom_a_sorted is not None:
-            # Keep the historical on-disk key for compatibility. It now means
-            # "use the sorted Gemm1/Gemm2 bridge"; runtime capability decides
-            # whether Gemm2 consumes it with matrix_load or regular loads.
+            entry_k2["a_sorted"] = bool(bottom_a_sorted)
+        if "bottom_a_use_mls_load" not in entry_k2 and bottom_a_sorted is not None:
             entry_k2["bottom_a_use_mls_load"] = bool(bottom_a_sorted)
 
         json_data_k1[f"{special_key}"] = entry_k1
