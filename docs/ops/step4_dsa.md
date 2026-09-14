@@ -75,6 +75,11 @@ python3 scripts/benchmarks/triton/step4_dsa/benchmark_sparse_attn_decode.py \
 
 数字见下文 BW1100 性能记录。
 
+## 接口对齐、健壮性与配置规范化（2026-09-12）
+
+- **接口与健壮性增强**：修复 step4_dsa 系列算子在空行输入、极值边界等情况下的潜在异常，全面对齐 step4_dsa 标准调用接口，强化张量维度连续性（如 `_require_contiguous_last_dim`）及合法性校验。
+- **配置接口规范化**：规范化 launch config 的 JSON 格式与字段解析体系；支持统一的设备级集中式配置匹配与跨平台编译能力自适应过滤。
+
 ## 已知问题
 
 ### BW1100 短上下文 decode 有效槽位分区（2026-09-09）
@@ -249,6 +254,17 @@ tile 尺寸与 default 相同，收益来自 `num_warps` / `num_stages` /
 
 实现：`triton/prefill.py`。溯源：Step-4 DSA handoff `sparse_attn.py`。
 
+#### 编译器调度与寄存器压力调优（2026-09-12）
+
+在 per-query autotune 探索空间中引入 HIP 编译器底层调度选项：`empty_arrive_after_mmac`、`max_memory_cluster_dwords`、`misched_regpressure`。在生产 shape `Q=128, H=8, G=1, topk=512, cache_regions=4096, D=192` 上：
+
+| 实现 | launch 调度参数 | 延迟 (ms) | 相对上一版 | 相对 default |
+|---|---|---:|---:|---:|
+| tuned (09-08) | `[8,16,256, warps=4, stages=1, waves=2]` | 0.681120 | 1.00x | 2.35x |
+| tuned (09-12) | 扩展调度选项 (`misched_regpressure` 等) | 0.615680 | **1.1063x** | 2.60x |
+
+加速比：`0.681120 / 0.615680 = 1.1063x`。
+
 #### KV-split occupancy（2026-09-04）
 
 公开入口 per-query 在 ``Q * G < CUs`` 时自动切 packed slots，再
@@ -416,6 +432,25 @@ out, lse = triton_sparse_attention_decode(
 
 - HCU JSON：`decode-k513-s1-b4-ctx16384-hpg8-d192-r8_bf16_BW1100.json`
 - 无对应 `s18` 文件时回退该 `s1` tile；`config={}` 走内置 `_decode_tile_defaults`
+
+#### 综合性能优化与调度/配置升级（2026-09-12）
+
+针对 decode 算子综合实施以下优化组合并在生产点完成加速比测定：
+1. **K Cache 访存布局对齐**：调整 K 加载为 `[BLOCK_D, tokens]` 布局，使 QK 矩阵乘直接执行 `tl.dot(Q, K)`，消除片上 `tl.trans(K)` 的寄存器与指令开销。
+2. **非 2 次幂 head_dim 双块切分（dsplit）**：针对 `head_dim=192` 拆为 `128 + 64` 双块并行计算并累加，彻底消除 pad 到 256 带来的 25% 访存及算力浪费。
+3. **Log2 域 Online Softmax 加速**：Softmax 缩放因子折入 $\log_2(e)$ 并采用硬件高吞吐 `exp2` 替代原生 `exp`，保存 LSE 时还原自然对数，精度严格在 step4_dsa 允差范围内通过验收。
+4. **归一化单次倒数复用**：逐元素除法优化为每个 head 单次计算倒数 `div_rn` 并广播乘法复用，大幅减少高延迟除法指令。
+5. **动态槽位负载均衡（BALANCE_LIVE）**：在 GPU 端基于各 request 实际有效 token 动态均衡 `slots_per_split`，消除切片空转。
+6. **硬件 Buffer 访存指令**：开启 `AMDGCN_USE_BUFFER_OPS=1` 走硬件原生 Buffer 操作，显著降低 VGPR 压力。
+
+##### 生产基准加速比测定（B=4, context=16384）
+
+| 实现 | 优化项 | 延迟 (us) | 加速比 |
+|---|---|---:|---:|
+| HEAD 基线 (8bbee9b) | padded `BLOCK_D=256` | 44.40 | 1.00x |
+| 最终优化版本 | dsplit + exp2 + 倒数复用 + BALANCE_LIVE + BufferOps | 24.0815 | **1.8437x** |
+
+加速比：`44.40us / 24.0815us = 1.8437x`（耗时降幅约 45.8%）。
 
 实现：`triton/decode.py`（`sparse_attention_decode`）。溯源：Step-4 DSA
 handoff `sparse_attn.py`。

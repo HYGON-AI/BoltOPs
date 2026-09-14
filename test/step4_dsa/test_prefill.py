@@ -283,45 +283,8 @@ def test_build_prefill_tiles_uses_query_space_offsets():
 
 
 @C.GPU_REQUIRED
-def test_sparse_prefill_split_overlap_window_matches_ref():
-    """packed_width not divisible by splits*BLOCK_R must not double-count slots."""
-    data = _make_prefill_case(
-        total_q=8, seq_regions=32, topk=17, empty_rows=False, seed=43
-    )
-    from boltops.step4_dsa.triton.prefill import sparse_attention_prefill
-
-    out, lse = sparse_attention_prefill(
-        data["query"],
-        data["key_cache"],
-        data["value_cache"],
-        data["packed"],
-        data["counts"],
-        num_kv_groups=data["groups"],
-        region_size=data["region_size"],
-        softmax_scale=data["scale"],
-        num_splits=8,
-        config={"BLOCK_R": 8, "BLOCK_H": 16, "BLOCK_D": 256, "num_warps": 4, "num_stages": 1},
-    )
-    ref_out, ref_lse = ref_sparse_attention(
-        data["query"],
-        data["key_cache"],
-        data["value_cache"],
-        data["packed"],
-        data["counts"],
-        num_kv_groups=data["groups"],
-        region_size=data["region_size"],
-        softmax_scale=data["scale"],
-    )
-    torch.cuda.synchronize()
-    out_check = compare(out.float(), ref_out.float(), rtol=OUT_RTOL, atol=OUT_ATOL)
-    lse_check = compare(lse, ref_lse, rtol=LSE_RTOL, atol=LSE_ATOL)
-    assert out_check.passed, out_check.format()
-    assert lse_check.passed, lse_check.format()
-
-
-@C.GPU_REQUIRED
-def test_sparse_prefill_auto_kv_split_matches_ref():
-    """Wide packed rows with Q*G underfilling CUs should auto-split and match ref."""
+def test_sparse_prefill_wide_rows_match_ref():
+    """Wide packed rows remain correct when the Q*G grid underfills the device."""
     data = _make_prefill_case(
         total_q=4, seq_regions=64, topk=32, empty_rows=False, seed=44
     )
@@ -351,6 +314,43 @@ def test_sparse_prefill_auto_kv_split_matches_ref():
     lse_check = compare(lse, ref_lse, rtol=LSE_RTOL, atol=LSE_ATOL)
     assert out_check.passed, out_check.format()
     assert lse_check.passed, lse_check.format()
+
+
+def test_prefill_launch_options_follow_backend_capabilities(monkeypatch):
+    from boltops.step4_dsa.triton import prefill
+
+    class _Capabilities:
+        @staticmethod
+        def supports(name: str) -> bool:
+            return name in {
+                "waves_per_eu",
+                "misched_regpressure",
+                "empty_arrive_after_mmac",
+                "max_memory_cluster_dwords",
+            }
+
+    monkeypatch.setattr(torch.version, "hip", "test")
+    monkeypatch.setattr(prefill, "get_triton_capabilities", lambda: _Capabilities())
+    options = prefill._build_launch_options(
+        {
+            "BLOCK_R": 8,
+            "num_warps": 2,
+            "num_stages": 1,
+            "waves_per_eu": 3,
+            "misched_regpressure": False,
+            "empty_arrive_after_mmac": True,
+            "max_memory_cluster_dwords": 16,
+            "unknown_option": 7,
+        }
+    )
+    assert options == {
+        "num_warps": 2,
+        "num_stages": 1,
+        "waves_per_eu": 3,
+        "misched_regpressure": False,
+        "empty_arrive_after_mmac": True,
+        "max_memory_cluster_dwords": 16,
+    }
 
 
 def test_sparse_prefill_rejects_strided_head_dim():

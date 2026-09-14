@@ -1,8 +1,6 @@
 """Sparse GQA prefill attention over selected regions (scalar and query-tiled).
 
 Vendored from Step-4 DSA handoff ``inference/kernel.py`` (``sparse_attn`` prefill).
-Per-query ``num_splits is None`` chooses occupancy from device CU count; split
-windows are disjoint (``slots < window_end``). Tiled prefill is unchanged.
 """
 
 from __future__ import annotations
@@ -18,15 +16,13 @@ import triton.language as tl
 
 from boltops.step4_dsa.triton.common import (
     _device_name_for_config,
-    _dtype_tag,
     _fit_block_regions,
     _require_contiguous_last_dim,
 )
+from boltops.utility.triton_capability import get_triton_capabilities
 
 REGION_VALID_SHIFT = tl.constexpr(24)
 REGION_ID_MASK = tl.constexpr((1 << 24) - 1)
-DECODE_PHYS_SHIFT = tl.constexpr(32)
-DECODE_LOW_MASK = tl.constexpr((1 << 32) - 1)
 NEGATIVE_INFINITY = tl.constexpr(float("-inf"))
 
 
@@ -46,10 +42,8 @@ def _sparse_attn_prefill_kernel(
     stride_v_token,
     stride_v_group,
     stride_packed_row,
-    stride_out_split,
     stride_out_token,
     stride_out_head,
-    stride_lse_split,
     stride_lse_token,
     softmax_scale,
     total_q,
@@ -57,7 +51,6 @@ def _sparse_attn_prefill_kernel(
     heads_per_group: tl.constexpr,
     head_dim: tl.constexpr,
     region_size: tl.constexpr,
-    slots_per_split: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_R: tl.constexpr,
@@ -68,14 +61,9 @@ def _sparse_attn_prefill_kernel(
     max is per head, exactly as in dense flash attention -- the only difference is that
     the K/V rows come from a gather driven by the packed region list instead of a
     contiguous range.
-
-    ``program_id(2)`` partitions the packed row into disjoint slot windows;
-    ``slots < window_end`` keeps adjacent splits from overlapping when
-    ``slots_per_split % BLOCK_R != 0``. ``num_splits=1`` is the full packed row.
     """
     query = tl.program_id(0)
     group = tl.program_id(1)
-    split = tl.program_id(2)
     row = group * total_q + query
     count = tl.load(counts_ptr + row).to(tl.int32)
 
@@ -99,11 +87,9 @@ def _sparse_attn_prefill_kernel(
     accumulator = tl.zeros((BLOCK_H, BLOCK_D), dtype=tl.float32)
 
     offsets_in_region = tl.arange(0, region_size)
-    window_begin = split * slots_per_split
-    window_end = window_begin + slots_per_split
-    for base in tl.range(window_begin, window_end, BLOCK_R):
+    for base in tl.range(0, topk, BLOCK_R):
         slots = base + tl.arange(0, BLOCK_R)
-        slot_ok = (slots < count) & (slots < topk) & (slots < window_end)
+        slot_ok = slots < count
         meta = tl.load(
             packed_ptr + row * stride_packed_row + slots, mask=slot_ok, other=-1
         )
@@ -164,7 +150,6 @@ def _sparse_attn_prefill_kernel(
     output = tl.where(selected[:, None], accumulator / running_sum[:, None], 0.0)
     tl.store(
         out_ptr
-        + split * stride_out_split
         + query * stride_out_token
         + (group * heads_per_group + heads)[:, None] * stride_out_head
         + dims[None, :],
@@ -172,11 +157,7 @@ def _sparse_attn_prefill_kernel(
         mask=tile_ok,
     )
     tl.store(
-        lse_ptr
-        + split * stride_lse_split
-        + query * stride_lse_token
-        + group * heads_per_group
-        + heads,
+        lse_ptr + query * stride_lse_token + group * heads_per_group + heads,
         tl.where(selected, running_max + tl.log(running_sum), NEGATIVE_INFINITY),
         mask=head_ok,
     )
@@ -509,88 +490,136 @@ _CONFIG_DIR = os.path.join(
     "config",
     "sparse_attn_prefill",
 )
-_LAUNCH_KEYS = frozenset(
-    {
-        "BLOCK_R",
-        "BLOCK_H",
-        "BLOCK_D",
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-    }
-)
-_GRID_KEYS = ("num_warps", "num_stages", "waves_per_eu")
-_TILED_LAUNCH_KEYS = frozenset(
-    {
-        "BLOCK_R",
-        "BLOCK_Q",
-        "BLOCK_D",
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-    }
-)
+_KERNEL_CONFIG_KEYS = frozenset({"BLOCK_R", "BLOCK_H", "BLOCK_D", "BLOCK_Q"})
+_STANDARD_LAUNCH_KEYS = frozenset({"num_warps", "num_stages"})
 
 
-def sparse_attn_prefill_config_filename(
-    packed_width: int,
-    heads_per_group: int,
-    head_dim: int,
-    region_size: int,
-    dtype: torch.dtype | str,
-    device: str | None = None,
-) -> str:
-    """Return ``prefill-k{width}-hpg{hpg}-d{dim}-r{region}_{dtype}_{device}.json``."""
-    dtype_tag = dtype if isinstance(dtype, str) else _dtype_tag(dtype)
-    device_tag = device if device is not None else _device_name_for_config()
-    return (
-        f"prefill-k{int(packed_width)}-hpg{int(heads_per_group)}"
-        f"-d{int(head_dim)}-r{int(region_size)}_{dtype_tag}_{device_tag}.json"
-    )
+def _build_launch_options(
+    config: dict[str, Any],
+    *,
+    defaults: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build portable Triton launch options from a matched JSON config.
+
+    Kernel constexpr fields are consumed separately. Standard launch fields are
+    always accepted; HIP-specific compiler fields are forwarded only when the
+    installed backend declares support for them. Unknown and unsupported fields
+    are ignored so configs remain portable across Triton versions.
+    """
+    options = dict(defaults or {})
+    for name in _STANDARD_LAUNCH_KEYS:
+        if name in config:
+            options[name] = int(config[name])
+    if torch.version.hip is None:
+        return options
+
+    capabilities = get_triton_capabilities()
+    for name, value in config.items():
+        if name in _KERNEL_CONFIG_KEYS or name in _STANDARD_LAUNCH_KEYS:
+            continue
+        if capabilities.supports(name):
+            options[name] = value
+    return options
 
 
-def sparse_attn_prefill_config_path(
-    packed_width: int,
-    heads_per_group: int,
-    head_dim: int,
-    region_size: int,
-    dtype: torch.dtype | str,
-    device: str | None = None,
-) -> str:
-    return os.path.join(
-        _CONFIG_DIR,
-        sparse_attn_prefill_config_filename(
-            packed_width, heads_per_group, head_dim, region_size, dtype, device
-        ),
-    )
+def _prefill_config_filename(device: str) -> str:
+    """Return ``sparse_attn_prefill_{device}.json``."""
+    return f"sparse_attn_prefill_{device}.json"
 
 
-def _filter_launch_config(config: dict[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in config.items() if key in _LAUNCH_KEYS}
+def _prefill_config_match_score(
+    match: dict[str, Any], shape: dict[str, Any]
+) -> tuple[int, int, float] | None:
+    """Return (exact_count, bound_count, -total_width) or ``None`` on mismatch.
+
+    Supports exact-value keys and range keys with ``_min`` / ``_max`` suffixes,
+    mirroring the MLA ``_config_match_score`` convention.
+    """
+    exact = 0
+    bounds = 0
+    widths: dict[str, dict[str, float]] = {}
+    for key, expected in match.items():
+        if key.endswith("_min") or key.endswith("_max"):
+            field, kind = key.rsplit("_", 1)
+            actual = shape.get(field)
+            if actual is None:
+                return None
+            if kind == "min" and actual < expected:
+                return None
+            if kind == "max" and actual > expected:
+                return None
+            widths.setdefault(field, {})[kind] = expected
+            bounds += 1
+        elif shape.get(key) != expected:
+            return None
+        else:
+            exact += 1
+    total_width = 0.0
+    for limits in widths.values():
+        if "min" in limits and "max" in limits:
+            total_width += limits["max"] - limits["min"]
+        else:
+            total_width += float("inf")
+    return exact, bounds, -total_width
 
 
-@functools.lru_cache
-def _load_sparse_attn_prefill_config(
-    packed_width: int,
-    heads_per_group: int,
-    head_dim: int,
-    region_size: int,
-    dtype_tag: str,
-    device: str,
-) -> dict[str, Any] | None:
-    path = sparse_attn_prefill_config_path(
-        packed_width, heads_per_group, head_dim, region_size, dtype_tag, device
-    )
+@functools.lru_cache(maxsize=None)
+def _load_prefill_device_configs(device: str) -> dict[str, Any]:
+    """Load ``sparse_attn_prefill_{device}.json`` and return its parsed dict."""
+    path = os.path.join(_CONFIG_DIR, _prefill_config_filename(device))
     if not os.path.exists(path):
+        return {}
+    try:
+        with open(path) as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _load_sparse_attn_prefill_config(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    packed_regions: torch.Tensor,
+    region_size: int,
+) -> dict[str, Any] | None:
+    """Select the best-matching config entry from ``sparse_attn_prefill_{device}.json``.
+
+    Shape fields extracted from the tensors and matched against each entry's
+    ``match`` dict (mirroring the MLA ``_get_tuned_config`` convention):
+
+    * ``s_q``         – number of query tokens  (``query.shape[0]``)
+    * ``h_q``         – total query heads        (``query.shape[1]``)
+    * ``h_kv``        – KV-cache head groups     (``key_cache.shape[1]``, == ``num_kv_groups``)
+    * ``d``           – head dimension           (``query.shape[2]``)
+    * ``topk``        – selected region slots    (``packed_regions.shape[1]``)
+    * ``region_size`` – tokens per region        (runtime argument)
+    * ``dtype``       – e.g. ``"bfloat16"``      (``str(query.dtype).replace("torch.", "")``)
+    """
+    device_tag = _device_name_for_config()
+    data = _load_prefill_device_configs(device_tag)
+    shape = {
+        "s_q": int(query.shape[0]),
+        "h_q": int(query.shape[1]),
+        "h_kv": int(key_cache.shape[1]),
+        "d": int(query.shape[2]),
+        "topk": int(packed_regions.shape[1]),
+        "region_size": int(region_size),
+        "dtype": str(query.dtype).replace("torch.", ""),
+    }
+    selected = None
+    selected_score: tuple[int, int, float] | None = None
+    for entry in data.get("configs", ()):
+        match = entry.get("match", {})
+        if not isinstance(match, dict):
+            continue
+        score = _prefill_config_match_score(match, shape)
+        if score is not None and (selected_score is None or score > selected_score):
+            selected, selected_score = entry, score
+    if selected is None:
         return None
-    with open(path) as handle:
-        payload = json.load(handle)
-    if not isinstance(payload, dict):
-        return None
-    filtered = _filter_launch_config(payload)
-    if "BLOCK_R" not in filtered:
-        return None
-    return filtered
+    raw = selected.get("config", {})
+    return dict(raw) if isinstance(raw, dict) else None
 
 
 def _per_query_tile_defaults(
@@ -614,90 +643,87 @@ def _per_query_tile_defaults(
 
 
 def sparse_attn_prefill_tiled_union_bucket(union: int) -> int:
-    """Bucket a tile-union width with ``next_power_of_2`` for config filenames."""
+    """Bucket a tile-union width with ``next_power_of_2`` for config matching."""
     return int(triton.next_power_of_2(max(1, int(union))))
 
 
-def sparse_attn_prefill_tiled_config_filename(
-    packed_width: int,
-    union_bucket: int,
-    heads_per_group: int,
-    head_dim: int,
-    region_size: int,
-    block_q: int,
-    dtype: torch.dtype | str,
-    device: str | None = None,
-) -> str:
-    """Return ``prefill-tiled-k{width}-u{union}-hpg{hpg}-d{dim}-r{region}-q{bq}_{dtype}_{device}.json``."""
-    dtype_tag = dtype if isinstance(dtype, str) else _dtype_tag(dtype)
-    device_tag = device if device is not None else _device_name_for_config()
-    return (
-        f"prefill-tiled-k{int(packed_width)}-u{int(union_bucket)}"
-        f"-hpg{int(heads_per_group)}-d{int(head_dim)}-r{int(region_size)}"
-        f"-q{int(block_q)}_{dtype_tag}_{device_tag}.json"
-    )
+def _prefill_tiled_config_filename(device: str) -> str:
+    """Return ``sparse_attn_prefill_tiled_{device}.json``."""
+    return f"sparse_attn_prefill_tiled_{device}.json"
 
 
-def sparse_attn_prefill_tiled_config_path(
-    packed_width: int,
-    union_bucket: int,
-    heads_per_group: int,
-    head_dim: int,
-    region_size: int,
-    block_q: int,
-    dtype: torch.dtype | str,
-    device: str | None = None,
-) -> str:
-    return os.path.join(
-        _CONFIG_DIR,
-        sparse_attn_prefill_tiled_config_filename(
-            packed_width,
-            union_bucket,
-            heads_per_group,
-            head_dim,
-            region_size,
-            block_q,
-            dtype,
-            device,
-        ),
-    )
-
-
-def _filter_tiled_launch_config(config: dict[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in config.items() if key in _TILED_LAUNCH_KEYS}
-
-
-@functools.lru_cache
-def _load_sparse_attn_prefill_tiled_config(
-    packed_width: int,
-    union_bucket: int,
-    heads_per_group: int,
-    head_dim: int,
-    region_size: int,
-    block_q: int,
-    dtype_tag: str,
-    device: str,
-) -> dict[str, Any] | None:
-    path = sparse_attn_prefill_tiled_config_path(
-        packed_width,
-        union_bucket,
-        heads_per_group,
-        head_dim,
-        region_size,
-        block_q,
-        dtype_tag,
-        device,
-    )
+@functools.lru_cache(maxsize=None)
+def _load_prefill_tiled_device_configs(device: str) -> dict[str, Any]:
+    """Load ``sparse_attn_prefill_tiled_{device}.json`` and return its parsed dict."""
+    path = os.path.join(_CONFIG_DIR, _prefill_tiled_config_filename(device))
     if not os.path.exists(path):
+        return {}
+    try:
+        with open(path) as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _load_sparse_attn_prefill_tiled_config(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    q_starts: torch.Tensor,
+    tile_phys: torch.Tensor,
+    packed_width: int,
+    region_size: int,
+    block_q: int,
+) -> dict[str, Any] | None:
+    """Select the best matching tiled-prefill config for the runtime shape.
+
+    The fields mirror MLA's tensor-shape based matching while avoiding
+    equivalent dimensions from key/value cache and tile metadata:
+
+    * ``s_q``          – number of query tokens          (``query.shape[0]``)
+    * ``num_tiles``    – number of query tiles           (``q_starts.numel()``)
+    * ``h_q``          – total query heads               (``query.shape[1]``)
+    * ``h_kv``         – KV-cache head groups            (``key_cache.shape[1]``)
+    * ``d``            – common head dimension           (``query.shape[2]``)
+    * ``topk``         – packed selected-region width    (``packed_width``)
+    * ``union_bucket`` – bucketed tile-union width       (``tile_phys.shape[1]``)
+    * ``region_size``  – tokens per region               (runtime argument)
+    * ``block_q``      – query tile width                (runtime argument)
+    * ``dtype``        – query/cache element type        (``query.dtype``)
+
+    ``block_regions`` is intentionally excluded: it only determines the
+    fallback ``BLOCK_R`` when no tuned config matches. A matched config supplies
+    ``BLOCK_R`` directly. ``value_cache`` is also excluded because its shape is
+    required to equal ``key_cache.shape`` by the public entry point.
+    """
+    device_tag = _device_name_for_config()
+    data = _load_prefill_tiled_device_configs(device_tag)
+    union_bucket = sparse_attn_prefill_tiled_union_bucket(int(tile_phys.shape[1]))
+    shape = {
+        "s_q": int(query.shape[0]),
+        "num_tiles": int(q_starts.numel()),
+        "h_q": int(query.shape[1]),
+        "h_kv": int(key_cache.shape[1]),
+        "d": int(query.shape[2]),
+        "topk": int(packed_width),
+        "union_bucket": union_bucket,
+        "region_size": int(region_size),
+        "block_q": int(block_q),
+        "dtype": str(query.dtype).replace("torch.", ""),
+    }
+    selected = None
+    selected_score: tuple[int, int, float] | None = None
+    for entry in data.get("configs", ()):
+        match = entry.get("match", {})
+        if not isinstance(match, dict):
+            continue
+        score = _prefill_config_match_score(match, shape)
+        if score is not None and (selected_score is None or score > selected_score):
+            selected, selected_score = entry, score
+    if selected is None:
         return None
-    with open(path) as handle:
-        payload = json.load(handle)
-    if not isinstance(payload, dict):
-        return None
-    filtered = _filter_tiled_launch_config(payload)
-    if "BLOCK_R" not in filtered:
-        return None
-    return filtered
+    raw = selected.get("config", {})
+    return dict(raw) if isinstance(raw, dict) else None
 
 
 def _run_tiled_prefill(
@@ -762,14 +788,13 @@ def _run_tiled_prefill(
     launch = config
     if launch is None:
         launch = _load_sparse_attn_prefill_tiled_config(
+            query,
+            key_cache,
+            q_starts,
+            tile_phys,
             packed_width,
-            sparse_attn_prefill_tiled_union_bucket(union),
-            heads_per_group,
-            head_dim,
             region_size,
             block_q,
-            _dtype_tag(query.dtype),
-            _device_name_for_config(),
         )
     default_r = _fit_block_regions(
         min(block_regions, triton.next_power_of_2(union)),
@@ -777,11 +802,11 @@ def _run_tiled_prefill(
         block_d=block_d,
         element_size=key_cache.element_size(),
     )
-    extra: dict[str, Any] = {"num_warps": 4, "num_stages": 2}
+    extra = {"num_warps": 4, "num_stages": 2}
     if launch:
         block_d = int(launch.get("BLOCK_D", block_d))
-        block_r = int(launch["BLOCK_R"])
-        extra = {key: launch[key] for key in _GRID_KEYS if key in launch}
+        block_r = int(launch.get("BLOCK_R", default_r))
+        extra = _build_launch_options(launch, defaults=extra)
     else:
         block_r = default_r
     _sparse_attn_prefill_tiled_kernel[
@@ -846,10 +871,6 @@ def sparse_attention_prefill(
     request_indices: torch.Tensor | None = None,
     block_q: int = 128,
     config: dict[str, Any] | None = None,
-    num_splits: int | None = None,
-    kv_split_target_programs: int | None = None,
-    min_slots_per_split: int = 8,
-    return_partials: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Sparse attention over per-query selected regions.
 
@@ -874,22 +895,18 @@ def sparse_attention_prefill(
             repeated group-major. Tiles are split at changes in this vector so
             per-request logical ids never alias.
         block_q: query tile width for the tiled implementation; must be a power of two.
-        config: launch override. ``None`` loads a path-specific JSON. Per-query uses
-            ``prefill-k{width}-hpg{hpg}-d{dim}-r{region}_{dtype}_{device}.json``. Tiled
-            uses ``prefill-tiled-k{width}-u{union}-hpg{hpg}-d{dim}-r{region}-q{bq}_{dtype}_{device}.json``
-            after tiles are built (``u`` is ``next_power_of_2`` of the union width). A
-            mapping is used as-is (no shared-memory shrink). An empty mapping skips
-            lookup and keeps the built-in defaults.
-        num_splits: ``None`` picks a split count from device CU count and ``Q * G``.
-            An explicit value is used as-is. With more than one split the default is
-            to merge to ``[total_q, heads, dim]``; pass ``return_partials=True``
-            to keep the leading split axis for :func:`merge_split_states`. Tiled
-            prefill ignores this argument.
+        config: launch override. ``None`` loads a device-specific JSON and selects
+            the most specific matching entry. Per-query prefill reads
+            ``sparse_attn_prefill_{device}.json``; tiled prefill reads
+            ``sparse_attn_prefill_tiled_{device}.json`` after tile metadata is built.
+            Missing tile fields use the built-in defaults; supported Triton compiler
+            options are forwarded according to the active backend. An empty mapping
+            skips lookup and keeps all built-in defaults.
 
     Returns:
-        Merged ``(out [total_q, num_heads, head_dim], lse [total_q, num_heads])``
-        unless ``return_partials`` is set, in which case both have a leading split
-        axis. Rows with no selected region get a zero output and ``lse = -inf``.
+        ``(out, lse)`` shaped ``[total_q, num_heads, head_dim]`` and
+        ``[total_q, num_heads]``. Rows with no selected region get a zero output and
+        ``lse = -inf``.
 
     The caller must guarantee the selected regions are distinct. Our selector does (the
     stage 3 gate checks it), but a union-with-sliding-window path would not, and duplicate
@@ -969,39 +986,21 @@ def sparse_attention_prefill(
             lse=lse,
         )
 
-    from boltops.step4_dsa.triton.merge import merge_split_states
-
-    if num_splits is None:
-        num_splits = choose_prefill_kv_splits(
-            total_q,
-            num_kv_groups,
-            topk,
-            target_programs=kv_split_target_programs,
-            min_slots_per_split=min_slots_per_split,
-            device=query.device,
-        )
-    num_splits = max(int(num_splits), 1)
-    slots_per_split = -(-topk // num_splits)
-
-    out = torch.empty(
-        (num_splits, total_q, num_heads, head_dim), device=query.device, dtype=query.dtype
-    )
+    out = torch.empty_like(query)
     _require_contiguous_last_dim(out, "out")
-    lse = torch.empty((num_splits, total_q, num_heads), device=query.device, dtype=torch.float32)
+    lse = torch.empty((total_q, num_heads), device=query.device, dtype=torch.float32)
     launch = config
     if launch is None:
         launch = _load_sparse_attn_prefill_config(
-            topk,
-            heads_per_group,
-            head_dim,
+            query,
+            key_cache,
+            packed_regions,
             region_size,
-            _dtype_tag(query.dtype),
-            _device_name_for_config(),
         )
     default_h, default_d, default_r = _per_query_tile_defaults(
         heads_per_group=heads_per_group,
         head_dim=head_dim,
-        topk=slots_per_split,
+        topk=topk,
         block_regions=block_regions,
         region_size=region_size,
         element_size=key_cache.element_size(),
@@ -1010,12 +1009,12 @@ def sparse_attention_prefill(
     if launch:
         block_h = int(launch.get("BLOCK_H", default_h))
         block_d = int(launch.get("BLOCK_D", default_d))
-        block_r = int(launch["BLOCK_R"])
-        extra = {key: launch[key] for key in _GRID_KEYS if key in launch}
+        block_r = int(launch.get("BLOCK_R", default_r))
+        extra = _build_launch_options(launch)
     else:
         block_h, block_d, block_r = default_h, default_d, default_r
 
-    _sparse_attn_prefill_kernel[(total_q, num_kv_groups, num_splits)](
+    _sparse_attn_prefill_kernel[(total_q, num_kv_groups)](
         query,
         key_cache,
         value_cache,
@@ -1032,61 +1031,19 @@ def sparse_attention_prefill(
         packed_regions.stride(0),
         out.stride(0),
         out.stride(1),
-        out.stride(2),
         lse.stride(0),
-        lse.stride(1),
         scale,
         total_q,
         topk=topk,
         heads_per_group=heads_per_group,
         head_dim=head_dim,
         region_size=region_size,
-        slots_per_split=slots_per_split,
         BLOCK_H=block_h,
         BLOCK_D=block_d,
         BLOCK_R=block_r,
         **extra,
     )
-    if num_splits == 1:
-        return out[0], lse[0]
-    if return_partials:
-        return out, lse
-    return merge_split_states(out, lse)
-
-
-def choose_prefill_kv_splits(
-    total_q: int,
-    num_kv_groups: int,
-    packed_width: int,
-    *,
-    target_programs: int | None = None,
-    min_slots_per_split: int = 8,
-    device: torch.device | None = None,
-) -> int:
-    """Pick a packed-slot split count from CU occupancy, not an evidence-shape test.
-
-    Underfills (``Q * G < CUs``) use ``ceil(CUs / (Q*G))`` like decode. When the
-    per-query grid already covers the device, keep one split: extra waves plus
-    ``merge_split_states`` did not beat the serial packed-row loop on a full
-    grid. Callers may still pass ``target_programs`` to request extra waves.
-    Cap so a full row keeps ``min_slots_per_split`` slots per window.
-    """
-    packed_width = max(int(packed_width), 1)
-    programs_base = max(int(total_q) * int(num_kv_groups), 1)
-    if target_programs is None:
-        try:
-            index = (
-                device.index
-                if device is not None and device.index is not None
-                else torch.cuda.current_device()
-            )
-            target_programs = int(torch.cuda.get_device_properties(index).multi_processor_count)
-        except Exception:
-            target_programs = 1
-    target_programs = max(int(target_programs or 1), 1)
-    splits = -(-target_programs // programs_base)
-    max_splits = max(1, packed_width // max(int(min_slots_per_split), 1))
-    return min(max(splits, 1), max_splits, packed_width)
+    return out, lse
 
 
 # Previous landing name; same function.

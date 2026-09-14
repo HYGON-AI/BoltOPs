@@ -265,8 +265,6 @@ def triton_sparse_attention_prefill(
     """Sparse GQA prefill. Tiled path needs logical ids, positions, and request ids.
 
     Q / K / V / ``out`` last dim must be contiguous (``stride(-1) == 1``).
-    Per-query path auto KV-splits when ``Q * G`` underfills the device, then
-    merges with :func:`triton_merge_split_states`.
     """
     from boltops.step4_dsa.triton.prefill import sparse_attention_prefill as impl
 
@@ -285,7 +283,6 @@ def triton_sparse_attention_prefill(
         request_indices=request_indices,
         block_q=block_q,
         config=config,
-        num_splits=None,
     )
 
 

@@ -1,0 +1,29 @@
+{
+  "metadata": {
+    "triton_version": "3.6.0",
+    "device_name": "BW1100"
+  },
+  "configs": [
+    {
+      "match": {
+        "h_q": 8,
+        "h_kv": 1,
+        "d": 192,
+        "topk": 513,
+        "region_size": 8,
+        "dtype": "bfloat16"
+      },
+      "config": {
+        "BLOCK_R": 8,
+        "BLOCK_H": 16,
+        "BLOCK_D": 256,
+        "num_warps": 2,
+        "num_stages": 1,
+        "waves_per_eu": 3,
+        "misched_regpressure": false,
+        "empty_arrive_after_mmac": true,
+        "max_memory_cluster_dwords": 16
+      }
+    }
+  ]
+}

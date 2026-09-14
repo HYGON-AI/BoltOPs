@@ -30,9 +30,10 @@ from step4_dsa.benchmark_cases import BenchmarkCase, tp8_geometry  # noqa: E402
 
 from boltops.step4_dsa.triton.prefill import (  # noqa: E402
     _build_prefill_tiles,
+    _CONFIG_DIR,
+    _prefill_tiled_config_filename,
     _run_tiled_prefill,
     sparse_attention_prefill,
-    sparse_attn_prefill_tiled_config_path,
     sparse_attn_prefill_tiled_union_bucket,
 )
 
@@ -221,7 +222,7 @@ def main() -> None:
     packed_width = int(data["packed"].shape[1])
     heads_per_group = args.heads // args.groups
     head_dim = int(data["query"].shape[2])
-    _, _, tile_phys, _, _, _ = _build_prefill_tiles(
+    q_starts, _, tile_phys, _, _, _ = _build_prefill_tiles(
         data["logical_ids"].contiguous(),
         data["packed"].contiguous(),
         data["q_positions"],
@@ -233,16 +234,11 @@ def main() -> None:
     )
     union = int(tile_phys.shape[1])
     union_bucket = sparse_attn_prefill_tiled_union_bucket(union)
+    from boltops.step4_dsa.triton.common import _device_name_for_config
+    import os
+    device_tag = _device_name_for_config()
     output = args.output or Path(
-        sparse_attn_prefill_tiled_config_path(
-            packed_width,
-            union_bucket,
-            heads_per_group,
-            head_dim,
-            geo.region_block_size,
-            args.block_q,
-            data["query"].dtype,
-        )
+        os.path.join(_CONFIG_DIR, _prefill_tiled_config_filename(device_tag))
     )
     timing_path = output.with_suffix(".timings.json")
     if args.resume and output.exists():
@@ -266,8 +262,39 @@ def main() -> None:
     missing = [key for key in ("num_warps", "num_stages", "waves_per_eu") if key not in cfg]
     if missing:
         raise RuntimeError(f"tuned config omitted launch keys {missing}: {cfg}")
+    # Build the new-format entry to upsert into the configs list.
+    new_entry = {
+        "match": {
+            "s_q": int(data["query"].shape[0]),
+            "num_tiles": int(q_starts.numel()),
+            "h_q": int(data["query"].shape[1]),
+            "h_kv": int(data["key_cache"].shape[1]),
+            "d": head_dim,
+            "topk": packed_width,
+            "union_bucket": union_bucket,
+            "region_size": int(geo.region_block_size),
+            "block_q": args.block_q,
+            "dtype": str(data["query"].dtype).replace("torch.", ""),
+        },
+        "config": cfg,
+        "latency_ms": ms,
+    }
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(cfg, indent=4) + "\n")
+    # Load existing file (if any) and upsert the entry with the same match.
+    existing: dict = {}
+    if output.exists():
+        try:
+            existing = json.loads(output.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            existing = {}
+    if not isinstance(existing, dict) or "configs" not in existing:
+        existing = {"metadata": {"device_name": device_tag}, "configs": []}
+    configs = existing.get("configs", [])
+    match_key = new_entry["match"]
+    configs = [e for e in configs if e.get("match") != match_key]
+    configs.append(new_entry)
+    existing["configs"] = configs
+    output.write_text(json.dumps(existing, indent=2) + "\n")
     timing_path.write_text(json.dumps({"ms": ms, "config": cfg}, indent=4) + "\n")
 
 
