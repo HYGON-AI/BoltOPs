@@ -181,7 +181,8 @@ def build_junit(data: dict, log_dir: Path) -> str:
 
 
 def main() -> int:
-    results_file = find_latest_results()
+    # CI selects the exact matrix job's report. Manual use keeps auto-discovery.
+    results_file = Path(sys.argv[3]) if len(sys.argv) >= 4 else find_latest_results()
     if results_file is None:
         xml_str = make_error_suite("No optest results found under " + str(RESULTS_ROOT))
         JUNIT_OUTPUT.parent.mkdir(parents=True, exist_ok=True)
@@ -195,7 +196,8 @@ def main() -> int:
         xml_str = make_error_suite(f"Failed to read optest results {results_file}: {exc}")
         JUNIT_OUTPUT.parent.mkdir(parents=True, exist_ok=True)
         JUNIT_OUTPUT.write_text(xml_str, encoding="utf-8")
-        print(f"Invalid optest results; wrote failure JUnit report to {JUNIT_OUTPUT}")
+        print(f"Failed to read optest results {results_file}: {exc}")
+        print(f"Wrote failure JUnit report to {JUNIT_OUTPUT}")
         return 1
     branch = data.get("branch", "?")
     commit = data.get("commit", "?")[:8]
