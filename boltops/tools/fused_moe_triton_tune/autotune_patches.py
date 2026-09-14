@@ -170,6 +170,15 @@ def _keep_autotune_config(
 
     if kpack == 2 and block_k <= 32:
         return False
+    enable_v_mmac_cluster = config.get("enable_v_mmac_cluster", 0)
+    if enable_v_mmac_cluster != 0 and block_m < 64 and block_n < 64:
+        return False
+    # The HCU LLVM v-MMAC clustering pass and kpack=2 are independently
+    # valid, but their combination VMFaults at runtime for small FP8-channel
+    # MoE tiles (reproduced on gfx938 for BM16/BN256/BK256).  Keep both
+    # optimizations in the search space, just not in the same candidate.
+    if kpack == 2 and enable_v_mmac_cluster != 0:
+        return False
     if test_type in ("int4", "int4int8_channel") and block_k < 32:
         return False
     if block_k > k or block_n > n or group_m > block_m:

@@ -804,22 +804,20 @@ def test_autotune_does_not_hide_other_runtime_errors():
         robust_bench(lambda: None, (0.5, 0.2, 0.8))
 
 
-def test_small_fp8_channel_autotune_searches_cross_region_mmac_cluster(
-    monkeypatch,
-):
-    class _MmacClusterOnly:
+def test_fp8_channel_autotune_prunes_unsafe_mmac_cluster_configs(monkeypatch):
+    class _MmacClusterAndKpack:
         @staticmethod
         def supports(name):
-            return name == "enable_v_mmac_cluster"
+            return name in ("enable_v_mmac_cluster", "kpack")
 
     monkeypatch.setattr(
-        autotune_patches, "triton_capabilities", _MmacClusterOnly()
+        autotune_patches, "triton_capabilities", _MmacClusterAndKpack()
     )
     monkeypatch.setattr(autotune_patches, "test_type", "fp8_channel")
     monkeypatch.setattr(autotune_patches, "capMLS", False)
     monkeypatch.setattr(autotune_patches, "compile_only", 0)
     monkeypatch.setattr(autotune_patches, "mode_autotune_min_block_size_n1", 32)
-    monkeypatch.setattr(autotune_patches, "mode_autotune_max_block_size_n1", 32)
+    monkeypatch.setattr(autotune_patches, "mode_autotune_max_block_size_n1", 64)
     monkeypatch.setattr(
         autotune_patches, "mode_autotune_min_block_size_k1", 64, raising=False
     )
@@ -827,7 +825,7 @@ def test_small_fp8_channel_autotune_searches_cross_region_mmac_cluster(
         autotune_patches, "mode_autotune_max_block_size_k1", 64, raising=False
     )
 
-    def cluster_values(num_input_tokens):
+    def configs(num_input_tokens):
         configs = autotune_patches.generate_config2_lists(
             BLOCK_SIZE_M=16,
             N=320,
@@ -839,10 +837,33 @@ def test_small_fp8_channel_autotune_searches_cross_region_mmac_cluster(
             num_input_tokens=num_input_tokens,
         )
         assert configs
-        return {c.kwargs.get("enable_v_mmac_cluster") for c in configs}
+        return configs
 
-    assert cluster_values(4) == {0, 2}
-    assert cluster_values(2048) == {0}
+    small = configs(4)
+    assert not any(
+        c.kwargs.get("enable_v_mmac_cluster") != 0
+        and c.kwargs["BLOCK_SIZE_N"] < 64
+        for c in small
+    )
+    assert any(
+        c.kwargs.get("enable_v_mmac_cluster") == 2
+        and c.kwargs["BLOCK_SIZE_N"] == 64
+        and c.kwargs.get("kpack") == 1
+        for c in small
+    )
+    assert not any(
+        c.kwargs.get("enable_v_mmac_cluster") != 0
+        and c.kwargs.get("kpack") == 2
+        for c in small
+    )
+    assert any(
+        c.kwargs.get("enable_v_mmac_cluster") == 0
+        and c.kwargs.get("kpack") == 2
+        for c in small
+    )
+    assert {
+        c.kwargs.get("enable_v_mmac_cluster") for c in configs(2048)
+    } == {0}
 
 
 def test_sorted_bridge_does_not_force_mls(monkeypatch):
