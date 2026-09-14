@@ -188,8 +188,8 @@ performance:optest:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"'
   parallel:
     matrix:
-      - RUNNER_TAG: [nmz, bw]
-        TORCH_VERSION: ["2.10.0"]
+      - RUNNER_TAG: [nmz]
+        TORCH_VERSION: ["2.10.0", "2.11.0"]
   before_script:
     - !reference [.dcu-runner, before_script]
     - !reference [.git-auth, before_script]
@@ -220,8 +220,10 @@ performance:optest:
     # Install the exact repaired wheel produced and validated by build:test-wheel.
     - |
       TORCH_TAG=$(echo "${TORCH_VERSION}" | tr -d '.')
-      BOLTOPS_WHEEL=$(find output -maxdepth 1 -type f -name "*torch${TORCH_TAG}*.whl" -print -quit)
-      test -n "${BOLTOPS_WHEEL}"
+      set -- output/*torch${TORCH_TAG}*.whl
+      test "$#" -eq 1
+      test -f "$1"
+      BOLTOPS_WHEEL="$1"
       echo "Performance wheel: ${BOLTOPS_WHEEL}"
       python -m pip install --force-reinstall --no-deps "${BOLTOPS_WHEEL}"
     - |
@@ -236,8 +238,9 @@ performance:optest:
       assert numpy.__version__ == "1.24.3", numpy.__version__
       print(f"Performance dependency set: torch={torch.__version__}, numpy={numpy.__version__}")
       PY
-    # optest uses the current branch name in its output directory.
-    - git checkout -B "_ci_performance_${RUNNER_TAG}"
+    # optest strips leading underscores; use a safe name unique to this job.
+    - export OPTEST_RUN_BRANCH="ci_performance_${RUNNER_TAG}_torch${TORCH_VERSION}_${CI_JOB_ID}"
+    - git checkout -B "${OPTEST_RUN_BRANCH}"
   script:
     - |
       HIP_VISIBLE_DEVICES=$(CIsmi need 1 --timeout "${CISMI_TIMEOUT}")
@@ -248,21 +251,33 @@ performance:optest:
       optest_rc=0
       optest --op_name boltops --test_mode per --test_dir "${CI_PROJECT_DIR}" || optest_rc=$?
 
-      mkdir -p "optest_artifacts/${RUNNER_TAG}"
+      artifact_dir="${CI_PROJECT_DIR}/optest_artifacts/${RUNNER_TAG}/torch${TORCH_VERSION}"
+      mkdir -p "${artifact_dir}"
+      result_pattern="/op_test_output/boltops/${OPTEST_RUN_BRANCH}_*/.optest-results.json"
+      echo "Looking for current-job results: ${result_pattern}" | tee "${artifact_dir}/collection.log"
       latest_results=$(find /op_test_output/boltops -mindepth 2 -maxdepth 2 \
-        -name .optest-results.json -printf '%T@ %h\n' 2>/dev/null | \
-        sort -n | tail -n1 | cut -d' ' -f2-)
+        -path "${result_pattern}" -printf '%T@ %h\n' 2>/dev/null | \
+        sort -n | tail -n1 | cut -d' ' -f2-) || latest_results=""
+      results_file="${artifact_dir}/missing-optest-results.json"
       if [ -n "${latest_results}" ]; then
-        version_dir=$(basename "${latest_results}")
-        cp -a "${latest_results}" "optest_artifacts/${RUNNER_TAG}/results"
-        if [ -d "/op_test_log/boltops/${version_dir}" ]; then
-          cp -a "/op_test_log/boltops/${version_dir}" \
-            "optest_artifacts/${RUNNER_TAG}/logs"
-        fi
+        results_file="${latest_results}/.optest-results.json"
+        echo "Selected results: ${results_file}" | tee -a "${artifact_dir}/collection.log"
+        cp -a "${latest_results}" "${artifact_dir}/results"
+      else
+        echo "ERROR: No current-job report matched ${result_pattern}" | tee -a "${artifact_dir}/collection.log"
+      fi
+      # Keep this job's logs even if a failed benchmark never wrote its report.
+      mkdir -p "${artifact_dir}/logs"
+      if [ -d /op_test_log/boltops ]; then
+        while IFS= read -r -d '' log_dir; do
+          cp -a "${log_dir}" "${artifact_dir}/logs/"
+        done < <(find /op_test_log/boltops -mindepth 1 -maxdepth 1 -type d \
+          -name "${OPTEST_RUN_BRANCH}_*" -print0)
       fi
 
       report_rc=0
-      python ci_script/optest_to_junit.py "${CI_PROJECT_DIR}" "${RUNNER_TAG}" || report_rc=$?
+      python ci_script/optest_to_junit.py "${CI_PROJECT_DIR}" "${RUNNER_TAG}_torch${TORCH_VERSION}" \
+        "${results_file}" || report_rc=$?
       if [ "${report_rc}" -ne 0 ]; then
         exit "${report_rc}"
       fi
@@ -272,10 +287,10 @@ performance:optest:
   artifacts:
     when: always
     paths:
-      - scripts/${RUNNER_TAG}_boltops_output.xml
-      - optest_artifacts/${RUNNER_TAG}/
+      - scripts/${RUNNER_TAG}_torch${TORCH_VERSION}_boltops_output.xml
+      - optest_artifacts/${RUNNER_TAG}/torch${TORCH_VERSION}/
     reports:
-      junit: scripts/${RUNNER_TAG}_boltops_output.xml
+      junit: scripts/${RUNNER_TAG}_torch${TORCH_VERSION}_boltops_output.xml
     expire_in: 7 days
 
 publish:
