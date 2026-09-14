@@ -5,6 +5,9 @@ Matches the vLLM / handoff caller: ``num_splits==1`` auto-splits to fill CUs and
 returns merged states; ``num_splits>1`` returns partials for the caller to merge.
 Split windows are disjoint (``slots < window_end``). Tuner / occupancy JSON
 measurement opts out with ``auto_kv_split=False``.
+
+On the ``num_splits==1`` path, occupancy JSON may pin the launch grid with
+``AUTO_KV_SPLITS``; otherwise :func:`choose_decode_kv_splits` is used.
 """
 
 from __future__ import annotations
@@ -20,10 +23,10 @@ import triton.language as tl
 
 from boltops.step4_dsa.triton.common import (
     _device_name_for_config,
-    _dtype_tag,
     _fit_block_regions,
     _require_contiguous_last_dim,
 )
+from boltops.utility.triton_capability import get_triton_capabilities
 
 DECODE_PHYS_SHIFT = tl.constexpr(32)
 DECODE_LOW_MASK = tl.constexpr((1 << 32) - 1)
@@ -393,131 +396,158 @@ _CONFIG_DIR = os.path.join(
 )
 # Shared by both kernels. ``BLOCK_D`` is only in the padded-kernel JSON;
 # dsplit occupancy files omit it (and never carry ``BLOCK_D1`` / ``BLOCK_D2``).
-_COMMON_LAUNCH_KEYS = frozenset(
-    {
-        "BLOCK_R",
-        "BLOCK_H",
-        "BALANCE_LIVE",
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-    }
-)
-_LAUNCH_KEYS = _COMMON_LAUNCH_KEYS | {"BLOCK_D"}
-_GRID_KEYS = ("num_warps", "num_stages", "waves_per_eu")
+# ``AUTO_KV_SPLITS`` is host-only: pins the s1 auto-path launch grid; never a
+# kernel constexpr.
+_HOST_CONFIG_KEYS = frozenset({"AUTO_KV_SPLITS"})
+_COMMON_KERNEL_CONFIG_KEYS = frozenset({"BLOCK_R", "BLOCK_H", "BALANCE_LIVE"})
+_PADDED_KERNEL_CONFIG_KEYS = _COMMON_KERNEL_CONFIG_KEYS | {"BLOCK_D"}
+_ALL_KERNEL_CONFIG_KEYS = _PADDED_KERNEL_CONFIG_KEYS | {"BLOCK_D1", "BLOCK_D2"}
+_HOST_OR_KERNEL_CONFIG_KEYS = _ALL_KERNEL_CONFIG_KEYS | _HOST_CONFIG_KEYS
+_STANDARD_LAUNCH_KEYS = frozenset({"num_warps", "num_stages"})
 
 
-def sparse_attn_decode_config_filename(
-    packed_width: int,
-    num_splits: int,
-    heads_per_group: int,
-    head_dim: int,
-    region_size: int,
-    dtype: torch.dtype | str,
-    device: str | None = None,
-    *,
-    batch: int | None = None,
-    context: int | None = None,
-) -> str:
-    """Return the launch JSON name.
+def _build_launch_options(config: dict[str, Any]) -> dict[str, Any]:
+    """Build portable Triton launch options from a decode config.
 
-    With both ``batch`` and ``context``:
-    ``decode-k{width}-s{splits}-b{batch}-ctx{context}-hpg{hpg}-d{dim}-r{region}_{dtype}_{device}.json``.
-    Otherwise the fallback name without ``b`` / ``ctx``.
+    Standard launch fields are always accepted. HIP-specific compiler fields
+    are forwarded only when the installed backend declares support for them.
+    Kernel constexpr, host-only, unknown, and unsupported fields are omitted.
     """
-    dtype_tag = dtype if isinstance(dtype, str) else _dtype_tag(dtype)
-    device_tag = device if device is not None else _device_name_for_config()
-    occupancy = ""
-    if batch is not None and context is not None:
-        occupancy = f"-b{int(batch)}-ctx{int(context)}"
-    return (
-        f"decode-k{int(packed_width)}-s{int(num_splits)}{occupancy}"
-        f"-hpg{int(heads_per_group)}-d{int(head_dim)}-r{int(region_size)}"
-        f"_{dtype_tag}_{device_tag}.json"
-    )
+    options = {
+        name: int(config[name])
+        for name in _STANDARD_LAUNCH_KEYS
+        if name in config
+    }
+    if torch.version.hip is None:
+        return options
+
+    capabilities = get_triton_capabilities()
+    consumed = _HOST_OR_KERNEL_CONFIG_KEYS | _STANDARD_LAUNCH_KEYS
+    for name, value in config.items():
+        if name not in consumed and capabilities.supports(name):
+            options[name] = value
+    return options
 
 
-def sparse_attn_decode_config_path(
-    packed_width: int,
-    num_splits: int,
-    heads_per_group: int,
-    head_dim: int,
-    region_size: int,
-    dtype: torch.dtype | str,
-    device: str | None = None,
-    *,
-    batch: int | None = None,
-    context: int | None = None,
-) -> str:
-    return os.path.join(
-        _CONFIG_DIR,
-        sparse_attn_decode_config_filename(
-            packed_width,
-            num_splits,
-            heads_per_group,
-            head_dim,
-            region_size,
-            dtype,
-            device,
-            batch=batch,
-            context=context,
-        ),
-    )
+def _decode_config_filename(device: str) -> str:
+    """Return ``sparse_attn_decode_{device}.json``."""
+    return f"sparse_attn_decode_{device}.json"
+
+
+def _decode_config_match_score(
+    match: dict[str, Any], shape: dict[str, Any]
+) -> tuple[int, int, float] | None:
+    """Return match specificity, or ``None`` when a shape does not match."""
+    exact = 0
+    bounds = 0
+    widths: dict[str, dict[str, float]] = {}
+    for key, expected in match.items():
+        if key.endswith("_min") or key.endswith("_max"):
+            field, kind = key.rsplit("_", 1)
+            actual = shape.get(field)
+            if actual is None:
+                return None
+            if kind == "min" and actual < expected:
+                return None
+            if kind == "max" and actual > expected:
+                return None
+            widths.setdefault(field, {})[kind] = expected
+            bounds += 1
+        elif shape.get(key) != expected:
+            return None
+        else:
+            exact += 1
+    total_width = 0.0
+    for limits in widths.values():
+        if "min" in limits and "max" in limits:
+            total_width += limits["max"] - limits["min"]
+        else:
+            total_width += float("inf")
+    return exact, bounds, -total_width
+
+
+@functools.lru_cache(maxsize=None)
+def _load_decode_device_configs(device: str) -> dict[str, Any]:
+    path = os.path.join(_CONFIG_DIR, _decode_config_filename(device))
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path) as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def _filter_launch_config(config: dict[str, Any], *, head_dim: int) -> dict[str, Any]:
-    """Keep launch keys for the kernel ``head_dim`` selects.
+    """Keep host, selected-kernel, and supported Triton launch fields.
 
     ``_sparse_attn_decode_dsplit_kernel``: no ``BLOCK_D`` (chunks come from
     ``head_dim``). Leftover ``BLOCK_D`` / ``BLOCK_D1`` / ``BLOCK_D2`` are dropped.
     ``_sparse_attn_decode_kernel``: keep ``BLOCK_D`` when the JSON has it.
+    ``AUTO_KV_SPLITS`` is retained for the s1 auto path and never forwarded to
+    the kernel. Other compiler fields are retained only when the current HIP
+    backend declares them in ``HIPOptions``.
     """
     dsplit = _decode_head_dim_split(head_dim) is not None
-    allowed = _COMMON_LAUNCH_KEYS if dsplit else _LAUNCH_KEYS
-    return {key: value for key, value in config.items() if key in allowed}
-
-
-def _read_launch_config(path: str, *, head_dim: int) -> dict[str, Any] | None:
-    if not os.path.exists(path):
-        return None
-    with open(path) as handle:
-        payload = json.load(handle)
-    if not isinstance(payload, dict):
-        return None
-    filtered = _filter_launch_config(payload, head_dim=head_dim)
-    if "BLOCK_R" not in filtered:
-        return None
+    kernel_keys = _COMMON_KERNEL_CONFIG_KEYS if dsplit else _PADDED_KERNEL_CONFIG_KEYS
+    consumed = kernel_keys | _HOST_CONFIG_KEYS
+    filtered = {key: value for key, value in config.items() if key in consumed}
+    filtered.update(_build_launch_options(config))
     return filtered
 
 
-@functools.lru_cache
+def _clamp_auto_kv_splits(value: int, packed_width: int) -> int:
+    return min(max(int(value), 1), max(int(packed_width), 1))
+
+
 def _load_sparse_attn_decode_config(
-    packed_width: int,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    packed_regions: torch.Tensor,
+    kv_seqlens: torch.Tensor,
     num_splits: int,
-    heads_per_group: int,
-    head_dim: int,
     region_size: int,
-    dtype_tag: str,
-    device: str,
-    batch: int | None,
-    context: int | None,
 ) -> dict[str, Any] | None:
-    if batch is None or context is None:
+    """Select the most specific decode config for the runtime tensor shape.
+
+    Equivalent dimensions are represented once: ``d`` comes from ``query`` and
+    applies to query/key/value, while ``h_kv`` comes from ``key_cache`` and is
+    equivalent to the public ``num_kv_groups`` argument. Physical cache capacity
+    (``key_cache.shape[0]``) is excluded; actual work is represented by ``s_kv``
+    from the maximum runtime sequence length and by ``topk``.
+    """
+    device_tag = _device_name_for_config()
+    data = _load_decode_device_configs(device_tag)
+    shape = {
+        "s_q": int(query.shape[0]),
+        "s_kv": int(kv_seqlens.max().item()),
+        "h_q": int(query.shape[1]),
+        "h_kv": int(key_cache.shape[1]),
+        "topk": int(packed_regions.shape[1]),
+        "d": int(query.shape[2]),
+        "num_splits": int(num_splits),
+        "region_size": int(region_size),
+        "dtype": str(query.dtype).replace("torch.", ""),
+    }
+    selected = None
+    selected_score: tuple[int, int, float] | None = None
+    for entry in data.get("configs", ()):
+        match = entry.get("match", {})
+        if not isinstance(match, dict):
+            continue
+        score = _decode_config_match_score(match, shape)
+        if score is not None and (selected_score is None or score > selected_score):
+            selected, selected_score = entry, score
+    if selected is None:
         return None
-    return _read_launch_config(
-        sparse_attn_decode_config_path(
-            packed_width,
-            num_splits,
-            heads_per_group,
-            head_dim,
-            region_size,
-            dtype_tag,
-            device,
-            batch=batch,
-            context=context,
-        ),
-        head_dim=head_dim,
-    )
+    config = selected.get("config", {})
+    if not isinstance(config, dict):
+        return None
+    filtered = _filter_launch_config(config, head_dim=int(query.shape[2]))
+    if "BLOCK_R" not in filtered:
+        return None
+    return filtered
 
 
 def _decode_tile_defaults(
@@ -552,8 +582,8 @@ def choose_decode_kv_splits(
     """Pick a split count that fills CUs without emptying each split's slot window.
 
     Size-aware occupancy only: uses ``B * G`` and device CU count. Caps splits so
-    each window still has at least ``min_slots_per_split`` packed slots when the
-    row is full.
+    ``ceil(packed_width / splits) >= min_slots_per_split`` when the row is full
+    (``max_splits = (K - 1) // (M - 1)`` for ``M > 1``).
     """
     packed_width = max(int(packed_width), 1)
     programs_base = max(int(num_reqs) * int(num_kv_groups), 1)
@@ -569,7 +599,12 @@ def choose_decode_kv_splits(
             target_programs = 1
     target_programs = max(int(target_programs or 1), 1)
     splits = -(-target_programs // programs_base)
-    max_splits = max(1, packed_width // max(int(min_slots_per_split), 1))
+    min_slots = max(int(min_slots_per_split), 1)
+    if min_slots <= 1:
+        max_splits = packed_width
+    else:
+        # ceil(K/S) >= M  <=>  S <= (K - 1) // (M - 1)
+        max_splits = max(1, (packed_width - 1) // (min_slots - 1))
     return min(max(splits, 1), max_splits, packed_width)
 
 
@@ -610,17 +645,27 @@ def sparse_attention_decode(
             final states": occupancy-split to fill CUs, then merge. ``>1`` is an
             explicit split count and returns partials with a leading split axis
             for :func:`merge_split_states`. Launch JSON is keyed by this
-            caller-facing value (``s1`` is the fast path, even if launch is 18-way).
+            caller-facing value (``s1`` is the fast path, even if launch is N-way).
         auto_kv_split: ``None`` follows the contract above. ``False`` uses
             ``num_splits`` as-is (true 1-way when it is 1).
         return_partials: ``None`` follows the contract (partials only when the
             caller asked for ``num_splits>1``). ``True`` / ``False`` overrides.
         config: launch override. ``None`` loads
-            ``config/sparse_attn_decode/decode-k{width}-s{splits}-b{batch}-ctx{context}-hpg{hpg}-d{dim}-r{region}_{dtype}_{device}.json``
-            using ``batch=num_reqs`` and ``context=kv_seqlens[0]``. Missing that
-            file retries the ``s1`` occupancy JSON, then the built-in default tile.
-            A mapping is used as-is (no shared-memory shrink). An empty mapping
-            skips lookup and keeps the built-in defaults.
+            ``config/sparse_attn_decode/sparse_attn_decode_{device}.json`` and
+            selects the most specific entry matching the runtime tensor shape,
+            sequence length, and caller-facing split count. If an explicit
+            ``num_splits>1`` entry is absent, selection retries with ``num_splits=1``
+            before using the built-in default tile. A mapping is filtered to
+            kernel fields plus portable Triton launch options (no shared-memory
+            shrink). Standard ``num_warps`` / ``num_stages`` fields are accepted;
+            additional HIP compiler fields such as ``waves_per_eu`` or
+            ``misched_regpressure`` are forwarded only when the current backend's
+            ``HIPOptions`` declares them. Unknown or unsupported fields are ignored.
+            An empty mapping skips lookup and keeps the built-in defaults.
+            On the auto path (``num_splits==1``), ``AUTO_KV_SPLITS`` in the
+            occupancy JSON / override pins the launch grid (clamped to
+            ``[1, packed_width]``); if absent, :func:`choose_decode_kv_splits`
+            is used. Explicit ``num_splits>1`` ignores ``AUTO_KV_SPLITS``.
             Occupancy JSON for ``_sparse_attn_decode_kernel`` includes ``BLOCK_D``;
             the dsplit kernel (non-pow2 ``head_dim``) omits it and derives
             ``BLOCK_D1`` / ``BLOCK_D2`` from ``head_dim``. Leftover ``BLOCK_D`` /
@@ -661,17 +706,48 @@ def sparse_attention_decode(
         auto_kv_split = num_splits is None or int(num_splits) == 1
     if auto_kv_split:
         config_splits = 1
-        num_splits = choose_decode_kv_splits(
-            num_reqs,
-            num_kv_groups,
-            topk,
-            target_programs=kv_split_target_programs,
-            min_slots_per_split=min_slots_per_split,
-            device=query.device,
-        )
     else:
         num_splits = max(int(num_splits if num_splits is not None else 1), 1)
         config_splits = num_splits
+
+    # Load occupancy JSON before choosing the auto-path grid so ``AUTO_KV_SPLITS``
+    # can pin launch. JSON is named by the caller-facing num_splits (s1 = fast
+    # path), not the occupancy launch count.
+    launch = config
+    if launch is None:
+        launch = _load_sparse_attn_decode_config(
+            query,
+            key_cache,
+            packed_regions,
+            kv_seqlens,
+            config_splits,
+            region_size,
+        )
+        if not launch and config_splits != 1:
+            launch = _load_sparse_attn_decode_config(
+                query,
+                key_cache,
+                packed_regions,
+                kv_seqlens,
+                1,
+                region_size,
+            )
+    elif launch:
+        launch = _filter_launch_config(launch, head_dim=head_dim)
+
+    if auto_kv_split:
+        pinned = launch.get("AUTO_KV_SPLITS") if launch else None
+        if pinned is not None:
+            num_splits = _clamp_auto_kv_splits(int(pinned), topk)
+        else:
+            num_splits = choose_decode_kv_splits(
+                num_reqs,
+                num_kv_groups,
+                topk,
+                target_programs=kv_split_target_programs,
+                min_slots_per_split=min_slots_per_split,
+                device=query.device,
+            )
     if return_partials is None:
         return_partials = (not auto_kv_split) and num_splits > 1
     slots_per_split = -(-topk // num_splits)
@@ -681,33 +757,6 @@ def sparse_attention_decode(
     )
     _require_contiguous_last_dim(out, "out")
     lse = torch.empty((num_splits, num_reqs, num_heads), device=query.device, dtype=torch.float32)
-    launch = config
-    if launch is None:
-        # JSON is named by the caller-facing num_splits (s1 = fast path), not
-        # the occupancy launch count.
-        launch = _load_sparse_attn_decode_config(
-            topk,
-            config_splits,
-            heads_per_group,
-            head_dim,
-            region_size,
-            _dtype_tag(query.dtype),
-            _device_name_for_config(),
-            num_reqs,
-            int(kv_seqlens[0].item()),
-        )
-        if not launch and config_splits != 1:
-            launch = _load_sparse_attn_decode_config(
-                topk,
-                1,
-                heads_per_group,
-                head_dim,
-                region_size,
-                _dtype_tag(query.dtype),
-                _device_name_for_config(),
-                num_reqs,
-                int(kv_seqlens[0].item()),
-            )
     default_h, default_d, default_r = _decode_tile_defaults(
         heads_per_group=heads_per_group,
         head_dim=head_dim,
@@ -721,7 +770,11 @@ def sparse_attention_decode(
     if launch:
         block_h = int(launch.get("BLOCK_H", default_h))
         block_r = int(launch["BLOCK_R"])
-        extra = {key: launch[key] for key in _GRID_KEYS if key in launch}
+        extra = {
+            key: value
+            for key, value in launch.items()
+            if key not in _HOST_OR_KERNEL_CONFIG_KEYS
+        }
     else:
         block_h, block_r = default_h, default_r
 

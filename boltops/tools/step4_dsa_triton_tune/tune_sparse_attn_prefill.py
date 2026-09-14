@@ -29,8 +29,9 @@ from step4_dsa.bench_inputs import _build_prefill_inputs  # noqa: E402
 from step4_dsa.benchmark_cases import BenchmarkCase, tp8_geometry  # noqa: E402
 
 from boltops.step4_dsa.triton.prefill import (  # noqa: E402
+    _CONFIG_DIR,
+    _prefill_config_filename,
     sparse_attention_prefill,
-    sparse_attn_prefill_config_path,
 )
 
 OUT_RTOL, OUT_ATOL = 1e-2, 2e-2
@@ -163,14 +164,12 @@ def main() -> None:
     packed_width = int(data["packed"].shape[1])
     heads_per_group = args.heads // args.groups
     head_dim = int(data["query"].shape[2])
+    dtype_tag = "bf16" if data["query"].dtype == torch.bfloat16 else str(data["query"].dtype).replace("torch.", "")
+    from boltops.step4_dsa.triton.common import _device_name_for_config
+    device_tag = _device_name_for_config()
+    import os
     output = args.output or Path(
-        sparse_attn_prefill_config_path(
-            packed_width,
-            heads_per_group,
-            head_dim,
-            geo.region_block_size,
-            data["query"].dtype,
-        )
+        os.path.join(_CONFIG_DIR, _prefill_config_filename(device_tag))
     )
     timing_path = output.with_suffix(".timings.json")
     if args.resume and output.exists():
@@ -188,8 +187,35 @@ def main() -> None:
     missing = [key for key in ("num_warps", "num_stages", "waves_per_eu") if key not in cfg]
     if missing:
         raise RuntimeError(f"tuned config omitted launch keys {missing}: {cfg}")
+    # Build the new-format entry to upsert into the configs list.
+    new_entry = {
+        "match": {
+            "h_q": int(data["query"].shape[1]),
+            "h_kv": args.groups,
+            "d": head_dim,
+            "topk": packed_width,
+            "region_size": int(geo.region_block_size),
+            "dtype": str(data["query"].dtype).replace("torch.", ""),
+        },
+        "config": cfg,
+        "latency_ms": ms,
+    }
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(cfg, indent=4) + "\n")
+    # Load existing file (if any) and upsert the entry with the same match.
+    existing: dict = {}
+    if output.exists():
+        try:
+            existing = json.loads(output.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            existing = {}
+    if not isinstance(existing, dict) or "configs" not in existing:
+        existing = {"metadata": {"device_name": device_tag}, "configs": []}
+    configs = existing.get("configs", [])
+    match_key = new_entry["match"]
+    configs = [e for e in configs if e.get("match") != match_key]
+    configs.append(new_entry)
+    existing["configs"] = configs
+    output.write_text(json.dumps(existing, indent=2) + "\n")
     timing_path.write_text(json.dumps({"ms": ms, "config": cfg}, indent=4) + "\n")
 
 

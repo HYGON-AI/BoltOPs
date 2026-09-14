@@ -87,6 +87,63 @@ def _make_decode_case(
     }
 
 
+def test_decode_launch_options_follow_backend_capabilities(monkeypatch):
+    from boltops.step4_dsa.triton import decode
+
+    class _Capabilities:
+        @staticmethod
+        def supports(name: str) -> bool:
+            return name in {
+                "waves_per_eu",
+                "misched_regpressure",
+                "empty_arrive_after_mmac",
+                "max_memory_cluster_dwords",
+            }
+
+    monkeypatch.setattr(torch.version, "hip", "test")
+    monkeypatch.setattr(decode, "get_triton_capabilities", lambda: _Capabilities())
+    config = {
+        "AUTO_KV_SPLITS": 4,
+        "BLOCK_R": 8,
+        "BLOCK_H": 16,
+        "BLOCK_D": 128,
+        "BLOCK_D1": 128,
+        "BLOCK_D2": 64,
+        "BALANCE_LIVE": True,
+        "num_warps": 2,
+        "num_stages": 1,
+        "waves_per_eu": 3,
+        "misched_regpressure": False,
+        "empty_arrive_after_mmac": True,
+        "max_memory_cluster_dwords": 16,
+        "unknown_option": 7,
+    }
+    expected_options = {
+        "num_warps": 2,
+        "num_stages": 1,
+        "waves_per_eu": 3,
+        "misched_regpressure": False,
+        "empty_arrive_after_mmac": True,
+        "max_memory_cluster_dwords": 16,
+    }
+
+    assert decode._filter_launch_config(config, head_dim=128) == {
+        "AUTO_KV_SPLITS": 4,
+        "BLOCK_R": 8,
+        "BLOCK_H": 16,
+        "BLOCK_D": 128,
+        "BALANCE_LIVE": True,
+        **expected_options,
+    }
+    assert decode._filter_launch_config(config, head_dim=192) == {
+        "AUTO_KV_SPLITS": 4,
+        "BLOCK_R": 8,
+        "BLOCK_H": 16,
+        "BALANCE_LIVE": True,
+        **expected_options,
+    }
+
+
 @C.GPU_REQUIRED
 @pytest.mark.parametrize("empty_rows", [False, True])
 def test_sparse_decode_matches_ref(empty_rows: bool):
