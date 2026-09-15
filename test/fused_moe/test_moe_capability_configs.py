@@ -206,7 +206,6 @@ def test_tune_cli_names_exact_k_and_topk_configs():
 def _autotune_log(
     use_block_pingpong: str | None,
     buffer_cache_swizzle: str | None = None,
-    enable_v_mmac_cluster: str | None = None,
     bottom_a_use_mls_load: str | None = None,
     a_sorted: str | None = None,
 ) -> str:
@@ -217,11 +216,6 @@ def _autotune_log(
         ""
         if buffer_cache_swizzle is None
         else f", buffer_cache_swizzle: {buffer_cache_swizzle}"
-    )
-    mmac_cluster = (
-        ""
-        if enable_v_mmac_cluster is None
-        else f", enable_v_mmac_cluster: {enable_v_mmac_cluster}"
     )
     bottom_a_mls = (
         ""
@@ -235,7 +229,7 @@ def _autotune_log(
         "* 0  : BLOCK_SIZE_N: 64, BLOCK_SIZE_K: 64, GROUP_SIZE_M: 1, "
         "COMBINE_SCALE_LOAD: False, USE_MLS_LOAD: False, waves_per_eu: 1, "
         "instruction_sched_variant: none, sched_latency: none, kpack: 1"
-        f"{pingpong}{cache_swizzle}{mmac_cluster}{bottom_a_mls}{sorted_a}, "
+        f"{pingpong}{cache_swizzle}{bottom_a_mls}{sorted_a}, "
         "num_warps: 8, num_ctas: 1, "
         "num_stages: 2, maxnreg: None\n"
         "\t : times(20 statics, rep:20 ms): 1.0 ms\n"
@@ -278,20 +272,9 @@ def test_log_parser_preserves_supported_buffer_cache_swizzle_option(tmp_path):
     assert json.loads(bottom.read_text())["1"]["buffer_cache_swizzle"] is True
 
 
-def test_log_parser_preserves_supported_mmac_cluster_option(tmp_path):
-    results = moe_log_parser.parse_log_file(_autotune_log("False", "False", "2"))
-    top = tmp_path / "top.json"
-    bottom = tmp_path / "bottom.json"
-
-    moe_log_parser.save_results_to_json(results, top, bottom)
-
-    assert json.loads(top.read_text())["1"]["enable_v_mmac_cluster"] == 2
-    assert json.loads(bottom.read_text())["1"]["enable_v_mmac_cluster"] == 2
-
-
 def test_log_parser_preserves_bottom_a_mls_only_for_gemm2(tmp_path):
     results = moe_log_parser.parse_log_file(
-        _autotune_log("False", "False", "0", "True")
+        _autotune_log("False", "False", "True")
     )
     top = tmp_path / "top.json"
     bottom = tmp_path / "bottom.json"
@@ -804,14 +787,14 @@ def test_autotune_does_not_hide_other_runtime_errors():
         robust_bench(lambda: None, (0.5, 0.2, 0.8))
 
 
-def test_fp8_channel_autotune_prunes_unsafe_mmac_cluster_configs(monkeypatch):
-    class _MmacClusterAndKpack:
+def test_fp8_channel_autotune_prunes_unsafe_small_configs(monkeypatch):
+    class _KpackCapability:
         @staticmethod
         def supports(name):
-            return name in ("enable_v_mmac_cluster", "kpack")
+            return name == "kpack"
 
     monkeypatch.setattr(
-        autotune_patches, "triton_capabilities", _MmacClusterAndKpack()
+        autotune_patches, "triton_capabilities", _KpackCapability()
     )
     monkeypatch.setattr(autotune_patches, "test_type", "fp8_channel")
     monkeypatch.setattr(autotune_patches, "capMLS", False)
@@ -840,30 +823,68 @@ def test_fp8_channel_autotune_prunes_unsafe_mmac_cluster_configs(monkeypatch):
         return configs
 
     small = configs(4)
+    assert any(c.kwargs.get("kpack") == 2 for c in small)
+
+    monkeypatch.setattr(autotune_patches, "mode_autotune_max_block_size_n1", 256)
+    monkeypatch.setattr(
+        autotune_patches, "mode_autotune_max_block_size_k1", 256, raising=False
+    )
+    small = configs(4)
     assert not any(
-        c.kwargs.get("enable_v_mmac_cluster") != 0
-        and c.kwargs["BLOCK_SIZE_N"] < 64
+        c.kwargs["BLOCK_SIZE_N"] >= 256
+        and c.kwargs["BLOCK_SIZE_K"] >= 256
+        for c in small
+    )
+    assert not any(
+        c.kwargs["BLOCK_SIZE_N"] >= 256 and c.num_warps >= 8
         for c in small
     )
     assert any(
-        c.kwargs.get("enable_v_mmac_cluster") == 2
-        and c.kwargs["BLOCK_SIZE_N"] == 64
-        and c.kwargs.get("kpack") == 1
+        c.kwargs["BLOCK_SIZE_N"] >= 256
+        and c.kwargs["BLOCK_SIZE_K"] < 256
+        and c.num_warps <= 4
         for c in small
     )
+
+
+def test_fp8_channel_autotune_avoids_wide_decode_mls(monkeypatch):
+    class _KpackCapability:
+        @staticmethod
+        def supports(name):
+            return name == "kpack"
+
+    monkeypatch.setattr(
+        autotune_patches, "triton_capabilities", _KpackCapability()
+    )
+    monkeypatch.setattr(autotune_patches, "test_type", "fp8_channel")
+    monkeypatch.setattr(autotune_patches, "capMLS", True)
+    monkeypatch.setattr(autotune_patches, "compile_only", 0)
+    monkeypatch.setattr(autotune_patches, "mode_autotune_min_block_size_n1", 16)
+    monkeypatch.setattr(autotune_patches, "mode_autotune_max_block_size_n1", 64)
+    monkeypatch.setattr(
+        autotune_patches, "mode_autotune_min_block_size_k1", 64, raising=False
+    )
+    monkeypatch.setattr(
+        autotune_patches, "mode_autotune_max_block_size_k1", 64, raising=False
+    )
+
+    def configs(n, num_input_tokens):
+        return autotune_patches.generate_config2_lists(
+            BLOCK_SIZE_M=16,
+            N=n,
+            K=7168,
+            MUL_ROUTED_WEIGHT=False,
+            per_channel_quant=True,
+            num_valid_tokens=num_input_tokens * 6,
+            top_k=6,
+            num_input_tokens=num_input_tokens,
+        )
+
     assert not any(
-        c.kwargs.get("enable_v_mmac_cluster") != 0
-        and c.kwargs.get("kpack") == 2
-        for c in small
+        config.kwargs["USE_MLS_LOAD"] for config in configs(1536, 4)
     )
-    assert any(
-        c.kwargs.get("enable_v_mmac_cluster") == 0
-        and c.kwargs.get("kpack") == 2
-        for c in small
-    )
-    assert {
-        c.kwargs.get("enable_v_mmac_cluster") for c in configs(2048)
-    } == {0}
+    assert any(config.kwargs["USE_MLS_LOAD"] for config in configs(1536, 128))
+    assert any(config.kwargs["USE_MLS_LOAD"] for config in configs(768, 4))
 
 
 def test_sorted_bridge_does_not_force_mls(monkeypatch):

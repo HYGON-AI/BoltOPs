@@ -40,7 +40,6 @@ _SAVED_CONFIG_KEYS = (
     "kpack",
     "use_block_pingpong",
     "buffer_cache_swizzle",
-    "enable_v_mmac_cluster",
     "num_warps",
     "num_stages",
 )

@@ -156,6 +156,11 @@ def _keep_autotune_config(
     if uses_matrix_load_mls:
         if num_stages >= 3 or n % block_n != 0 or k % block_k != 0:
             return False
+        # Wide FP8-channel Gemm1 exposes a gfx938 MLS runtime fault at decode
+        # sizes (first reproduced by E384/N768/K7168, whose Gemm1 N is 1536).
+        # Ordinary loads remain legal, and narrower TP8 Gemm1 keeps MLS.
+        if test_type == "fp8_channel" and num_tokens < 128 and n >= 1536:
+            return False
         # The HCU MLS lowering fixes kWidth to the MLS base width and ignores
         # kpack.  Keeping kpack=2 would compile the same program as kpack=1
         # and could save a misleading configuration.
@@ -170,14 +175,28 @@ def _keep_autotune_config(
 
     if kpack == 2 and block_k <= 32:
         return False
-    enable_v_mmac_cluster = config.get("enable_v_mmac_cluster", 0)
-    if enable_v_mmac_cluster != 0 and block_m < 64 and block_n < 64:
+
+    # Wide-N tiles with 8/16 warps also VMFault for small FP8-channel inputs,
+    # while their 2/4-warp variants remain usable.
+    if (
+        test_type == "fp8_channel"
+        and num_tokens < 128
+        and block_m < 64
+        and block_n >= 256
+        and num_warps >= 8
+    ):
         return False
-    # The HCU LLVM v-MMAC clustering pass and kpack=2 are independently
-    # valid, but their combination VMFaults at runtime for small FP8-channel
-    # MoE tiles (reproduced on gfx938 for BM16/BN256/BK256).  Keep both
-    # optimizations in the search space, just not in the same candidate.
-    if kpack == 2 and enable_v_mmac_cluster != 0:
+    # On gfx938, small-M FP8-channel BM16/BN256/BK256 VMFaults across several
+    # compiler-option variants. Device faults are reported asynchronously, so
+    # the individual triggering variant cannot be isolated safely; drop the
+    # oversized reduction tile for this small-M regime.
+    if (
+        test_type == "fp8_channel"
+        and num_tokens < 128
+        and block_m < 64
+        and block_n >= 256
+        and block_k >= 256
+    ):
         return False
     if test_type in ("int4", "int4int8_channel") and block_k < 32:
         return False
@@ -437,16 +456,6 @@ def generate_config2_lists(
         if num_tokens >= _LARGE_MOE_TOKEN_THRESHOLD
         else (False,),
     )
-    # Mode 2 includes mode 1's barriers and cross-region A/B-load analysis.
-    # It matched or beat mode 1 in the profitable small FP8-channel cases, so
-    # keep only the default and mode 2 in this targeted search.
-    enable_v_mmac_cluster_options = _compiler_option_values(
-        "enable_v_mmac_cluster",
-        (0, 2)
-        if test_type == "fp8_channel"
-        and num_tokens < _LARGE_MOE_TOKEN_THRESHOLD
-        else (0,),
-    )
     # PrepareBlockPingpong owns the actual three-stage/two-buffer pipeline.
     # Keep one canonical frontend stage value for PP to avoid tuning duplicate
     # configurations; do not make PP legality depend on this external value.
@@ -470,8 +479,7 @@ def generate_config2_lists(
                 sched_latency: {sched_latency}, \
                 kpack_options: {kpack_options}, \
                 use_block_pingpong_options: {use_block_pingpong_options}, \
-                buffer_cache_swizzle_options: {buffer_cache_swizzle_options}, \
-                enable_v_mmac_cluster_options: {enable_v_mmac_cluster_options}")
+                buffer_cache_swizzle_options: {buffer_cache_swizzle_options}")
 
     configs = []
     config_count = 0
@@ -484,7 +492,6 @@ def generate_config2_lists(
             combine_scale_load_options,
             pipeline_options,
             buffer_cache_swizzle_options,
-            enable_v_mmac_cluster_options,
             num_warp_options,
             schedule_options,
             kpack_options,
@@ -498,7 +505,6 @@ def generate_config2_lists(
             combine_scale_load,
             (num_stage, use_block_pingpong),
             buffer_cache_swizzle,
-            enable_v_mmac_cluster,
             num_warp,
             schedule,
             kpack,
@@ -520,7 +526,6 @@ def generate_config2_lists(
                 kpack=kpack,
                 use_block_pingpong=use_block_pingpong,
                 buffer_cache_swizzle=buffer_cache_swizzle,
-                enable_v_mmac_cluster=enable_v_mmac_cluster,
             )
             _add_schedule_option(config, schedule_option_name, schedule)
 
