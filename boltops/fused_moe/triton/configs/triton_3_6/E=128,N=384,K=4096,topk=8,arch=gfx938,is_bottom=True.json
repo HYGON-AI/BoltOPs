@@ -13,7 +13,6 @@
         "kpack": 1,
         "use_block_pingpong": false,
         "buffer_cache_swizzle": false,
-        "enable_v_mmac_cluster": 0,
         "num_warps": 4,
         "num_stages": 1
     },
@@ -31,7 +30,6 @@
         "kpack": 1,
         "use_block_pingpong": false,
         "buffer_cache_swizzle": false,
-        "enable_v_mmac_cluster": 0,
         "num_warps": 4,
         "num_stages": 1
     },
@@ -49,7 +47,6 @@
         "kpack": 2,
         "use_block_pingpong": false,
         "buffer_cache_swizzle": false,
-        "enable_v_mmac_cluster": 0,
         "num_warps": 4,
         "num_stages": 1
     },
@@ -67,7 +64,6 @@
         "kpack": 2,
         "use_block_pingpong": false,
         "buffer_cache_swizzle": false,
-        "enable_v_mmac_cluster": 0,
         "num_warps": 4,
         "num_stages": 1
     },
@@ -85,7 +81,6 @@
         "kpack": 2,
         "use_block_pingpong": false,
         "buffer_cache_swizzle": false,
-        "enable_v_mmac_cluster": 0,
         "num_warps": 2,
         "num_stages": 1
     },
@@ -103,7 +98,6 @@
         "kpack": 2,
         "use_block_pingpong": false,
         "buffer_cache_swizzle": false,
-        "enable_v_mmac_cluster": 0,
         "num_warps": 2,
         "num_stages": 1
     },
@@ -121,7 +115,6 @@
         "kpack": 2,
         "use_block_pingpong": false,
         "buffer_cache_swizzle": false,
-        "enable_v_mmac_cluster": 0,
         "num_warps": 2,
         "num_stages": 1
     },
@@ -139,7 +132,6 @@
         "kpack": 2,
         "use_block_pingpong": false,
         "buffer_cache_swizzle": false,
-        "enable_v_mmac_cluster": 0,
         "num_warps": 2,
         "num_stages": 1
     },
@@ -157,7 +149,6 @@
         "kpack": 2,
         "use_block_pingpong": false,
         "buffer_cache_swizzle": false,
-        "enable_v_mmac_cluster": 0,
         "num_warps": 2,
         "num_stages": 1
     },
@@ -175,7 +166,6 @@
         "kpack": 2,
         "use_block_pingpong": false,
         "buffer_cache_swizzle": false,
-        "enable_v_mmac_cluster": 0,
         "num_warps": 4,
         "num_stages": 1
     },
@@ -193,7 +183,6 @@
         "kpack": 2,
         "use_block_pingpong": false,
         "buffer_cache_swizzle": false,
-        "enable_v_mmac_cluster": 0,
         "num_warps": 4,
         "num_stages": 1
     },
@@ -211,7 +200,6 @@
         "kpack": 1,
         "use_block_pingpong": false,
         "buffer_cache_swizzle": false,
-        "enable_v_mmac_cluster": 0,
         "num_warps": 4,
         "num_stages": 2
     },
@@ -229,7 +217,6 @@
         "kpack": 2,
         "use_block_pingpong": false,
         "buffer_cache_swizzle": true,
-        "enable_v_mmac_cluster": 0,
         "num_warps": 4,
         "num_stages": 1
     },
@@ -247,7 +234,6 @@
         "kpack": 2,
         "use_block_pingpong": false,
         "buffer_cache_swizzle": true,
-        "enable_v_mmac_cluster": 0,
         "num_warps": 4,
         "num_stages": 1
     },
@@ -265,7 +251,6 @@
         "kpack": 1,
         "use_block_pingpong": false,
         "buffer_cache_swizzle": true,
-        "enable_v_mmac_cluster": 0,
         "num_warps": 4,
         "num_stages": 1
     },
@@ -283,7 +268,6 @@
         "kpack": 1,
         "use_block_pingpong": false,
         "buffer_cache_swizzle": true,
-        "enable_v_mmac_cluster": 0,
         "num_warps": 4,
         "num_stages": 1
     },
@@ -301,7 +285,6 @@
         "kpack": 1,
         "use_block_pingpong": false,
         "buffer_cache_swizzle": false,
-        "enable_v_mmac_cluster": 0,
         "num_warps": 4,
         "num_stages": 1
     }
