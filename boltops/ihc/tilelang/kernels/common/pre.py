@@ -56,7 +56,7 @@ def _ihc_pre_epilogue(
         group_rows = n_splits_aligned // split_groups
 
     @T.prim_func
-    def kernel(
+    def ihc_pre_epilogue(
         residual: T.Tensor[(n, hc, hidden), T.bfloat16],
         gemm_out_mul: T.Tensor[(n_splits, n, n_out), T.float32],
         gemm_out_sqrsum: T.Tensor[(n_splits, n), T.float32],
@@ -170,7 +170,7 @@ def _ihc_pre_epilogue(
                 for v in T.vectorized(vec_size):
                     layer_in[pid, last_base + v] = ol[v]
 
-    return kernel
+    return ihc_pre_epilogue
 
 
 def ihc_pre(

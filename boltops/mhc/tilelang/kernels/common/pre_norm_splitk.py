@@ -7,6 +7,7 @@ from tilelang import language as T
 _PASS_CONFIGS = {
     tilelang.PassConfigKey.TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE: True,
     tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+    tilelang.PassConfigKey.TL_DISABLE_DATA_RACE_CHECK: True,
 }
 
 _TF32_ROUND_BITS = 0x1000
@@ -138,7 +139,7 @@ def mhc_pre_gemm_sqrsum_splitk_kernel(
                 if t < num_tokens and j < mhc_mult3:
                     out_partial[bz, t, j] = out_shared[i, j]
 
-    @tilelang.jit
+    @tilelang.jit(pass_configs=_PASS_CONFIGS)
     def mhc_pre_gemm_sqrsum_splitk_stage_1(
         out_partial: T.Tensor[(split_k, num_tokens, 32), T.float32],
         sqrsum_partial: T.Tensor[(split_k, num_tokens), T.float32],

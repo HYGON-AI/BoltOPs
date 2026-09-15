@@ -45,7 +45,7 @@ def ihc_gemm_sqrsum_splitk_kernel(
     num_tokens = T.dynamic("num_tokens")
 
     @tilelang.jit(pass_configs=_PASS_CONFIGS)
-    def stage_0(
+    def ihc_gemm_sqrsum_splitk_stage_0(
         x: T.Tensor[(num_tokens, k_total), T.bfloat16],
         fn: T.Tensor[(n_out, k_total), T.float32],
         out_partial: T.Tensor[(split_k, num_tokens, n_out), T.float32],
@@ -144,4 +144,4 @@ def ihc_gemm_sqrsum_splitk_kernel(
                 if t < num_tokens and j < n_out:
                     out_partial[bz, t, j] = out_shared[i, j]
 
-    return stage_0
+    return ihc_gemm_sqrsum_splitk_stage_0

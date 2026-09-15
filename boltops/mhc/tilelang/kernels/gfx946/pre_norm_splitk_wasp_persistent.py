@@ -36,6 +36,7 @@ _PASS_CONFIGS = {
     tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
     tilelang.PassConfigKey.TL_ENABLE_HCU_WDRA: True,
     tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
+    tilelang.PassConfigKey.TL_DISABLE_DATA_RACE_CHECK: True,
 }
 
 
