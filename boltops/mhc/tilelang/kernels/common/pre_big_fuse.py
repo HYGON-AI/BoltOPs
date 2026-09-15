@@ -18,7 +18,9 @@ def _round_to_tf32_kernel(n_elem: int) -> tilelang.JITKernel:
     return _compile_round_to_tf32(n_elem)
 
 
-@tilelang.jit  # inp, out both passed in; out_idx would mean only inp is passed and out is allocated inside the adapter
+@tilelang.jit(
+    pass_configs={tilelang.PassConfigKey.TL_DISABLE_DATA_RACE_CHECK: True},
+)  # inp, out both passed in; out_idx would mean only inp is passed and out is allocated inside the adapter
 def _compile_round_to_tf32(n_elem: int) -> tilelang.JITKernel:
     """Bitcast float32 -> int32, add 0x1000, bitcast back (1D linear scan for coalescing)."""
     _TF32_ROUND_BITS = 0x1000

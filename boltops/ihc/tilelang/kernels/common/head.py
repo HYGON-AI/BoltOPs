@@ -41,7 +41,7 @@ def _ihc_head_epilogue(hc: int, hidden: int, n_splits: int, rms_eps: float, hc_e
         group_rows = n_splits_aligned // split_groups
 
     @T.prim_func
-    def kernel(
+    def ihc_head_epilogue(
         residual: T.Tensor[(n, hc, hidden), T.bfloat16],
         gemm_out_mul: T.Tensor[(n_splits, n, hc), T.float32],
         gemm_out_sqrsum: T.Tensor[(n_splits, n), T.float32],
@@ -145,7 +145,7 @@ def _ihc_head_epilogue(hc: int, hidden: int, n_splits: int, rms_eps: float, hc_e
             for v in T.vectorized(vec_size):
                 hidden_out[pid, last_base + v] = ol[v]
 
-    return kernel
+    return ihc_head_epilogue
 
 
 def ihc_head(

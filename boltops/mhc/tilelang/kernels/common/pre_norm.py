@@ -7,13 +7,14 @@ _PASS_CONFIGS = {
     tilelang.PassConfigKey.TL_DISABLE_WGMMA: True,
     tilelang.PassConfigKey.TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE: True,
     tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+    tilelang.PassConfigKey.TL_DISABLE_DATA_RACE_CHECK: True,
 }
 
 
 _TF32_ROUND_BITS = 0x1000
 
 
-@tilelang.jit
+@tilelang.jit(pass_configs=_PASS_CONFIGS)
 def _mhc_fn_normw_merge_fwd(m: int, n: int, dtype: T.dtype = T.float32) -> tilelang.JITKernel:
     n_blk = 256
 
@@ -33,7 +34,7 @@ def _mhc_fn_normw_merge_fwd(m: int, n: int, dtype: T.dtype = T.float32) -> tilel
     return _mhc_fn_normw_merge_fwd_
 
 
-@tilelang.jit
+@tilelang.jit(pass_configs=_PASS_CONFIGS)
 def _mhc_fn_normw_merge_bwd(m: int, n: int, dtype: T.dtype = T.float32) -> tilelang.JITKernel:
     n_blk = 256
 

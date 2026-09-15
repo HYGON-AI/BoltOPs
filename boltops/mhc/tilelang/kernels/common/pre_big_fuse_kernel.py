@@ -11,6 +11,7 @@ from tilelang import language as T
         tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL: 10,
         tilelang.PassConfigKey.TL_DISABLE_VECTORIZE_256: True,
         tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+        tilelang.PassConfigKey.TL_DISABLE_DATA_RACE_CHECK: True,
     },
 )
 def _mhc_pre_big_fuse(

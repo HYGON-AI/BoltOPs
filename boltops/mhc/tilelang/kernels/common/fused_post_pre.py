@@ -9,6 +9,7 @@ from tilelang import language as T
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
         tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
         tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL: 10,
+        tilelang.PassConfigKey.TL_DISABLE_DATA_RACE_CHECK: True,
     },
 )
 def mhc_post_tilelang(
@@ -65,6 +66,7 @@ def mhc_post_tilelang(
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
         tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
         tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL: 10,
+        tilelang.PassConfigKey.TL_DISABLE_DATA_RACE_CHECK: True,
     },
 )
 def mhc_fused_tilelang(

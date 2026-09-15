@@ -35,7 +35,7 @@ def _ihc_post_split_h(hc: int, hidden: int, n_thr: int = _DEFAULT_N_THR, h_blk: 
     h_blk = math.gcd(hidden, h_blk)
 
     @T.prim_func
-    def kernel(
+    def ihc_post_split_h(
         x: T.Tensor[(n, hidden), T.bfloat16],
         residual: T.Tensor[(n, hc, hidden), T.bfloat16],
         post: T.Tensor[(n, hc), T.float32],
@@ -57,7 +57,7 @@ def _ihc_post_split_h(hc: int, hidden: int, n_thr: int = _DEFAULT_N_THR, h_blk: 
                 out_local[i_hc, i_h] = post_local[i_hc] * x_local[i_h] + residual_local[i_hc, i_h]
             T.copy(out_local, out[pid_n, 0, h_start], disable_tma=True, coalesced_width=8)
 
-    return kernel
+    return ihc_post_split_h
 
 
 @tilelang.jit(pass_configs=_PASS_CONFIGS)
@@ -71,7 +71,7 @@ def _ihc_post_pipeline(hc: int, hidden: int, n_thr: int = _DEFAULT_N_THR, h_blk:
     h_blk = math.gcd(hidden, h_blk)
 
     @T.prim_func
-    def kernel(
+    def ihc_post_pipeline(
         x: T.Tensor[(n, hidden), T.bfloat16],
         residual: T.Tensor[(n, hc, hidden), T.bfloat16],
         post: T.Tensor[(n, hc), T.float32],
@@ -94,7 +94,7 @@ def _ihc_post_pipeline(hc: int, hidden: int, n_thr: int = _DEFAULT_N_THR, h_blk:
                     out_local[i_hc, i_h] = post_local[i_hc] * x_local[i_h] + residual_local[i_hc, i_h]
                 T.copy(out_local, out[pid_n, 0, h_start], disable_tma=True, coalesced_width=8)
 
-    return kernel
+    return ihc_post_pipeline
 
 
 @tilelang.jit(pass_configs=_PASS_CONFIGS)
@@ -104,7 +104,7 @@ def _ihc_post_wo_shmem(hc: int, hidden: int, n_thr: int = _DEFAULT_N_THR, h_blk:
     h_blk = math.gcd(hidden, h_blk)
 
     @T.prim_func
-    def kernel(
+    def ihc_post_wo_shmem(
         x: T.Tensor[(n, hidden), T.bfloat16],
         residual: T.Tensor[(n, hc, hidden), T.bfloat16],
         post: T.Tensor[(n, hc), T.float32],
@@ -125,7 +125,7 @@ def _ihc_post_wo_shmem(hc: int, hidden: int, n_thr: int = _DEFAULT_N_THR, h_blk:
                     out_local[i_hc, i_h] = post_local[i_hc] * x_local[i_h] + residual_local[i_hc, i_h]
                 T.copy(out_local, out[pid_n, 0, h_start], disable_tma=True, coalesced_width=8)
 
-    return kernel
+    return ihc_post_wo_shmem
 
 
 def ihc_post(

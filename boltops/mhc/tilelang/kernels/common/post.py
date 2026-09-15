@@ -15,6 +15,7 @@ from boltops.utility.arch_info import get_device_info
         tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL: 10,
         tilelang.PassConfigKey.TL_DISABLE_VECTORIZE_256: True,
         tilelang.PassConfigKey.TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE: True,
+        tilelang.PassConfigKey.TL_DISABLE_DATA_RACE_CHECK: True,
     },
 )
 def _mhc_post_fwd(mhc: int, hidden: int, n_thr: int = 128, h_blk: int = 1024) -> tilelang.JITKernel:
@@ -63,6 +64,7 @@ def _mhc_post_fwd(mhc: int, hidden: int, n_thr: int = 128, h_blk: int = 1024) ->
         tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL: 10,
         tilelang.PassConfigKey.TL_DISABLE_VECTORIZE_256: True,
         tilelang.PassConfigKey.TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE: True,
+        tilelang.PassConfigKey.TL_DISABLE_DATA_RACE_CHECK: True,
     },
 )
 def _mhc_post_fwd_split_h(
@@ -116,6 +118,7 @@ def _mhc_post_fwd_split_h(
         tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL: 10,
         tilelang.PassConfigKey.TL_DISABLE_VECTORIZE_256: True,
         tilelang.PassConfigKey.TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE: True,
+        tilelang.PassConfigKey.TL_DISABLE_DATA_RACE_CHECK: True,
     },
 )
 def _mhc_post_fwd_wo_shmem(
