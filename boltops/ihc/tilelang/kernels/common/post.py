@@ -20,6 +20,7 @@ _PASS_CONFIGS = {
     tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL: 10,
     tilelang.PassConfigKey.TL_DISABLE_VECTORIZE_256: True,
     tilelang.PassConfigKey.TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE: True,
+    tilelang.PassConfigKey.TL_DISABLE_DATA_RACE_CHECK: True,
 }
 
 _DEFAULT_H_BLK = 1024

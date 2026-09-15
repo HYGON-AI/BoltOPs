@@ -15,6 +15,7 @@ from boltops.utility.arch_info import get_device_info
 _PASS_CONFIGS = {
     tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
     tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+    tilelang.PassConfigKey.TL_DISABLE_DATA_RACE_CHECK: True,
 }
 
 
