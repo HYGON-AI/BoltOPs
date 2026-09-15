@@ -1,7 +1,8 @@
 # Generic 系列算子说明
 
 Generic 用于归类不属于 Gemm、MoE、KDA 等专用系列的通用融合算子。目前包含
-注意力残差融合和带 mask 的 Mamba state scatter，以及 causal conv1d（fwd + update，统一入口 + SGLang/vLLM 双 port）。
+注意力残差融合、带 mask 的 Mamba state scatter、causal conv1d（fwd + update，
+统一入口 + SGLang/vLLM 双 port），以及框架无关的 QSA 分页选择和稀疏注意力。
 
 公开 API 统一从 `boltops.generic` 导入：
 
@@ -10,7 +11,11 @@ from boltops.generic import (
     attn_res,
     causal_conv1d_fn,
     causal_conv1d_update,
+    expand_qsa_block_indices,
     fused_mamba_state_scatter_with_mask,
+    qsa_mqa_paged,
+    qsa_select_paged_tokens,
+    qsa_sparse_paged_attention,
 )
 ```
 
@@ -22,6 +27,10 @@ from boltops.generic import (
 | `fused_mamba_state_scatter_with_mask` | 按目标索引和 step mask 更新 Mamba state cache | `boltops.generic` | Triton | [Mamba state scatter](mamba_state_scatter.md) |
 | `causal_conv1d_fn` | varlen 连续批处理的 causal depthwise conv1d（extend/prefill），自动路由 SGLang/vLLM port | `boltops.generic` | Triton | [causal conv1d](causal_conv1d.md) |
 | `causal_conv1d_update` | decode 单步的 causal conv1d + state 更新，自动路由 SGLang/vLLM port | `boltops.generic` | Triton | [causal conv1d](causal_conv1d.md) |
+| `qsa_mqa_paged` | 对分页压缩 K cache 计算 FP32 QSA 分数 | `boltops.generic` | Triton | [QSA](qsa.md) |
+| `qsa_select_paged_tokens` | 选择压缩 block 并展开为 causal token id | `boltops.generic` | Triton + PyTorch top-k | [QSA](qsa.md) |
+| `expand_qsa_block_indices` | 展开调用方提供的压缩 block id | `boltops.generic` | Triton | [QSA](qsa.md) |
+| `qsa_sparse_paged_attention` | 在分页 BF16 K/V cache 上执行稀疏 GQA | `boltops.generic` | Triton | [QSA](qsa.md) |
 
 ## 接口与实现边界
 
@@ -33,6 +42,8 @@ from boltops.generic import (
   自动路由到 SGLang / vLLM 两套 Triton port；常量、PDL stub 与 torch 参考实现
   在 `triton/causal_conv1d/common.py` 共享，kernel 本体保持两套可 diff 上游的
   移植。
+- 四个 QSA API 不依赖 vLLM；cache 生命周期、page table 和 request 映射由调用方
+  管理。可选 vLLM A/B 只位于测试目录，前提与命令见 [QSA 文档](qsa.md)。
 - 合并决策由 bake-off 数据驱动：`pytest test/test_generic_causal_conv1d.py
   --bench -s` 在相同真实 shape 上对比两个后端，判定标准见
   [causal conv1d](causal_conv1d.md)。
@@ -46,6 +57,7 @@ from boltops.generic import (
 pytest -q test/test_generic_attn_res.py
 pytest -q test/test_generic_mamba_state_scatter.py
 pytest -q test/test_generic_causal_conv1d.py
+pytest -q test/test_generic_qsa.py
 
 # 各算子的 benchmark case
 pytest -q test/test_generic_attn_res.py --bench -s
