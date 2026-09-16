@@ -16,13 +16,11 @@
       "config": {
         "BLOCK_R": 8,
         "BLOCK_H": 16,
-        "BLOCK_D": 256,
         "num_warps": 2,
         "num_stages": 1,
         "waves_per_eu": 3,
-        "misched_regpressure": false,
-        "empty_arrive_after_mmac": true,
-        "max_memory_cluster_dwords": 16
+        "kpack": 2,
+        "enable_v_mmac_cluster": 2
       }
     }
   ]

@@ -11,8 +11,8 @@ dict. ``kv_seqlens`` must contain a single context while tuning.
 Candidates include HIP ``waves_per_eu`` and ``BALANCE_LIVE``; ``sparse_attention_decode``
 forwards warps / stages / waves at launch. ``_sparse_attn_decode_dsplit_kernel``
 (non-pow2 ``head_dim``, e.g. 192) omits ``BLOCK_D``; the padded kernel writes it.
-JSON never contains ``BLOCK_D1`` / ``BLOCK_D2`` (those tiles are derived from
-``head_dim`` at launch).
+JSON never contains ``BLOCK_D1`` / ``BLOCK_D2`` / ``BLOCK_D3`` (those tiles
+are derived from ``head_dim`` at launch).
 
 ``--splits 1`` times the production fast path (auto KV-split + merge) and still
 writes the ``s1`` occupancy JSON, including ``AUTO_KV_SPLITS`` for the launch
@@ -79,7 +79,7 @@ _JSON_KEY_ORDER = (
     "num_stages",
     "waves_per_eu",
 )
-_FORBIDDEN_JSON_KEYS = frozenset({"BLOCK_D1", "BLOCK_D2"})
+_FORBIDDEN_JSON_KEYS = frozenset({"BLOCK_D1", "BLOCK_D2", "BLOCK_D3"})
 
 
 def candidates(block_h: int, *, block_d: int | None = None) -> list[dict]:
@@ -237,7 +237,7 @@ def tune_shape(
     if d_split is not None:
         print(
             "  kernel=_sparse_attn_decode_dsplit_kernel "
-            f"(omit BLOCK_D; chunks {d_split[0]}+{d_split[1]} from head_dim)",
+            f"(omit BLOCK_D; chunks {'+'.join(str(part) for part in d_split)} from head_dim)",
             flush=True,
         )
         grid = candidates(block_h)

@@ -24,7 +24,33 @@
         "BLOCK_H": 16,
         "num_warps": 1,
         "num_stages": 3,
-        "waves_per_eu": 2
+        "waves_per_eu": 2,
+        "empty_arrive_after_mmac": true
+      }
+    },
+    {
+      "match": {
+        "s_q": 128,
+        "s_kv": 16384,
+        "h_q": 8,
+        "h_kv": 1,
+        "topk": 513,
+        "d": 192,
+        "num_splits": 1,
+        "region_size": 8,
+        "dtype": "bfloat16"
+      },
+      "config": {
+        "BALANCE_LIVE": false,
+        "BLOCK_R": 8,
+        "BLOCK_H": 16,
+        "num_warps": 2,
+        "num_stages": 1,
+        "waves_per_eu": 1,
+        "enable_v_mmac_cluster": 2,
+        "kpack": 2,
+        "misched_regpressure": false,
+        "empty_arrive_after_mmac": true
       }
     },
     {
@@ -44,9 +70,13 @@
         "BALANCE_LIVE": false,
         "BLOCK_R": 2,
         "BLOCK_H": 16,
-        "num_warps": 1,
+        "num_warps": 2,
         "num_stages": 3,
-        "waves_per_eu": 2
+        "waves_per_eu": 2,
+        "kpack": 2,
+        "enable_v_mmac_cluster": 2,
+        "misched_regpressure": false,
+        "empty_arrive_after_mmac": true
       }
     },
     {
@@ -62,14 +92,17 @@
         "dtype": "bfloat16"
       },
       "config": {
-        "AUTO_KV_SPLITS": 12,
+        "AUTO_KV_SPLITS": 36,
+        "BALANCE_LIVE": false,
         "BLOCK_R": 8,
         "BLOCK_H": 16,
-        "num_warps": 1,
+        "num_warps": 2,
         "num_stages": 1,
         "waves_per_eu": 2,
-        "BALANCE_LIVE": false,
-        "kpack": 2
+        "kpack": 2,
+        "enable_v_mmac_cluster": 2,
+        "misched_regpressure": false,
+        "empty_arrive_after_mmac": true
       }
     },
     {
@@ -85,14 +118,17 @@
         "dtype": "bfloat16"
       },
       "config": {
-        "AUTO_KV_SPLITS": 12,
+        "AUTO_KV_SPLITS": 18,
+        "BALANCE_LIVE": false,
         "BLOCK_R": 8,
         "BLOCK_H": 16,
-        "num_warps": 8,
+        "num_warps": 2,
         "num_stages": 1,
         "waves_per_eu": 1,
-        "BALANCE_LIVE": false,
-        "kpack": 2
+        "kpack": 2,
+        "enable_v_mmac_cluster": 2,
+        "misched_regpressure": false,
+        "empty_arrive_after_mmac": true
       }
     },
     {
@@ -113,8 +149,12 @@
         "BLOCK_R": 2,
         "BLOCK_H": 16,
         "num_warps": 1,
-        "num_stages": 3,
-        "waves_per_eu": 2
+        "num_stages": 1,
+        "waves_per_eu": 2,
+        "kpack": 2,
+        "enable_v_mmac_cluster": 2,
+        "misched_regpressure": false,
+        "empty_arrive_after_mmac": true
       }
     },
     {
@@ -135,8 +175,37 @@
         "BLOCK_R": 2,
         "BLOCK_H": 16,
         "num_warps": 1,
-        "num_stages": 3,
-        "waves_per_eu": 2
+        "num_stages": 1,
+        "waves_per_eu": 2,
+        "kpack": 2,
+        "enable_v_mmac_cluster": 2,
+        "misched_regpressure": false,
+        "empty_arrive_after_mmac": true
+      }
+    },
+    {
+      "match": {
+        "s_q": 128,
+        "s_kv": 65536,
+        "h_q": 8,
+        "h_kv": 1,
+        "topk": 513,
+        "d": 192,
+        "num_splits": 1,
+        "region_size": 8,
+        "dtype": "bfloat16"
+      },
+      "config": {
+        "BALANCE_LIVE": false,
+        "BLOCK_R": 8,
+        "BLOCK_H": 16,
+        "num_warps": 2,
+        "num_stages": 1,
+        "waves_per_eu": 1,
+        "enable_v_mmac_cluster": 2,
+        "kpack": 2,
+        "misched_regpressure": false,
+        "empty_arrive_after_mmac": true
       }
     }
   ]

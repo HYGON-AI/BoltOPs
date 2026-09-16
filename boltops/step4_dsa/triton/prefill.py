@@ -24,6 +24,8 @@ from boltops.utility.triton_capability import get_triton_capabilities
 REGION_VALID_SHIFT = tl.constexpr(24)
 REGION_ID_MASK = tl.constexpr((1 << 24) - 1)
 NEGATIVE_INFINITY = tl.constexpr(float("-inf"))
+LOG2E = tl.constexpr(1.4426950408889634)
+LN2 = tl.constexpr(0.6931471805599453)
 
 
 @triton.jit
@@ -161,6 +163,200 @@ def _sparse_attn_prefill_kernel(
         tl.where(selected, running_max + tl.log(running_sum), NEGATIVE_INFINITY),
         mask=head_ok,
     )
+
+
+@triton.jit
+def _sparse_attn_prefill_dsplit_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    packed_ptr,
+    counts_ptr,
+    out_ptr,
+    lse_ptr,
+    stride_q_token,
+    stride_q_head,
+    stride_k_token,
+    stride_k_group,
+    stride_v_token,
+    stride_v_group,
+    stride_packed_row,
+    stride_out_token,
+    stride_out_head,
+    stride_lse_token,
+    softmax_scale,
+    total_q,
+    topk: tl.constexpr,
+    heads_per_group: tl.constexpr,
+    head_dim: tl.constexpr,
+    region_size: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_D1: tl.constexpr,
+    BLOCK_D2: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    USE_LOG2: tl.constexpr,
+    SHARED_RECIP: tl.constexpr,
+    K_TRANSPOSED_LOAD: tl.constexpr,
+) -> None:
+    """Per-query prefill specialized for an exact two-chunk head dimension.
+
+    For ``head_dim=192`` this uses ``128+64`` instead of padding all Q/K/V and
+    the output accumulator to 256. Online softmax is evaluated in the log2
+    domain and output normalization shares one reciprocal per head.
+    """
+    tl.static_assert(BLOCK_D1 + BLOCK_D2 == head_dim)
+    query = tl.program_id(0)
+    group = tl.program_id(1)
+    row = group * total_q + query
+    count = tl.load(counts_ptr + row).to(tl.int32)
+
+    heads = tl.arange(0, BLOCK_H)
+    dims1 = tl.arange(0, BLOCK_D1)
+    dims2 = BLOCK_D1 + tl.arange(0, BLOCK_D2)
+    head_ok = heads < heads_per_group
+    q_base = (
+        q_ptr
+        + query * stride_q_token
+        + (group * heads_per_group + heads)[:, None] * stride_q_head
+    )
+    queries1 = tl.load(q_base + dims1[None, :], mask=head_ok[:, None], other=0.0)
+    queries2 = tl.load(q_base + dims2[None, :], mask=head_ok[:, None], other=0.0)
+
+    scale = softmax_scale * LOG2E if USE_LOG2 else softmax_scale
+    running_max = tl.full((BLOCK_H,), NEGATIVE_INFINITY, dtype=tl.float32)
+    running_sum = tl.zeros((BLOCK_H,), dtype=tl.float32)
+    acc1 = tl.zeros((BLOCK_H, BLOCK_D1), dtype=tl.float32)
+    acc2 = tl.zeros((BLOCK_H, BLOCK_D2), dtype=tl.float32)
+
+    offsets_in_region = tl.arange(0, region_size)
+    for base in tl.range(0, topk, BLOCK_R):
+        slots = base + tl.arange(0, BLOCK_R)
+        slot_ok = slots < count
+        meta = tl.load(
+            packed_ptr + row * stride_packed_row + slots, mask=slot_ok, other=-1
+        )
+        physical = meta & REGION_ID_MASK
+        valid = meta >> REGION_VALID_SHIFT
+        live = slot_ok & (meta >= 0) & (valid > 0)
+
+        tokens = tl.reshape(
+            physical[:, None] * region_size + offsets_in_region[None, :],
+            (BLOCK_R * region_size,),
+        )
+        token_ok = tl.reshape(
+            live[:, None] & (offsets_in_region[None, :] < valid[:, None]),
+            (BLOCK_R * region_size,),
+        )
+        safe_tokens = tl.where(token_ok, tokens, 0)
+        if K_TRANSPOSED_LOAD:
+            k_base = (
+                k_ptr
+                + safe_tokens[None, :] * stride_k_token
+                + group * stride_k_group
+            )
+            keys1 = tl.load(
+                k_base + dims1[:, None], mask=token_ok[None, :], other=0.0
+            )
+            keys2 = tl.load(
+                k_base + dims2[:, None], mask=token_ok[None, :], other=0.0
+            )
+        else:
+            k_base = (
+                k_ptr
+                + safe_tokens[:, None] * stride_k_token
+                + group * stride_k_group
+            )
+            keys1 = tl.load(
+                k_base + dims1[None, :], mask=token_ok[:, None], other=0.0
+            )
+            keys2 = tl.load(
+                k_base + dims2[None, :], mask=token_ok[:, None], other=0.0
+            )
+        v_base = (
+            v_ptr
+            + safe_tokens[:, None] * stride_v_token
+            + group * stride_v_group
+        )
+        values1 = tl.load(
+            v_base + dims1[None, :], mask=token_ok[:, None], other=0.0
+        )
+        values2 = tl.load(
+            v_base + dims2[None, :], mask=token_ok[:, None], other=0.0
+        )
+
+        if K_TRANSPOSED_LOAD:
+            scores = (
+                tl.dot(queries1, keys1, out_dtype=tl.float32)
+                + tl.dot(queries2, keys2, out_dtype=tl.float32)
+            ) * scale
+        else:
+            scores = (
+                tl.dot(queries1, tl.trans(keys1), out_dtype=tl.float32)
+                + tl.dot(queries2, tl.trans(keys2), out_dtype=tl.float32)
+            ) * scale
+        scores = tl.where(
+            token_ok[None, :] & head_ok[:, None], scores, NEGATIVE_INFINITY
+        )
+        tile_max = tl.maximum(running_max, tl.max(scores, axis=1))
+        empty = tile_max == NEGATIVE_INFINITY
+        shift = tl.where(empty, 0.0, tile_max)
+        if USE_LOG2:
+            rescale = tl.where(empty, 1.0, tl.math.exp2(running_max - shift))
+            probabilities = tl.math.exp2(scores - shift[:, None])
+        else:
+            rescale = tl.where(empty, 1.0, tl.exp(running_max - shift))
+            probabilities = tl.exp(scores - shift[:, None])
+        running_sum = running_sum * rescale + tl.sum(probabilities, axis=1)
+        p = probabilities.to(values1.dtype)
+        acc1 = acc1 * rescale[:, None] + tl.dot(p, values1, out_dtype=tl.float32)
+        acc2 = acc2 * rescale[:, None] + tl.dot(p, values2, out_dtype=tl.float32)
+        running_max = tile_max
+
+    selected = running_sum > 0
+    if SHARED_RECIP:
+        inv_sum = tl.div_rn(1.0, tl.where(selected, running_sum, 1.0))
+        output1 = tl.where(selected[:, None], acc1 * inv_sum[:, None], 0.0)
+        output2 = tl.where(selected[:, None], acc2 * inv_sum[:, None], 0.0)
+    else:
+        output1 = tl.where(selected[:, None], acc1 / running_sum[:, None], 0.0)
+        output2 = tl.where(selected[:, None], acc2 / running_sum[:, None], 0.0)
+    out_base = (
+        out_ptr
+        + query * stride_out_token
+        + (group * heads_per_group + heads)[:, None] * stride_out_head
+    )
+    tl.store(
+        out_base + dims1[None, :],
+        output1.to(out_ptr.dtype.element_ty),
+        mask=head_ok[:, None],
+    )
+    tl.store(
+        out_base + dims2[None, :],
+        output2.to(out_ptr.dtype.element_ty),
+        mask=head_ok[:, None],
+    )
+    tl.store(
+        lse_ptr + query * stride_lse_token + group * heads_per_group + heads,
+        tl.where(
+            selected,
+            running_max * LN2 + tl.log(running_sum)
+            if USE_LOG2
+            else running_max + tl.log(running_sum),
+            NEGATIVE_INFINITY,
+        ),
+        mask=head_ok,
+    )
+
+
+def _prefill_head_dim_split(head_dim: int) -> tuple[int, int] | None:
+    """Return two power-of-two chunks that exactly cover ``head_dim``."""
+    if head_dim <= 0 or head_dim & (head_dim - 1) == 0:
+        return None
+    d1 = 1 << (head_dim.bit_length() - 1)
+    d2 = head_dim - d1
+    if d2 >= 16 and d2 & (d2 - 1) == 0:
+        return d1, d2
+    return None
 
 
 @triton.jit
@@ -1014,35 +1210,72 @@ def sparse_attention_prefill(
     else:
         block_h, block_d, block_r = default_h, default_d, default_r
 
-    _sparse_attn_prefill_kernel[(total_q, num_kv_groups)](
-        query,
-        key_cache,
-        value_cache,
-        packed_regions,
-        region_counts,
-        out,
-        lse,
-        query.stride(0),
-        query.stride(1),
-        key_cache.stride(0),
-        key_cache.stride(1),
-        value_cache.stride(0),
-        value_cache.stride(1),
-        packed_regions.stride(0),
-        out.stride(0),
-        out.stride(1),
-        lse.stride(0),
-        scale,
-        total_q,
-        topk=topk,
-        heads_per_group=heads_per_group,
-        head_dim=head_dim,
-        region_size=region_size,
-        BLOCK_H=block_h,
-        BLOCK_D=block_d,
-        BLOCK_R=block_r,
-        **extra,
-    )
+    dim_split = _prefill_head_dim_split(head_dim)
+    if dim_split is not None:
+        d1, d2 = dim_split
+        _sparse_attn_prefill_dsplit_kernel[(total_q, num_kv_groups)](
+            query,
+            key_cache,
+            value_cache,
+            packed_regions,
+            region_counts,
+            out,
+            lse,
+            query.stride(0),
+            query.stride(1),
+            key_cache.stride(0),
+            key_cache.stride(1),
+            value_cache.stride(0),
+            value_cache.stride(1),
+            packed_regions.stride(0),
+            out.stride(0),
+            out.stride(1),
+            lse.stride(0),
+            scale,
+            total_q,
+            topk=topk,
+            heads_per_group=heads_per_group,
+            head_dim=head_dim,
+            region_size=region_size,
+            BLOCK_H=block_h,
+            BLOCK_D1=d1,
+            BLOCK_D2=d2,
+            BLOCK_R=block_r,
+            USE_LOG2=True,
+            SHARED_RECIP=True,
+            K_TRANSPOSED_LOAD=False,
+            **extra,
+        )
+    else:
+        _sparse_attn_prefill_kernel[(total_q, num_kv_groups)](
+            query,
+            key_cache,
+            value_cache,
+            packed_regions,
+            region_counts,
+            out,
+            lse,
+            query.stride(0),
+            query.stride(1),
+            key_cache.stride(0),
+            key_cache.stride(1),
+            value_cache.stride(0),
+            value_cache.stride(1),
+            packed_regions.stride(0),
+            out.stride(0),
+            out.stride(1),
+            lse.stride(0),
+            scale,
+            total_q,
+            topk=topk,
+            heads_per_group=heads_per_group,
+            head_dim=head_dim,
+            region_size=region_size,
+            BLOCK_H=block_h,
+            BLOCK_D=block_d,
+            BLOCK_R=block_r,
+            **extra,
+        )
     return out, lse
 
 
