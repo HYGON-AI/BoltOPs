@@ -1,4 +1,4 @@
-"""Packed ragged Sparse-GQA decode migrated from the Qwen QSA path."""
+"""Packed ragged Sparse-GQA decode kernels."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .compact import is_fp8_kv_dtype, _unit_scale
+from .kv_compact import is_fp8_kv_dtype, _unit_scale
 from .config import load_config
 
 
@@ -143,6 +143,120 @@ def _sparse_gqa_chunk_prefill(
     )
 
 
+@triton.jit
+def _sparse_gqa_split_partial(q, k, v, indices, cu_q, cu_k, kv_lens, p_max, p_sum, p_acc, scale, topk, sq_m: tl.constexpr, sq_h: tl.constexpr, sq_d: tl.constexpr, sk_n: tl.constexpr, sk_h: tl.constexpr, sk_d: tl.constexpr, sv_n: tl.constexpr, sv_h: tl.constexpr, sv_d: tl.constexpr, si_m: tl.constexpr, si_g: tl.constexpr, si_n: tl.constexpr, NUM_KV_HEADS: tl.constexpr, GROUP_SIZE: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, HEAD_DIM: tl.constexpr, SPLITS: tl.constexpr):
+    split = tl.program_id(0)
+    batch_group = tl.program_id(1)
+    group = batch_group % NUM_KV_HEADS
+    batch = batch_group // NUM_KV_HEADS
+    q_start = tl.load(cu_q + batch)
+    q_end = tl.load(cu_q + batch + 1)
+    k_start = tl.load(cu_k + batch).to(tl.int64)
+    kv_len = tl.load(kv_lens + batch).to(tl.int64)
+    row_limit = tl.minimum(topk, ((tl.minimum(topk, kv_len - (q_end - q_start) + 1) + BLOCK_N - 1) // BLOCK_N) * BLOCK_N)
+    blocks = (row_limit + BLOCK_N - 1) // BLOCK_N
+    blocks_per_split = (blocks + SPLITS - 1) // SPLITS
+    split_start = split * blocks_per_split * BLOCK_N
+    split_end = tl.minimum(row_limit, split_start + blocks_per_split * BLOCK_N)
+    offs_h, offs_d, offs_n = tl.arange(0, BLOCK_M), tl.arange(0, HEAD_DIM), tl.arange(0, BLOCK_N)
+    qv = tl.load(q + q_start * sq_m + (group * GROUP_SIZE + offs_h[:, None]) * sq_h + offs_d[None, :] * sq_d, mask=(offs_h < GROUP_SIZE)[:, None], other=0.0)
+    qv = (qv * scale * 1.4426950408).to(qv.dtype)
+    kb, vb = k + k_start * sk_n + group * sk_h, v + k_start * sv_n + group * sv_h
+    idx = indices + q_start * si_m + group * si_g
+    m = tl.full([BLOCK_M], -float("inf"), tl.float32)
+    z, acc = tl.zeros([BLOCK_M], tl.float32), tl.zeros([BLOCK_M, HEAD_DIM], tl.float32)
+    for start in range(split_start, split_end, BLOCK_N):
+        current = start + offs_n
+        token = tl.load(idx + current * si_n, mask=current < topk, other=-1)
+        valid = token >= 0
+        keys = tl.load(
+            kb + token[None, :] * sk_n + offs_d[:, None] * sk_d,
+            mask=valid[None, :],
+            other=0.0,
+        )
+        vals = tl.load(vb + token[:, None] * sv_n + offs_d[None, :] * sv_d, mask=valid[:, None], other=0.0)
+        scores = tl.where(valid[None, :], tl.dot(qv, keys), -float("inf"))
+        next_m = tl.maximum(m, tl.max(scores, 1))
+        alpha, p = tl.math.exp2(m - next_m), tl.math.exp2(scores - next_m[:, None])
+        acc = tl.dot(p.to(vals.dtype), vals, acc * alpha[:, None])
+        z, m = z * alpha + tl.sum(p, 1), next_m
+    base = (split * (tl.num_programs(1)) + batch_group) * BLOCK_M + offs_h
+    tl.store(p_max + base, m)
+    tl.store(p_sum + base, z)
+    tl.store(p_acc + base[:, None] * HEAD_DIM + offs_d[None, :], acc)
+
+
+@triton.jit
+def _sparse_gqa_split_merge(out, p_max, p_sum, p_acc, cu_q, NUM_KV_HEADS: tl.constexpr, GROUP_SIZE: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_D: tl.constexpr, HEAD_DIM: tl.constexpr, SPLITS: tl.constexpr):
+    bg = tl.program_id(0)
+    group, batch = bg % NUM_KV_HEADS, bg // NUM_KV_HEADS
+    h = tl.arange(0, BLOCK_M)
+    d = tl.program_id(1) * BLOCK_D + tl.arange(0, BLOCK_D)
+    base = bg * BLOCK_M + h
+    stride = tl.num_programs(0) * BLOCK_M
+    m = tl.full([BLOCK_M], -float("inf"), tl.float32)
+    for split in range(0, SPLITS):
+        m = tl.maximum(m, tl.load(p_max + base + split * stride))
+    z = tl.zeros([BLOCK_M], tl.float32)
+    acc = tl.zeros([BLOCK_M, BLOCK_D], tl.float32)
+    for split in range(0, SPLITS):
+        split_base = base + split * stride
+        split_z = tl.load(p_sum + split_base)
+        alpha = tl.where(split_z > 0, tl.math.exp2(tl.load(p_max + split_base) - m), 0.0)
+        split_acc = tl.load(p_acc + split_base[:, None] * HEAD_DIM + d[None, :])
+        z += split_z * alpha
+        acc += split_acc * alpha[:, None]
+    q_start = tl.load(cu_q + batch)
+    tl.store(out + q_start * (NUM_KV_HEADS * GROUP_SIZE * HEAD_DIM) + (group * GROUP_SIZE + h[:, None]) * HEAD_DIM + d[None, :], acc / z[:, None], mask=(h < GROUP_SIZE)[:, None] & (d < HEAD_DIM)[None, :])
+
+
+@triton.jit
+def _sparse_gqa_split_merge_2(
+    out,
+    p_max,
+    p_sum,
+    p_acc,
+    cu_q,
+    NUM_KV_HEADS: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+    batch_group = tl.program_id(0)
+    group = batch_group % NUM_KV_HEADS
+    batch = batch_group // NUM_KV_HEADS
+    offs_h = tl.arange(0, BLOCK_M)
+    offs_d = tl.program_id(1) * BLOCK_D + tl.arange(0, BLOCK_D)
+    base = batch_group * BLOCK_M + offs_h
+    split_stride = tl.num_programs(0) * BLOCK_M
+
+    max0 = tl.load(p_max + base)
+    max1 = tl.load(p_max + base + split_stride)
+    max_value = tl.maximum(max0, max1)
+    sum0 = tl.load(p_sum + base)
+    sum1 = tl.load(p_sum + base + split_stride)
+    alpha0 = tl.where(sum0 > 0, tl.math.exp2(max0 - max_value), 0.0)
+    alpha1 = tl.where(sum1 > 0, tl.math.exp2(max1 - max_value), 0.0)
+    acc0 = tl.load(p_acc + base[:, None] * HEAD_DIM + offs_d[None, :])
+    acc1 = tl.load(
+        p_acc + (base + split_stride)[:, None] * HEAD_DIM + offs_d[None, :]
+    )
+    output = (acc0 * alpha0[:, None] + acc1 * alpha1[:, None]) / (
+        sum0 * alpha0 + sum1 * alpha1
+    )[:, None]
+
+    q_start = tl.load(cu_q + batch)
+    tl.store(
+        out
+        + q_start * (NUM_KV_HEADS * GROUP_SIZE * HEAD_DIM)
+        + (group * GROUP_SIZE + offs_h[:, None]) * HEAD_DIM
+        + offs_d[None, :],
+        output,
+        mask=(offs_h < GROUP_SIZE)[:, None] & (offs_d < HEAD_DIM)[None, :],
+    )
+
+
 def _validate_decode(q, k, v, indices, cu_q, cu_k, kv_lens) -> None:
     if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
         raise ValueError("q/k/v must be packed rank-3 [N,H,D] tensors")
@@ -210,7 +324,11 @@ def _launch_sparse_gqa_chunk_prefill(
     )
     config = {"BLOCK_N": 32, "num_warps": 8, "num_stages": 2} | tuned
     block_n = int(config["BLOCK_N"])
-    launch = {key: value for key, value in config.items() if key != "BLOCK_N"}
+    launch = {
+        key: config[key]
+        for key in ("num_warps", "num_stages")
+        if key in config
+    }
     out = torch.empty_like(q)
     _sparse_gqa_chunk_prefill[(grid_m, (cu_q.shape[0] - 1) * num_kv_heads)](
         q,
@@ -265,12 +383,121 @@ def sparse_gqa_packed_decode_triton(
 ):
     """Run one packed sparse-attention row per request without a host sync.
 
-    Decode and speculative-verify already compact the selected K/V rows into
-    contiguous request segments. This wrapper reuses the chunk-prefill kernel
-    with a fixed query length of one, avoiding a device-to-host sync during
-    graph capture.
+    Decode and speculative-verify compact the selected K/V rows into
+    contiguous request segments. The split online-softmax path applies when
+    every request supplies one contiguous decode query; FP8, strided-query,
+    and multi-query inputs retain the chunk-prefill path.
     """
     k, v = k.contiguous(), v.contiguous()
+    single_query_per_request = q.shape[0] == cu_q.shape[0] - 1
+    if (
+        single_query_per_request
+        and q.is_contiguous()
+        and not is_fp8_kv_dtype(k.dtype)
+    ):
+        return _sparse_gqa_packed_decode_triton_split(
+            q, k, v, indices, cu_q, cu_k, kv_lens, scale
+        )
     return _launch_sparse_gqa_chunk_prefill(
         q, k, v, indices, cu_q, cu_k, kv_lens, scale, 1, k_scale, v_scale
     )
+
+
+def _sparse_gqa_packed_decode_triton_split(
+    q,
+    k,
+    v,
+    indices,
+    cu_q,
+    cu_k,
+    kv_lens,
+    scale,
+    *,
+    config: Optional[dict] = None,
+):
+    _validate_decode(q, k, v, indices, cu_q, cu_k, kv_lens)
+    if not q.is_contiguous() or not k.is_contiguous() or not v.is_contiguous():
+        raise ValueError("split decode requires contiguous Q/K/V")
+    _, q_heads, head_dim = q.shape
+    kv_heads = k.shape[1]
+    group_size = q_heads // kv_heads
+    batch_groups = (cu_q.shape[0] - 1) * kv_heads
+    block_m = max(16, triton.next_power_of_2(group_size))
+    batch_size = cu_q.shape[0] - 1
+    is_production_batch = batch_size in (1, 8, 32)
+    if batch_size == 32:
+        default_splits = 7 if group_size <= 4 else 6
+    else:
+        default_splits = 16 if batch_size in (1, 8) else 2
+    default_partial_stages = (
+        1 if batch_size == 32 else (2 if is_production_batch else 3)
+    )
+    if batch_size in (1, 8):
+        default_merge_block_d, default_merge_num_warps = 16, 1
+    elif batch_size == 32:
+        default_merge_block_d, default_merge_num_warps = 32, 4
+    else:
+        default_merge_block_d, default_merge_num_warps = head_dim, 4
+    defaults = {
+        "BLOCK_N": 32,
+        "num_warps": 2 if is_production_batch else 4,
+        "num_stages": default_partial_stages,
+        "SPLITS": default_splits,
+        "MERGE_BLOCK_D": default_merge_block_d,
+        "MERGE_NUM_WARPS": default_merge_num_warps,
+    }
+    tuned = (
+        load_config(
+            "decode",
+            batch_size,
+            indices.shape[-1],
+            q_heads,
+            kv_heads,
+            head_dim,
+            q.dtype,
+        )
+        if config is None
+        else config
+    )
+    config = defaults | tuned
+    block_n = int(config["BLOCK_N"])
+    partial_num_warps = int(config["num_warps"])
+    partial_num_stages = int(config["num_stages"])
+    splits = int(config["SPLITS"])
+    merge_block_d = int(config["MERGE_BLOCK_D"])
+    merge_num_warps = int(config["MERGE_NUM_WARPS"])
+    p_max = torch.empty((splits, batch_groups, block_m), device=q.device, dtype=torch.float32)
+    p_sum = torch.empty_like(p_max)
+    p_acc = torch.empty(
+        (splits, batch_groups, block_m, head_dim),
+        device=q.device,
+        dtype=torch.float32,
+    )
+    _sparse_gqa_split_partial[(splits, batch_groups)](
+        q, k, v, indices, cu_q, cu_k, kv_lens, p_max, p_sum, p_acc, scale,
+        indices.shape[-1], q.stride(0), q.stride(1), q.stride(2),
+        k.stride(0), k.stride(1), k.stride(2), v.stride(0), v.stride(1),
+        v.stride(2), indices.stride(0), indices.stride(1) if indices.ndim == 3 else 0,
+        indices.stride(2) if indices.ndim == 3 else indices.stride(1),
+        NUM_KV_HEADS=kv_heads, GROUP_SIZE=group_size, BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        HEAD_DIM=head_dim,
+        SPLITS=splits,
+        num_warps=partial_num_warps,
+        num_stages=partial_num_stages,
+    )
+    out = torch.empty_like(q)
+    if splits == 2:
+        _sparse_gqa_split_merge_2[(batch_groups, triton.cdiv(head_dim, merge_block_d))](
+            out, p_max, p_sum, p_acc, cu_q, NUM_KV_HEADS=kv_heads,
+            GROUP_SIZE=group_size, BLOCK_M=block_m, BLOCK_D=merge_block_d,
+            HEAD_DIM=head_dim,
+            num_warps=merge_num_warps,
+        )
+    else:
+        _sparse_gqa_split_merge[(batch_groups, triton.cdiv(head_dim, merge_block_d))](
+            out, p_max, p_sum, p_acc, cu_q, NUM_KV_HEADS=kv_heads,
+            GROUP_SIZE=group_size, BLOCK_M=block_m, HEAD_DIM=head_dim,
+            BLOCK_D=merge_block_d, SPLITS=splits, num_warps=merge_num_warps,
+        )
+    return out

@@ -1,4 +1,4 @@
-"""Pack selected Qwen QSA rows from the HCU-FA paged KV layout."""
+"""Pack selected rows from the HCU-FA paged KV layout."""
 
 from __future__ import annotations
 
@@ -48,33 +48,39 @@ def _compact_kv_hcu_fa(
     page_size: tl.constexpr,
     req_stride: tl.constexpr,
     idx_stride: tl.constexpr,
-    k_sp,
-    k_sh,
-    k_so,
-    k_sd,
-    v_sp,
-    v_sh,
-    v_so,
-    v_sd,
-    ok0,
-    ok1,
-    ok2,
-    ov0,
-    ov1,
-    ov2,
+    k_sp: tl.constexpr,
+    k_sh: tl.constexpr,
+    k_so: tl.constexpr,
+    k_sd: tl.constexpr,
+    v_sp: tl.constexpr,
+    v_sh: tl.constexpr,
+    v_so: tl.constexpr,
+    v_sd: tl.constexpr,
+    ok0: tl.constexpr,
+    ok1: tl.constexpr,
+    ok2: tl.constexpr,
+    ov0: tl.constexpr,
+    ov1: tl.constexpr,
+    ov2: tl.constexpr,
     k_scale,
     v_scale,
     BLOCK_TOPK: tl.constexpr,
     BLOCK_D: tl.constexpr,
     DEQUANTIZE_FP8: tl.constexpr,
+    GROUPED_V: tl.constexpr,
+    TOKEN_MAJOR: tl.constexpr,
+    PACKED_V: tl.constexpr,
 ):
     """Gather selected tokens from HCU FA paged KV into packed NHD rows.
 
     K is (pages, heads, page, dim); V is (pages, heads, dim, page). Physical
-    slots are page * page_size + offset, matching the production Qwen QSA
-    HCU-FA cache contract. This does not change the pool layout.
+    slots are page * page_size + offset in the HCU-FA cache layout. This does
+    not change the pool layout.
     """
-    batch, head, block = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    if TOKEN_MAJOR:
+        block, head, batch = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    else:
+        batch, head, block = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     cols = block * BLOCK_TOPK + tl.arange(0, BLOCK_TOPK)
     dims = tl.arange(0, BLOCK_D)
     length = tl.load(seq_lens + batch)
@@ -113,7 +119,57 @@ def _compact_kv_hcu_fa(
     k_dst = out_k + dst * ok0 + head * ok1 + dims[None, :] * ok2
     v_dst = out_v + dst * ov0 + head * ov1 + dims[None, :] * ov2
     k_values = tl.load(k_ptrs, mask=mask, other=0.0)
-    v_values = tl.load(v_ptrs, mask=mask, other=0.0)
+    # Validate four-slot locality on device before using coalesced V loads.
+    if GROUPED_V and BLOCK_TOPK >= 4 and page_size % 4 == 0 and v_so == 1:
+        group_slots = tl.reshape(slots, (BLOCK_TOPK // 4, 4))
+        lanes = tl.arange(0, 4)
+        bases = tl.sum(tl.where(lanes[None, :] == 0, group_slots, 0), 1)
+        expected = bases[:, None] + lanes[None, :]
+        grouped_valid = tl.reshape(valid, (BLOCK_TOPK // 4, 4))
+        mismatch = grouped_valid & (
+            (group_slots != expected) | (bases[:, None] % 4 != 0)
+        )
+        contiguous = tl.sum(tl.sum(mismatch.to(tl.int32), 1), 0) == 0
+        if contiguous:
+            if (
+                PACKED_V and v.dtype.element_ty.primitive_bitwidth == 8
+                and v_sp % 4 == 0 and v_sh % 4 == 0 and v_sd % 4 == 0
+            ):
+                # The wrapper checks pointer alignment. The slot check above
+                # guarantees all four bytes remain inside the same cache page,
+                # including masked tail bytes. Preserve FP8 bits until descale.
+                bases = tl.multiple_of(bases, 4)
+                vp = (
+                    v.to(tl.pointer_type(tl.uint32))
+                    + (bases // page_size)[:, None] * (v_sp // 4)
+                    + head * (v_sh // 4) + (bases % page_size)[:, None] // 4
+                    + dims[None, :] * (v_sd // 4)
+                )
+                vm = (tl.sum(grouped_valid.to(tl.int32), 1) > 0)[:, None]
+                words = tl.load(vp, mask=vm & (dims[None, :] < dim), other=0)
+                bytes_v = (
+                    (words[:, None, :] >> (lanes[None, :, None] * 8)) & 255
+                ).to(tl.uint8)
+                v_values = tl.reshape(
+                    bytes_v.to(v.dtype.element_ty, bitcast=True),
+                    (BLOCK_TOPK, BLOCK_D),
+                )
+            else:
+                # [group, dim, token] exposes V's contiguous page offsets.
+                vp = (
+                    v + (bases // page_size)[:, None, None] * v_sp
+                    + head * v_sh + (bases % page_size)[:, None, None]
+                    + dims[None, :, None] * v_sd + lanes[None, None, :]
+                )
+                vm = grouped_valid[:, None, :] & (dims[None, :, None] < dim)
+                vv = tl.load(vp, mask=vm, other=0.0)
+                v_values = tl.reshape(
+                    tl.permute(vv, (0, 2, 1)), (BLOCK_TOPK, BLOCK_D)
+                )
+        else:
+            v_values = tl.load(v_ptrs, mask=mask, other=0.0)
+    else:
+        v_values = tl.load(v_ptrs, mask=mask, other=0.0)
     if DEQUANTIZE_FP8:
         k_values = k_values.to(tl.float32) * k_scale
         v_values = v_values.to(tl.float32) * v_scale
@@ -249,10 +305,18 @@ def _launch_compact_hcu_fa(
     dequantize_fp8 = is_fp8_kv_dtype(k.dtype) and not is_fp8_kv_dtype(out_k.dtype)
     heads = k.shape[1]
     dim = k.shape[3]
+    grouped_v = bool(config.get("GROUPED_V", False))
+    token_major = bool(config.get("TOKEN_MAJOR", False))
+    packed_v = bool(config.get("PACKED_V", False)) and v.data_ptr() % 4 == 0
     launch = {
-        key: value for key, value in config.items() if key != "BLOCK_TOPK"
+        key: value
+        for key, value in config.items()
+        if key not in ("BLOCK_TOPK", "GROUPED_V", "TOKEN_MAJOR", "PACKED_V")
     }
-    _compact_kv_hcu_fa[(batch, heads, triton.cdiv(topk, block_topk))](
+    blocks = triton.cdiv(topk, block_topk)
+    # Keep neighboring CTAs within one request's cache working set.
+    grid = (blocks, heads, batch) if token_major else (batch, heads, blocks)
+    _compact_kv_hcu_fa[grid](
         k,
         v,
         req_to_token,
@@ -287,6 +351,9 @@ def _launch_compact_hcu_fa(
         BLOCK_TOPK=block_topk,
         BLOCK_D=triton.next_power_of_2(dim),
         DEQUANTIZE_FP8=dequantize_fp8,
+        GROUPED_V=grouped_v,
+        TOKEN_MAJOR=token_major,
+        PACKED_V=packed_v,
         **launch,
     )
 

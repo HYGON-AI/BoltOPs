@@ -1,36 +1,17 @@
-# Qwen Sparse GQA Triton Kernel 使用说明
+# Qwen Sparse-GQA 使用说明
 
-该模块提供 Qwen3.8-Flash-Next QSA 在 Hygon DCU decode 路径上的两个 Triton
-算子。函数名、调用签名和核心 kernel 直接复用 Qwen QSA
-`qsa/sparse_attn.py`，BoltOPs 侧补充参数校验、独立正确性 reference、benchmark
-和 HCU 离线调优配置；不提供 AITer 或 NVIDIA 接口适配层。
+Qwen Sparse-GQA 提供 KV compact 和 packed attention 两个 forward 算子，用于
+QSA decode/verify 路径。Compact 从 HCU-FA paged KV cache 中收集被选中的 token，
+Decode 在连续的 ragged K/V 上计算 grouped-query attention。
 
 相关文档：
 
-- [Sparse GQA Triton autotune 使用手册](../../../boltops/tools/sparse_gqa_triton_tune/tune_sparse_gqa_user_guide.md)
+- [KV Compact](sparse_gqa/sparse_gqa_kv_compact.md)
+- [Packed Decode](sparse_gqa/sparse_gqa_decode.md)
 
-## 1. 算子用途与数据流
+## 1. 算子用途与支持范围
 
-Sparse GQA decode 分为 KV compact 和 packed attention 两步：
-
-```text
-HCU-FA paged FP8/BF16 K/V cache
-        │ selected logical positions + req_to_token
-        ▼
-qwen_sparse_kv_extraction_compact_hcu_fa_triton
-        │ packed ragged NHD K/V + cu_k
-        ▼
-sparse_gqa_packed_decode_triton
-        │
-        ▼
-[total_q,Hq,D] attention output
-```
-
-HCU-FA cache 使用非对称布局：K 为 `[pages,Hkv,page_size,D]`，V 为
-`[pages,Hkv,D,page_size]`。Compact 根据请求内逻辑位置查找物理 slot，将选中的
-K/V 写入连续的 ragged NHD buffer；packed decode 再对每个请求执行 sparse GQA。
-
-## 2. 公共接口
+公开接口从 `boltops.fa.sparse_gqa` 导入：
 
 ```python
 from boltops.fa.sparse_gqa import (
@@ -39,7 +20,72 @@ from boltops.fa.sparse_gqa import (
 )
 ```
 
+| 接口 | 主要用途 | 返回值 |
+| --- | --- | --- |
+| `qwen_sparse_kv_extraction_compact_hcu_fa_triton` | 从 paged cache 提取选中的 K/V | 原地写入 `out_k/out_v`，返回 `None` |
+| `sparse_gqa_packed_decode_triton` | 在 packed ragged K/V 上计算 Sparse-GQA | 与 `q` shape、dtype 相同的 tensor |
+
+当前仅支持 forward，不包含 backward。
+
+## 2. 数据流和数学语义
+
+```text
+HCU-FA paged K/V cache
+        │ req_to_token + selected indices
+        ▼
+KV compact
+        │ packed K/V + cu_k
+        ▼
+Packed Sparse GQA
+        │ q + relative indices + cu_q/cu_k
+        ▼
+attention output
+```
+
 ### 2.1 KV compact
+
+HCU-FA 的 K/V 使用不同的物理布局：
+
+```text
+K: [pages, Hkv, page_size, D]
+V: [pages, Hkv, D, page_size]
+```
+
+对 batch `b` 的第 `j` 列选择项 `p`：
+
+```text
+request = req_indices[b]
+slot    = req_to_token[request, p]
+page    = slot // page_size
+offset  = slot % page_size
+dst     = cu_k[b] + j
+
+out_k[dst, h, :] = k[page, h, offset, :]
+out_v[dst, h, :] = v[page, h, :, offset]
+```
+
+负索引、超出 `seq_lens[b]` 的位置和 top-k padding 不参与写出，且不会把后续
+有效项向前压紧；对应目标行保持调用前的内容。FP8 cache 反量化到 BF16/FP16
+时，K 和 V 分别应用 `k_scale`、`v_scale`，未传入的 scale 按 `1.0` 处理。
+
+### 2.2 Packed Sparse-GQA
+
+令 `G = Hq / Hkv`。Query head `hq` 使用 KV head
+`hkv = floor(hq / G)`。对 query `t` 的有效相对索引集合 `I_t`：
+
+```text
+score(t,hq,i) = scale * dot(q[t,hq,:], k[cu_k[b]+i,hkv,:])
+prob           = softmax(score, dim=i)
+out[t,hq,:]    = sum_i prob(i) * v[cu_k[b]+i,hkv,:]
+```
+
+二维 `indices:[T,topk]` 表示所有 KV heads 共用一组选择；三维
+`indices:[T,Hkv,topk]` 表示每个 KV head 使用独立选择。索引均相对于当前请求
+在 packed K/V 中的起点，而不是 paged cache 的绝对 slot。
+
+## 3. 接口说明
+
+### 3.1 KV compact
 
 ```python
 qwen_sparse_kv_extraction_compact_hcu_fa_triton(
@@ -60,16 +106,16 @@ qwen_sparse_kv_extraction_compact_hcu_fa_triton(
 )
 ```
 
-Compact 原地写入调用方预分配的 `out_k/out_v`，返回 `None`。
+完整参数、布局和 dtype 约束见 [KV Compact](sparse_gqa/sparse_gqa_kv_compact.md)。
 
-### 2.2 Packed decode
+### 3.2 Packed decode
 
 ```python
 out = sparse_gqa_packed_decode_triton(
     q,
-    packed_k,
-    packed_v,
-    relative_indices,
+    k,
+    v,
+    indices,
     cu_q,
     cu_k,
     kv_lens,
@@ -79,48 +125,15 @@ out = sparse_gqa_packed_decode_triton(
 )
 ```
 
-Packed decode 返回与 `q` 相同 shape 和 dtype 的新 tensor。wrapper 固定使用
-`grid_m=1`，并且不通过 `.item()` 读取设备数据，适用于 decode graph capture。
+完整参数、ragged ABI 和 dtype 约束见
+[Packed Decode](sparse_gqa/sparse_gqa_decode.md)。
 
-## 3. 输入输出与布局
+## 4. 生产 shape
 
-### 3.1 Compact 输入输出
+`D1/D8/D32` 中的数字表示 decode batch size，head dim 记为 `D`，两者不要
+混淆。
 
-| 参数 | Shape/类型 | 含义 |
-| --- | --- | --- |
-| `k` | `[pages,Hkv,page_size,D]` | HCU-FA paged K cache |
-| `v` | `[pages,Hkv,D,page_size]` | HCU-FA paged V cache |
-| `req_to_token` | `[num_requests,max_context]`，int32/int64 | 请求内位置到物理 slot 的映射 |
-| `req_indices` | `[B]`，int32/int64 | 当前 batch 对应的请求编号 |
-| `indices` | `[B,topk]` | 每个请求选中的逻辑位置，`-1` 为 padding |
-| `seq_lens` | `[num_requests]` | 每个请求的有效上下文长度 |
-| `cu_k` | `[B+1]` | packed K/V 的请求边界 |
-| `out_k/out_v` | `[sum(valid_counts),Hkv,D]` | 调用方预分配的 packed 输出 |
-| `k_scale/v_scale` | float，可选 | FP8 cache 到输出 dtype 的反量化 scale |
-
-Compact 先用 `req_indices` 选择请求，再以 `indices` 查询 `req_to_token`，最后把
-物理 slot 拆成 `page/offset` 并写入 `cu_k` 描述的连续输出。
-
-### 3.2 Decode 输入输出
-
-| 参数 | Shape/类型 | 含义 |
-| --- | --- | --- |
-| `q` | `[total_q,Hq,D]` | packed query；decode 路径每个请求一行 |
-| `packed_k/packed_v` | `[total_k,Hkv,D]` | compact 后的连续 K/V |
-| `relative_indices` | `[B,topk]` 或 `[B,Hkv,topk]` | packed 请求段内的相对索引 |
-| `cu_q` | `[B+1]` | query 请求边界 |
-| `cu_k` | `[B+1]` | K/V 请求边界 |
-| `kv_lens` | `[B]` | 每个请求的有效 K/V 数量 |
-| `scale` | float | attention score scale，通常为 `D**-0.5` |
-| `k_scale/v_scale` | float，可选 | packed K/V 为 FP8 时的反量化 scale |
-| 返回值 | `[total_q,Hq,D]` | sparse GQA 输出 |
-
-## 4. 生产 Shape
-
-所有生产 case 固定 `D=256`、`Hkv=1`、`topk_width=2051`、
-`selected_tokens=2048`、`page_size=64`。
-
-| 分发 | Case | B | Context | Hq | Hkv | D |
+| 分发 | Case | Batch | Context | Hq | Hkv | Head dim |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
 | TP8 | D1 | 1 | 4096 | 3 | 1 | 256 |
 | TP8 | D8 | 8 | 32768 | 3 | 1 | 256 |
@@ -129,111 +142,87 @@ Compact 先用 `req_indices` 选择请求，再以 `indices` 查询 `req_to_toke
 | TP4 | D8 | 8 | 32768 | 6 | 1 | 256 |
 | TP4 | D32 | 32 | 32768 | 6 | 1 | 256 |
 
-`production` 模拟在完整 context 上生成 512 个 QSA 压缩 block，将每个 block
-展开为 4 个 token，并打乱物理 page 分配；`contiguous` 只用于测量理想局部性
-上界。每行 2051 宽的 indices 中有 2048 个有效 token，其余位置为 `-1`。
+这些 case 使用 `page_size=64`、2048 个有效 token 和宽度为 2051 的 indices；
+多出的列为 padding。
 
-## 5. 使用约束
+## 5. 共同前置条件
 
-- 所有输入 tensor 必须位于同一设备。
-- metadata 必须使用 int32 或 int64。
-- `Hq % Hkv == 0`。
-- K/V cache 为 FP8 且输出为 BF16/FP16 时，需要传入正确的
-  `k_scale/v_scale`。
-- Compact 的 K/V cache 布局不对称，不能把 V 当作
-  `[pages,Hkv,page_size,D]` 读取。
-- Packed decode 使用 packed 请求段内的相对索引，不能直接传 paged cache 的
-  绝对 slot。
-- 配置与 Triton capability、gfx arch、每卡 CU 数、shape 和 dtype 绑定，不应
-  跨硬件档位直接复制最优配置。
+- 所有输入、metadata 和输出 buffer 必须位于同一 CUDA/HIP device。
+- `q` 必须为 FP16 或 BF16。
+- Decode 的 K/V dtype 必须相同，并且为与 `q` 相同的 dtype 或受支持的 FP8。
+- `Hq % Hkv == 0`，Q/K/V 的 head dim 必须一致。
+- `req_to_token`、`req_indices`、`indices`、`seq_lens`、`cu_q`、
+  `cu_k` 和 `kv_lens` 使用 int32 或 int64。
+- `cu_q`、`cu_k` 必须是合法的单调前缀和，并与实际 packed tensor 分段一致。
+- FP8 K/V 转换为 FP16/BF16 时，`k_scale/v_scale` 缺省为 `1.0`；调用方应按
+  实际量化方式传入 scale。
+- Compact 输入使用 paged cache 绝对映射；Decode 输入使用请求分段内的相对索引，
+  两种索引不能互换。
+- Wrapper 只校验 rank、shape、dtype 和 device 等结构条件；前缀和单调性、索引
+  上界和输出容量由调用方保证，详细要求见两个子文档。
 
-## 6. 正确性测试与性能基准
+## 6. 正确性测试、性能基准与调优
+
+### 6.1 Pytest
 
 ```bash
-pytest -q \
-  test/fa/test_sparse_gqa.py \
-  test/fa/test_sparse_gqa_config.py \
-  test/test_package_smoke.py \
-  -x
+PYTHONPATH=. pytest -q test/fa/test_sparse_gqa.py
 ```
 
-测试覆盖 HCU-FA 非对称布局、请求到物理 slot 映射、ragged `cu_k`、
-FP16/BF16/FP8、TP4/TP8 的 D1/D8/D32、乱序与 per-KV-head indices、非连续
-输入、端到端 compact→decode、配置精确匹配和旧文件兼容回退。
+测试覆盖：
+
+- HCU-FA 非对称 K/V 布局和请求到物理 slot 的映射；
+- ragged `cu_k`、乱序选择、padding 和跨 tile 访问；
+- FP16、BF16、FP8 cache 与独立 K/V scale；
+- 共享 indices 和 per-KV-head indices；
+- TP4/TP8 的 D1、D8、D32 生产几何；
+- Compact 到 Decode 的组合路径和非法输入校验。
+
+可选 benchmark：
 
 ```bash
-# FLA 风格的可选 pytest benchmark
-pytest -q -s test/fa/test_sparse_gqa.py --bench
+PYTHONPATH=. pytest -q -s test/fa/test_sparse_gqa.py --bench
 ```
 
-每个 case 在计时前都会对比独立 Torch compact/attention reference，然后输出
-compact、decode 和端到端延迟。
+benchmark 在计时前先与独立 Torch reference 比较，然后分别输出 compact、
+decode 和端到端时间。
 
-## 7. Autotune 与配置选择
+### 6.2 配置调优
+
+安装项目后可使用 CLI 对生产 case 做正确性校验和候选配置搜索：
 
 ```bash
-# 单 case
-boltops-sparse-gqa-tune-cli --tp 8 --case D8 --fp8-cache
-
-# TP4/TP8 全量生产 case；不要添加 --quick
-python3 -m boltops.tools.sparse_gqa_triton_tune.tune_sparse_gqa \
-  --tp 4 \
+boltops-sparse-gqa-tune-cli \
   --tp 8 \
-  --case D1 \
   --case D8 \
-  --case D32 \
   --fp8-cache \
-  --access-pattern production \
-  --warmup-ms 50 \
-  --rep-ms 200
+  --samples 3 \
+  --report sparse_gqa_tune_report.json
 ```
 
-Compact 搜索 `BLOCK_TOPK/num_warps/num_stages`，decode 搜索
-`BLOCK_N/num_warps/num_stages`。每个候选先通过 correctness gate，再参与计时。
+`--quick` 仅校验并写出 baseline；完整模式会遍历 compact 和 decode 候选。默认
+输出目录为当前 Triton capability 对应的配置目录，可用 `--output-dir` 指向临时
+目录，避免直接更新仓库 JSON。
 
-配置目录按 Triton capability 分层，文件名按 kernel、gfx arch 和当前设备 CU 数
-区分：
+## 7. 语义边界
 
-```text
-boltops/fa/sparse_gqa/triton/configs/
-└── triton_3_6/
-    ├── qwen_sparse_kv_compact-gfx936-cu80.json
-    ├── qwen_sparse_kv_compact-gfx938-cu64.json
-    ├── qwen_sparse_kv_compact-gfx938-cu72.json
-    ├── sparse_gqa_packed_decode-gfx936-cu80.json
-    ├── sparse_gqa_packed_decode-gfx938-cu64.json
-    └── sparse_gqa_packed_decode-gfx938-cu72.json
-```
-
-运行时使用 `torch.cuda.get_device_properties(...).multi_processor_count` 获取每卡
-CU 数，优先加载当前 capability 下的精确 `arch+CU` 文件，再尝试兼容的低版本
-capability 目录，最后回退到旧版无 CU 文件；未命中精确 shape 时使用安全默认
-配置。完整 shape 和 dtype 保存在每个 JSON 的 `match` 字段中。
+- Compact 只负责 gather 和可选反量化，不计算 attention。
+- Decode 接收已经连续化的 K/V；它不读取 paged cache，也不执行
+  `req_to_token` 映射。
+- `indices` 的 `-1` 表示 padding。其他非负值必须落在对应请求的 packed K/V
+  有效范围内。
+- `out_k/out_v` 由调用方分配，容量必须覆盖 `cu_k[-1]` 描述的全部有效行。
+- Decode 返回新 tensor；Compact 原地写入输出 buffer。
 
 ## 附录 A. 仓库文件
 
-| 用途 | 路径 |
+| 用途 | 文件 |
 | --- | --- |
-| 公共接口 | `boltops/fa/sparse_gqa/__init__.py` |
-| KV compact | `boltops/fa/sparse_gqa/triton/compact.py` |
+| 公开接口 | `boltops/fa/sparse_gqa/__init__.py` |
+| KV compact | `boltops/fa/sparse_gqa/triton/kv_compact.py` |
 | Packed decode | `boltops/fa/sparse_gqa/triton/packed_decode.py` |
 | 配置加载 | `boltops/fa/sparse_gqa/triton/config.py` |
-| 生产 case/reference | `boltops/tools/sparse_gqa_triton_tune/` |
-| 正确性测试 | `test/fa/test_sparse_gqa.py` |
-| 配置测试 | `test/fa/test_sparse_gqa_config.py` |
-
-## 附录 B. 溯源
-
-- 源码合同：Qwen QSA `qsa/sparse_attn.py` 中 `_compact_kv_hcu_fa`、
-  `_sparse_gqa_chunk_prefill` 及其 wrapper。
-- 上层合同：`qwen_sparse_attn_backend.py` 的 HCU compact + packed decode 路径。
-- 生产 shape：交接材料 `SHAPES_TP8.md` 与 `SHAPES_TP4.md`。
-
-## 附录 C. 实现备注
-
-- Compact 的默认配置为 `BLOCK_TOPK=16,num_warps=8,num_stages=1`。
-- Packed decode 的默认配置为 `BLOCK_N=32,num_warps=8,num_stages=2`。
-- `config=None` 时自动加载离线调优配置；内部测试和 autotune 可以显式传入
-  config，以保证 baseline 与候选测量不受运行时自动选择影响。
-- Compact 对相同 B/topk/Hkv/D/dtype/page_size 的 TP4/TP8 case 复用配置；decode
-  因 Hq 不同分别保存精确匹配项。
+| 调优入口 | `boltops-sparse-gqa-tune-cli` → `boltops.tools.sparse_gqa_triton_tune.tune_sparse_gqa:main` |
+| 正确性与性能测试 | `test/fa/test_sparse_gqa.py` |
+| Compact 文档 | [`sparse_gqa/sparse_gqa_kv_compact.md`](sparse_gqa/sparse_gqa_kv_compact.md) |
+| Decode 文档 | [`sparse_gqa/sparse_gqa_decode.md`](sparse_gqa/sparse_gqa_decode.md) |

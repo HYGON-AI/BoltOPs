@@ -2,69 +2,84 @@
   "configs": [
     {
       "config": {
-        "BLOCK_N": 32,
-        "num_stages": 3,
-        "num_warps": 4
-      },
-      "match": {
-        "batch": 1,
-        "dtype": "bfloat16",
-        "head_dim": 256,
-        "hkv": 1,
-        "hq": 3,
-        "topk": 2051
-      }
-    },
-    {
-      "config": {
-        "BLOCK_N": 32,
-        "num_stages": 3,
-        "num_warps": 4
-      },
-      "match": {
-        "batch": 1,
-        "dtype": "bfloat16",
-        "head_dim": 256,
-        "hkv": 1,
-        "hq": 6,
-        "topk": 2051
-      }
-    },
-    {
-      "config": {
-        "BLOCK_N": 32,
-        "num_stages": 3,
-        "num_warps": 4
-      },
-      "match": {
-        "batch": 32,
-        "dtype": "bfloat16",
-        "head_dim": 256,
-        "hkv": 1,
-        "hq": 3,
-        "topk": 2051
-      }
-    },
-    {
-      "config": {
-        "BLOCK_N": 32,
-        "num_stages": 3,
-        "num_warps": 4
-      },
-      "match": {
-        "batch": 32,
-        "dtype": "bfloat16",
-        "head_dim": 256,
-        "hkv": 1,
-        "hq": 6,
-        "topk": 2051
-      }
-    },
-    {
-      "config": {
-        "BLOCK_N": 32,
-        "num_stages": 3,
+        "BLOCK_N": 64,
+        "MERGE_BLOCK_D": 8,
+        "MERGE_NUM_WARPS": 1,
+        "SPLITS": 32,
+        "num_stages": 2,
         "num_warps": 2
+      },
+      "match": {
+        "batch": 1,
+        "dtype": "bfloat16",
+        "head_dim": 256,
+        "hkv": 1,
+        "hq": 3,
+        "topk": 2051
+      }
+    },
+    {
+      "config": {
+        "BLOCK_N": 64,
+        "MERGE_BLOCK_D": 8,
+        "MERGE_NUM_WARPS": 1,
+        "SPLITS": 32,
+        "num_stages": 1,
+        "num_warps": 4
+      },
+      "match": {
+        "batch": 1,
+        "dtype": "bfloat16",
+        "head_dim": 256,
+        "hkv": 1,
+        "hq": 6,
+        "topk": 2051
+      }
+    },
+    {
+      "config": {
+        "BLOCK_N": 32,
+        "MERGE_BLOCK_D": 16,
+        "MERGE_NUM_WARPS": 1,
+        "SPLITS": 7,
+        "num_stages": 1,
+        "num_warps": 2
+      },
+      "match": {
+        "batch": 32,
+        "dtype": "bfloat16",
+        "head_dim": 256,
+        "hkv": 1,
+        "hq": 3,
+        "topk": 2051
+      }
+    },
+    {
+      "config": {
+        "BLOCK_N": 32,
+        "MERGE_BLOCK_D": 16,
+        "MERGE_NUM_WARPS": 1,
+        "SPLITS": 7,
+        "num_stages": 1,
+        "num_warps": 2
+      },
+      "match": {
+        "batch": 32,
+        "dtype": "bfloat16",
+        "head_dim": 256,
+        "hkv": 1,
+        "hq": 6,
+        "topk": 2051
+      }
+    },
+    {
+      "config": {
+        "BLOCK_N": 16,
+        "MERGE_BLOCK_D": 16,
+        "MERGE_NUM_WARPS": 1,
+        "SPLITS": 24,
+        "num_stages": 3,
+        "num_warps": 1
       },
       "match": {
         "batch": 8,
@@ -77,9 +92,12 @@
     },
     {
       "config": {
-        "BLOCK_N": 32,
+        "BLOCK_N": 16,
+        "MERGE_BLOCK_D": 16,
+        "MERGE_NUM_WARPS": 1,
+        "SPLITS": 24,
         "num_stages": 3,
-        "num_warps": 2
+        "num_warps": 1
       },
       "match": {
         "batch": 8,

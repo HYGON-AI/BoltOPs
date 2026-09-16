@@ -103,9 +103,9 @@ def make_production_inputs(
     k_scale: float = 0.5,
     v_scale: float = 0.25,
 ) -> dict:
-    """Create a deterministic simulation of the documented HCU decode path.
+    """Create a deterministic simulation of the production HCU decode path.
 
-    ``production`` spreads selected QSA blocks across the full documented
+    ``production`` spreads selected QSA blocks across the full configured
     context and permutes physical pages. ``contiguous`` keeps both mappings
     ordered and is useful only as an ideal-locality upper bound.
     """
