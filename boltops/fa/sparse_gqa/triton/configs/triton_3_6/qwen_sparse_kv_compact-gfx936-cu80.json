@@ -2,7 +2,10 @@
   "configs": [
     {
       "config": {
-        "BLOCK_TOPK": 8,
+        "BLOCK_TOPK": 4,
+        "GROUPED_V": true,
+        "PACKED_V": true,
+        "TOKEN_MAJOR": true,
         "num_stages": 1,
         "num_warps": 4
       },
@@ -17,8 +20,11 @@
     },
     {
       "config": {
-        "BLOCK_TOPK": 64,
-        "num_stages": 1,
+        "BLOCK_TOPK": 4,
+        "GROUPED_V": true,
+        "PACKED_V": true,
+        "TOKEN_MAJOR": true,
+        "num_stages": 2,
         "num_warps": 2
       },
       "match": {
@@ -32,9 +38,12 @@
     },
     {
       "config": {
-        "BLOCK_TOPK": 64,
+        "BLOCK_TOPK": 4,
+        "GROUPED_V": true,
+        "PACKED_V": true,
+        "TOKEN_MAJOR": true,
         "num_stages": 1,
-        "num_warps": 4
+        "num_warps": 2
       },
       "match": {
         "batch": 8,

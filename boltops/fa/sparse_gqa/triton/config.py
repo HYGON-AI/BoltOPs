@@ -31,6 +31,23 @@ _KIND_CONFIG_STEMS = {
 }
 
 
+def _is_positive_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+_DECODE_OPTIONAL_KEYS = {
+    "SPLITS": _is_positive_int,
+    "MERGE_BLOCK_D": _is_positive_int,
+    "MERGE_NUM_WARPS": _is_positive_int,
+}
+
+_COMPACT_OPTIONAL_KEYS = {
+    "GROUPED_V": lambda value: isinstance(value, bool),
+    "TOKEN_MAJOR": lambda value: isinstance(value, bool),
+    "PACKED_V": lambda value: isinstance(value, bool),
+}
+
+
 def _selector(value: object) -> str:
     """Return a stable filename/key selector value."""
     normalized = str(value).replace("torch.", "")
@@ -120,6 +137,21 @@ def _validate_config(kind: str, config: object, path: Path, batch: int) -> dict:
                 key,
             )
             return {}
+    if kind in ("decode", "compact"):
+        optional = (
+            _DECODE_OPTIONAL_KEYS if kind == "decode" else _COMPACT_OPTIONAL_KEYS
+        )
+        for key, validator in optional.items():
+            if key in config and not validator(config[key]):
+                logger.warning(
+                    "Invalid Sparse-GQA config for batch %d at %s: "
+                    "%s has invalid value %r.",
+                    batch,
+                    path,
+                    key,
+                    config[key],
+                )
+                return {}
     return config
 
 

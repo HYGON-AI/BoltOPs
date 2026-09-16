@@ -418,7 +418,7 @@ def test_bench_simulated_production_decode(
     bench_warmup: int,
     bench_repeat: int,
 ) -> None:
-    """Benchmark the documented TP4/TP8 D1/D8/D32 HCU decode shapes."""
+    """Benchmark the production TP4/TP8 D1/D8/D32 HCU decode shapes."""
     data = make_production_inputs(case, access_pattern="production", fp8_cache=True)
     compact_data = data["compact"]
     q, packed_k, packed_v, indices, cu_q, cu_k, kv_lens = data["decode"]
@@ -476,17 +476,140 @@ def test_bench_simulated_production_decode(
     actual_out = decode()
     torch.testing.assert_close(actual_out, expected_out, rtol=1e-2, atol=4e-3)
 
-    compact_ms = triton.testing.do_bench(
-        compact, warmup=bench_warmup, rep=bench_repeat
-    )
-    decode_ms = triton.testing.do_bench(
-        decode, warmup=bench_warmup, rep=bench_repeat
-    )
-    end_to_end_ms = triton.testing.do_bench(
-        end_to_end, warmup=bench_warmup, rep=bench_repeat
-    )
+    def bench_median(fn) -> float:
+        # do_bench treats warmup/rep as milliseconds and clears L2 per sample.
+        # The median prevents occasional device stalls from skewing the result.
+        return float(
+            triton.testing.do_bench(
+                fn,
+                warmup=bench_warmup,
+                rep=bench_repeat,
+                return_mode="median",
+            )
+        )
+
+    compact_ms = bench_median(compact)
+    decode_ms = bench_median(decode)
+    end_to_end_ms = bench_median(end_to_end)
     print(
         f"Sparse-GQA {case.case_id}: compact={compact_ms:.6f} ms, "
         f"decode={decode_ms:.6f} ms, "
         f"e2e={end_to_end_ms:.6f} ms"
+    )
+
+
+@GPU_REQUIRED
+@pytest.mark.parametrize(
+    "pattern",
+    ["grouped", "unaligned", "random", "duplicates", "holes", "strided", "offset"],
+)
+@pytest.mark.parametrize("fp8", [False, True])
+@pytest.mark.parametrize("packed", [False, True])
+def test_compact_grouped_v_preserves_general_gather(pattern, fp8, packed):
+    """The vectorized V path must preserve arbitrary slots and masked writes."""
+    from boltops.fa.sparse_gqa.triton.kv_compact import _launch_compact_hcu_fa
+
+    data = _make_compact_case(
+        batch=3, topk=19, heads=2, dim=80, page_size=8, counts=(19, 17, 13)
+    )
+    if pattern != "random":
+        mapping = torch.arange(
+            data["req_to_token"].shape[1], device=data["k"].device,
+            dtype=torch.int32,
+        )
+        data["req_to_token"][:] = mapping + (pattern == "unaligned")
+        for row, count in enumerate((19, 17, 13)):
+            data["indices"][row, :count] = torch.arange(
+                count, device=data["k"].device, dtype=torch.int32
+            )
+    if pattern == "duplicates":
+        data["indices"][:, 5:8] = data["indices"][:, 1:4]
+    if pattern == "holes":
+        data["indices"][:, 0] = -1
+        data["indices"][:, 6] = data["seq_lens"]
+    if fp8:
+        _convert_cache_to_fp8(data)
+    if pattern == "offset":
+        original = data["v"]
+        storage = torch.empty(
+            original.numel() + 1, device=original.device, dtype=original.dtype
+        )
+        data["v"] = storage[1:].view(original.shape)
+        data["v"].copy_(original)
+    if pattern == "strided":
+        # Force the generic V path and exercise strided source/destination rows.
+        for name in ("k", "v", "out_k", "out_v"):
+            original = data[name]
+            storage = torch.empty(
+                (*original.shape[:-1], original.shape[-1] * 2),
+                device=original.device, dtype=original.dtype,
+            )
+            data[name] = storage[..., ::2]
+            if name in ("k", "v"):
+                data[name].copy_(original)
+    data["out_k"].fill_(-7)
+    data["out_v"].fill_(-7)
+    expected_k = data["out_k"].clone()
+    expected_v = data["out_v"].clone()
+    k_scale, v_scale = (0.5, 0.25) if fp8 else (1.0, 1.0)
+    for b in range(data["batch"]):
+        start, end = int(data["cu_k"][b]), int(data["cu_k"][b + 1])
+        pos = data["indices"][b, :end - start].long()
+        valid = (pos >= 0) & (pos < data["seq_lens"][b])
+        slots = data["req_to_token"][
+            int(data["req_indices"][b]), pos[valid]
+        ].long()
+        rows = torch.arange(start, end, device=pos.device)[valid]
+        pages, offsets = slots // data["page_size"], slots % data["page_size"]
+        expected_k[rows] = (
+            data["k"][pages, :, offsets, :].float() * k_scale
+        ).to(expected_k.dtype)
+        expected_v[rows] = (
+            data["v"][pages, :, :, offsets].float() * v_scale
+        ).to(expected_v.dtype)
+    _launch_compact_hcu_fa(
+        **{key: value for key, value in data.items() if key != "counts"},
+        k_scale=k_scale, v_scale=v_scale,
+        config={
+            "BLOCK_TOPK": 8, "num_warps": 2, "num_stages": 1,
+            "GROUPED_V": True, "TOKEN_MAJOR": True,
+            "PACKED_V": packed,
+        },
+    )
+    torch.testing.assert_close(data["out_k"], expected_k, atol=0, rtol=0)
+    torch.testing.assert_close(data["out_v"], expected_v, atol=0, rtol=0)
+
+
+@GPU_REQUIRED
+def test_compact_packed_v_preserves_fp8_output_bits():
+    from boltops.fa.sparse_gqa.triton.kv_compact import _launch_compact_hcu_fa
+
+    data = _make_compact_case(topk=17, counts=(17, 15, 13))
+    _convert_cache_to_fp8(data)
+    data["req_to_token"][:] = torch.arange(
+        data["req_to_token"].shape[1], device=data["k"].device,
+        dtype=torch.int32,
+    )
+    for row, count in enumerate((17, 15, 13)):
+        data["indices"][row, :count] = torch.arange(
+            count, device=data["k"].device, dtype=torch.int32
+        )
+    data["out_k"] = torch.empty_like(data["out_k"], dtype=data["k"].dtype)
+    data["out_v"] = torch.empty_like(data["out_v"], dtype=data["v"].dtype)
+    expected_k, expected_v = reference_compact(data)
+    _launch_compact_hcu_fa(
+        **{key: value for key, value in data.items() if key != "counts"},
+        k_scale=0.5, v_scale=0.25,
+        config={
+            "BLOCK_TOPK": 4, "num_warps": 2, "num_stages": 1,
+            "GROUPED_V": True, "TOKEN_MAJOR": True, "PACKED_V": True,
+        },
+    )
+    torch.testing.assert_close(
+        data["out_k"].view(torch.uint8), expected_k.view(torch.uint8),
+        atol=0, rtol=0,
+    )
+    torch.testing.assert_close(
+        data["out_v"].view(torch.uint8), expected_v.view(torch.uint8),
+        atol=0, rtol=0,
     )
