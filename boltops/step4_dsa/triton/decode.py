@@ -236,6 +236,7 @@ def _sparse_attn_decode_dsplit_kernel(
     BLOCK_H: tl.constexpr,
     BLOCK_D1: tl.constexpr,
     BLOCK_D2: tl.constexpr,
+    BLOCK_D3: tl.constexpr,
     BLOCK_R: tl.constexpr,
     BALANCE_LIVE: tl.constexpr = False,
 ) -> None:
@@ -244,10 +245,12 @@ def _sparse_attn_decode_dsplit_kernel(
     Two differences, both performance-only (bit-level output differs by fp
     rounding order, not semantics):
 
-    - ``head_dim`` is covered by two pow2 chunks ``BLOCK_D1 + BLOCK_D2 ==
-      head_dim`` (e.g. 192 = 128 + 64) instead of one padded ``BLOCK_D =
-      next_pow2(head_dim)``. QK is ``dot(q1, k1) + dot(q2, k2)`` and the PV
-      accumulator is split the same way. This removes the padding share of the
+    - ``head_dim`` is covered by three pow2 chunks ``BLOCK_D1 + BLOCK_D2 +
+      BLOCK_D3 == head_dim`` (e.g. 192 = 64 + 64 + 64) instead of one padded
+      ``BLOCK_D = next_pow2(head_dim)`` or a 128+64 pair. QK is
+      ``dot(q0, k0) + dot(q1, k1) + dot(q2, k2)`` and the PV accumulator is
+      split the same way. Three 64-wide MMACs use fewer VGPRs than one 128-wide
+      tile plus one 64-wide tile. This also removes the padding share of the
       K/V LDS tiles, the MMACs and the accumulator rescale (25% for 192), and
       the ``dims < head_dim`` mask disappears because the chunks cover the head
       exactly.
@@ -257,11 +260,12 @@ def _sparse_attn_decode_dsplit_kernel(
       merge-kernel contract is unchanged.
 
     Launched by :func:`sparse_attention_decode` when ``head_dim`` splits into
-    two pow2 chunks of at least 16; otherwise the original kernel runs.
-    Occupancy JSONs omit ``BLOCK_D`` / ``BLOCK_D1`` / ``BLOCK_D2`` on this path;
-    the chunks are derived from ``head_dim``. A leftover ``BLOCK_D`` is ignored.
+    three 64-wide chunks (currently ``head_dim=192``); otherwise the original
+    kernel runs. Occupancy JSONs omit ``BLOCK_D`` / ``BLOCK_D1`` / ``BLOCK_D2``
+    / ``BLOCK_D3`` on this path; the chunks are derived from ``head_dim``. A
+    leftover ``BLOCK_D`` is ignored.
     """
-    tl.static_assert(BLOCK_D1 + BLOCK_D2 == head_dim)
+    tl.static_assert(BLOCK_D1 + BLOCK_D2 + BLOCK_D3 == head_dim)
     request = tl.program_id(0)
     group = tl.program_id(1)
     split = tl.program_id(2)
@@ -270,8 +274,9 @@ def _sparse_attn_decode_dsplit_kernel(
     kv_seqlen = tl.load(seqlens_ptr + request).to(tl.int64)
 
     heads = tl.arange(0, BLOCK_H)
-    dims1 = tl.arange(0, BLOCK_D1)
-    dims2 = BLOCK_D1 + tl.arange(0, BLOCK_D2)
+    dims0 = tl.arange(0, BLOCK_D1)
+    dims1 = BLOCK_D1 + tl.arange(0, BLOCK_D2)
+    dims2 = BLOCK_D1 + BLOCK_D2 + tl.arange(0, BLOCK_D3)
     head_ok = heads < heads_per_group
 
     q_base = (
@@ -279,6 +284,7 @@ def _sparse_attn_decode_dsplit_kernel(
         + request * stride_q_token
         + (group * heads_per_group + heads)[:, None] * stride_q_head
     )
+    queries0 = tl.load(q_base + dims0[None, :], mask=head_ok[:, None], other=0.0)
     queries1 = tl.load(q_base + dims1[None, :], mask=head_ok[:, None], other=0.0)
     queries2 = tl.load(q_base + dims2[None, :], mask=head_ok[:, None], other=0.0)
 
@@ -286,8 +292,9 @@ def _sparse_attn_decode_dsplit_kernel(
 
     running_max = tl.full((BLOCK_H,), NEGATIVE_INFINITY, dtype=tl.float32)
     running_sum = tl.zeros((BLOCK_H,), dtype=tl.float32)
-    acc1 = tl.zeros((BLOCK_H, BLOCK_D1), dtype=tl.float32)
-    acc2 = tl.zeros((BLOCK_H, BLOCK_D2), dtype=tl.float32)
+    acc0 = tl.zeros((BLOCK_H, BLOCK_D1), dtype=tl.float32)
+    acc1 = tl.zeros((BLOCK_H, BLOCK_D2), dtype=tl.float32)
+    acc2 = tl.zeros((BLOCK_H, BLOCK_D3), dtype=tl.float32)
 
     offsets_in_region = tl.arange(0, region_size)
     if BALANCE_LIVE:
@@ -317,14 +324,17 @@ def _sparse_attn_decode_dsplit_kernel(
         )
 
         k_base = k_ptr + tokens[None, :] * stride_k_token + group * stride_k_group
+        keys0 = tl.load(k_base + dims0[:, None], mask=token_ok[None, :], other=0.0)
         keys1 = tl.load(k_base + dims1[:, None], mask=token_ok[None, :], other=0.0)
         keys2 = tl.load(k_base + dims2[:, None], mask=token_ok[None, :], other=0.0)
         v_base = v_ptr + tokens[:, None] * stride_v_token + group * stride_v_group
+        values0 = tl.load(v_base + dims0[None, :], mask=token_ok[:, None], other=0.0)
         values1 = tl.load(v_base + dims1[None, :], mask=token_ok[:, None], other=0.0)
         values2 = tl.load(v_base + dims2[None, :], mask=token_ok[:, None], other=0.0)
 
         scores = (
-            tl.dot(queries1, keys1, out_dtype=tl.float32)
+            tl.dot(queries0, keys0, out_dtype=tl.float32)
+            + tl.dot(queries1, keys1, out_dtype=tl.float32)
             + tl.dot(queries2, keys2, out_dtype=tl.float32)
         ) * scale
         scores = tl.where(
@@ -337,7 +347,8 @@ def _sparse_attn_decode_dsplit_kernel(
         rescale = tl.where(empty, 1.0, tl.math.exp2(running_max - shift))
         probabilities = tl.math.exp2(scores - shift[:, None])
         running_sum = running_sum * rescale + tl.sum(probabilities, axis=1)
-        p = probabilities.to(values1.dtype)
+        p = probabilities.to(values0.dtype)
+        acc0 = acc0 * rescale[:, None] + tl.dot(p, values0, out_dtype=tl.float32)
         acc1 = acc1 * rescale[:, None] + tl.dot(p, values1, out_dtype=tl.float32)
         acc2 = acc2 * rescale[:, None] + tl.dot(p, values2, out_dtype=tl.float32)
         running_max = tile_max
@@ -345,6 +356,7 @@ def _sparse_attn_decode_dsplit_kernel(
     selected = running_sum > 0
     # Reuse one reciprocal per head instead of dividing every output element.
     inv_sum = tl.div_rn(1.0, tl.where(selected, running_sum, 1.0))
+    output0 = tl.where(selected[:, None], acc0 * inv_sum[:, None], 0.0)
     output1 = tl.where(selected[:, None], acc1 * inv_sum[:, None], 0.0)
     output2 = tl.where(selected[:, None], acc2 * inv_sum[:, None], 0.0)
     out_base = (
@@ -352,6 +364,11 @@ def _sparse_attn_decode_dsplit_kernel(
         + split * stride_out_split
         + request * stride_out_token
         + (group * heads_per_group + heads)[:, None] * stride_out_head
+    )
+    tl.store(
+        out_base + dims0[None, :],
+        output0.to(out_ptr.dtype.element_ty),
+        mask=head_ok[:, None],
     )
     tl.store(
         out_base + dims1[None, :],
@@ -374,18 +391,21 @@ def _sparse_attn_decode_dsplit_kernel(
     )
 
 
-def _decode_head_dim_split(head_dim: int) -> tuple[int, int] | None:
-    """``(D1, D2)`` pow2 chunks covering ``head_dim`` exactly, or ``None``.
+def _decode_head_dim_split(head_dim: int) -> tuple[int, int, int] | None:
+    """``(D1, D2, D3)`` pow2 MMAC chunks covering ``head_dim``, or ``None``.
 
-    ``None`` (pow2 ``head_dim``, or a remainder below ``tl.dot``'s minimum of
-    16) keeps the original single-``BLOCK_D`` kernel.
+    ``None`` (pow2 ``head_dim``, or a remainder that is not the 192-dim
+    ``128+64`` split) keeps the original single-``BLOCK_D`` kernel.
+
+    ``head_dim=192`` is launched as ``64+64+64`` rather than ``128+64``: three
+    64-wide MMACs use fewer VGPRs than one 128-wide tile plus one 64-wide tile.
     """
     if head_dim <= 0 or head_dim & (head_dim - 1) == 0:
         return None
     d1 = 1 << (head_dim.bit_length() - 1)
     d2 = head_dim - d1
-    if d2 >= 16 and d2 & (d2 - 1) == 0:
-        return d1, d2
+    if d1 == 128 and d2 == 64:
+        return 64, 64, 64
     return None
 
 
@@ -395,13 +415,14 @@ _CONFIG_DIR = os.path.join(
     "sparse_attn_decode",
 )
 # Shared by both kernels. ``BLOCK_D`` is only in the padded-kernel JSON;
-# dsplit occupancy files omit it (and never carry ``BLOCK_D1`` / ``BLOCK_D2``).
+# dsplit occupancy files omit it (and never carry ``BLOCK_D1`` / ``BLOCK_D2``
+# / ``BLOCK_D3``).
 # ``AUTO_KV_SPLITS`` is host-only: pins the s1 auto-path launch grid; never a
 # kernel constexpr.
 _HOST_CONFIG_KEYS = frozenset({"AUTO_KV_SPLITS"})
 _COMMON_KERNEL_CONFIG_KEYS = frozenset({"BLOCK_R", "BLOCK_H", "BALANCE_LIVE"})
 _PADDED_KERNEL_CONFIG_KEYS = _COMMON_KERNEL_CONFIG_KEYS | {"BLOCK_D"}
-_ALL_KERNEL_CONFIG_KEYS = _PADDED_KERNEL_CONFIG_KEYS | {"BLOCK_D1", "BLOCK_D2"}
+_ALL_KERNEL_CONFIG_KEYS = _PADDED_KERNEL_CONFIG_KEYS | {"BLOCK_D1", "BLOCK_D2", "BLOCK_D3"}
 _HOST_OR_KERNEL_CONFIG_KEYS = _ALL_KERNEL_CONFIG_KEYS | _HOST_CONFIG_KEYS
 _STANDARD_LAUNCH_KEYS = frozenset({"num_warps", "num_stages"})
 
@@ -483,7 +504,8 @@ def _filter_launch_config(config: dict[str, Any], *, head_dim: int) -> dict[str,
     """Keep host, selected-kernel, and supported Triton launch fields.
 
     ``_sparse_attn_decode_dsplit_kernel``: no ``BLOCK_D`` (chunks come from
-    ``head_dim``). Leftover ``BLOCK_D`` / ``BLOCK_D1`` / ``BLOCK_D2`` are dropped.
+    ``head_dim``). Leftover ``BLOCK_D`` / ``BLOCK_D1`` / ``BLOCK_D2`` /
+    ``BLOCK_D3`` are dropped.
     ``_sparse_attn_decode_kernel``: keep ``BLOCK_D`` when the JSON has it.
     ``AUTO_KV_SPLITS`` is retained for the s1 auto path and never forwarded to
     the kernel. Other compiler fields are retained only when the current HIP
@@ -668,8 +690,9 @@ def sparse_attention_decode(
             is used. Explicit ``num_splits>1`` ignores ``AUTO_KV_SPLITS``.
             Occupancy JSON for ``_sparse_attn_decode_kernel`` includes ``BLOCK_D``;
             the dsplit kernel (non-pow2 ``head_dim``) omits it and derives
-            ``BLOCK_D1`` / ``BLOCK_D2`` from ``head_dim``. Leftover ``BLOCK_D`` /
-            ``BLOCK_D1`` / ``BLOCK_D2`` on that path are ignored.
+            ``BLOCK_D1`` / ``BLOCK_D2`` / ``BLOCK_D3`` from ``head_dim``. Leftover
+            ``BLOCK_D`` / ``BLOCK_D1`` / ``BLOCK_D2`` / ``BLOCK_D3`` on that path
+            are ignored.
             ``BALANCE_LIVE`` balances valid slots across automatic splits. It is
             ignored for explicit splits or partial outputs to preserve their windows.
 
@@ -814,13 +837,14 @@ def sparse_attention_decode(
         and auto_kv_split and not return_partials and num_splits > 1,
     )
     if d_split is not None:
-        # Non-pow2 head_dim (e.g. 192): padding-free two-chunk kernel.
+        # Non-pow2 head_dim (e.g. 192): padding-free 64+64+64 kernel.
         # Occupancy JSON omits ``BLOCK_D``; chunks come from ``head_dim``.
         _sparse_attn_decode_dsplit_kernel[(num_reqs, num_kv_groups, num_splits)](
             *common_args,
             **common_meta,
             BLOCK_D1=d_split[0],
             BLOCK_D2=d_split[1],
+            BLOCK_D3=d_split[2],
             **extra,
         )
     else:

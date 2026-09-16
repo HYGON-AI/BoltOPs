@@ -109,6 +109,7 @@ def test_decode_launch_options_follow_backend_capabilities(monkeypatch):
         "BLOCK_D": 128,
         "BLOCK_D1": 128,
         "BLOCK_D2": 64,
+        "BLOCK_D3": 64,
         "BALANCE_LIVE": True,
         "num_warps": 2,
         "num_stages": 1,
@@ -135,6 +136,8 @@ def test_decode_launch_options_follow_backend_capabilities(monkeypatch):
         "BALANCE_LIVE": True,
         **expected_options,
     }
+    assert decode._decode_head_dim_split(192) == (64, 64, 64)
+    assert decode._decode_head_dim_split(128) is None
     assert decode._filter_launch_config(config, head_dim=192) == {
         "AUTO_KV_SPLITS": 4,
         "BLOCK_R": 8,
