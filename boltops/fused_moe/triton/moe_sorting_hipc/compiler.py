@@ -24,6 +24,11 @@ from torch.utils.cpp_extension import get_default_build_root, include_paths, lib
 from torch.utils.file_baton import FileBaton
 
 
+# Keep HIPC kernels compatible with BMZ runtimes that cannot launch v6 objects.
+# Use the same version in compiler flags and the extension cache identity.
+_CODE_OBJECT_VERSION = "5"
+
+
 def _aicc() -> Path:
     configured = os.environ.get("BOLT_OPS_AICC")
     candidates = [
@@ -40,24 +45,6 @@ def _aicc() -> Path:
         "HIPC kernel compilation requires aicc or hipcc; "
         "set BOLT_OPS_AICC to its path"
     )
-
-
-def _code_object_version() -> str | None:
-    """Honor AITER/CK COV when compiling HIPC kernels on ROCm 7.x."""
-    cov = (
-        os.environ.get("BOLT_OPS_CODE_OBJECT_VERSION")
-        or os.environ.get("AITER_CODE_OBJECT_VERSION")
-        or os.environ.get("CK_CODE_OBJECT_VERSION")
-        or ""
-    ).strip()
-    if not cov:
-        return None
-    if cov not in {"4", "5", "6"}:
-        raise ValueError(
-            "HIP code-object version must be one of 4, 5, or 6; "
-            f"got {cov!r}"
-        )
-    return cov
 
 
 def _compiler_identity(compiler: Path) -> bytes:
@@ -80,7 +67,7 @@ def _digest(
     value.update(str(torch.version.hip).encode())
     value.update(str(torch._C._GLIBCXX_USE_CXX11_ABI).encode())
     value.update(f"{sys.version_info[:3]}".encode())
-    value.update(f"cov={_code_object_version() or 'default'}".encode())
+    value.update(f"cov={_CODE_OBJECT_VERSION}".encode())
     if torch.cuda.is_available():
         value.update(torch.cuda.get_device_name(torch.cuda.current_device()).encode())
     for path in sorted({*sources, *headers}):
@@ -149,9 +136,7 @@ def _compile_flags(module_name: str, include_dirs: Iterable[Path]) -> list[str]:
             "-fno-gpu-rdc",
         ]
     )
-    cov = _code_object_version()
-    if cov is not None:
-        flags.append(f"-mcode-object-version={cov}")
+    flags.append(f"-mcode-object-version={_CODE_OBJECT_VERSION}")
     return flags
 
 
