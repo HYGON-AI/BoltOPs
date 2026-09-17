@@ -1,7 +1,11 @@
-"""Triton backend for MQA logits (prefill)."""
+"""Triton backend for MQA logits (prefill).
 
-from boltops.mqa_logits.triton.fp8_mqa_logits import fp8_mqa_logits
+Public callers should use ``boltops.mqa_logits.triton_mqa_logits``. Low-level
+float8 row/BN kernels live in ``fp8_mqa_logits.py`` and are used internally.
+"""
+
+from boltops.mqa_logits import triton_mqa_logits
 
 __all__ = [
-    "fp8_mqa_logits",
+    "triton_mqa_logits",
 ]

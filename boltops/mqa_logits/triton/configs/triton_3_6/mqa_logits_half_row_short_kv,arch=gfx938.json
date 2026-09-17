@@ -1,0 +1,354 @@
+{
+  "meta": {
+    "arch": "gfx938",
+    "source": "mqa_logits_half_row_short_kv_tune_gfx938.json",
+    "kernel": "mqa_logits_half_row",
+    "note": "short-KV only; compare includes BN / Gluon / lightop"
+  },
+  "by_shape": [
+    {
+      "seq_len": 16,
+      "seq_kv": 66,
+      "num_heads": 8,
+      "label": "m16-n66-h8",
+      "best_ms": 0.11802653272946675,
+      "main": {
+        "block_kv": 32,
+        "num_warps": 4,
+        "num_stages": 1,
+        "waves_per_eu": 0,
+        "head_split_k": 1
+      }
+    },
+    {
+      "seq_len": 16,
+      "seq_kv": 66,
+      "num_heads": 64,
+      "label": "m16-n66-h64",
+      "best_ms": 0.11178653389215469,
+      "main": {
+        "block_kv": 32,
+        "num_warps": 8,
+        "num_stages": 1,
+        "waves_per_eu": 4,
+        "head_split_k": 1
+      }
+    },
+    {
+      "seq_len": 32,
+      "seq_kv": 66,
+      "num_heads": 8,
+      "label": "m32-n66-h8",
+      "best_ms": 0.11333333353201548,
+      "main": {
+        "block_kv": 16,
+        "num_warps": 2,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "head_split_k": 1
+      }
+    },
+    {
+      "seq_len": 32,
+      "seq_kv": 66,
+      "num_heads": 64,
+      "label": "m32-n66-h64",
+      "best_ms": 0.1085653339823087,
+      "main": {
+        "block_kv": 128,
+        "num_warps": 4,
+        "num_stages": 1,
+        "waves_per_eu": 0,
+        "head_split_k": 1
+      }
+    },
+    {
+      "seq_len": 64,
+      "seq_kv": 66,
+      "num_heads": 8,
+      "label": "m64-n66-h8",
+      "best_ms": 0.11338666627804438,
+      "main": {
+        "block_kv": 16,
+        "num_warps": 2,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "head_split_k": 1
+      }
+    },
+    {
+      "seq_len": 64,
+      "seq_kv": 66,
+      "num_heads": 64,
+      "label": "m64-n66-h64",
+      "best_ms": 0.10939733386039734,
+      "main": {
+        "block_kv": 128,
+        "num_warps": 4,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "head_split_k": 1
+      }
+    }
+  ],
+  "compare": [
+    {
+      "label": "m16-n66-h8",
+      "s_q": 16,
+      "s_k": 66,
+      "num_heads": 8,
+      "row_ms": 0.03599231566488743,
+      "bn_ms": 0.014759569862810728,
+      "gluon_ms": 0.0141657142933192,
+      "lightop_ms": 0.018364877871623855,
+      "row_over_lo": 1.959845086718506,
+      "row_over_bn": 2.4385748364914246,
+      "gluon_over_lo": 0.7713481348660144,
+      "gluon_over_bn": 0.9597647102855044,
+      "bn_over_lo": 0.8036846183233377,
+      "best": "Gluon",
+      "row_cfg": {
+        "block_kv": 32,
+        "num_warps": 4,
+        "num_stages": 1,
+        "waves_per_eu": 0,
+        "head_split_k": 1
+      },
+      "bn_cfg": {
+        "block_m": 16,
+        "block_n": 64,
+        "head_split_k": 1,
+        "num_warps": 2,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "w_group": 4
+      },
+      "gluon_cfg": {
+        "block_m": 16,
+        "block_n": 64,
+        "head_split_k": 1,
+        "w_group": 4,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "kv_tiles_n": 2,
+        "q_double_buf": false,
+        "w_lds_pp": false
+      }
+    },
+    {
+      "label": "m16-n66-h64",
+      "s_q": 16,
+      "s_k": 66,
+      "num_heads": 64,
+      "row_ms": 0.02129158694162101,
+      "bn_ms": 0.0196719644624593,
+      "gluon_ms": 0.01842410254534589,
+      "lightop_ms": 0.018532840965403117,
+      "row_over_lo": 1.148857154786354,
+      "row_over_bn": 1.0823315069652801,
+      "gluon_over_lo": 0.9941326631863826,
+      "gluon_over_bn": 0.9365664817311586,
+      "bn_over_lo": 1.0614651309630663,
+      "best": "Gluon",
+      "row_cfg": {
+        "block_kv": 32,
+        "num_warps": 8,
+        "num_stages": 1,
+        "waves_per_eu": 4,
+        "head_split_k": 1
+      },
+      "bn_cfg": {
+        "block_m": 16,
+        "block_n": 64,
+        "head_split_k": 16,
+        "num_warps": 8,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "w_group": 4
+      },
+      "gluon_cfg": {
+        "block_m": 16,
+        "block_n": 64,
+        "head_split_k": 16,
+        "w_group": 4,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "kv_tiles_n": 1,
+        "q_double_buf": false,
+        "w_lds_pp": false
+      }
+    },
+    {
+      "label": "m32-n66-h8",
+      "s_q": 32,
+      "s_k": 66,
+      "num_heads": 8,
+      "row_ms": 0.033068668069142215,
+      "bn_ms": 0.0188236664771364,
+      "gluon_ms": 0.019794926434283107,
+      "lightop_ms": 0.018419999880967913,
+      "row_over_lo": 1.7952588644319014,
+      "row_over_bn": 1.7567601991518538,
+      "gluon_over_lo": 1.0746431358414834,
+      "gluon_over_bn": 1.051597809508919,
+      "bn_over_lo": 1.021914581909719,
+      "best": "LO",
+      "row_cfg": {
+        "block_kv": 16,
+        "num_warps": 2,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "head_split_k": 1
+      },
+      "bn_cfg": {
+        "block_m": 32,
+        "block_n": 128,
+        "head_split_k": 1,
+        "num_warps": 4,
+        "num_stages": 1,
+        "waves_per_eu": 0,
+        "w_group": 8
+      },
+      "gluon_cfg": {
+        "block_m": 32,
+        "block_n": 128,
+        "head_split_k": 1,
+        "w_group": 8,
+        "num_stages": 1,
+        "waves_per_eu": 0,
+        "kv_tiles_n": 2,
+        "q_double_buf": false,
+        "w_lds_pp": false
+      }
+    },
+    {
+      "label": "m32-n66-h64",
+      "s_q": 32,
+      "s_k": 66,
+      "num_heads": 64,
+      "row_ms": 0.0189744855236748,
+      "bn_ms": 0.030871317577329783,
+      "gluon_ms": 0.030040306183545626,
+      "lightop_ms": 0.020246779830273936,
+      "row_over_lo": 0.9371606587682284,
+      "row_over_bn": 0.6146315419206024,
+      "gluon_over_lo": 1.4837078505999235,
+      "gluon_over_bn": 0.9730814406705334,
+      "bn_over_lo": 1.5247519771598217,
+      "best": "row",
+      "row_cfg": {
+        "block_kv": 128,
+        "num_warps": 4,
+        "num_stages": 1,
+        "waves_per_eu": 0,
+        "head_split_k": 1
+      },
+      "bn_cfg": {
+        "block_m": 32,
+        "block_n": 32,
+        "head_split_k": 4,
+        "num_warps": 8,
+        "num_stages": 2,
+        "waves_per_eu": 4,
+        "w_group": 8
+      },
+      "gluon_cfg": {
+        "block_m": 32,
+        "block_n": 32,
+        "head_split_k": 4,
+        "w_group": 8,
+        "num_stages": 2,
+        "waves_per_eu": 4,
+        "kv_tiles_n": 1,
+        "q_double_buf": false,
+        "w_lds_pp": false
+      }
+    },
+    {
+      "label": "m64-n66-h8",
+      "s_q": 64,
+      "s_k": 66,
+      "num_heads": 8,
+      "row_ms": 0.033069875542061186,
+      "bn_ms": 0.015773665383458136,
+      "gluon_ms": 0.01580013708625029,
+      "lightop_ms": 0.018350684760163907,
+      "row_over_lo": 1.8021058055473789,
+      "row_over_bn": 2.0965244753284553,
+      "gluon_over_lo": 0.8610107629634397,
+      "gluon_over_bn": 1.001678221399315,
+      "bn_over_lo": 0.8595682171871851,
+      "best": "BN",
+      "row_cfg": {
+        "block_kv": 16,
+        "num_warps": 2,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "head_split_k": 1
+      },
+      "bn_cfg": {
+        "block_m": 32,
+        "block_n": 32,
+        "head_split_k": 1,
+        "num_warps": 2,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "w_group": 8
+      },
+      "gluon_cfg": {
+        "block_m": 32,
+        "block_n": 32,
+        "head_split_k": 1,
+        "w_group": 8,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "kv_tiles_n": 1,
+        "q_double_buf": false,
+        "w_lds_pp": false
+      }
+    },
+    {
+      "label": "m64-n66-h64",
+      "s_q": 64,
+      "s_k": 66,
+      "num_heads": 64,
+      "row_ms": 0.02591700741409588,
+      "bn_ms": 0.038988462317798095,
+      "gluon_ms": 0.0347493107605028,
+      "lightop_ms": 0.026918541783323653,
+      "row_over_lo": 0.9627938847026166,
+      "row_over_bn": 0.6647353056102666,
+      "gluon_over_lo": 1.2909061360088383,
+      "gluon_over_bn": 0.8912716402421406,
+      "bn_over_lo": 1.4483868640296071,
+      "best": "row",
+      "row_cfg": {
+        "block_kv": 128,
+        "num_warps": 4,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "head_split_k": 1
+      },
+      "bn_cfg": {
+        "block_m": 16,
+        "block_n": 32,
+        "head_split_k": 1,
+        "num_warps": 2,
+        "num_stages": 2,
+        "waves_per_eu": 4,
+        "w_group": 1
+      },
+      "gluon_cfg": {
+        "block_m": 16,
+        "block_n": 32,
+        "head_split_k": 1,
+        "w_group": 1,
+        "num_stages": 2,
+        "waves_per_eu": 4,
+        "kv_tiles_n": 1,
+        "q_double_buf": false,
+        "w_lds_pp": false
+      }
+    }
+  ]
+}

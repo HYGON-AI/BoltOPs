@@ -25,6 +25,8 @@ _TRITON_CONFIGS_DIR = Path(__file__).resolve().parent / "configs"
 _CONFIG_STEM = "fp8_mqa_logits"
 _TILED_CONFIG_STEM = "fp8_mqa_logits_tiled"
 _GLUON_CONFIG_STEM = "fp8_mqa_logits_gluon"
+_HALF_CONFIG_STEM = "mqa_logits_half"
+_HALF_ROW_CONFIG_STEM = "mqa_logits_half_row_short_kv"
 
 # Code fallback when no JSON is found.
 _FALLBACK_LAUNCH = {
@@ -248,6 +250,14 @@ _GLUON_FALLBACK_LAUNCH = {
     "kv_tiles_n": 2,
 }
 
+# Half-precision BN launch knobs (geometry still from ``get_half_bn_dispatch``).
+_HALF_FALLBACK_LAUNCH = {
+    "num_warps": 4,
+    "num_stages": 2,
+    "waves_per_eu": 0,
+    "w_group": 8,
+}
+
 
 def clamp_gluon_w_group(preferred: int, num_heads: int) -> int:
     """Pick an even ``w_group`` that divides ``num_heads``, preferring ``preferred``."""
@@ -277,6 +287,18 @@ def get_gluon_config_file_name(arch: Optional[str] = None) -> str:
     """MoE-style name: ``fp8_mqa_logits_gluon,arch=gfx938.json``."""
     arch = arch or arch_info.get_arch()
     return f"{_GLUON_CONFIG_STEM},arch={arch}.json"
+
+
+def get_half_config_file_name(arch: Optional[str] = None) -> str:
+    """MoE-style name: ``mqa_logits_half,arch=gfx938.json``."""
+    arch = arch or arch_info.get_arch()
+    return f"{_HALF_CONFIG_STEM},arch={arch}.json"
+
+
+def get_half_row_config_file_name(arch: Optional[str] = None) -> str:
+    """MoE-style name: ``mqa_logits_half_row_short_kv,arch=gfx938.json``."""
+    arch = arch or arch_info.get_arch()
+    return f"{_HALF_ROW_CONFIG_STEM},arch={arch}.json"
 
 
 def _flatten_entry(entry: dict[str, Any]) -> dict[str, Any]:
@@ -344,10 +366,77 @@ def _load_gluon_config_file(arch: str) -> Optional[dict[str, Any]]:
     return None
 
 
+@functools.lru_cache(maxsize=8)
+def _load_half_config_file(arch: str) -> Optional[dict[str, Any]]:
+    caps = get_triton_capabilities()
+    candidates = (
+        get_half_config_file_name(arch),
+        f"{_HALF_CONFIG_STEM}.json",
+    )
+    for config_dir in get_compatible_triton_config_dirs(_TRITON_CONFIGS_DIR, caps):
+        for name in candidates:
+            path = config_dir / name
+            if path.is_file():
+                with path.open("r", encoding="utf-8") as f:
+                    return json.load(f)
+    return None
+
+
+@functools.lru_cache(maxsize=8)
+def _load_half_row_config_file(arch: str) -> Optional[dict[str, Any]]:
+    caps = get_triton_capabilities()
+    candidates = (
+        get_half_row_config_file_name(arch),
+        f"{_HALF_ROW_CONFIG_STEM}.json",
+    )
+    for config_dir in get_compatible_triton_config_dirs(_TRITON_CONFIGS_DIR, caps):
+        for name in candidates:
+            path = config_dir / name
+            if path.is_file():
+                with path.open("r", encoding="utf-8") as f:
+                    return json.load(f)
+    return None
+
+
 def _flatten_gluon_entry(entry: dict[str, Any]) -> dict[str, Any]:
     main = entry.get("main") or entry
     out = {**_GLUON_FALLBACK_LAUNCH}
     out.update(main)
+    return out
+
+
+def _flatten_half_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    main = entry.get("main") or entry
+    out: dict[str, Any] = {}
+    for key in (
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "w_group",
+        "block_m",
+        "block_n",
+        "head_split_k",
+    ):
+        if key in main:
+            out[key] = main[key]
+    return out
+
+
+def _flatten_half_row_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    main = entry.get("main") or entry
+    out: dict[str, Any] = {}
+    for key in (
+        "block_kv",
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "head_split_k",
+        "clear_block_kv",
+        "clear_num_warps",
+        "clear_num_stages",
+    ):
+        if key in main:
+            out[key] = main[key]
     return out
 
 
@@ -506,3 +595,122 @@ def get_fp8_mqa_gluon_launch_config(
             int(out["head_split_k"]), int(num_heads)
         )
     return out
+
+
+def get_mqa_logits_half_launch_config(
+    seq_len: int, seq_len_kv: int, num_heads: int
+) -> dict[str, Any]:
+    """Pick half-BN launch knobs from shipped ``mqa_logits_half`` JSON.
+
+    Preference order:
+      1. exact ``by_shape`` match on ``(seq_len, seq_kv, num_heads)``
+      2. tightest ``by_region`` with ``seq_len/seq_kv/num_heads <= *_leq``
+      3. smallest ``by_seq_kv[].seq_kv_leq >= seq_len_kv``
+      4. ``default`` / ``{}`` so callers keep code geometry defaults
+    """
+    arch = arch_info.get_arch()
+    data = _load_half_config_file(arch)
+    if not data:
+        return {}
+
+    entry = _find_gluon_by_shape_entry(data, seq_len, seq_len_kv, num_heads)
+    if entry is None:
+        entry = _find_gluon_by_region_entry(data, seq_len, seq_len_kv, num_heads)
+    if entry is None:
+        buckets = sorted(
+            data.get("by_seq_kv") or [],
+            key=lambda b: int(b["seq_kv_leq"]),
+        )
+        for bucket in buckets:
+            if seq_len_kv <= int(bucket["seq_kv_leq"]):
+                entry = bucket
+                break
+    if entry is None:
+        entry = data.get("default") or {}
+    return _flatten_half_entry(entry)
+
+
+def get_mqa_logits_half_row_launch_config(
+    seq_len: int, seq_len_kv: int, num_heads: int
+) -> dict[str, Any]:
+    """Pick half-row knobs from ``mqa_logits_half_row_short_kv`` JSON.
+
+    Preference: exact ``by_shape``, else tightest ``by_region``.
+    """
+    arch = arch_info.get_arch()
+    data = _load_half_row_config_file(arch)
+    if not data:
+        return {}
+    entry = _find_gluon_by_shape_entry(data, seq_len, seq_len_kv, num_heads)
+    if entry is None:
+        entry = _find_gluon_by_region_entry(data, seq_len, seq_len_kv, num_heads)
+    if entry is None:
+        return {}
+    return _flatten_half_row_entry(entry)
+
+
+def get_half_mqa_shape_dispatch(
+    seq_len: int, seq_len_kv: int, num_heads: int
+) -> dict[str, Any]:
+    """Half auto path: ``row`` or ``bn`` from shipped GPU compare (both Triton versions).
+
+    Reads ``mqa_logits_half_row_short_kv`` ``compare`` / ``dispatch`` tables written by
+    the short-KV (or all-sizes) row|BN retune. Prefer exact ``(M,N,H)``; optionally
+    a coarse ``by_region`` path pick. No match → ``bn`` (safe default).
+
+    Gluon half remains opt-in via ``backend='gluon_bn_align'``.
+    """
+    arch = arch_info.get_arch()
+    row_data = _load_half_row_config_file(arch)
+    use_row = False
+    row_kw: dict[str, Any] = {}
+    if row_data:
+        # Explicit path table (exact shapes), if present.
+        for ent in row_data.get("dispatch") or []:
+            sq = int(ent.get("s_q", ent.get("seq_len", -1)))
+            sk = int(ent.get("s_k", ent.get("seq_kv", -1)))
+            nh = int(ent.get("num_heads", -1))
+            if sq != int(seq_len) or sk != int(seq_len_kv) or nh != int(num_heads):
+                continue
+            path = str(ent.get("path", "bn")).lower()
+            use_row = path == "row"
+            if use_row:
+                row_kw = dict(ent.get("row_cfg") or {})
+            break
+        else:
+            for cmp in row_data.get("compare") or []:
+                sq = int(cmp.get("s_q", cmp.get("seq_len", -1)))
+                sk = int(cmp.get("s_k", cmp.get("seq_kv", -1)))
+                nh = int(cmp.get("num_heads", -1))
+                if (
+                    sq != int(seq_len)
+                    or sk != int(seq_len_kv)
+                    or nh != int(num_heads)
+                ):
+                    continue
+                path = str(cmp.get("path", "")).lower()
+                if path == "row" or (
+                    not path and float(cmp.get("row_over_bn", 2.0)) < 1.0
+                ):
+                    use_row = True
+                    row_kw = dict(cmp.get("row_cfg") or {})
+                break
+            else:
+                # Coarse region path pick (FP8-style Q/KV/H leq), if shipped.
+                region = _find_gluon_by_region_entry(
+                    {"by_region": row_data.get("by_region_path") or []},
+                    seq_len,
+                    seq_len_kv,
+                    num_heads,
+                )
+                if region is not None and str(region.get("path", "")).lower() == "row":
+                    use_row = True
+                    row_kw = dict(region.get("row_cfg") or {})
+
+        if use_row and not row_kw:
+            row_kw = get_mqa_logits_half_row_launch_config(
+                seq_len, seq_len_kv, num_heads
+            )
+    if use_row:
+        return {"path": "row", **row_kw}
+    return {"path": "bn"}

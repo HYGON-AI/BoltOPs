@@ -107,6 +107,7 @@ boltops = [
     "mla/triton/configs/**/*.json",
     "fa/sparse_gqa/triton/configs/triton_*/*.json",
     "mqa_logits/triton/SOURCE.md",
+    "mqa_logits/triton/PERFORMANCE.md",
     "mqa_logits/triton/configs/triton_*/*.json",
     "step4_dsa/triton/SOURCE.md",
     "step4_dsa/triton/config/*/*.json",
