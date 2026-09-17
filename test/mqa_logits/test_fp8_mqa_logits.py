@@ -17,7 +17,7 @@ import torch
 
 pytest.importorskip("triton")
 
-from boltops.mqa_logits import fp8_mqa_logits  # noqa: E402
+from boltops.mqa_logits import triton_mqa_logits  # noqa: E402
 from boltops.utility.arch_info import get_fp8_e4m3_dtype  # noqa: E402
 
 DEVICE = "cuda"
@@ -200,7 +200,7 @@ def test_fp8_mqa_logits_backends(
     q_fp8, kv_fp8, scales, weights, ks, ke = _make_inputs(
         s_q, s_k, num_heads, head_dim, disable_cp=True
     )
-    logits = fp8_mqa_logits(
+    logits = triton_mqa_logits(
         q_fp8, kv_fp8, scales, weights, ks, ke, backend=backend
     )
     _assert_close_to_ref(logits, q_fp8, kv_fp8, scales, weights, ks, ke)
@@ -226,7 +226,7 @@ def test_fp8_mqa_logits_auto_grid(
     q_fp8, kv_fp8, scales, weights, ks, ke = _make_inputs(
         s_q, s_k, num_heads, head_dim, disable_cp=disable_cp
     )
-    logits = fp8_mqa_logits(q_fp8, kv_fp8, scales, weights, ks, ke)
+    logits = triton_mqa_logits(q_fp8, kv_fp8, scales, weights, ks, ke)
     _assert_close_to_ref(logits, q_fp8, kv_fp8, scales, weights, ks, ke)
 
 
@@ -235,7 +235,7 @@ def test_fp8_mqa_logits_auto_grid(
 def test_fp8_mqa_logits_dout_inplace() -> None:
     q_fp8, kv_fp8, scales, weights, ks, ke = _make_inputs(32, 1024, 64, 128)
     d_out = torch.empty(32, 1024, device=DEVICE, dtype=torch.float32)
-    out = fp8_mqa_logits(
+    out = triton_mqa_logits(
         q_fp8, kv_fp8, scales, weights, ks, ke, D_out=d_out, backend="auto"
     )
     assert out.data_ptr() == d_out.data_ptr()
@@ -277,7 +277,7 @@ def test_bench_fp8_mqa_logits_size_grid(
     d_out = torch.empty(s_q, s_k, device=DEVICE, dtype=torch.float32)
 
     def run():
-        fp8_mqa_logits(
+        triton_mqa_logits(
             q_fp8, kv_fp8, scales, weights, ks, ke, D_out=d_out, backend="auto"
         )
 
@@ -316,7 +316,7 @@ def test_bench_fp8_mqa_logits_backends_size_grid(
     d_out = torch.empty(s_q, s_k, device=DEVICE, dtype=torch.float32)
 
     def run():
-        fp8_mqa_logits(
+        triton_mqa_logits(
             q_fp8, kv_fp8, scales, weights, ks, ke, D_out=d_out, backend=backend
         )
 
@@ -359,7 +359,7 @@ def test_bench_fp8_mqa_logits_vs_lightop_size_grid(
     flops = useful_flops(ks, ke, num_heads, head_dim)
 
     def run_boltops():
-        fp8_mqa_logits(
+        triton_mqa_logits(
             q_fp8, kv_fp8, scales, weights, ks, ke, D_out=d_out, backend="auto"
         )
 
@@ -379,14 +379,186 @@ def test_bench_fp8_mqa_logits_vs_lightop_size_grid(
         f"{flops / (ms_lightop * 1e-3) / 1e12:.2f} TFLOPS\n"
         f"  lightop/boltops: {ratio:.2f}x (>1 means boltops is faster)"
     )
-def test_fp8_mqa_logits_impl_default_triton():
-    from boltops.mqa_logits import fp8_mqa_logits
+
+
+def test_triton_mqa_logits_smoke():
+    from boltops.mqa_logits import triton_mqa_logits
 
     q_fp8, kv_fp8, scales, weights, ks, ke = _make_inputs(16, 128, 8, 128)
-    out = fp8_mqa_logits(q_fp8, kv_fp8, scales, weights, ks, ke)
+    out = triton_mqa_logits(q_fp8, kv_fp8, scales, weights, ks, ke)
     assert out.shape == (16, 128)
-    out2 = fp8_mqa_logits(q_fp8, kv_fp8, scales, weights, ks, ke, impl="triton")
-    assert out2.shape == (16, 128)
 
 
+def test_mqa_logits_public_export():
+    from boltops.mqa_logits import triton_mqa_logits
+    import boltops.mqa_logits as pkg
+
+    assert callable(triton_mqa_logits)
+    assert not hasattr(pkg, "mqa_logits")
+    assert not hasattr(pkg, "fp8_mqa_logits")
+
+
+def test_mqa_logits_half_rejects_kv_scales():
+    from boltops.mqa_logits import triton_mqa_logits
+
+    q, kv, weights, ks, ke = _make_half_inputs(16, 66, 8, 128, torch.bfloat16)
+    scales = torch.ones(66, device=DEVICE, dtype=torch.float32)
+    with pytest.raises(ValueError, match="float8 path requires"):
+        triton_mqa_logits(q, kv, scales, weights, ks, ke)
+
+
+def _make_half_inputs(
+    s_q: int,
+    s_k: int,
+    num_heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    *,
+    seed: int = 0,
+):
+    torch.manual_seed(seed)
+    q = torch.randn(s_q, num_heads, head_dim, device=DEVICE, dtype=dtype)
+    kv = torch.randn(s_k, head_dim, device=DEVICE, dtype=dtype)
+    weights = torch.randn(s_q, num_heads, device=DEVICE, dtype=torch.float32)
+    ks = torch.zeros(s_q, dtype=torch.int32, device=DEVICE)
+    ke = torch.arange(s_q, dtype=torch.int32, device=DEVICE) + (s_k - s_q)
+    return q, kv, weights, ks, ke
+
+
+@GPU_REQUIRED
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("backend", ["auto", "row", "bn"])
+@pytest.mark.parametrize("s_q,s_k,num_heads,head_dim", [
+    pytest.param(16, 66, 8, 128, id="tiny-H8"),
+    pytest.param(32, 128, 64, 128, id="short"),
+    pytest.param(64, 4096, 64, 128, id="mid"),
+    pytest.param(64, 16384, 64, 128, id="large-N"),
+])
+@torch.inference_mode()
+def test_mqa_logits_half_backends(
+    dtype: torch.dtype,
+    backend: str,
+    s_q: int,
+    s_k: int,
+    num_heads: int,
+    head_dim: int,
+) -> None:
+    from boltops.mqa_logits import triton_mqa_logits
+    from boltops.mqa_logits.triton.mqa_logits_half import get_half_bn_dispatch
+
+    q, kv, weights, ks, ke = _make_half_inputs(s_q, s_k, num_heads, head_dim, dtype)
+    logits = triton_mqa_logits(q, kv, None, weights, ks, ke, backend=backend)
+    ref = ref_fp8_mqa_logits(q, kv, weights, ks, ke)
+    ref_neginf = ref == float("-inf")
+    out_neginf = logits == float("-inf")
+    assert torch.equal(out_neginf, ref_neginf)
+    diff = calc_diff(
+        logits.masked_fill(out_neginf, 0),
+        ref.masked_fill(ref_neginf, 0),
+    )
+    assert diff < 2e-2, f"{diff=} {dtype=} {backend=} {s_q}x{s_k}"
+    # Geometry may come from ship JSON (exact by_shape), not only code defaults.
+    disp = get_half_bn_dispatch(s_q, s_k, num_heads)
+    assert int(disp["block_n"]) >= 16 and int(disp["block_m"]) >= 1
+    assert int(disp["head_split_k"]) >= 1
+
+
+@GPU_REQUIRED
+@torch.inference_mode()
+def test_mqa_logits_half_rejects_gluon() -> None:
+    from boltops.mqa_logits import triton_mqa_logits
+
+    q, kv, weights, ks, ke = _make_half_inputs(16, 66, 8, 128, torch.bfloat16)
+    with pytest.raises(ValueError, match="gluon"):
+        triton_mqa_logits(q, kv, None, weights, ks, ke, backend="gluon")
+
+
+@GPU_REQUIRED
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize(
+    "s_q,s_k,num_heads,head_dim",
+    [
+        pytest.param(16, 66, 8, 128, id="tiny-H8"),
+        pytest.param(64, 4096, 64, 128, id="mid"),
+    ],
+)
+@torch.inference_mode()
+def test_mqa_logits_half_gluon_bn_align(
+    dtype: torch.dtype,
+    s_q: int,
+    s_k: int,
+    num_heads: int,
+    head_dim: int,
+) -> None:
+    from boltops.mqa_logits import triton_mqa_logits
+    from boltops.mqa_logits.triton.fp8_mqa_logits_gluon import (
+        gluon_prefill_available,
+    )
+
+    if not gluon_prefill_available():
+        pytest.skip("Gluon unavailable")
+
+    q, kv, weights, ks, ke = _make_half_inputs(s_q, s_k, num_heads, head_dim, dtype)
+    logits = triton_mqa_logits(q, kv, None, weights, ks, ke, backend="gluon_bn_align")
+    ref = ref_fp8_mqa_logits(q, kv, weights, ks, ke)
+    ref_neginf = ref == float("-inf")
+    out_neginf = logits == float("-inf")
+    assert torch.equal(out_neginf, ref_neginf)
+    diff = calc_diff(
+        logits.masked_fill(out_neginf, 0),
+        ref.masked_fill(ref_neginf, 0),
+    )
+    assert diff < 2e-2, f"{diff=} {dtype=} {s_q}x{s_k}"
+
+
+@GPU_REQUIRED
+@pytest.mark.bench
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize(
+    "s_q,s_k,num_heads",
+    [
+        pytest.param(64, 4096, 64, id="mid"),
+        pytest.param(128, 8192, 64, id="long"),
+    ],
+)
+@torch.inference_mode()
+def test_bench_mqa_logits_half_vs_lightop(
+    dtype: torch.dtype,
+    s_q: int,
+    s_k: int,
+    num_heads: int,
+    time_ms: Callable,
+    bench_warmup: int,
+    bench_repeat: int,
+) -> None:
+    lightop = pytest.importorskip("lightop")
+    from boltops.mqa_logits import triton_mqa_logits
+
+    q, kv, weights, ks, ke = _make_half_inputs(s_q, s_k, num_heads, 128, dtype)
+    out_bo = torch.empty(s_q, s_k, device=DEVICE, dtype=torch.float32)
+    out_lo = torch.empty_like(out_bo)
+
+    def run_boltops():
+        return triton_mqa_logits(q, kv, None, weights, ks, ke, D_out=out_bo)
+
+    def run_lightop():
+        return lightop.mqa_logits(
+            q, kv, weights, ks, ke, None, clean_logit=True, D_out=out_lo
+        )
+
+    got = run_boltops().clone()
+    ref = run_lightop().clone()
+    finite = torch.isfinite(ref) & torch.isfinite(got)
+    if bool(finite.any()):
+        md = (got - ref).abs()[finite].max().item()
+        assert md < 5e-2, f"max abs diff {md}"
+
+    ms_bo = time_ms(run_boltops, bench_warmup, bench_repeat)
+    ms_lo = time_ms(run_lightop, bench_warmup, bench_repeat)
+    ratio = ms_lo / ms_bo if ms_bo > 0 else float("inf")
+    print(
+        f"[bench half vs_lightop] {s_q}x{s_k} H={num_heads} {dtype}\n"
+        f"  boltops: {ms_bo:.3f} ms  lightop: {ms_lo:.3f} ms  "
+        f"lo/bo: {ratio:.2f}x"
+    )
 

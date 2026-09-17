@@ -1,4 +1,4 @@
-"""FP8 MQA logits for sparse-attention indexer (prefill / non-paged).
+"""MQA logits for sparse-attention indexer (prefill / non-paged).
 
 Vendored from hygon aiter ``aiter.ops.triton.attention.fp8_mqa_logits``
 (and the matching ``_triton_kernels`` file). Formula matches DeepGEMM /
@@ -6,6 +6,9 @@ vLLM ``fp8_mqa_logits``:
 
     logits[m, n] = sum_h ReLU(Q[m,h] · KV[n] * scale[n]) * W[m,h]
     outside [cu_starts[m], cu_ends[m]) -> -inf
+
+This module is the **internal float8** row/BN implementation. Public callers
+use ``boltops.mqa_logits.triton_mqa_logits`` (``kv_scales`` set → float8; ``None`` → half).
 """
 
 from __future__ import annotations
@@ -41,22 +44,13 @@ DEFAULT_CLEAR_SCHEDULE_HINT = "none"
 
 
 def _filter_hip_launch_kwargs(kwargs: dict) -> dict:
-    """Drop unsupported HIPOptions instead of passing False/unsupported values."""
+    """Drop unsupported HIPOptions instead of passing False/unsupported values.
+
+    Every key must exist on the installed backend's ``HIPOptions``; unknown
+    launch kwargs raise ``KeyError`` from Triton's JIT.
+    """
     caps = get_triton_capabilities()
-    out = {}
-    for key, value in kwargs.items():
-        if key in (
-            "waves_per_eu",
-            "matrix_instr_nonkdim",
-            "kpack",
-            "schedule_hint",
-            "use_block_pingpong",
-            "sched_latency",
-        ):
-            if not caps.supports(key):
-                continue
-        out[key] = value
-    return out
+    return {key: value for key, value in kwargs.items() if caps.supports(key)}
 
 
 @triton.jit
@@ -401,7 +395,7 @@ def _fp8_mqa_clear_logits_kernel(
 def fp8_mqa_logits(
     Q: torch.Tensor,
     KV: torch.Tensor,
-    kv_scales: torch.Tensor,
+    kv_scales: Optional[torch.Tensor],
     weights: torch.Tensor,
     cu_starts: torch.Tensor,
     cu_ends: torch.Tensor,
@@ -428,12 +422,15 @@ def fp8_mqa_logits(
     auto_bn_tile: bool = True,
     bn_w_group: Optional[int] = None,
 ) -> torch.Tensor:
-    """Compute FP8 MQA logits for sparse-attention top-k (prefill / dense KV).
+    """Compute MQA logits for sparse-attention top-k (prefill / dense KV).
 
     Args:
-        Q: ``[seq_len, NUM_HEADS, HEAD_SIZE]``, float8
-        KV: ``[seq_len_kv, HEAD_SIZE]``, float8
-        kv_scales: ``[seq_len_kv]``, float32 per-token dequant scales
+        Q: ``[seq_len, NUM_HEADS, HEAD_SIZE]``, float8 / float16 / bfloat16
+        KV: ``[seq_len_kv, HEAD_SIZE]``, same dtype as ``Q``
+        kv_scales: ``[seq_len_kv]`` float32 per-token scales (required for
+            float8 Q/KV). This low-level kernel is float8-only; half inputs
+            must go through ``boltops.mqa_logits.triton_mqa_logits`` with
+            ``kv_scales=None``.
         weights: ``[seq_len, NUM_HEADS]``, float32
         cu_starts: ``[seq_len]``, int32, inclusive KV start per query row
         cu_ends: ``[seq_len]``, int32, exclusive KV end per query row
@@ -463,6 +460,15 @@ def fp8_mqa_logits(
     """
     seq_len, num_heads, head_size = Q.shape
     seq_len_kv = KV.shape[0]
+
+    if Q.dtype in (torch.float16, torch.bfloat16):
+        raise ValueError(
+            "fp8_mqa_logits low-level kernel is float8-only; use "
+            "boltops.mqa_logits.triton_mqa_logits(..., kv_scales=None) for half"
+        )
+
+    if kv_scales is None:
+        raise ValueError("kv_scales is required for float8 Q/KV")
 
     disp = None
     if bn_tile is None and auto_bn_tile:
@@ -508,8 +514,10 @@ def fp8_mqa_logits(
     clear_schedule_hint = _pick(
         "clear_schedule_hint", clear_schedule_hint, DEFAULT_CLEAR_SCHEDULE_HINT
     )
-    # gfx936 and older lack native fp8 MMAC; emulate f16 dot like Triton 3.6.
-    dot_fp16 = not arch_info.is_fp8_avail()
+    # FP8 on arches without native FP8 MMAC: emulate with f16 dots.
+    # Native fp16/bf16 inputs keep their dtype (do not force bf16→fp16).
+    is_half = Q.dtype in (torch.float16, torch.bfloat16)
+    dot_fp16 = (not is_half) and (not arch_info.is_fp8_avail())
     # Host must recompute masking whenever BLOCK_KV changes.
     logits_masking = seq_len_kv % block_kv != 0
     assert num_heads & (num_heads - 1) == 0, "num q. heads should be power of 2."

@@ -1,13 +1,16 @@
 """MQA logits operator package (sparse-attention indexer scoring).
 
-Public signature and ship-time / runtime selection live here.
+Public Triton entry lives here; TileLang can be added later as a sibling
+export (e.g. ``tilelang_mqa_logits``) without renaming this API.
 
 * docs: ``docs/ops/mqa_logits.md``
 * tests: ``test/mqa_logits/``
 
-Public operators:
+Public operator:
 
-* ``fp8_mqa_logits`` — prefill / dense KV
+* ``triton_mqa_logits`` — prefill / dense KV (Triton)
+  - ``kv_scales`` provided → float8 path
+  - ``kv_scales is None`` → fp16/bf16 path
 """
 
 from __future__ import annotations
@@ -16,50 +19,66 @@ from typing import Optional
 
 import torch
 
+_HALF_DTYPES = (torch.float16, torch.bfloat16)
 
-def fp8_mqa_logits(
+
+def _is_fp8_dtype(dtype: torch.dtype) -> bool:
+    name = str(dtype)
+    return "float8_e4m3" in name
+
+
+def _is_half_dtype(dtype: torch.dtype) -> bool:
+    return dtype in _HALF_DTYPES
+
+
+def triton_mqa_logits(
     Q: torch.Tensor,
     KV: torch.Tensor,
-    kv_scales: torch.Tensor,
+    kv_scales: Optional[torch.Tensor],
     weights: torch.Tensor,
     cu_starts: torch.Tensor,
     cu_ends: torch.Tensor,
     *,
     D_out: Optional[torch.Tensor] = None,
-    impl: str = "triton",
     backend: Optional[str] = None,
 ) -> torch.Tensor:
-    """FP8 MQA logits for sparse-attention top-k (prefill / non-paged).
+    """MQA logits for sparse-attention top-k (prefill / non-paged, Triton).
 
-    ``impl`` selects the framework backend (currently Triton only):
+    Path selection is by ``kv_scales``:
 
-    * ``\"triton\"`` (default) / ``None`` / ``\"auto\"`` — Triton
+    * ``kv_scales`` is a float32 tensor → float8 Q/KV path
+    * ``kv_scales is None`` → fp16/bf16 path (dedicated half kernels)
 
-    Within Triton, ``backend`` selects the kernel path:
+    ``Q`` / ``KV`` must share dtype and match the chosen path.
 
-    * ``None`` / ``\"auto\"`` — shape + capability: Gluon → ``row``|``gluon``;
-      else ``row``|``bn``
-    * ``\"row\"`` / ``\"bn\"`` / ``\"gluon\"`` — force that path (``gluon``
-      raises if unavailable)
+    ``backend`` selects the Triton kernel path:
+
+    * ``None`` / ``\"auto\"`` — float8: Gluon → ``row``|``gluon``, else
+      ``row``|``bn``; half: ``row``|``bn`` (row only on short-KV shapes where
+      tune beats BN; else full-size tuned BN).
+    * ``\"row\"`` / ``\"bn\"`` / ``\"gluon\"`` — float8 as named; half ``row``
+      uses per-row KV scan, half ``bn`` forces BN; half ``gluon`` unsupported
+      (use experimental ``gluon_bn_align``).
+    * ``\"gluon_bn_align\"`` / ``\"gluon-exp\"`` / ``\"gluon_exp\"`` —
+      **experimental** BN-aligned Gluon (float8 or half); not selected by auto.
+    * ``\"gluon_opt\"`` — **experimental** float8 alias of ship Gluon
+      (ablation-backed); prefer ``\"gluon\"`` in product code.
 
     ``D_out``: optional preallocated ``[M, N]`` float32 buffer written in-place.
     """
-    impl_norm = None if impl is None else str(impl).strip().lower()
-    if impl_norm in (None, "", "auto", "triton"):
-        return _fp8_mqa_logits_triton(
-            Q,
-            KV,
-            kv_scales,
-            weights,
-            cu_starts,
-            cu_ends,
-            D_out=D_out,
-            backend=backend,
-        )
-    raise ValueError(f"impl must be None/'auto'/'triton', got {impl!r}")
+    return _triton_mqa_logits(
+        Q,
+        KV,
+        kv_scales,
+        weights,
+        cu_starts,
+        cu_ends,
+        D_out=D_out,
+        backend=backend,
+    )
 
 
-def _fp8_mqa_logits_triton(
+def _triton_mqa_logits(
     Q,
     KV,
     kv_scales,
@@ -72,11 +91,98 @@ def _fp8_mqa_logits_triton(
 ):
     from boltops.mqa_logits.triton.mqa_config_utils import get_fp8_mqa_shape_dispatch
 
+    if Q.dtype != KV.dtype:
+        raise ValueError(
+            f"Q and KV must share dtype, got Q={Q.dtype} KV={KV.dtype}"
+        )
+
+    use_fp8 = kv_scales is not None
+    if use_fp8:
+        if not _is_fp8_dtype(Q.dtype):
+            raise ValueError(
+                "kv_scales is set → float8 path requires float8_e4m3* Q/KV, "
+                f"got {Q.dtype}"
+            )
+    else:
+        if not _is_half_dtype(Q.dtype):
+            raise ValueError(
+                "kv_scales is None → half path requires float16/bfloat16 Q/KV, "
+                f"got {Q.dtype}"
+            )
+
     seq_len = int(Q.shape[0])
     seq_len_kv = int(KV.shape[0])
     num_heads = int(Q.shape[1])
-
     backend_norm = None if backend is None else str(backend).strip().lower()
+
+    if not use_fp8:
+        if backend_norm == "gluon":
+            raise ValueError(
+                "backend='gluon' does not support float16/bfloat16 inputs yet; "
+                "use backend=None/'auto'/'row'/'bn' or 'gluon_bn_align'"
+            )
+        if backend_norm in ("gluon_bn_align", "gluon-exp", "gluon_exp"):
+            from boltops.mqa_logits.triton.fp8_mqa_logits_gluon import (
+                gluon_prefill_available,
+            )
+            from boltops.mqa_logits.triton.mqa_logits_half_gluon_bn_align import (
+                mqa_logits_half_gluon_bn_align,
+            )
+
+            if not gluon_prefill_available():
+                raise RuntimeError(
+                    "backend='gluon_bn_align' requested but Gluon is unavailable"
+                )
+            return mqa_logits_half_gluon_bn_align(
+                Q, KV, weights, cu_starts, cu_ends, D_out=D_out
+            )
+        if backend_norm == "row":
+            from boltops.mqa_logits.triton.mqa_logits_half_row import (
+                mqa_logits_half_row,
+            )
+
+            return mqa_logits_half_row(
+                Q, KV, weights, cu_starts, cu_ends, D_out=D_out
+            )
+        if backend_norm not in (None, "", "auto", "bn"):
+            raise ValueError(
+                "backend must be None/'auto'/'row'/'bn'/'gluon'/"
+                f"'gluon_bn_align', got {backend!r}"
+            )
+        if backend_norm in (None, "", "auto"):
+            from boltops.mqa_logits.triton.mqa_config_utils import (
+                get_half_mqa_shape_dispatch,
+            )
+
+            disp = get_half_mqa_shape_dispatch(seq_len, seq_len_kv, num_heads)
+            if disp.get("path") == "row":
+                from boltops.mqa_logits.triton.mqa_logits_half_row import (
+                    mqa_logits_half_row,
+                )
+
+                row_kw = {"D_out": D_out}
+                for key in (
+                    "block_kv",
+                    "num_warps",
+                    "num_stages",
+                    "waves_per_eu",
+                    "head_split_k",
+                    "clear_block_kv",
+                    "clear_num_warps",
+                    "clear_num_stages",
+                ):
+                    if key in disp:
+                        row_kw[key] = int(disp[key])
+                return mqa_logits_half_row(
+                    Q, KV, weights, cu_starts, cu_ends, **row_kw
+                )
+        from boltops.mqa_logits.triton.mqa_logits_half import mqa_logits_half
+
+        return mqa_logits_half(
+            Q, KV, weights, cu_starts, cu_ends, D_out=D_out
+        )
+
+    # float8 path (kv_scales provided)
     if backend_norm in (None, "", "auto"):
         gluon_ok = False
         try:
@@ -123,6 +229,36 @@ def _fp8_mqa_logits_triton(
             force_gluon_kernel=True,
         )
 
+    if backend_norm in ("gluon_bn_align", "gluon-exp", "gluon_exp"):
+        from boltops.mqa_logits.triton.fp8_mqa_logits_gluon_bn_align import (
+            fp8_mqa_logits_gluon_bn_align,
+        )
+        from boltops.mqa_logits.triton.fp8_mqa_logits_gluon import (
+            gluon_prefill_available,
+        )
+
+        if not gluon_prefill_available():
+            raise RuntimeError(
+                "backend='gluon_bn_align' requested but Gluon is unavailable"
+            )
+        return fp8_mqa_logits_gluon_bn_align(
+            Q, KV, kv_scales, weights, cu_starts, cu_ends, D_out=D_out
+        )
+
+    if backend_norm in ("gluon_opt", "gluon-opt"):
+        from boltops.mqa_logits.triton.fp8_mqa_logits_gluon import (
+            gluon_prefill_available,
+        )
+        from boltops.mqa_logits.triton.fp8_mqa_logits_gluon_opt import (
+            fp8_mqa_logits_gluon_opt,
+        )
+
+        if not gluon_prefill_available():
+            raise RuntimeError("backend='gluon_opt' requested but Gluon is unavailable")
+        return fp8_mqa_logits_gluon_opt(
+            Q, KV, kv_scales, weights, cu_starts, cu_ends, D_out=D_out
+        )
+
     if backend_norm == "row":
         # Apply the same shape-tuned row knobs auto uses on tiny KV
         # (block_kv / warps / stages). Mid/large forced-row keeps JSON defaults.
@@ -157,7 +293,8 @@ def _fp8_mqa_logits_triton(
         )
 
     raise ValueError(
-        f"backend must be None/'auto'/'row'/'bn'/'gluon', got {backend!r}"
+        "backend must be None/'auto'/'row'/'bn'/'gluon'/'gluon_bn_align'/'gluon_opt', "
+        f"got {backend!r}"
     )
 
 
@@ -207,5 +344,5 @@ def _run_triton_prefill(
 
 
 __all__ = [
-    "fp8_mqa_logits",
+    "triton_mqa_logits",
 ]
