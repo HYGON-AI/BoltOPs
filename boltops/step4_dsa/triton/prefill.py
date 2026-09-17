@@ -44,8 +44,10 @@ def _sparse_attn_prefill_kernel(
     stride_v_token,
     stride_v_group,
     stride_packed_row,
+    stride_out_split,
     stride_out_token,
     stride_out_head,
+    stride_lse_split,
     stride_lse_token,
     softmax_scale,
     total_q,
@@ -53,6 +55,7 @@ def _sparse_attn_prefill_kernel(
     heads_per_group: tl.constexpr,
     head_dim: tl.constexpr,
     region_size: tl.constexpr,
+    slots_per_split: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_R: tl.constexpr,
@@ -63,9 +66,14 @@ def _sparse_attn_prefill_kernel(
     max is per head, exactly as in dense flash attention -- the only difference is that
     the K/V rows come from a gather driven by the packed region list instead of a
     contiguous range.
+
+    Split windows are a partition of the packed row. The last ``BLOCK_R`` tile is
+    clamped with ``slots < window_end`` so a window that is not a multiple of
+    ``BLOCK_R`` cannot walk into the next split.
     """
     query = tl.program_id(0)
     group = tl.program_id(1)
+    split = tl.program_id(2)
     row = group * total_q + query
     count = tl.load(counts_ptr + row).to(tl.int32)
 
@@ -89,9 +97,11 @@ def _sparse_attn_prefill_kernel(
     accumulator = tl.zeros((BLOCK_H, BLOCK_D), dtype=tl.float32)
 
     offsets_in_region = tl.arange(0, region_size)
-    for base in tl.range(0, topk, BLOCK_R):
+    window_begin = split * slots_per_split
+    window_end = window_begin + slots_per_split
+    for base in tl.range(window_begin, window_end, BLOCK_R):
         slots = base + tl.arange(0, BLOCK_R)
-        slot_ok = slots < count
+        slot_ok = (slots < count) & (slots < topk) & (slots < window_end)
         meta = tl.load(
             packed_ptr + row * stride_packed_row + slots, mask=slot_ok, other=-1
         )
@@ -152,6 +162,7 @@ def _sparse_attn_prefill_kernel(
     output = tl.where(selected[:, None], accumulator / running_sum[:, None], 0.0)
     tl.store(
         out_ptr
+        + split * stride_out_split
         + query * stride_out_token
         + (group * heads_per_group + heads)[:, None] * stride_out_head
         + dims[None, :],
@@ -159,7 +170,11 @@ def _sparse_attn_prefill_kernel(
         mask=tile_ok,
     )
     tl.store(
-        lse_ptr + query * stride_lse_token + group * heads_per_group + heads,
+        lse_ptr
+        + split * stride_lse_split
+        + query * stride_lse_token
+        + group * heads_per_group
+        + heads,
         tl.where(selected, running_max + tl.log(running_sum), NEGATIVE_INFINITY),
         mask=head_ok,
     )
@@ -181,8 +196,10 @@ def _sparse_attn_prefill_dsplit_kernel(
     stride_v_token,
     stride_v_group,
     stride_packed_row,
+    stride_out_split,
     stride_out_token,
     stride_out_head,
+    stride_lse_split,
     stride_lse_token,
     softmax_scale,
     total_q,
@@ -190,48 +207,56 @@ def _sparse_attn_prefill_dsplit_kernel(
     heads_per_group: tl.constexpr,
     head_dim: tl.constexpr,
     region_size: tl.constexpr,
+    slots_per_split: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_D1: tl.constexpr,
     BLOCK_D2: tl.constexpr,
+    BLOCK_D3: tl.constexpr,
     BLOCK_R: tl.constexpr,
-    USE_LOG2: tl.constexpr,
-    SHARED_RECIP: tl.constexpr,
-    K_TRANSPOSED_LOAD: tl.constexpr,
 ) -> None:
-    """Per-query prefill specialized for an exact two-chunk head dimension.
+    """Per-query prefill specialized for an exact three-chunk head dimension.
 
-    For ``head_dim=192`` this uses ``128+64`` instead of padding all Q/K/V and
-    the output accumulator to 256. Online softmax is evaluated in the log2
-    domain and output normalization shares one reciprocal per head.
+    ``head_dim=192`` launches as ``64+64+64`` MMACs (not a 256-padded tile).
+    Inner-loop schedule: cluster the three K gathers, QK, then the three V
+    gathers, then softmax / PV. Online softmax is log2; the epilogue shares one
+    reciprocal per head. K is loaded already transposed for ``tl.dot``. Split
+    windows partition the packed row; ``slots < window_end`` keeps the last
+    ``BLOCK_R`` tile out of the next split.
     """
-    tl.static_assert(BLOCK_D1 + BLOCK_D2 == head_dim)
+    tl.static_assert(BLOCK_D1 + BLOCK_D2 + BLOCK_D3 == head_dim)
     query = tl.program_id(0)
     group = tl.program_id(1)
+    split = tl.program_id(2)
     row = group * total_q + query
     count = tl.load(counts_ptr + row).to(tl.int32)
 
     heads = tl.arange(0, BLOCK_H)
-    dims1 = tl.arange(0, BLOCK_D1)
-    dims2 = BLOCK_D1 + tl.arange(0, BLOCK_D2)
+    dims0 = tl.arange(0, BLOCK_D1)
+    dims1 = BLOCK_D1 + tl.arange(0, BLOCK_D2)
+    dims2 = BLOCK_D1 + BLOCK_D2 + tl.arange(0, BLOCK_D3)
     head_ok = heads < heads_per_group
     q_base = (
         q_ptr
         + query * stride_q_token
         + (group * heads_per_group + heads)[:, None] * stride_q_head
     )
+    queries0 = tl.load(q_base + dims0[None, :], mask=head_ok[:, None], other=0.0)
     queries1 = tl.load(q_base + dims1[None, :], mask=head_ok[:, None], other=0.0)
     queries2 = tl.load(q_base + dims2[None, :], mask=head_ok[:, None], other=0.0)
 
-    scale = softmax_scale * LOG2E if USE_LOG2 else softmax_scale
+    scale = softmax_scale * LOG2E
     running_max = tl.full((BLOCK_H,), NEGATIVE_INFINITY, dtype=tl.float32)
     running_sum = tl.zeros((BLOCK_H,), dtype=tl.float32)
-    acc1 = tl.zeros((BLOCK_H, BLOCK_D1), dtype=tl.float32)
-    acc2 = tl.zeros((BLOCK_H, BLOCK_D2), dtype=tl.float32)
+    acc0 = tl.zeros((BLOCK_H, BLOCK_D1), dtype=tl.float32)
+    acc1 = tl.zeros((BLOCK_H, BLOCK_D2), dtype=tl.float32)
+    acc2 = tl.zeros((BLOCK_H, BLOCK_D3), dtype=tl.float32)
 
     offsets_in_region = tl.arange(0, region_size)
-    for base in tl.range(0, topk, BLOCK_R):
+    window_begin = split * slots_per_split
+    window_end = window_begin + slots_per_split
+    for base in tl.range(window_begin, window_end, BLOCK_R):
         slots = base + tl.arange(0, BLOCK_R)
-        slot_ok = slots < count
+        slot_ok = (slots < count) & (slots < topk) & (slots < window_end)
         meta = tl.load(
             packed_ptr + row * stride_packed_row + slots, mask=slot_ok, other=-1
         )
@@ -248,82 +273,58 @@ def _sparse_attn_prefill_dsplit_kernel(
             (BLOCK_R * region_size,),
         )
         safe_tokens = tl.where(token_ok, tokens, 0)
-        if K_TRANSPOSED_LOAD:
-            k_base = (
-                k_ptr
-                + safe_tokens[None, :] * stride_k_token
-                + group * stride_k_group
-            )
-            keys1 = tl.load(
-                k_base + dims1[:, None], mask=token_ok[None, :], other=0.0
-            )
-            keys2 = tl.load(
-                k_base + dims2[:, None], mask=token_ok[None, :], other=0.0
-            )
-        else:
-            k_base = (
-                k_ptr
-                + safe_tokens[:, None] * stride_k_token
-                + group * stride_k_group
-            )
-            keys1 = tl.load(
-                k_base + dims1[None, :], mask=token_ok[:, None], other=0.0
-            )
-            keys2 = tl.load(
-                k_base + dims2[None, :], mask=token_ok[:, None], other=0.0
-            )
+        token_head_ok = token_ok[None, :] & head_ok[:, None]
+        k_base = (
+            k_ptr
+            + safe_tokens[None, :] * stride_k_token
+            + group * stride_k_group
+        )
+        k_mask = token_ok[None, :]
+        keys0 = tl.load(k_base + dims0[:, None], mask=k_mask, other=0.0)
+        keys1 = tl.load(k_base + dims1[:, None], mask=k_mask, other=0.0)
+        keys2 = tl.load(k_base + dims2[:, None], mask=k_mask, other=0.0)
+        scores = (
+            tl.dot(queries0, keys0, out_dtype=tl.float32)
+            + tl.dot(queries1, keys1, out_dtype=tl.float32)
+            + tl.dot(queries2, keys2, out_dtype=tl.float32)
+        ) * scale
+        scores = tl.where(token_head_ok, scores, NEGATIVE_INFINITY)
         v_base = (
             v_ptr
             + safe_tokens[:, None] * stride_v_token
             + group * stride_v_group
         )
-        values1 = tl.load(
-            v_base + dims1[None, :], mask=token_ok[:, None], other=0.0
-        )
-        values2 = tl.load(
-            v_base + dims2[None, :], mask=token_ok[:, None], other=0.0
-        )
-
-        if K_TRANSPOSED_LOAD:
-            scores = (
-                tl.dot(queries1, keys1, out_dtype=tl.float32)
-                + tl.dot(queries2, keys2, out_dtype=tl.float32)
-            ) * scale
-        else:
-            scores = (
-                tl.dot(queries1, tl.trans(keys1), out_dtype=tl.float32)
-                + tl.dot(queries2, tl.trans(keys2), out_dtype=tl.float32)
-            ) * scale
-        scores = tl.where(
-            token_ok[None, :] & head_ok[:, None], scores, NEGATIVE_INFINITY
-        )
+        v_mask = token_ok[:, None]
+        values0 = tl.load(v_base + dims0[None, :], mask=v_mask, other=0.0)
+        values1 = tl.load(v_base + dims1[None, :], mask=v_mask, other=0.0)
+        values2 = tl.load(v_base + dims2[None, :], mask=v_mask, other=0.0)
         tile_max = tl.maximum(running_max, tl.max(scores, axis=1))
         empty = tile_max == NEGATIVE_INFINITY
         shift = tl.where(empty, 0.0, tile_max)
-        if USE_LOG2:
-            rescale = tl.where(empty, 1.0, tl.math.exp2(running_max - shift))
-            probabilities = tl.math.exp2(scores - shift[:, None])
-        else:
-            rescale = tl.where(empty, 1.0, tl.exp(running_max - shift))
-            probabilities = tl.exp(scores - shift[:, None])
+        rescale = tl.where(empty, 1.0, tl.math.exp2(running_max - shift))
+        probabilities = tl.math.exp2(scores - shift[:, None])
         running_sum = running_sum * rescale + tl.sum(probabilities, axis=1)
-        p = probabilities.to(values1.dtype)
+        p = probabilities.to(queries0.dtype)
+        acc0 = acc0 * rescale[:, None] + tl.dot(p, values0, out_dtype=tl.float32)
         acc1 = acc1 * rescale[:, None] + tl.dot(p, values1, out_dtype=tl.float32)
         acc2 = acc2 * rescale[:, None] + tl.dot(p, values2, out_dtype=tl.float32)
         running_max = tile_max
 
     selected = running_sum > 0
-    if SHARED_RECIP:
-        inv_sum = tl.div_rn(1.0, tl.where(selected, running_sum, 1.0))
-        output1 = tl.where(selected[:, None], acc1 * inv_sum[:, None], 0.0)
-        output2 = tl.where(selected[:, None], acc2 * inv_sum[:, None], 0.0)
-    else:
-        output1 = tl.where(selected[:, None], acc1 / running_sum[:, None], 0.0)
-        output2 = tl.where(selected[:, None], acc2 / running_sum[:, None], 0.0)
+    inv_sum = tl.div_rn(1.0, tl.where(selected, running_sum, 1.0))
+    output0 = tl.where(selected[:, None], acc0 * inv_sum[:, None], 0.0)
+    output1 = tl.where(selected[:, None], acc1 * inv_sum[:, None], 0.0)
+    output2 = tl.where(selected[:, None], acc2 * inv_sum[:, None], 0.0)
     out_base = (
         out_ptr
+        + split * stride_out_split
         + query * stride_out_token
         + (group * heads_per_group + heads)[:, None] * stride_out_head
+    )
+    tl.store(
+        out_base + dims0[None, :],
+        output0.to(out_ptr.dtype.element_ty),
+        mask=head_ok[:, None],
     )
     tl.store(
         out_base + dims1[None, :],
@@ -336,26 +337,32 @@ def _sparse_attn_prefill_dsplit_kernel(
         mask=head_ok[:, None],
     )
     tl.store(
-        lse_ptr + query * stride_lse_token + group * heads_per_group + heads,
+        lse_ptr
+        + split * stride_lse_split
+        + query * stride_lse_token
+        + group * heads_per_group
+        + heads,
         tl.where(
             selected,
-            running_max * LN2 + tl.log(running_sum)
-            if USE_LOG2
-            else running_max + tl.log(running_sum),
+            running_max * LN2 + tl.log(running_sum),
             NEGATIVE_INFINITY,
         ),
         mask=head_ok,
     )
 
 
-def _prefill_head_dim_split(head_dim: int) -> tuple[int, int] | None:
-    """Return two power-of-two chunks that exactly cover ``head_dim``."""
+def _prefill_head_dim_split(head_dim: int) -> tuple[int, int, int] | None:
+    """``(D1, D2, D3)`` pow2 MMAC chunks covering ``head_dim``, or ``None``.
+
+    ``head_dim=192`` is launched as ``64+64+64`` rather than ``128+64``: three
+    64-wide MMACs use fewer VGPRs than one 128-wide tile plus one 64-wide tile.
+    """
     if head_dim <= 0 or head_dim & (head_dim - 1) == 0:
         return None
     d1 = 1 << (head_dim.bit_length() - 1)
     d2 = head_dim - d1
-    if d2 >= 16 and d2 & (d2 - 1) == 0:
-        return d1, d2
+    if d1 == 128 and d2 == 64:
+        return 64, 64, 64
     return None
 
 
@@ -686,7 +693,22 @@ _CONFIG_DIR = os.path.join(
     "config",
     "sparse_attn_prefill",
 )
-_KERNEL_CONFIG_KEYS = frozenset({"BLOCK_R", "BLOCK_H", "BLOCK_D", "BLOCK_Q"})
+# Occupancy JSON keys consumed by this file:
+#   AUTO_KV_SPLITS                         – host only (grid split count)
+#   BLOCK_R, BLOCK_H, BLOCK_D, BLOCK_Q     – tiles
+#   num_warps, num_stages                  – standard launch
+#   remaining keys                         – HIP compiler options if the backend supports them
+# Dsplit path is fixed: 64+64+64, log2 softmax, shared reciprocal, transposed K,
+# hybrid K-before-QK / V-after-QK schedule.
+_HOST_CONFIG_KEYS = frozenset({"AUTO_KV_SPLITS"})
+_KERNEL_CONFIG_KEYS = frozenset(
+    {
+        "BLOCK_R",
+        "BLOCK_H",
+        "BLOCK_D",
+        "BLOCK_Q",
+    }
+)
 _STANDARD_LAUNCH_KEYS = frozenset({"num_warps", "num_stages"})
 
 
@@ -711,7 +733,11 @@ def _build_launch_options(
 
     capabilities = get_triton_capabilities()
     for name, value in config.items():
-        if name in _KERNEL_CONFIG_KEYS or name in _STANDARD_LAUNCH_KEYS:
+        if (
+            name in _KERNEL_CONFIG_KEYS
+            or name in _STANDARD_LAUNCH_KEYS
+            or name in _HOST_CONFIG_KEYS
+        ):
             continue
         if capabilities.supports(name):
             options[name] = value
@@ -779,26 +805,30 @@ def _load_sparse_attn_prefill_config(
     packed_regions: torch.Tensor,
     region_size: int,
 ) -> dict[str, Any] | None:
-    """Select the best-matching config entry from ``sparse_attn_prefill_{device}.json``.
+    """Select a per-query config by unique ``sparse_attention_prefill`` inputs.
 
-    Shape fields extracted from the tensors and matched against each entry's
-    ``match`` dict (mirroring the MLA ``_get_tuned_config`` convention):
+    Duplicate extents are recorded once:
 
-    * ``s_q``         – number of query tokens  (``query.shape[0]``)
-    * ``h_q``         – total query heads        (``query.shape[1]``)
-    * ``h_kv``        – KV-cache head groups     (``key_cache.shape[1]``, == ``num_kv_groups``)
-    * ``d``           – head dimension           (``query.shape[2]``)
-    * ``topk``        – selected region slots    (``packed_regions.shape[1]``)
-    * ``region_size`` – tokens per region        (runtime argument)
-    * ``dtype``       – e.g. ``"bfloat16"``      (``str(query.dtype).replace("torch.", "")``)
+    * ``s_q`` / ``h_q`` / ``d`` / ``dtype`` from ``query``
+      (``[total_q, num_heads, head_dim]``). ``d`` also covers K/V head dim.
+    * ``s_k`` / ``h_kv`` from ``key_cache`` (``[tokens, num_kv_groups, head_dim]``).
+      ``value_cache`` must equal ``key_cache``; ``num_kv_groups`` is ``h_kv``.
+    * ``topk`` from ``packed_regions.shape[1]``. Row count is ``h_kv * s_q``.
+    * ``region_size`` from the keyword argument.
+
+    Not match keys: ``region_counts`` (same rows as ``packed_regions``);
+    ``softmax_scale`` (defaults from ``d``); ``block_regions`` (fallback
+    ``BLOCK_R`` only); ``logical_regions`` / ``q_positions`` /
+    ``request_indices`` / ``block_q`` (tiled JSON).
     """
     device_tag = _device_name_for_config()
     data = _load_prefill_device_configs(device_tag)
     shape = {
         "s_q": int(query.shape[0]),
         "h_q": int(query.shape[1]),
-        "h_kv": int(key_cache.shape[1]),
         "d": int(query.shape[2]),
+        "s_k": int(key_cache.shape[0]),
+        "h_kv": int(key_cache.shape[1]),
         "topk": int(packed_regions.shape[1]),
         "region_size": int(region_size),
         "dtype": str(query.dtype).replace("torch.", ""),
@@ -836,6 +866,68 @@ def _per_query_tile_defaults(
         element_size=element_size,
     )
     return block_h, block_d, block_r
+
+
+def _clamp_auto_kv_splits(value: int, packed_width: int) -> int:
+    return min(max(int(value), 1), max(int(packed_width), 1))
+
+
+def choose_prefill_kv_splits(
+    total_q: int,
+    num_kv_groups: int,
+    packed_width: int,
+    *,
+    target_programs: int | None = None,
+    min_slots_per_split: int = 8,
+    device: torch.device | None = None,
+) -> int:
+    """Pick a split count that fills CUs without emptying each split's slot window.
+
+    Size-aware occupancy only: uses ``Q * G`` and device CU count. Caps splits so
+    ``ceil(packed_width / splits) >= min_slots_per_split`` when the row is full.
+    Extra-wave occupancy beyond CU-fill is pinned per match by ``AUTO_KV_SPLITS``
+    in the occupancy JSON. The chooser itself only covers ``Q * G < CUs``.
+    """
+    packed_width = max(int(packed_width), 1)
+    programs_base = max(int(total_q) * int(num_kv_groups), 1)
+    if target_programs is None:
+        try:
+            index = (
+                device.index
+                if device is not None and device.index is not None
+                else torch.cuda.current_device()
+            )
+            target_programs = int(torch.cuda.get_device_properties(index).multi_processor_count)
+        except Exception:
+            target_programs = 1
+    target_programs = max(int(target_programs or 1), 1)
+    splits = -(-target_programs // programs_base)
+    min_slots = max(int(min_slots_per_split), 1)
+    if min_slots <= 1:
+        max_splits = packed_width
+    else:
+        max_splits = max(1, (packed_width - 1) // (min_slots - 1))
+    return min(max(splits, 1), max_splits, packed_width)
+
+
+def _resolve_prefill_kv_splits(
+    launch: dict[str, Any] | None,
+    *,
+    total_q: int,
+    num_kv_groups: int,
+    packed_width: int,
+    device: torch.device | None = None,
+) -> int:
+    """Pinned ``AUTO_KV_SPLITS`` if present, otherwise CU-fill occupancy."""
+    pinned = launch.get("AUTO_KV_SPLITS") if launch else None
+    if pinned is not None:
+        return _clamp_auto_kv_splits(int(pinned), packed_width)
+    return choose_prefill_kv_splits(
+        total_q,
+        num_kv_groups,
+        packed_width,
+        device=device,
+    )
 
 
 def sparse_attn_prefill_tiled_union_bucket(union: int) -> int:
@@ -1098,6 +1190,11 @@ def sparse_attention_prefill(
             Missing tile fields use the built-in defaults; supported Triton compiler
             options are forwarded according to the active backend. An empty mapping
             skips lookup and keeps all built-in defaults.
+            On the per-query path, ``AUTO_KV_SPLITS`` pins extra-wave KV splits so
+            ``Q * G`` occupancy can hide gather latency; if absent,
+            :func:`choose_prefill_kv_splits` fills CUs (``ceil(CUs / (Q*G))``,
+            usually 1 at production ``Q=128``). ``AUTO_KV_SPLITS`` is host-only.
+            Partials are always merged with :func:`merge_split_states`.
 
     Returns:
         ``(out, lse)`` shaped ``[total_q, num_heads, head_dim]`` and
@@ -1182,9 +1279,8 @@ def sparse_attention_prefill(
             lse=lse,
         )
 
-    out = torch.empty_like(query)
-    _require_contiguous_last_dim(out, "out")
-    lse = torch.empty((total_q, num_heads), device=query.device, dtype=torch.float32)
+    from boltops.step4_dsa.triton.merge import merge_split_states
+
     launch = config
     if launch is None:
         launch = _load_sparse_attn_prefill_config(
@@ -1193,10 +1289,28 @@ def sparse_attention_prefill(
             packed_regions,
             region_size,
         )
+    num_splits = _resolve_prefill_kv_splits(
+        launch,
+        total_q=total_q,
+        num_kv_groups=num_kv_groups,
+        packed_width=topk,
+        device=query.device,
+    )
+    slots_per_split = -(-topk // num_splits)
+
+    out = torch.empty(
+        (num_splits, total_q, num_heads, head_dim),
+        device=query.device,
+        dtype=query.dtype,
+    )
+    _require_contiguous_last_dim(out, "out")
+    lse = torch.empty(
+        (num_splits, total_q, num_heads), device=query.device, dtype=torch.float32
+    )
     default_h, default_d, default_r = _per_query_tile_defaults(
         heads_per_group=heads_per_group,
         head_dim=head_dim,
-        topk=topk,
+        topk=slots_per_split,
         block_regions=block_regions,
         region_size=region_size,
         element_size=key_cache.element_size(),
@@ -1210,73 +1324,59 @@ def sparse_attention_prefill(
     else:
         block_h, block_d, block_r = default_h, default_d, default_r
 
+    common_args = (
+        query,
+        key_cache,
+        value_cache,
+        packed_regions,
+        region_counts,
+        out,
+        lse,
+        query.stride(0),
+        query.stride(1),
+        key_cache.stride(0),
+        key_cache.stride(1),
+        value_cache.stride(0),
+        value_cache.stride(1),
+        packed_regions.stride(0),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        lse.stride(0),
+        lse.stride(1),
+        scale,
+        total_q,
+    )
+    common_meta = dict(
+        topk=topk,
+        heads_per_group=heads_per_group,
+        head_dim=head_dim,
+        region_size=region_size,
+        slots_per_split=slots_per_split,
+        BLOCK_H=block_h,
+        BLOCK_R=block_r,
+    )
     dim_split = _prefill_head_dim_split(head_dim)
     if dim_split is not None:
-        d1, d2 = dim_split
-        _sparse_attn_prefill_dsplit_kernel[(total_q, num_kv_groups)](
-            query,
-            key_cache,
-            value_cache,
-            packed_regions,
-            region_counts,
-            out,
-            lse,
-            query.stride(0),
-            query.stride(1),
-            key_cache.stride(0),
-            key_cache.stride(1),
-            value_cache.stride(0),
-            value_cache.stride(1),
-            packed_regions.stride(0),
-            out.stride(0),
-            out.stride(1),
-            lse.stride(0),
-            scale,
-            total_q,
-            topk=topk,
-            heads_per_group=heads_per_group,
-            head_dim=head_dim,
-            region_size=region_size,
-            BLOCK_H=block_h,
+        d1, d2, d3 = dim_split
+        _sparse_attn_prefill_dsplit_kernel[(total_q, num_kv_groups, num_splits)](
+            *common_args,
             BLOCK_D1=d1,
             BLOCK_D2=d2,
-            BLOCK_R=block_r,
-            USE_LOG2=True,
-            SHARED_RECIP=True,
-            K_TRANSPOSED_LOAD=False,
+            BLOCK_D3=d3,
+            **common_meta,
             **extra,
         )
     else:
-        _sparse_attn_prefill_kernel[(total_q, num_kv_groups)](
-            query,
-            key_cache,
-            value_cache,
-            packed_regions,
-            region_counts,
-            out,
-            lse,
-            query.stride(0),
-            query.stride(1),
-            key_cache.stride(0),
-            key_cache.stride(1),
-            value_cache.stride(0),
-            value_cache.stride(1),
-            packed_regions.stride(0),
-            out.stride(0),
-            out.stride(1),
-            lse.stride(0),
-            scale,
-            total_q,
-            topk=topk,
-            heads_per_group=heads_per_group,
-            head_dim=head_dim,
-            region_size=region_size,
-            BLOCK_H=block_h,
+        _sparse_attn_prefill_kernel[(total_q, num_kv_groups, num_splits)](
+            *common_args,
+            **common_meta,
             BLOCK_D=block_d,
-            BLOCK_R=block_r,
             **extra,
         )
-    return out, lse
+    if num_splits == 1:
+        return out[0], lse[0]
+    return merge_split_states(out, lse)
 
 
 # Previous landing name; same function.

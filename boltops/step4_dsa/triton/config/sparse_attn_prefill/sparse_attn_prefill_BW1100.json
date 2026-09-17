@@ -1,26 +1,211 @@
 {
   "metadata": {
     "triton_version": "3.6.0",
-    "device_name": "BW1100"
+    "device_name": "BW1100",
+    "arch": "gfx938"
   },
   "configs": [
     {
       "match": {
+        "s_q": 1,
         "h_q": 8,
-        "h_kv": 1,
         "d": 192,
+        "s_k": 32768,
+        "h_kv": 1,
         "topk": 513,
         "region_size": 8,
         "dtype": "bfloat16"
       },
       "config": {
+        "AUTO_KV_SPLITS": 72,
+        "BLOCK_R": 8,
+        "BLOCK_H": 16,
+        "num_warps": 2,
+        "num_stages": 2,
+        "waves_per_eu": 2,
+        "kpack": 1,
+        "enable_v_mmac_cluster": 2,
+        "empty_arrive_after_mmac": false,
+        "misched_regpressure": false,
+        "schedule_hint": "attention",
+        "amdgpu_enable_max_ilp_scheduling_strategy": true
+      }
+    },
+    {
+      "match": {
+        "s_q": 4,
+        "h_q": 8,
+        "d": 192,
+        "s_k": 32768,
+        "h_kv": 1,
+        "topk": 513,
+        "region_size": 8,
+        "dtype": "bfloat16"
+      },
+      "config": {
+        "AUTO_KV_SPLITS": 72,
+        "BLOCK_R": 8,
+        "BLOCK_H": 16,
+        "num_warps": 1,
+        "num_stages": 1,
+        "waves_per_eu": 3,
+        "kpack": 2,
+        "enable_v_mmac_cluster": 2,
+        "empty_arrive_after_mmac": false,
+        "misched_regpressure": false,
+        "schedule_hint": "attention",
+        "hcu_use_gfx946_sched_model_v2": true,
+        "amdgpu_enable_max_ilp_scheduling_strategy": true
+      }
+    },
+    {
+      "match": {
+        "s_q": 8,
+        "h_q": 8,
+        "d": 192,
+        "s_k": 32768,
+        "h_kv": 1,
+        "topk": 513,
+        "region_size": 8,
+        "dtype": "bfloat16"
+      },
+      "config": {
+        "AUTO_KV_SPLITS": 18,
         "BLOCK_R": 8,
         "BLOCK_H": 16,
         "num_warps": 2,
         "num_stages": 1,
         "waves_per_eu": 3,
         "kpack": 2,
-        "enable_v_mmac_cluster": 2
+        "enable_v_mmac_cluster": 2,
+        "empty_arrive_after_mmac": true,
+        "misched_regpressure": false,
+        "schedule_hint": "attention"
+      }
+    },
+    {
+      "match": {
+        "s_q": 32,
+        "h_q": 8,
+        "d": 192,
+        "s_k": 32768,
+        "h_kv": 1,
+        "topk": 513,
+        "region_size": 8,
+        "dtype": "bfloat16"
+      },
+      "config": {
+        "AUTO_KV_SPLITS": 18,
+        "BLOCK_R": 8,
+        "BLOCK_H": 16,
+        "num_warps": 2,
+        "num_stages": 1,
+        "waves_per_eu": 1,
+        "kpack": 1,
+        "enable_v_mmac_cluster": 2,
+        "empty_arrive_after_mmac": true,
+        "misched_regpressure": false,
+        "schedule_hint": "attention"
+      }
+    },
+    {
+      "match": {
+        "s_q": 64,
+        "h_q": 8,
+        "d": 192,
+        "s_k": 32768,
+        "h_kv": 1,
+        "topk": 513,
+        "region_size": 8,
+        "dtype": "bfloat16"
+      },
+      "config": {
+        "AUTO_KV_SPLITS": 8,
+        "BLOCK_R": 8,
+        "BLOCK_H": 16,
+        "num_warps": 2,
+        "num_stages": 1,
+        "waves_per_eu": 3,
+        "kpack": 2,
+        "enable_v_mmac_cluster": 2,
+        "empty_arrive_after_mmac": true,
+        "misched_regpressure": false,
+        "schedule_hint": "attention"
+      }
+    },
+    {
+      "match": {
+        "s_q": 128,
+        "h_q": 8,
+        "d": 192,
+        "s_k": 32768,
+        "h_kv": 1,
+        "topk": 513,
+        "region_size": 8,
+        "dtype": "bfloat16"
+      },
+      "config": {
+        "AUTO_KV_SPLITS": 4,
+        "BLOCK_R": 8,
+        "BLOCK_H": 16,
+        "num_warps": 2,
+        "num_stages": 1,
+        "waves_per_eu": 3,
+        "kpack": 2,
+        "enable_v_mmac_cluster": 2,
+        "empty_arrive_after_mmac": true,
+        "misched_regpressure": false,
+        "schedule_hint": "attention"
+      }
+    },
+    {
+      "match": {
+        "s_q": 512,
+        "h_q": 8,
+        "d": 192,
+        "s_k": 32768,
+        "h_kv": 1,
+        "topk": 513,
+        "region_size": 8,
+        "dtype": "bfloat16"
+      },
+      "config": {
+        "AUTO_KV_SPLITS": 4,
+        "BLOCK_R": 8,
+        "BLOCK_H": 16,
+        "num_warps": 2,
+        "num_stages": 1,
+        "waves_per_eu": 3,
+        "kpack": 2,
+        "enable_v_mmac_cluster": 2,
+        "empty_arrive_after_mmac": true,
+        "misched_regpressure": false,
+        "schedule_hint": "attention"
+      }
+    },
+    {
+      "match": {
+        "s_q": 4096,
+        "h_q": 8,
+        "d": 192,
+        "s_k": 32768,
+        "h_kv": 1,
+        "topk": 513,
+        "region_size": 8,
+        "dtype": "bfloat16"
+      },
+      "config": {
+        "AUTO_KV_SPLITS": 1,
+        "BLOCK_R": 8,
+        "BLOCK_H": 16,
+        "num_warps": 2,
+        "num_stages": 1,
+        "waves_per_eu": 3,
+        "kpack": 2,
+        "enable_v_mmac_cluster": 2,
+        "empty_arrive_after_mmac": true,
+        "misched_regpressure": false,
+        "schedule_hint": "attention"
       }
     }
   ]

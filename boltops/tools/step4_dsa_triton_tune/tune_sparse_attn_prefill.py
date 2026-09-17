@@ -190,9 +190,11 @@ def main() -> None:
     # Build the new-format entry to upsert into the configs list.
     new_entry = {
         "match": {
+            "s_q": int(data["query"].shape[0]),
             "h_q": int(data["query"].shape[1]),
-            "h_kv": args.groups,
             "d": head_dim,
+            "s_k": int(data["key_cache"].shape[0]),
+            "h_kv": int(data["key_cache"].shape[1]),
             "topk": packed_width,
             "region_size": int(geo.region_block_size),
             "dtype": str(data["query"].dtype).replace("torch.", ""),

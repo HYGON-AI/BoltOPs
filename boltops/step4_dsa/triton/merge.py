@@ -103,6 +103,17 @@ def merge_split_states(
     out = torch.empty((tokens, num_heads, head_dim), device=partial_out.device, dtype=partial_out.dtype)
     _require_contiguous_last_dim(out, "out")
     lse = torch.empty((tokens, num_heads), device=partial_out.device, dtype=torch.float32)
+    block_s = triton.next_power_of_2(num_splits)
+    # Prefill merge is 1024 tiny workgroups (Q=128, H=8, S=4). Default HIP
+    # num_warps=4 launched 4096 waves of 255 instructions and spent 50% of
+    # cycles No-Eligible. One warp is enough for S<=8; large decode S keeps
+    # more warps so BLOCK_S*BLOCK_D states still fit.
+    if block_s <= 8:
+        num_warps = 1
+    elif block_s <= 32:
+        num_warps = 2
+    else:
+        num_warps = 4
     _merge_split_states_kernel[(tokens, num_heads)](
         partial_out,
         partial_lse,
@@ -118,8 +129,10 @@ def merge_split_states(
         lse.stride(0),
         num_splits,
         head_dim=head_dim,
-        BLOCK_S=triton.next_power_of_2(num_splits),
+        BLOCK_S=block_s,
         BLOCK_D=triton.next_power_of_2(head_dim),
+        num_warps=num_warps,
+        num_stages=1,
     )
     return out, lse
 

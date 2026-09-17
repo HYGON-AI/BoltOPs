@@ -25,6 +25,9 @@
         "num_warps": 1,
         "num_stages": 3,
         "waves_per_eu": 2,
+        "kpack": 2,
+        "enable_v_mmac_cluster": 2,
+        "misched_regpressure": true,
         "empty_arrive_after_mmac": true
       }
     },
@@ -41,16 +44,18 @@
         "dtype": "bfloat16"
       },
       "config": {
+        "AUTO_KV_SPLITS": 2,
         "BALANCE_LIVE": false,
-        "BLOCK_R": 8,
+        "BLOCK_R": 4,
         "BLOCK_H": 16,
-        "num_warps": 2,
+        "num_warps": 1,
         "num_stages": 1,
-        "waves_per_eu": 1,
-        "enable_v_mmac_cluster": 2,
+        "waves_per_eu": 2,
         "kpack": 2,
+        "enable_v_mmac_cluster": 2,
         "misched_regpressure": false,
-        "empty_arrive_after_mmac": true
+        "empty_arrive_after_mmac": true,
+        "amdgpu_enable_max_ilp_scheduling_strategy": true
       }
     },
     {
@@ -68,15 +73,16 @@
       "config": {
         "AUTO_KV_SPLITS": 72,
         "BALANCE_LIVE": false,
-        "BLOCK_R": 2,
+        "BLOCK_R": 8,
         "BLOCK_H": 16,
         "num_warps": 2,
-        "num_stages": 3,
-        "waves_per_eu": 2,
-        "kpack": 2,
+        "num_stages": 1,
+        "waves_per_eu": 1,
+        "kpack": 1,
         "enable_v_mmac_cluster": 2,
         "misched_regpressure": false,
-        "empty_arrive_after_mmac": true
+        "empty_arrive_after_mmac": true,
+        "hcu_use_gfx946_sched_model_v2": true
       }
     },
     {
@@ -92,17 +98,18 @@
         "dtype": "bfloat16"
       },
       "config": {
-        "AUTO_KV_SPLITS": 36,
+        "AUTO_KV_SPLITS": 54,
         "BALANCE_LIVE": false,
-        "BLOCK_R": 8,
+        "BLOCK_R": 2,
         "BLOCK_H": 16,
         "num_warps": 2,
-        "num_stages": 1,
-        "waves_per_eu": 2,
+        "num_stages": 3,
+        "waves_per_eu": 1,
         "kpack": 2,
         "enable_v_mmac_cluster": 2,
         "misched_regpressure": false,
-        "empty_arrive_after_mmac": true
+        "empty_arrive_after_mmac": true,
+        "hcu_use_gfx946_sched_model_v2": true
       }
     },
     {
@@ -118,17 +125,19 @@
         "dtype": "bfloat16"
       },
       "config": {
-        "AUTO_KV_SPLITS": 18,
+        "AUTO_KV_SPLITS": 36,
         "BALANCE_LIVE": false,
-        "BLOCK_R": 8,
+        "BLOCK_R": 2,
         "BLOCK_H": 16,
-        "num_warps": 2,
-        "num_stages": 1,
+        "num_warps": 1,
+        "num_stages": 2,
         "waves_per_eu": 1,
         "kpack": 2,
         "enable_v_mmac_cluster": 2,
         "misched_regpressure": false,
-        "empty_arrive_after_mmac": true
+        "empty_arrive_after_mmac": true,
+        "hcu_use_gfx946_sched_model_v2": true,
+        "amdgpu_enable_max_ilp_scheduling_strategy": true
       }
     },
     {
@@ -144,7 +153,7 @@
         "dtype": "bfloat16"
       },
       "config": {
-        "AUTO_KV_SPLITS": 72,
+        "AUTO_KV_SPLITS": 18,
         "BALANCE_LIVE": false,
         "BLOCK_R": 2,
         "BLOCK_H": 16,
@@ -154,7 +163,8 @@
         "kpack": 2,
         "enable_v_mmac_cluster": 2,
         "misched_regpressure": false,
-        "empty_arrive_after_mmac": true
+        "empty_arrive_after_mmac": true,
+        "hcu_use_gfx946_sched_model_v2": true
       }
     },
     {
@@ -170,17 +180,19 @@
         "dtype": "bfloat16"
       },
       "config": {
-        "AUTO_KV_SPLITS": 72,
+        "PIPELINE_KV": true,
+        "AUTO_KV_SPLITS": 4,
         "BALANCE_LIVE": false,
-        "BLOCK_R": 2,
+        "BLOCK_R": 4,
         "BLOCK_H": 16,
-        "num_warps": 1,
+        "num_warps": 2,
         "num_stages": 1,
-        "waves_per_eu": 2,
-        "kpack": 2,
+        "waves_per_eu": 1,
+        "kpack": 1,
         "enable_v_mmac_cluster": 2,
         "misched_regpressure": false,
-        "empty_arrive_after_mmac": true
+        "empty_arrive_after_mmac": true,
+        "amdgpu_enable_max_ilp_scheduling_strategy": true
       }
     },
     {
@@ -196,16 +208,19 @@
         "dtype": "bfloat16"
       },
       "config": {
+        "PIPELINE_KV": true,
+        "AUTO_KV_SPLITS": 2,
         "BALANCE_LIVE": false,
-        "BLOCK_R": 8,
+        "BLOCK_R": 4,
         "BLOCK_H": 16,
         "num_warps": 2,
         "num_stages": 1,
-        "waves_per_eu": 1,
+        "waves_per_eu": 2,
+        "kpack": 1,
         "enable_v_mmac_cluster": 2,
-        "kpack": 2,
         "misched_regpressure": false,
-        "empty_arrive_after_mmac": true
+        "empty_arrive_after_mmac": true,
+        "amdgpu_enable_max_ilp_scheduling_strategy": true
       }
     }
   ]
