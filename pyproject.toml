@@ -64,6 +64,12 @@ packages = [
     "boltops.mqa_logits",
     "boltops.mqa_logits.triton",
     "boltops.mqa_logits.tilelang",
+    "boltops.mqa_logits.tilelang.configs",
+    "boltops.mqa_logits.tilelang.configs.mqa_decode",
+    "boltops.mqa_logits.tilelang.configs.mqa_prefill",
+    "boltops.mqa_logits.tilelang.kernels",
+    "boltops.mqa_logits.tilelang.kernels.common",
+    "boltops.mqa_logits.tilelang.kernels.gfx938",
     "boltops.fla",
     "boltops.fla.common",
     "boltops.fla.common.triton",
@@ -122,5 +128,6 @@ boltops = [
 testpaths = ["test"]
 pythonpath = ["."]
 markers = [
+    "slow: long GPU grids skipped unless --runslow",
     "bench: performance benchmark on real-model sizes (requires --bench/--benchmark)",
 ]

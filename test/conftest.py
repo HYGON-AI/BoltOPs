@@ -1,6 +1,8 @@
 """Shared pytest hooks for correctness vs performance suites.
 
 Default: run functional/correctness tests only.
+With ``--runslow``: also collect ``@pytest.mark.slow`` GPU grids (TileLang MQA
+shape sweeps, extra kernels). CI omits these.
 With ``--bench`` / ``--benchmark``: also collect ``@pytest.mark.bench`` cases
 (real-model sizes, timing). Bench and correctness use different shape sets on
 purpose.
@@ -16,6 +18,12 @@ import torch
 
 def pytest_addoption(parser: pytest.Parser) -> None:
     group = parser.getgroup("boltops")
+    group.addoption(
+        "--runslow",
+        action="store_true",
+        default=False,
+        help="also run @pytest.mark.slow cases (large TileLang MQA GPU grids)",
+    )
     group.addoption(
         "--bench",
         "--benchmark",
@@ -40,6 +48,10 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line(
         "markers",
+        "slow: long GPU grids skipped unless --runslow (CI default omits these)",
+    )
+    config.addinivalue_line(
+        "markers",
         "bench: performance benchmark on real-model sizes (requires --bench/--benchmark)",
     )
 
@@ -47,14 +59,19 @@ def pytest_configure(config: pytest.Config) -> None:
 def pytest_collection_modifyitems(
     config: pytest.Config, items: list[pytest.Item]
 ) -> None:
-    if config.getoption("--bench"):
-        return
     skip_bench = pytest.mark.skip(
         reason="pass --bench or --benchmark to run performance benchmarks"
     )
+    skip_slow = pytest.mark.skip(
+        reason="pass --runslow to run @pytest.mark.slow GPU grids"
+    )
+    run_bench = config.getoption("--bench")
+    run_slow = config.getoption("--runslow")
     for item in items:
-        if "bench" in item.keywords:
+        if not run_bench and "bench" in item.keywords:
             item.add_marker(skip_bench)
+        if not run_slow and "slow" in item.keywords:
+            item.add_marker(skip_slow)
 
 
 @pytest.fixture

@@ -4,7 +4,6 @@ from tilelang import language as T
 
 _PASS_CONFIGS = {
     tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-    tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
     tilelang.PassConfigKey.TL_DISABLE_DATA_RACE_CHECK: True,
 }
 

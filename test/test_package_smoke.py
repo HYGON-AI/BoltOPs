@@ -15,7 +15,11 @@ from boltops.generic import (
 )
 from boltops.fla.kda import recompute_w_u_fwd as recompute_w_u_fwd_kda
 from boltops.fla.gdn import recompute_w_u_fwd as recompute_w_u_fwd_gdn
-from boltops.mqa_logits import triton_mqa_logits
+from boltops.mqa_logits import (
+    tilelang_qsa_mqa_decode,
+    tilelang_qsa_mqa_prefill,
+    triton_mqa_logits,
+)
 from boltops.gemm import (
     awq_gemm_triton,
     batched_gemm_a16wfp4,
@@ -68,6 +72,8 @@ def test_version():
 def test_operator_package_exports():
     assert callable(attn_res)
     assert callable(triton_mqa_logits)
+    assert callable(tilelang_qsa_mqa_decode)
+    assert callable(tilelang_qsa_mqa_prefill)
     assert callable(fused_mamba_state_scatter_with_mask)
     assert callable(recompute_w_u_fwd_kda)
     assert callable(recompute_w_u_fwd_gdn)
