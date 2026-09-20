@@ -3,7 +3,7 @@
 Public Triton entry lives here; TileLang can be added later as a sibling
 export (e.g. ``tilelang_mqa_logits``) without renaming this API.
 
-* docs: ``docs/ops/mqa_logits.md``
+* docs: ``docs/ops/mqa_logits.md`` (FP8 Triton), ``docs/ops/mqa_logits_tilelang.md`` (BF16 TileLang)
 * tests: ``test/mqa_logits/``
 
 Public operator:
@@ -11,6 +11,8 @@ Public operator:
 * ``triton_mqa_logits`` — prefill / dense KV (Triton)
   - ``kv_scales`` provided → float8 path
   - ``kv_scales is None`` → fp16/bf16 path
+* ``tilelang_qsa_mqa_prefill`` — TileLang QSA prefill / dense KV
+* ``tilelang_qsa_mqa_decode`` — TileLang QSA paged decode
 """
 
 from __future__ import annotations
@@ -29,6 +31,44 @@ def _is_fp8_dtype(dtype: torch.dtype) -> bool:
 
 def _is_half_dtype(dtype: torch.dtype) -> bool:
     return dtype in _HALF_DTYPES
+
+
+def tilelang_qsa_mqa_prefill(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    score_scale: Optional[float] = None,
+    effective_range: Optional[int] = None,
+) -> torch.Tensor:
+    """Compute BF16 QSA MQA logits for prefill through the TileLang backend.
+
+    ``effective_range`` is the longest valid key span among all rows in
+    this launch, ``max(row_ends - row_starts)``. Packed multi-sequence
+    batches still use one value (the max across sequences). ``None``
+    (default) means the heuristic uses ``k.shape[0]``.
+    """
+    from .tilelang._dispatch import resolve
+
+    return resolve("qsa_mqa_prefill", q.device)(
+        q, k, row_starts, row_ends, score_scale, effective_range
+    )
+
+
+def tilelang_qsa_mqa_decode(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    context_lens: torch.Tensor,
+    max_model_len: int,
+    score_scale: Optional[float] = None,
+) -> torch.Tensor:
+    """Compute BF16 QSA MQA logits for paged decode through the TileLang backend."""
+    from .tilelang._dispatch import resolve
+
+    return resolve("qsa_mqa_decode", q.device)(
+        q, k_cache, page_table, context_lens, max_model_len, score_scale
+    )
 
 
 def triton_mqa_logits(
@@ -345,4 +385,6 @@ def _run_triton_prefill(
 
 __all__ = [
     "triton_mqa_logits",
+    "tilelang_qsa_mqa_decode",
+    "tilelang_qsa_mqa_prefill",
 ]

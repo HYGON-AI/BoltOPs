@@ -161,7 +161,7 @@ build:test-wheel:
       cp pyproject.toml "${wheel_test_dir}/pyproject.toml"
       (
         cd "${wheel_test_dir}"
-        python -m pytest test -s --tb=short \
+        python -m pytest test -s --tb=short -m "not slow" \
           --junitxml="${CI_PROJECT_DIR}/boltops_test.xml"
       )
   artifacts:

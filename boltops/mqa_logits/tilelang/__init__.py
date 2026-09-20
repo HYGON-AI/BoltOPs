@@ -1,1 +1,1 @@
-"""TileLang backend for MQA logits (placeholder)."""
+"""TileLang backend for MQA logits."""
