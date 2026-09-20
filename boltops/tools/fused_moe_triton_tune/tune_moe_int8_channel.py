@@ -414,7 +414,13 @@ HIDDEN_SIZES = [get_env_int("MOE_HIDDEN_SIZE", 384)]  # N1/2 = K2 = HIDDEN_SIZES
 FFN_HIDDEN_SIZES = [get_env_int("MOE_FFN_HIDDEN_SIZE", 3072)]  # K1, N2
 EP_SIZE = [ep_size]
 TOP_KS = [get_env_int("MOE_TOP_K", 8)]
-DTYPES = [torch.half]
+# Match the deployment activation dtype when tuning channel-wise INT8 kernels.
+# Preserve FP16 as the default for existing CLI users.
+_activation_dtype = os.environ.get("MOE_ACTIVATION_DTYPE", "fp16").lower()
+_activation_dtypes = {"fp16": torch.float16, "bf16": torch.bfloat16}
+if _activation_dtype not in _activation_dtypes:
+    raise ValueError("MOE_ACTIVATION_DTYPE must be fp16 or bf16")
+DTYPES = [_activation_dtypes[_activation_dtype]]
 
 case_counter_x = 1
 
@@ -525,7 +531,7 @@ moe_configs = [
         xlabel='Batch Size',
         plot_name='MoE INT8 Channel Performance (Times ms)',  # 图表标题
         args={
-            'dtype': torch.half,
+            'dtype': DTYPES[0],
             'device': 'cuda',
         }
     )

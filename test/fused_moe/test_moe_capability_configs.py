@@ -759,6 +759,15 @@ def test_checked_in_moe_configs_have_explicit_shape_selectors():
             assert selector_kinds == {"exact", "fuzzy"}
             for family, kinds in shapes.items():
                 if kinds == {"exact"}:
+                    # This BMZ family has only been measured at K2048/topk8.
+                    # Do not require an unvalidated fuzzy range just to ship it.
+                    if family == "E=256,N=512,arch=gfx936,dtype=int8_w8a8.json":
+                        assert all(
+                            name.replace(",is_bottom=True", "")
+                            == "E=256,N=512,K=2048,topk=8,arch=gfx936,dtype=int8_w8a8.json"
+                            for name in shape_paths[family]
+                        )
+                        continue
                     assert all(
                         ",K=1232,topk=1," in name
                         for name in shape_paths[family]
