@@ -9,6 +9,19 @@ from pathlib import Path
 from typing import Optional
 
 
+def random_int8_weights(shape, device):
+    """Preserve rand->scale->truncate values without full-sized FP32 copies.
+
+    Called separately for each weight: peak storage is one FP32 weight plus
+    its INT8 result, not both GEMMs' FP32 weights and expression temporaries.
+    The random draw shape/order and FP32 operation order remain unchanged.
+    """
+    import torch
+
+    values = torch.rand(shape, dtype=torch.float32, device=device)
+    return values.sub_(0.5).mul_(2).mul_(127).clamp_(-128, 127).to(torch.int8)
+
+
 def get_env_int(name: str, default: int) -> int:
     value = os.environ.get(name)
     if value is None or value == "":
