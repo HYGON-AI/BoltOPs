@@ -26,9 +26,7 @@ class GetConfig(Protocol):
         ...
 
 
-@lru_cache(maxsize=None)
-def resolve_get_config(arch: str) -> GetConfig:
-    """Resolve exact, family, then common configuration for an architecture."""
+def _load_prefill_config_module(arch: str):
     targets = targets_for_arch(arch)
     for target in targets:
         qualified_name = (
@@ -39,12 +37,28 @@ def resolve_get_config(arch: str) -> GetConfig:
         except ModuleNotFoundError:
             spec = None
         if spec is not None:
-            return import_module(qualified_name).get_config
-
+            return import_module(qualified_name)
     raise RuntimeError(
         f"No QSA MQA prefill config module found for architecture {arch}; "
         f"tried targets {targets}"
     )
 
 
-__all__ = ["QSAMQAPrefillConfig", "resolve_get_config"]
+@lru_cache(maxsize=None)
+def resolve_get_config(arch: str) -> GetConfig:
+    """BF16 WASP launch policy."""
+    return _load_prefill_config_module(arch).get_config
+
+
+@lru_cache(maxsize=None)
+def resolve_get_config_fp8(arch: str) -> GetConfig:
+    """FP8 WASP launch policy; falls back to BF16 if an arch has no overlay."""
+    module = _load_prefill_config_module(arch)
+    return getattr(module, "get_config_fp8", module.get_config)
+
+
+__all__ = [
+    "QSAMQAPrefillConfig",
+    "resolve_get_config",
+    "resolve_get_config_fp8",
+]

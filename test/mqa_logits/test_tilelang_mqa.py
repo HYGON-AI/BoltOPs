@@ -1,5 +1,14 @@
 # SPDX-License-Identifier: MIT
-"""Correctness tests for TileLang MQA logits prefill / decode."""
+"""Correctness tests for TileLang MQA logits prefill / decode.
+
+Requires ``tilelang`` (``pytest.importorskip``). FP8 cases need gfx938
+(``@GFX938_REQUIRED``); on other arches they skip.
+
+CI default (no ``--runslow``) FP8 smoke:
+
+- ``test_qsa_mqa_prefill_fp8_matches_torch``
+- ``test_qsa_mqa_decode_fp8_packed_matches_torch``
+"""
 
 from __future__ import annotations
 
@@ -39,6 +48,18 @@ from boltops.utility.arch_info import get_device_info
 DEVICE = "cuda"
 GPU_REQUIRED = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA/HIP device is required"
+)
+
+
+def _is_gfx938_device() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    return str(get_device_info(DEVICE).arch).startswith("gfx938")
+
+
+GFX938_REQUIRED = pytest.mark.skipif(
+    not _is_gfx938_device(),
+    reason="TileLang FP8 QSA MQA requires gfx938",
 )
 SLOW = pytest.mark.slow
 
@@ -259,6 +280,82 @@ def test_qsa_mqa_prefill_matches_torch(rows: int):
     assert out.shape == (rows, keys)
     finite = torch.isfinite(ref)
     torch.testing.assert_close(out[finite], ref[finite], atol=1e-4, rtol=1e-4)
+    assert torch.equal(torch.isfinite(out), finite)
+
+
+def _assert_fp8_packed_decode_matches_torch(heads: int, *, seed: int = 3) -> None:
+    from boltops.mqa_logits.tilelang.kernels.common.mqa import pack_fp8_paged_k_cache
+
+    torch.manual_seed(seed)
+    batch, head_dim, page_size = 3, 128, 16
+    max_pages = 16
+    pages = 20
+    max_model_len = max_pages * page_size
+    q_f = torch.randn(batch, heads, head_dim, device=DEVICE, dtype=torch.float32)
+    k_f = torch.randn(pages, page_size, 1, head_dim, device=DEVICE, dtype=torch.float32)
+    scales = k_f.abs().amax(dim=-1).clamp(min=1e-4) / 240.0
+    k_fp8 = (k_f / scales.unsqueeze(-1)).to(torch.float8_e4m3fn)
+    q = q_f.to(torch.float8_e4m3fn)
+    packed = pack_fp8_paged_k_cache(k_fp8, scales.squeeze(2))
+    page_table = torch.zeros(batch, max_pages, device=DEVICE, dtype=torch.int32)
+    for b in range(batch):
+        page_table[b] = torch.arange(max_pages, device=DEVICE) % pages
+    context_lens = torch.tensor([17, 63, 95], device=DEVICE, dtype=torch.int32)
+    scale = math.sqrt(head_dim)
+    ref = torch_qsa_mqa_decode(
+        q, packed, page_table, context_lens, max_model_len, scale
+    )
+    out = tilelang_qsa_mqa_decode(
+        q, packed, page_table, context_lens, max_model_len, scale
+    )
+    finite = torch.isfinite(ref)
+    torch.testing.assert_close(out[finite], ref[finite], atol=2e-2, rtol=2e-2)
+    assert torch.equal(torch.isfinite(out), finite)
+
+
+@GPU_REQUIRED
+@GFX938_REQUIRED
+def test_qsa_mqa_prefill_fp8_matches_torch():
+    """CI default: small shape + ragged row windows (gfx938 only)."""
+    torch.manual_seed(0)
+    rows, keys, heads, head_dim = 41, 96, 4, 128
+    fp8 = torch.float8_e4m3fn
+    q = torch.randn(rows, heads, head_dim, device=DEVICE, dtype=torch.float32).to(fp8)
+    k = torch.randn(keys, 1, head_dim, device=DEVICE, dtype=torch.float32).to(fp8)
+    kv_scales = torch.rand(keys, device=DEVICE, dtype=torch.float32) + 0.25
+    starts = torch.zeros(rows, device=DEVICE, dtype=torch.int32)
+    ends = torch.full((rows,), keys, device=DEVICE, dtype=torch.int32)
+    starts[10:20] = 13
+    ends[10:20] = 79
+    ends[20:30] = 48
+    scale = math.sqrt(head_dim)
+    ref = torch_qsa_mqa_prefill(q, k, starts, ends, scale, kv_scales)
+    out = tilelang_qsa_mqa_prefill(q, k, starts, ends, scale, kv_scales)
+    assert out.shape == (rows, keys)
+    finite = torch.isfinite(ref)
+    torch.testing.assert_close(out[finite], ref[finite], atol=2e-2, rtol=2e-2)
+    assert torch.equal(torch.isfinite(out), finite)
+
+
+@GPU_REQUIRED
+@GFX938_REQUIRED
+@SLOW
+@pytest.mark.parametrize("heads", [32, 64])
+def test_qsa_mqa_prefill_fp8_heuristic_shape_matches_torch(heads: int):
+    """rows=4608 keys=8192; extra heads compile distinct WASP configs."""
+    torch.manual_seed(11)
+    rows, keys, head_dim = 4608, 8192, 128
+    fp8 = torch.float8_e4m3fn
+    q = torch.randn(rows, heads, head_dim, device=DEVICE, dtype=torch.float32).to(fp8)
+    k = torch.randn(keys, 1, head_dim, device=DEVICE, dtype=torch.float32).to(fp8)
+    kv_scales = torch.rand(keys, device=DEVICE, dtype=torch.float32) + 0.25
+    starts = torch.zeros(rows, device=DEVICE, dtype=torch.int32)
+    ends = torch.full((rows,), keys, device=DEVICE, dtype=torch.int32)
+    scale = math.sqrt(head_dim)
+    ref = torch_qsa_mqa_prefill(q, k, starts, ends, scale, kv_scales)
+    out = tilelang_qsa_mqa_prefill(q, k, starts, ends, scale, kv_scales)
+    finite = torch.isfinite(ref)
+    torch.testing.assert_close(out[finite], ref[finite], atol=2e-2, rtol=2e-2)
     assert torch.equal(torch.isfinite(out), finite)
 
 
@@ -637,6 +734,21 @@ def test_qsa_mqa_decode_matches_torch(page_size: int, heads: int):
     finite = torch.isfinite(ref)
     torch.testing.assert_close(out[finite], ref[finite], atol=1e-4, rtol=1e-4)
     assert torch.equal(torch.isfinite(out), finite)
+
+
+@GPU_REQUIRED
+@GFX938_REQUIRED
+def test_qsa_mqa_decode_fp8_packed_matches_torch():
+    """CI default: batch=3 H=4 packed cache (gfx938 only)."""
+    _assert_fp8_packed_decode_matches_torch(4)
+
+
+@GPU_REQUIRED
+@GFX938_REQUIRED
+@SLOW
+@pytest.mark.parametrize("heads", [16, 32, 64])
+def test_qsa_mqa_decode_fp8_packed_extra_heads(heads: int):
+    _assert_fp8_packed_decode_matches_torch(heads)
 
 
 @GPU_REQUIRED

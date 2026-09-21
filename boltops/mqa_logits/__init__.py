@@ -39,19 +39,22 @@ def tilelang_qsa_mqa_prefill(
     row_starts: torch.Tensor,
     row_ends: torch.Tensor,
     score_scale: Optional[float] = None,
+    kv_scales: Optional[torch.Tensor] = None,
     effective_range: Optional[int] = None,
 ) -> torch.Tensor:
-    """Compute BF16 QSA MQA logits for prefill through the TileLang backend.
+    """Compute QSA MQA logits for prefill through the TileLang backend.
 
-    ``effective_range`` is the longest valid key span among all rows in
-    this launch, ``max(row_ends - row_starts)``. Packed multi-sequence
-    batches still use one value (the max across sequences). ``None``
-    (default) means the heuristic uses ``k.shape[0]``.
+    ``kv_scales is None`` selects BF16 WASP. A float32 ``[keys]`` tensor
+    selects FP8 WASP (Q/K must be ``float8_e4m3*``). ``effective_range``
+    is the longest valid key span among all rows in this launch,
+    ``max(row_ends - row_starts)``. Packed multi-sequence batches still
+    use one value (the max across sequences). ``None`` (default) means
+    the heuristic uses ``k.shape[0]``.
     """
     from .tilelang._dispatch import resolve
 
     return resolve("qsa_mqa_prefill", q.device)(
-        q, k, row_starts, row_ends, score_scale, effective_range
+        q, k, row_starts, row_ends, score_scale, kv_scales, effective_range
     )
 
 
@@ -63,7 +66,12 @@ def tilelang_qsa_mqa_decode(
     max_model_len: int,
     score_scale: Optional[float] = None,
 ) -> torch.Tensor:
-    """Compute BF16 QSA MQA logits for paged decode through the TileLang backend."""
+    """Compute QSA MQA logits for paged decode through the TileLang backend.
+
+    BF16 uses ``k_cache [pages, page_size, 1, D]``.  gfx938 FP8 uses the
+    aiter/DeepGEMM packed layout ``[..., D+4]`` (per-token fp32 scale in
+    the last 4 bytes).  gfx936 has no FP8 decode path.
+    """
     from .tilelang._dispatch import resolve
 
     return resolve("qsa_mqa_decode", q.device)(

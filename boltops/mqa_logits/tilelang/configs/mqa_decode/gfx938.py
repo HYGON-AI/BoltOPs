@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-from .common import QSAMQADecodeConfig
+from .common import QSAMQADecodeConfig, small_batch_config
 
 
 def _persistent(splits: int) -> QSAMQADecodeConfig:
@@ -37,6 +37,11 @@ def get_config(
         raise ValueError(f"QSA MQA decode requires cu_count > 0, got {cu_count}")
     if num_heads <= 0:
         raise ValueError(f"QSA MQA decode requires num_heads > 0, got {num_heads}")
+
+    # Batch 1 and 8 were not in the original BF16 sweep.  S8 there is only
+    # ``batch * 8`` CTAs and loses to a ~256-CTA launch on the FP8 measurements.
+    if batch <= 8:
+        return small_batch_config(batch, max_model_len, num_heads)
 
     wide_heads = num_heads > 16
 
@@ -72,4 +77,24 @@ def get_config(
     return _persistent(8 if batch <= 16 else 32)
 
 
-__all__ = ["get_config"]
+@lru_cache(maxsize=256)
+def get_config_fp8(
+    batch: int,
+    max_model_len: int,
+    cu_count: int,
+    num_heads: int,
+) -> QSAMQADecodeConfig:
+    """FP8 occupancy policy.
+
+    Batch 1-16 target about 256 CTAs.  Batch 1 uses an ordinary G launch
+    because persistent splits stop helping before the G grid does.  Batch 8
+    and 16 use persistent splits so ragged rows are cut by their real
+    ``context_len``.  Larger batches keep the BF16 table.
+    """
+    get_config(batch, max_model_len, cu_count, num_heads)
+    if batch <= 16:
+        return small_batch_config(batch, max_model_len, num_heads)
+    return get_config(batch, max_model_len, cu_count, num_heads)
+
+
+__all__ = ["get_config", "get_config_fp8"]

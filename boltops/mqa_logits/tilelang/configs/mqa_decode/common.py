@@ -27,10 +27,43 @@ def _persistent(splits: int) -> QSAMQADecodeConfig:
     return QSAMQADecodeConfig(persistent_splits=splits)
 
 
+# Enough CTAs to cover a few waves on 72 CUs.  Batch 1 reaches this with a
+# G launch; batch 2-8 does it with persistent splits.
+_TARGET_CTAS = 256
+
+
+def _floor_pow2(value: int) -> int:
+    if value <= 1:
+        return 1
+    return 1 << (value.bit_length() - 1)
+
+
+def small_batch_config(
+    batch: int, max_model_len: int, num_heads: int
+) -> QSAMQADecodeConfig:
+    """Launch about ``_TARGET_CTAS`` CTAs for batches the old table skipped.
+
+    ``groups_per_cta`` and ``persistent_splits`` come from the allocated queue
+    (``max_model_len / 128``), not from the live ``context_lens``.  H64 wants
+    about half as many CTAs on a single long request.  Splits are capped so
+    each one still owns at least four groups.
+    """
+    groups = max(1, max_model_len // 128)
+    target = 128 if num_heads >= 64 and batch <= 1 else _TARGET_CTAS
+    if batch <= 1:
+        groups_per_cta = _floor_pow2(max(1, groups // target))
+        return QSAMQADecodeConfig(groups_per_cta=groups_per_cta)
+    splits = _floor_pow2(min(groups, max(1, _TARGET_CTAS // batch)))
+    splits = min(splits, _floor_pow2(max(1, groups // 4)))
+    return _persistent(splits)
+
+
 def _reference_config(
     batch: int, max_model_len: int, num_heads: int
 ) -> QSAMQADecodeConfig:
     """Return the policy measured on the 72-CU gfx938 reference device."""
+    if batch <= 8:
+        return small_batch_config(batch, max_model_len, num_heads)
     wide_heads = num_heads > 16
     if batch > 64:
         if wide_heads and max_model_len > 32 * 1024:

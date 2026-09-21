@@ -42,4 +42,29 @@ def resolve_get_config(arch: str) -> GetConfig:
     )
 
 
-__all__ = ["QSAMQADecodeConfig", "resolve_get_config"]
+@lru_cache(maxsize=None)
+def resolve_get_config_fp8(arch: str) -> GetConfig:
+    """FP8 occupancy policy.  Missing overlay is an error, not a BF16 fallback."""
+    targets = targets_for_arch(arch)
+    tried = []
+    for target in targets:
+        qualified_name = f"boltops.mqa_logits.tilelang.configs.mqa_decode.{target}"
+        tried.append(qualified_name)
+        try:
+            spec = find_spec(qualified_name)
+        except ModuleNotFoundError:
+            spec = None
+        if spec is None:
+            continue
+        module = import_module(qualified_name)
+        getter = getattr(module, "get_config_fp8", None)
+        if getter is not None:
+            return getter
+
+    raise RuntimeError(
+        f"FP8 QSA MQA decode config is not available for architecture {arch}; "
+        f"tried {tried}"
+    )
+
+
+__all__ = ["QSAMQADecodeConfig", "resolve_get_config", "resolve_get_config_fp8"]

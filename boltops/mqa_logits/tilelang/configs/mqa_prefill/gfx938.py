@@ -107,7 +107,12 @@ def get_config(
             and num_rows < 4 * cu_count
         ):
             preferred_logical_m = 64
-        elif num_heads == 32 and phase_range >= 16 * 1024:
+        elif num_heads == 32 and (
+            # block_q=8 still fills the device; shrinking to 128 does not
+            # buy occupancy.  Under-filled Q is recovered by split-N below
+            # once n_tiles (keys) is long enough.
+            _ceil_div(num_rows, 8) >= cu_count or phase_range >= 16 * 1024
+        ):
             preferred_logical_m = 256
         elif num_heads == 8 and rows_per_cu > 16:
             preferred_logical_m = 256
@@ -125,11 +130,12 @@ def get_config(
             block_q_choices[-1],
         )
 
-    # Keep the byte distance between adjacent CTA phases below the observed
-    # ~16-KiB conflict period.  Since Logits is fp32, doubling the effective
-    # N range doubles the required phase count.  Use num_keys as the safe
-    # upper bound when the caller cannot cheaply provide the effective range.
-    if phase_range <= 2048:
+    # H4/H8 write many Q rows per CTA into fp32 Logits; keep adjacent CTA
+    # phases off the ~16-KiB conflict period.  H32/H64 have few Q rows per
+    # CTA and sweeps prefer a single phase.
+    if num_heads in (32, 64):
+        n_tile_phases = 1
+    elif phase_range <= 2048:
         n_tile_phases = 1
     elif phase_range < 16 * 1024:
         n_tile_phases = 4
@@ -175,7 +181,8 @@ def get_config(
             for split in _SPLIT_N_CHOICES
             if split <= n_tiles and q_ctas * split <= cu_count
         )
-    elif phase_range < 16 * 1024:
+    elif num_heads == 64 or phase_range < 16 * 1024:
+        # Occupied H64 prefers sn=1; extra N-split only helps long H32.
         split_n = 1
     elif num_heads == 8 and phase_range >= 32 * 1024:
         split_n = 4
@@ -192,3 +199,25 @@ def get_config(
         rows_divisible=num_rows % block_q == 0,
         heads=num_heads,
     )
+
+
+@lru_cache(maxsize=1024)
+def get_config_fp8(
+    num_rows: int,
+    num_keys: int,
+    cu_count: int,
+    effective_range: Optional[int] = None,
+    num_heads: int = 4,
+) -> QSAMQAPrefillConfig:
+    """FP8 WASP launch tiles.  Does not change H4/H8 BF16 ``get_config``.
+
+    H32/H64 inherit BF16 ``block_q`` / ``split_n`` / ``n_tile_phases=1``.
+    """
+    cfg = get_config(
+        num_rows,
+        num_keys,
+        cu_count,
+        effective_range=effective_range,
+        num_heads=num_heads,
+    )
+    return cfg
