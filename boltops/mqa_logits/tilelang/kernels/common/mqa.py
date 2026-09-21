@@ -52,6 +52,7 @@ def torch_qsa_mqa_prefill(
     row_starts: torch.Tensor,
     row_ends: torch.Tensor,
     score_scale: Optional[float] = None,
+    kv_scales: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     _validate_q(q)
     _validate_k(k)
@@ -59,6 +60,8 @@ def torch_qsa_mqa_prefill(
         raise ValueError("QSA query and key head dimensions must match")
     scores = torch.einsum("mhd,nd->mnh", q.float(), k[:, 0].float())
     logits = torch.relu(scores).sum(dim=-1) / (score_scale or math.sqrt(q.shape[-1]))
+    if kv_scales is not None:
+        logits = logits * kv_scales.to(device=q.device, dtype=logits.dtype).reshape(1, -1)
     columns = torch.arange(k.shape[0], device=q.device).unsqueeze(0)
     valid = (columns >= row_starts.to(q.device).reshape(-1, 1)) & (
         columns < row_ends.to(q.device).reshape(-1, 1)
@@ -66,11 +69,84 @@ def torch_qsa_mqa_prefill(
     return logits.masked_fill(~valid, -float("inf"))
 
 
+def _is_fp8_dtype(dtype: torch.dtype) -> bool:
+    return "float8_e4m3" in str(dtype)
+
+
+def _is_fp8_packed_decode_cache(q: torch.Tensor, k_cache: torch.Tensor) -> bool:
+    return (
+        k_cache.ndim == 4
+        and k_cache.shape[2] == 1
+        and k_cache.shape[-1] == q.shape[-1] + 4
+        and _is_fp8_dtype(q.dtype)
+    )
+
+
+def unpack_fp8_paged_k_cache(
+    k_cache: torch.Tensor, head_dim: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """View an aiter page-wise packed cache as logical FP8 K and fp32 scales."""
+    if k_cache.shape[-1] != head_dim + 4:
+        raise ValueError(
+            "packed FP8 decode cache last dim must be head_dim+4, "
+            f"got {tuple(k_cache.shape)} head_dim={head_dim}"
+        )
+    pages, page_size = k_cache.shape[:2]
+    flat_bytes = k_cache.view(torch.uint8).reshape(
+        pages, page_size * (head_dim + 4)
+    )
+    k_bytes = flat_bytes[:, : page_size * head_dim]
+    scale_bytes = flat_bytes[:, page_size * head_dim :]
+    if k_cache.dtype == torch.uint8:
+        k_fp8 = k_bytes.view(torch.float8_e4m3fn)
+    elif _is_fp8_dtype(k_cache.dtype):
+        k_fp8 = k_bytes.view(k_cache.dtype)
+    else:
+        raise ValueError(
+            "packed FP8 decode cache payload must be uint8 or float8_e4m3*, "
+            f"got {k_cache.dtype}"
+        )
+    return k_fp8.reshape(pages, page_size, 1, head_dim), scale_bytes.view(
+        torch.float32
+    ).reshape(pages, page_size)
+
+
+def pack_fp8_paged_k_cache(k_fp8: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    """Pack per-token fp32 scales into the last 4 bytes of each paged K token."""
+    if k_fp8.ndim != 4 or k_fp8.shape[2] != 1:
+        raise ValueError(
+            "FP8 K cache must be [pages, page_size, 1, head_dim], "
+            f"got {tuple(k_fp8.shape)}"
+        )
+    pages, page_size, _, head_dim = k_fp8.shape
+    if scales.shape != (pages, page_size):
+        raise ValueError(
+            "FP8 decode scales must be [pages, page_size], "
+            f"got {tuple(scales.shape)}"
+        )
+    packed = torch.empty(
+        (pages, page_size * (head_dim + 4)),
+        device=k_fp8.device,
+        dtype=torch.uint8,
+    )
+    packed[:, : page_size * head_dim] = k_fp8.view(torch.uint8).reshape(
+        pages, page_size * head_dim
+    )
+    packed[:, page_size * head_dim :] = (
+        scales.to(dtype=torch.float32).contiguous().view(torch.uint8).reshape(
+            pages, page_size * 4
+        )
+    )
+    return packed.view(pages, page_size, 1, head_dim + 4)
+
+
 def _validate_decode_inputs(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     page_table: torch.Tensor,
     context_lens: torch.Tensor,
+    *,
+    allow_packed_fp8: bool = False,
 ) -> None:
     _validate_q(q)
     if k_cache.ndim != 4 or k_cache.shape[2] != 1:
@@ -78,7 +154,8 @@ def _validate_decode_inputs(
             "QSA decode cache must be [pages, page_size, 1, head_dim], "
             f"got {tuple(k_cache.shape)}"
         )
-    if k_cache.shape[-1] != q.shape[-1]:
+    packed = allow_packed_fp8 and _is_fp8_packed_decode_cache(q, k_cache)
+    if not packed and k_cache.shape[-1] != q.shape[-1]:
         raise ValueError("QSA query and key head dimensions must match")
     if page_table.ndim != 2 or page_table.shape[0] != q.shape[0]:
         raise ValueError("QSA decode page table must have one row per query")
@@ -94,15 +171,28 @@ def torch_qsa_mqa_decode(
     max_model_len: int,
     score_scale: Optional[float] = None,
 ) -> torch.Tensor:
-    _validate_decode_inputs(q, k_cache, page_table, context_lens)
+    packed = _is_fp8_packed_decode_cache(q, k_cache)
+    _validate_decode_inputs(
+        q, k_cache, page_table, context_lens, allow_packed_fp8=packed
+    )
     batch = q.shape[0]
     page_size = k_cache.shape[1]
+    head_dim = q.shape[-1]
     total = page_table.shape[1] * page_size
-    gathered = k_cache[page_table.long().clamp_min(0).reshape(-1), :, 0].reshape(
-        batch, total, q.shape[-1]
-    )
-    scores = torch.einsum("bhd,bnd->bnh", q.float(), gathered.float())
-    scores = torch.relu(scores).sum(dim=-1) / (score_scale or math.sqrt(q.shape[-1]))
+    page_ids = page_table.long().clamp_min(0).reshape(-1)
+    if packed:
+        k_fp8, scales = unpack_fp8_paged_k_cache(k_cache, head_dim)
+        gathered = k_fp8[page_ids, :, 0].reshape(batch, total, head_dim)
+        gathered_scales = scales[page_ids].reshape(batch, total)
+        scores = torch.einsum("bhd,bnd->bnh", q.float(), gathered.float())
+        scores = torch.relu(scores).sum(dim=-1) * gathered_scales
+        scores = scores / (score_scale or math.sqrt(head_dim))
+    else:
+        gathered = k_cache[page_ids, :, 0].reshape(batch, total, head_dim)
+        scores = torch.einsum("bhd,bnd->bnh", q.float(), gathered.float())
+        scores = torch.relu(scores).sum(dim=-1) / (
+            score_scale or math.sqrt(head_dim)
+        )
     positions = torch.arange(total, device=q.device).unsqueeze(0)
     scores.masked_fill_(
         positions >= context_lens.to(q.device).reshape(-1, 1), -float("inf")
@@ -519,8 +609,11 @@ def tilelang_qsa_mqa_prefill(
     row_starts: torch.Tensor,
     row_ends: torch.Tensor,
     score_scale: Optional[float] = None,
+    kv_scales: Optional[torch.Tensor] = None,
     effective_range: Optional[int] = None,
 ) -> torch.Tensor:
+    if kv_scales is not None:
+        raise NotImplementedError("FP8 QSA prefill requires the gfx938 WASP kernel")
     if not HAS_TILELANG:
         raise RuntimeError("TileLang is unavailable")
     _validate_q(q)
@@ -652,10 +745,11 @@ def qsa_mqa_prefill(
     row_starts: torch.Tensor,
     row_ends: torch.Tensor,
     score_scale: Optional[float] = None,
+    kv_scales: Optional[torch.Tensor] = None,
     effective_range: Optional[int] = None,
 ) -> torch.Tensor:
     return tilelang_qsa_mqa_prefill(
-        q, k, row_starts, row_ends, score_scale, effective_range
+        q, k, row_starts, row_ends, score_scale, kv_scales, effective_range
     )
 
 
