@@ -86,3 +86,28 @@ def make_norm_inputs(
             dtype=torch.int32,
         ),
     }
+
+
+FP8_E4M3_MAX = 448.0
+
+
+def quantize_kv_fp8(tensor: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+    """Quantize K/V to ``float8_e4m3fn`` as ``clamp(x / scale, ±448)``.
+
+    Matches the vLLM DSA store path: the sparse kernels later multiply the same
+    ``scale`` back on the fp32 side.
+    """
+    dtype = getattr(torch, "float8_e4m3fn", None)
+    if dtype is None:
+        raise RuntimeError("torch.float8_e4m3fn is not available")
+    scaled = tensor.float() if float(scale) == 1.0 else tensor.float() / float(scale)
+    return scaled.clamp_(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(dtype)
+
+
+def apply_fp8_kv_cache(
+    data: dict, k_scale: float = 1.0, v_scale: float = 1.0
+) -> tuple[float, float]:
+    """Replace ``key_cache`` / ``value_cache`` in-place with ``float8_e4m3fn``."""
+    data["key_cache"] = quantize_kv_fp8(data["key_cache"], k_scale)
+    data["value_cache"] = quantize_kv_fp8(data["value_cache"], v_scale)
+    return float(k_scale), float(v_scale)

@@ -55,7 +55,10 @@ from step4_dsa.bench_inputs import _build_decode_inputs  # noqa: E402
 from step4_dsa.benchmark_cases import BenchmarkCase, tp8_geometry  # noqa: E402
 
 from boltops.step4_dsa import triton_decode_sparse_meta  # noqa: E402
-from boltops.step4_dsa.triton.common import _device_name_for_config  # noqa: E402
+from boltops.step4_dsa.triton.common import (  # noqa: E402
+    _device_name_for_config,
+    _occupancy_dtype,
+)
 from boltops.step4_dsa.triton.decode import (  # noqa: E402
     _CONFIG_DIR,
     _clamp_auto_kv_splits,
@@ -474,7 +477,7 @@ def _run_one(
         "d": named_head_dim,
         "num_splits": splits,
         "region_size": int(geo.region_block_size),
-        "dtype": str(data["query"].dtype).replace("torch.", ""),
+        "dtype": _occupancy_dtype(data["key_cache"].dtype),
     }
     if resume and output.exists():
         try:

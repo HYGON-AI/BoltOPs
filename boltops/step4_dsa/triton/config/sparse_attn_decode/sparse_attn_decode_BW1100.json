@@ -222,6 +222,114 @@
         "empty_arrive_after_mmac": true,
         "amdgpu_enable_max_ilp_scheduling_strategy": true
       }
+    },
+    {
+      "match": {
+        "h_q": 8,
+        "h_kv": 1,
+        "topk": 513,
+        "d": 192,
+        "num_splits": 1,
+        "region_size": 8,
+        "dtype": "float8_e4m3fn",
+        "s_q": 1,
+        "s_kv": 16384
+      },
+      "config": {
+        "PIPELINE_KV": true,
+        "AUTO_KV_SPLITS": 144,
+        "BALANCE_LIVE": false,
+        "BLOCK_R": 4,
+        "BLOCK_H": 16,
+        "num_warps": 2,
+        "num_stages": 1,
+        "waves_per_eu": 2,
+        "kpack": 1,
+        "enable_v_mmac_cluster": 0,
+        "misched_regpressure": false,
+        "empty_arrive_after_mmac": false,
+        "hcu_use_gfx946_sched_model_v2": true,
+        "amdgpu_enable_max_ilp_scheduling_strategy": true
+      }
+    },
+    {
+      "match": {
+        "h_q": 8,
+        "h_kv": 1,
+        "topk": 513,
+        "d": 192,
+        "num_splits": 1,
+        "region_size": 8,
+        "dtype": "float8_e4m3fn",
+        "s_q": 4,
+        "s_kv": 31929
+      },
+      "config": {
+        "AUTO_KV_SPLITS": 72,
+        "BALANCE_LIVE": false,
+        "BLOCK_R": 4,
+        "BLOCK_H": 16,
+        "num_warps": 1,
+        "num_stages": 1,
+        "waves_per_eu": 1,
+        "kpack": 2,
+        "enable_v_mmac_cluster": 0,
+        "misched_regpressure": false,
+        "empty_arrive_after_mmac": false,
+        "hcu_use_gfx946_sched_model_v2": true
+      }
+    },
+    {
+      "match": {
+        "h_q": 8,
+        "h_kv": 1,
+        "topk": 513,
+        "d": 192,
+        "num_splits": 1,
+        "region_size": 8,
+        "dtype": "float8_e4m3fn",
+        "s_q": 8,
+        "s_kv": 31929
+      },
+      "config": {
+        "AUTO_KV_SPLITS": 36,
+        "BALANCE_LIVE": false,
+        "BLOCK_R": 2,
+        "BLOCK_H": 16,
+        "num_warps": 1,
+        "num_stages": 2,
+        "waves_per_eu": 2,
+        "kpack": 2,
+        "enable_v_mmac_cluster": 0,
+        "misched_regpressure": false,
+        "empty_arrive_after_mmac": false
+      }
+    },
+    {
+      "match": {
+        "h_q": 8,
+        "h_kv": 1,
+        "topk": 513,
+        "d": 192,
+        "num_splits": 1,
+        "region_size": 8,
+        "dtype": "float8_e4m3fn",
+        "s_q": 4,
+        "s_kv": 16384
+      },
+      "config": {
+        "AUTO_KV_SPLITS": 72,
+        "BALANCE_LIVE": false,
+        "BLOCK_R": 4,
+        "BLOCK_H": 16,
+        "num_warps": 1,
+        "num_stages": 1,
+        "waves_per_eu": 1,
+        "kpack": 2,
+        "enable_v_mmac_cluster": 0,
+        "misched_regpressure": false,
+        "empty_arrive_after_mmac": false
+      }
     }
   ]
 }

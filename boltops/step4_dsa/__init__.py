@@ -261,10 +261,14 @@ def triton_sparse_attention_prefill(
     request_indices: Optional[torch.Tensor] = None,
     block_q: int = 128,
     config: Optional[dict] = None,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Sparse GQA prefill. Tiled path needs logical ids, positions, and request ids.
 
     Q / K / V / ``out`` last dim must be contiguous (``stride(-1) == 1``).
+    ``k_scale`` / ``v_scale`` are per-tensor dequantization scales for an fp8
+    KV cache (true tensor is ``cache * scale``); both default to 1.0.
     """
     from boltops.step4_dsa.triton.prefill import sparse_attention_prefill as impl
 
@@ -283,6 +287,8 @@ def triton_sparse_attention_prefill(
         request_indices=request_indices,
         block_q=block_q,
         config=config,
+        k_scale=k_scale,
+        v_scale=v_scale,
     )
 
 
@@ -300,13 +306,17 @@ def triton_sparse_attention_decode(
     num_splits: int = 1,
     block_regions: int = 16,
     config: Optional[dict] = None,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Sparse GQA decode. ``num_splits==1`` auto KV-splits to fill CUs and returns
     merged states. ``num_splits > 1`` returns partial states for the caller to merge.
 
     Same calling convention as vLLM ``Step4DSAImpl`` / handoff
     ``sparse_attention_decode``. Q / K / V / ``out`` last dim must be contiguous
-    (``stride(-1) == 1``)."""
+    (``stride(-1) == 1``). ``k_scale`` / ``v_scale`` are per-tensor dequantization
+    scales for an fp8 KV cache (true tensor is ``cache * scale``); both default
+    to 1.0."""
     from boltops.step4_dsa.triton.decode import sparse_attention_decode as impl
 
     return impl(
@@ -322,6 +332,8 @@ def triton_sparse_attention_decode(
         num_splits=num_splits,
         block_regions=block_regions,
         config=config,
+        k_scale=k_scale,
+        v_scale=v_scale,
     )
 
 

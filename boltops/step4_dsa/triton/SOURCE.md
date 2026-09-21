@@ -18,8 +18,8 @@ are not vendored):
 - `logits.py` — weighted-ReLU indexer scores (`kernel.py` ~500-645)
 - `topk.py` — signed top-k ids + fused prefill pack (`kernel.py` ~648-1004)
 - `metadata.py` — prefill/decode sparse metadata (`kernel.py` ~1059-1391)
-- `prefill.py` — sparse GQA prefill, scalar + query-tiled (`kernel.py` ~1429-2034)
-- `decode.py` — sparse GQA decode / split-KV (`kernel.py` ~2037-2181, 2288-2386)
+- `prefill.py` — sparse GQA prefill, scalar + query-tiled (`kernel.py` ~1429-2034). FP8 KV-cache *read*: host folds ``k_scale`` into ``softmax_scale``; kernel ``v_scale``; K/V widened to Q dtype after load. Write/quantize stays in the framework.
+- `decode.py` — sparse GQA decode / split-KV (`kernel.py` ~2037-2181, 2288-2386). Same FP8 KV-cache read contract as prefill.
 - `merge.py` — split-state LSE merge (`kernel.py` ~2183-2286)
 
 Sibling (not Triton impl):

@@ -1,16 +1,18 @@
 {
   "metadata": {
     "triton_version": "3.6.0",
-    "device_name": "BW1100"
+    "device_name": "BW1100",
+    "arch": "gfx938"
   },
   "configs": [
     {
       "match": {
         "s_q": 128,
-        "num_tiles": 1,
         "h_q": 8,
-        "h_kv": 1,
         "d": 192,
+        "s_k": 32768,
+        "h_kv": 1,
+        "num_tiles": 1,
         "topk": 513,
         "union_bucket": 1024,
         "region_size": 8,
@@ -18,13 +20,46 @@
         "dtype": "bfloat16"
       },
       "config": {
+        "AUTO_KV_SPLITS": 18,
         "BLOCK_Q": 128,
-        "BLOCK_D": 256,
         "BLOCK_R": 8,
         "num_warps": 8,
         "num_stages": 1,
-        "waves_per_eu": 1
-      }
+        "waves_per_eu": 1,
+        "empty_arrive_after_mmac": true,
+        "kpack": 1,
+        "enable_v_mmac_cluster": 2
+      },
+      "latency_ms": 0.05909005165100098
+    },
+    {
+      "match": {
+        "s_q": 128,
+        "h_q": 8,
+        "d": 192,
+        "s_k": 32768,
+        "h_kv": 1,
+        "num_tiles": 1,
+        "topk": 513,
+        "union_bucket": 1024,
+        "region_size": 8,
+        "block_q": 128,
+        "dtype": "float8_e4m3fn"
+      },
+      "config": {
+        "AUTO_KV_SPLITS": 18,
+        "BLOCK_Q": 128,
+        "BLOCK_R": 4,
+        "num_warps": 4,
+        "num_stages": 1,
+        "waves_per_eu": 1,
+        "empty_arrive_after_mmac": false,
+        "kpack": 2,
+        "enable_v_mmac_cluster": 0,
+        "amdgpu_enable_max_ilp_scheduling_strategy": true,
+        "misched_regpressure": false
+      },
+      "latency_ms": 0.12314030408859253
     }
   ]
 }

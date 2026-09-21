@@ -165,7 +165,10 @@ def main() -> None:
     heads_per_group = args.heads // args.groups
     head_dim = int(data["query"].shape[2])
     dtype_tag = "bf16" if data["query"].dtype == torch.bfloat16 else str(data["query"].dtype).replace("torch.", "")
-    from boltops.step4_dsa.triton.common import _device_name_for_config
+    from boltops.step4_dsa.triton.common import (
+        _device_name_for_config,
+        _occupancy_dtype,
+    )
     device_tag = _device_name_for_config()
     import os
     output = args.output or Path(
@@ -197,7 +200,7 @@ def main() -> None:
             "h_kv": int(data["key_cache"].shape[1]),
             "topk": packed_width,
             "region_size": int(geo.region_block_size),
-            "dtype": str(data["query"].dtype).replace("torch.", ""),
+            "dtype": _occupancy_dtype(data["key_cache"].dtype),
         },
         "config": cfg,
         "latency_ms": ms,

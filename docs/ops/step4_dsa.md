@@ -2,7 +2,7 @@
 
 `boltops.step4_dsa` 公开 Step-4 Dynamic Sparse Attention 的 **12 个数值 Triton API**（合同 `step4-dsa-ops-v1`）。Triton kernel 在 `boltops/step4_dsa/triton/`；模型几何在 `geometry.py`；生产 shape / 造数在 `test/step4_dsa/`（不进 wheel）；TileLang 目录为占位。
 
-不包含 vLLM planner / KV 缓存写入，也不包含 `kernel.py` 里的 MoE FP8 / 主注意力 `fused_qknorm_rope`。
+不包含 vLLM planner / KV 缓存写入，也不包含 `kernel.py` 里的 MoE FP8 / 主注意力 `fused_qknorm_rope`。sparse prefill/decode 可以**读取**框架侧写入的 FP8 KV cache（`float8_e4m3fn` + per-tensor `k_scale`/`v_scale`）；量化写入仍由框架完成。
 
 溯源见 [`boltops/step4_dsa/triton/SOURCE.md`](../../boltops/step4_dsa/triton/SOURCE.md)。
 
@@ -19,8 +19,8 @@
 | `triton_topk_select_and_pack` | 融合 select + prefill pack（物理 id） |
 | `triton_prefill_sparse_meta` | 宽 `topk+1` 的 prefill metadata（当前 region 追加） |
 | `triton_decode_sparse_meta` | int64 decode metadata |
-| `triton_sparse_attention_prefill` | 稀疏 GQA prefill；tiled 路径 `block_q=128`；per-query 在 `Q*G` 填不满 CU 时自动 KV-split |
-| `triton_sparse_attention_decode` | 稀疏 decode；默认 `num_splits=1` 自动按 CU 做 KV-split |
+| `triton_sparse_attention_prefill` | 稀疏 GQA prefill；tiled 路径 `block_q=128`；per-query 在 `Q*G` 填不满 CU 时自动 KV-split；可读 FP8 KV cache |
+| `triton_sparse_attention_decode` | 稀疏 decode；默认 `num_splits=1` 自动按 CU 做 KV-split；可读 FP8 KV cache |
 | `triton_merge_split_states` | split LSE 合并 |
 
 Vendor 常量（可直接作为 handoff `--ops-module boltops.step4_dsa`）：
@@ -206,10 +206,12 @@ out, lse = triton_sparse_attention_prefill(
     num_kv_groups=1, region_size=8, softmax_scale=None,
     block_regions=16, logical_regions=None, q_positions=None,
     request_indices=None, block_q=128, config=None,
+    k_scale=1.0, v_scale=1.0,
 )
 ```
 
-- `query`：`[Q, H, D]`；`key_cache` / `value_cache`：`[tokens, G, D]`
+- `query`：`[Q, H, D]`，BF16；`key_cache` / `value_cache`：`[tokens, G, D]`，BF16 或 `float8_e4m3fn`
+- `k_scale` / `v_scale`：FP8 cache 的 per-tensor 反量化标量，默认 `1.0`。真实值是 `cache * scale`。`k_scale` 在 host 折进 `softmax_scale`；`v_scale != 1` 时才乘在 FP32 输出上（`APPLY_V_SCALE` 编译期特化）
 - Q / K / V 以及写出的 `out` 最后一维必须连续（`stride(-1) == 1`），
   否则 `ValueError`。token / head stride 可以不连续
 - `packed_regions`：`[G * Q, packed_width]` int32；可选 tiled 还要
@@ -337,10 +339,12 @@ out, lse = triton_sparse_attention_decode(
     query, key_cache, value_cache, packed_regions, region_counts,
     kv_seqlens, num_kv_groups=1, region_size=8, softmax_scale=None,
     num_splits=1, block_regions=16, config=None,
+    k_scale=1.0, v_scale=1.0,
 )
 ```
 
-- `query`：`[B, H, D]`；`kv_seqlens`：`[B]` int32
+- `query`：`[B, H, D]`，BF16；`kv_seqlens`：`[B]` int32
+- `key_cache` / `value_cache`：BF16 或 `float8_e4m3fn`；`k_scale` / `v_scale` 与 prefill 相同
 - Q / K / V 以及写出的 `out` 最后一维必须连续（`stride(-1) == 1`），
   否则 `ValueError`。token / head stride 可以不连续
 - `packed_regions`：`[G * B, packed_width]` **int64**

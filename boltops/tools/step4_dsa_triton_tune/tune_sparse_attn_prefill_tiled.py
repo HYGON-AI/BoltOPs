@@ -234,7 +234,10 @@ def main() -> None:
     )
     union = int(tile_phys.shape[1])
     union_bucket = sparse_attn_prefill_tiled_union_bucket(union)
-    from boltops.step4_dsa.triton.common import _device_name_for_config
+    from boltops.step4_dsa.triton.common import (
+        _device_name_for_config,
+        _occupancy_dtype,
+    )
     import os
     device_tag = _device_name_for_config()
     output = args.output or Path(
@@ -266,15 +269,16 @@ def main() -> None:
     new_entry = {
         "match": {
             "s_q": int(data["query"].shape[0]),
-            "num_tiles": int(q_starts.numel()),
             "h_q": int(data["query"].shape[1]),
-            "h_kv": int(data["key_cache"].shape[1]),
             "d": head_dim,
+            "s_k": int(data["key_cache"].shape[0]),
+            "h_kv": int(data["key_cache"].shape[1]),
+            "num_tiles": int(q_starts.numel()),
             "topk": packed_width,
             "union_bucket": union_bucket,
             "region_size": int(geo.region_block_size),
             "block_q": args.block_q,
-            "dtype": str(data["query"].dtype).replace("torch.", ""),
+            "dtype": _occupancy_dtype(data["key_cache"].dtype),
         },
         "config": cfg,
         "latency_ms": ms,
