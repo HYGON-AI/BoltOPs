@@ -222,7 +222,7 @@
         "dtype": "float8_e4m3fn"
       },
       "config": {
-        "AUTO_KV_SPLITS": 6,
+        "AUTO_KV_SPLITS": 13,
         "BLOCK_R": 8,
         "BLOCK_H": 16,
         "num_warps": 1,
@@ -231,7 +231,7 @@
         "kpack": 1,
         "enable_v_mmac_cluster": 0,
         "empty_arrive_after_mmac": false,
-        "misched_regpressure": true,
+        "misched_regpressure": false,
         "schedule_hint": "attention",
         "amdgpu_enable_max_ilp_scheduling_strategy": true
       }

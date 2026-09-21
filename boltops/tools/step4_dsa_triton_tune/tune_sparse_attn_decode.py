@@ -8,8 +8,9 @@ Default output is ``sparse_attn_decode_{device}.json``. Multiple runtime shapes
 are stored as ``configs`` entries and selected through each entry's ``match``
 dict. ``kv_seqlens`` must contain a single context while tuning.
 
-Candidates include HIP ``waves_per_eu`` and ``BALANCE_LIVE``; ``sparse_attention_decode``
-forwards warps / stages / waves at launch. ``_sparse_attn_decode_dsplit_kernel``
+Candidates include HIP ``waves_per_eu``, ``BALANCE_LIVE``,
+``SPLIT_MAJOR`` grid ordering, and ``NARROW_INDEX`` index width; ``sparse_attention_decode`` forwards warps /
+stages / waves at launch. ``_sparse_attn_decode_dsplit_kernel``
 (non-pow2 ``head_dim``, e.g. 192) omits ``BLOCK_D``; the padded kernel writes it.
 JSON never contains ``BLOCK_D1`` / ``BLOCK_D2`` / ``BLOCK_D3`` (those tiles
 are derived from ``head_dim`` at launch).
@@ -77,6 +78,8 @@ _JSON_KEY_ORDER = (
     "BALANCE_LIVE",
     "BLOCK_R",
     "BLOCK_H",
+    "SPLIT_MAJOR",
+    "NARROW_INDEX",
     "BLOCK_D",
     "num_warps",
     "num_stages",
@@ -92,17 +95,21 @@ def candidates(block_h: int, *, block_d: int | None = None) -> list[dict]:
             for num_stages in (1, 2, 3, 4):
                 for waves in (1, 2):
                     for balance_live in (True, False):
-                        cfg: dict = {
-                            "BALANCE_LIVE": balance_live,
-                            "BLOCK_R": block_r,
-                            "BLOCK_H": block_h,
-                        }
-                        if block_d is not None:
-                            cfg["BLOCK_D"] = int(block_d)
-                        cfg["num_warps"] = num_warps
-                        cfg["num_stages"] = num_stages
-                        cfg["waves_per_eu"] = waves
-                        result.append(cfg)
+                        for split_major in (False, True):
+                            for narrow_index in (False, True):
+                                cfg: dict = {
+                                    "BALANCE_LIVE": balance_live,
+                                    "BLOCK_R": block_r,
+                                    "BLOCK_H": block_h,
+                                    "SPLIT_MAJOR": split_major,
+                                    "NARROW_INDEX": narrow_index,
+                                }
+                                if block_d is not None:
+                                    cfg["BLOCK_D"] = int(block_d)
+                                cfg["num_warps"] = num_warps
+                                cfg["num_stages"] = num_stages
+                                cfg["waves_per_eu"] = waves
+                                result.append(cfg)
     return result
 
 
@@ -114,6 +121,11 @@ def _ordered_cfg(cfg: dict, *, dsplit: bool) -> dict:
     }
     if dsplit:
         filtered.pop("BLOCK_D", None)
+    # False is the runtime default for optional constexpr switches. Omitting it
+    # keeps occupancy JSON compact while preserving an explicit True winner.
+    for key in ("BALANCE_LIVE", "SPLIT_MAJOR", "NARROW_INDEX"):
+        if filtered.get(key) is False:
+            filtered.pop(key)
     ordered = {key: filtered[key] for key in _JSON_KEY_ORDER if key in filtered}
     for key, value in filtered.items():
         if key not in ordered:
@@ -531,8 +543,6 @@ def _run_one(
     missing = [key for key in ("num_warps", "num_stages", "waves_per_eu") if key not in cfg]
     if missing:
         raise RuntimeError(f"tuned config omitted launch keys {missing}: {cfg}")
-    if "BALANCE_LIVE" not in cfg:
-        raise RuntimeError(f"tuned config omitted BALANCE_LIVE: {cfg}")
     if splits == 1 and "AUTO_KV_SPLITS" not in cfg:
         raise RuntimeError(f"s1 tuned config omitted AUTO_KV_SPLITS: {cfg}")
     if splits != 1 and "AUTO_KV_SPLITS" in cfg:

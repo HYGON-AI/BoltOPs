@@ -90,8 +90,12 @@ Decode launch 配置支持 `BALANCE_LIVE`（默认 false）。开启时，自动
 无需 host scalar 读取或 metadata 拷贝；grid 和 merge 输出形状保持不变。
 显式 split、返回 partial states、单 split 均忽略此选项，保持原窗口合同。
 
-仅以下三个 BW1100 JSON 开启，其他配置保持原路径。动态窗口在长上下文
-没有稳定收益，不应全局启用。`config={}` 仍使用原默认策略。
+`AUTO_KV_SPLITS` 选择整次 launch 共用的 split 数；`BALANCE_LIVE` 则按每行
+运行时 `region_counts` 重新划分窗口，两者作用维度不同，前者不能替代后者。
+历史上曾在三个短上下文 BW1100 点开启并得到下表收益；后续重新调优的当前
+BW1100 配置均选择 false，因此 JSON 省略该默认值，但保留内核和 tuner 支持，
+供高度 ragged 的自定义输入继续评估。动态窗口在长上下文没有稳定收益，不应
+全局启用。`config={}` 仍使用原默认策略。
 
 | B | context | HEAD 基线 us | 优化 us | 加速比 |
 | ---: | ---: | ---: | ---: | ---: |

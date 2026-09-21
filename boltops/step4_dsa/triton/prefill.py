@@ -1,6 +1,9 @@
 """Sparse GQA prefill attention over selected regions (scalar and query-tiled).
 
 Vendored from Step-4 DSA handoff ``inference/kernel.py`` (``sparse_attn`` prefill).
+Kernels, tile-metadata builders, and launchers live in this module. The padded
+fallback kernels are shared by BF16 and FP8. The 192-dim kernels stay separate:
+BF16 casts gathered K/V to the query dtype, and FP8 widens them through fp32.
 """
 
 from __future__ import annotations
@@ -30,6 +33,7 @@ LOG2E = tl.constexpr(1.4426950408889634)
 LN2 = tl.constexpr(0.6931471805599453)
 
 
+# Shared BF16/FP8 padded fallbacks. Gathered K/V cast with .to(queries.dtype).
 @triton.jit
 def _sparse_attn_prefill_kernel(
     q_ptr,
@@ -191,208 +195,6 @@ def _sparse_attn_prefill_kernel(
         tl.where(selected, running_max + tl.log(running_sum), NEGATIVE_INFINITY),
         mask=head_ok,
     )
-
-
-@triton.jit
-def _sparse_attn_prefill_dsplit_kernel(
-    q_ptr,
-    k_ptr,
-    v_ptr,
-    packed_ptr,
-    counts_ptr,
-    out_ptr,
-    lse_ptr,
-    stride_q_token,
-    stride_q_head,
-    stride_k_token,
-    stride_k_group,
-    stride_v_token,
-    stride_v_group,
-    stride_packed_row,
-    stride_out_split,
-    stride_out_token,
-    stride_out_head,
-    stride_lse_split,
-    stride_lse_token,
-    softmax_scale,
-    v_scale,
-    total_q,
-    topk: tl.constexpr,
-    heads_per_group: tl.constexpr,
-    head_dim: tl.constexpr,
-    region_size: tl.constexpr,
-    slots_per_split: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-    BLOCK_D1: tl.constexpr,
-    BLOCK_D2: tl.constexpr,
-    BLOCK_D3: tl.constexpr,
-    BLOCK_R: tl.constexpr,
-) -> None:
-    """Per-query prefill specialized for an exact three-chunk head dimension.
-
-    ``head_dim=192`` launches as ``64+64+64`` MMACs (not a 256-padded tile).
-    Inner-loop schedule: cluster the three K gathers, QK, then the three V
-    gathers, then softmax / PV. Online softmax is log2; the epilogue shares one
-    reciprocal per head. K is loaded already transposed for ``tl.dot``. Split
-    windows partition the packed row; ``slots < window_end`` keeps the last
-    ``BLOCK_R`` tile out of the next split.
-
-    ``v_scale`` and the ``k_scale`` already folded into ``softmax_scale``
-    dequantize an fp8 cache on the fp32 side; see :func:`_sparse_attn_prefill_kernel`.
-    """
-    tl.static_assert(BLOCK_D1 + BLOCK_D2 + BLOCK_D3 == head_dim)
-    query = tl.program_id(0)
-    group = tl.program_id(1)
-    split = tl.program_id(2)
-    row = group * total_q + query
-    count = tl.load(counts_ptr + row).to(tl.int32)
-
-    heads = tl.arange(0, BLOCK_H)
-    dims0 = tl.arange(0, BLOCK_D1)
-    dims1 = BLOCK_D1 + tl.arange(0, BLOCK_D2)
-    dims2 = BLOCK_D1 + BLOCK_D2 + tl.arange(0, BLOCK_D3)
-    head_ok = heads < heads_per_group
-    q_base = (
-        q_ptr
-        + query * stride_q_token
-        + (group * heads_per_group + heads)[:, None] * stride_q_head
-    )
-    queries0 = tl.load(q_base + dims0[None, :], mask=head_ok[:, None], other=0.0)
-    queries1 = tl.load(q_base + dims1[None, :], mask=head_ok[:, None], other=0.0)
-    queries2 = tl.load(q_base + dims2[None, :], mask=head_ok[:, None], other=0.0)
-
-    scale = softmax_scale * LOG2E
-    running_max = tl.full((BLOCK_H,), NEGATIVE_INFINITY, dtype=tl.float32)
-    running_sum = tl.zeros((BLOCK_H,), dtype=tl.float32)
-    acc0 = tl.zeros((BLOCK_H, BLOCK_D1), dtype=tl.float32)
-    acc1 = tl.zeros((BLOCK_H, BLOCK_D2), dtype=tl.float32)
-    acc2 = tl.zeros((BLOCK_H, BLOCK_D3), dtype=tl.float32)
-
-    offsets_in_region = tl.arange(0, region_size)
-    window_begin = split * slots_per_split
-    window_end = window_begin + slots_per_split
-    for base in tl.range(window_begin, window_end, BLOCK_R):
-        slots = base + tl.arange(0, BLOCK_R)
-        slot_ok = (slots < count) & (slots < topk) & (slots < window_end)
-        meta = tl.load(
-            packed_ptr + row * stride_packed_row + slots, mask=slot_ok, other=-1
-        )
-        physical = meta & REGION_ID_MASK
-        valid = meta >> REGION_VALID_SHIFT
-        live = slot_ok & (meta >= 0) & (valid > 0)
-
-        tokens = tl.reshape(
-            physical[:, None] * region_size + offsets_in_region[None, :],
-            (BLOCK_R * region_size,),
-        )
-        token_ok = tl.reshape(
-            live[:, None] & (offsets_in_region[None, :] < valid[:, None]),
-            (BLOCK_R * region_size,),
-        )
-        safe_tokens = tl.where(token_ok, tokens, 0)
-        token_head_ok = token_ok[None, :] & head_ok[:, None]
-        k_base = (
-            k_ptr
-            + safe_tokens[None, :] * stride_k_token
-            + group * stride_k_group
-        )
-        k_mask = token_ok[None, :]
-        keys0 = tl.load(k_base + dims0[:, None], mask=k_mask, other=0.0).to(
-            queries0.dtype
-        )
-        keys1 = tl.load(k_base + dims1[:, None], mask=k_mask, other=0.0).to(
-            queries0.dtype
-        )
-        keys2 = tl.load(k_base + dims2[:, None], mask=k_mask, other=0.0).to(
-            queries0.dtype
-        )
-        scores = (
-            tl.dot(queries0, keys0, out_dtype=tl.float32)
-            + tl.dot(queries1, keys1, out_dtype=tl.float32)
-            + tl.dot(queries2, keys2, out_dtype=tl.float32)
-        ) * scale
-        scores = tl.where(token_head_ok, scores, NEGATIVE_INFINITY)
-        v_base = (
-            v_ptr
-            + safe_tokens[:, None] * stride_v_token
-            + group * stride_v_group
-        )
-        v_mask = token_ok[:, None]
-        values0 = tl.load(v_base + dims0[None, :], mask=v_mask, other=0.0).to(
-            queries0.dtype
-        )
-        values1 = tl.load(v_base + dims1[None, :], mask=v_mask, other=0.0).to(
-            queries0.dtype
-        )
-        values2 = tl.load(v_base + dims2[None, :], mask=v_mask, other=0.0).to(
-            queries0.dtype
-        )
-        tile_max = tl.maximum(running_max, tl.max(scores, axis=1))
-        empty = tile_max == NEGATIVE_INFINITY
-        shift = tl.where(empty, 0.0, tile_max)
-        rescale = tl.where(empty, 1.0, tl.math.exp2(running_max - shift))
-        probabilities = tl.math.exp2(scores - shift[:, None])
-        running_sum = running_sum * rescale + tl.sum(probabilities, axis=1)
-        p = probabilities.to(queries0.dtype)
-        acc0 = acc0 * rescale[:, None] + tl.dot(p, values0, out_dtype=tl.float32)
-        acc1 = acc1 * rescale[:, None] + tl.dot(p, values1, out_dtype=tl.float32)
-        acc2 = acc2 * rescale[:, None] + tl.dot(p, values2, out_dtype=tl.float32)
-        running_max = tile_max
-
-    selected = running_sum > 0
-    inv_sum = tl.div_rn(1.0, tl.where(selected, running_sum, 1.0))
-    output0 = tl.where(selected[:, None], acc0 * inv_sum[:, None], 0.0) * v_scale
-    output1 = tl.where(selected[:, None], acc1 * inv_sum[:, None], 0.0) * v_scale
-    output2 = tl.where(selected[:, None], acc2 * inv_sum[:, None], 0.0) * v_scale
-    out_base = (
-        out_ptr
-        + split * stride_out_split
-        + query * stride_out_token
-        + (group * heads_per_group + heads)[:, None] * stride_out_head
-    )
-    tl.store(
-        out_base + dims0[None, :],
-        output0.to(out_ptr.dtype.element_ty),
-        mask=head_ok[:, None],
-    )
-    tl.store(
-        out_base + dims1[None, :],
-        output1.to(out_ptr.dtype.element_ty),
-        mask=head_ok[:, None],
-    )
-    tl.store(
-        out_base + dims2[None, :],
-        output2.to(out_ptr.dtype.element_ty),
-        mask=head_ok[:, None],
-    )
-    tl.store(
-        lse_ptr
-        + split * stride_lse_split
-        + query * stride_lse_token
-        + group * heads_per_group
-        + heads,
-        tl.where(
-            selected,
-            running_max * LN2 + tl.log(running_sum),
-            NEGATIVE_INFINITY,
-        ),
-        mask=head_ok,
-    )
-
-
-def _prefill_head_dim_split(head_dim: int) -> tuple[int, int, int] | None:
-    """``(D1, D2, D3)`` pow2 MMAC chunks covering ``head_dim``, or ``None``.
-
-    ``head_dim=192`` is launched as ``64+64+64`` rather than ``128+64``: three
-    64-wide MMACs use fewer VGPRs than one 128-wide tile plus one 64-wide tile.
-    """
-    if head_dim <= 0 or head_dim & (head_dim - 1) == 0:
-        return None
-    d1 = 1 << (head_dim.bit_length() - 1)
-    d2 = head_dim - d1
-    if d1 == 128 and d2 == 64:
-        return 64, 64, 64
-    return None
 
 
 @triton.jit
@@ -606,8 +408,185 @@ def _sparse_attn_prefill_tiled_kernel(
     )
 
 
+# BF16 192-dim kernels. Direct cast of gathered K/V to the query dtype.
 @triton.jit
-def _sparse_attn_prefill_tiled_dsplit_kernel(
+def _sparse_attn_prefill_dsplit_bf16_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    packed_ptr,
+    counts_ptr,
+    out_ptr,
+    lse_ptr,
+    stride_q_token,
+    stride_q_head,
+    stride_k_token,
+    stride_k_group,
+    stride_v_token,
+    stride_v_group,
+    stride_packed_row,
+    stride_out_split,
+    stride_out_token,
+    stride_out_head,
+    stride_lse_split,
+    stride_lse_token,
+    softmax_scale,
+    v_scale,
+    total_q,
+    topk: tl.constexpr,
+    heads_per_group: tl.constexpr,
+    head_dim: tl.constexpr,
+    region_size: tl.constexpr,
+    slots_per_split: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_D1: tl.constexpr,
+    BLOCK_D2: tl.constexpr,
+    BLOCK_D3: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+) -> None:
+    """Three 64-wide MMAC chunks with the HEAD BF16 online-softmax loop."""
+    tl.static_assert(BLOCK_D1 + BLOCK_D2 + BLOCK_D3 == head_dim)
+    query = tl.program_id(0)
+    group = tl.program_id(1)
+    split = tl.program_id(2)
+    row = group * total_q + query
+    count = tl.load(counts_ptr + row).to(tl.int32)
+
+    heads = tl.arange(0, BLOCK_H)
+    dims0 = tl.arange(0, BLOCK_D1)
+    dims1 = BLOCK_D1 + tl.arange(0, BLOCK_D2)
+    dims2 = BLOCK_D1 + BLOCK_D2 + tl.arange(0, BLOCK_D3)
+    head_ok = heads < heads_per_group
+    q_base = (
+        q_ptr
+        + query * stride_q_token
+        + (group * heads_per_group + heads)[:, None] * stride_q_head
+    )
+    queries0 = tl.load(q_base + dims0[None, :], mask=head_ok[:, None], other=0.0)
+    queries1 = tl.load(q_base + dims1[None, :], mask=head_ok[:, None], other=0.0)
+    queries2 = tl.load(q_base + dims2[None, :], mask=head_ok[:, None], other=0.0)
+
+    scale = softmax_scale * LOG2E
+    running_max = tl.full((BLOCK_H,), NEGATIVE_INFINITY, dtype=tl.float32)
+    running_sum = tl.zeros((BLOCK_H,), dtype=tl.float32)
+    acc0 = tl.zeros((BLOCK_H, BLOCK_D1), dtype=tl.float32)
+    acc1 = tl.zeros((BLOCK_H, BLOCK_D2), dtype=tl.float32)
+    acc2 = tl.zeros((BLOCK_H, BLOCK_D3), dtype=tl.float32)
+
+    offsets_in_region = tl.arange(0, region_size)
+    window_begin = split * slots_per_split
+    window_end = window_begin + slots_per_split
+    for base in tl.range(window_begin, window_end, BLOCK_R):
+        slots = base + tl.arange(0, BLOCK_R)
+        slot_ok = (slots < count) & (slots < topk) & (slots < window_end)
+        meta = tl.load(
+            packed_ptr + row * stride_packed_row + slots, mask=slot_ok, other=-1
+        )
+        physical = meta & REGION_ID_MASK
+        valid = meta >> REGION_VALID_SHIFT
+        live = slot_ok & (meta >= 0) & (valid > 0)
+
+        tokens = tl.reshape(
+            physical[:, None] * region_size + offsets_in_region[None, :],
+            (BLOCK_R * region_size,),
+        )
+        token_ok = tl.reshape(
+            live[:, None] & (offsets_in_region[None, :] < valid[:, None]),
+            (BLOCK_R * region_size,),
+        )
+        safe_tokens = tl.where(token_ok, tokens, 0)
+        token_head_ok = token_ok[None, :] & head_ok[:, None]
+        k_base = (
+            k_ptr
+            + safe_tokens[None, :] * stride_k_token
+            + group * stride_k_group
+        )
+        k_mask = token_ok[None, :]
+        keys0 = tl.load(k_base + dims0[:, None], mask=k_mask, other=0.0).to(
+            queries0.dtype
+        )
+        keys1 = tl.load(k_base + dims1[:, None], mask=k_mask, other=0.0).to(
+            queries0.dtype
+        )
+        keys2 = tl.load(k_base + dims2[:, None], mask=k_mask, other=0.0).to(
+            queries0.dtype
+        )
+        scores = (
+            tl.dot(queries0, keys0, out_dtype=tl.float32)
+            + tl.dot(queries1, keys1, out_dtype=tl.float32)
+            + tl.dot(queries2, keys2, out_dtype=tl.float32)
+        ) * scale
+        scores = tl.where(token_head_ok, scores, NEGATIVE_INFINITY)
+        v_base = (
+            v_ptr
+            + safe_tokens[:, None] * stride_v_token
+            + group * stride_v_group
+        )
+        v_mask = token_ok[:, None]
+        values0 = tl.load(v_base + dims0[None, :], mask=v_mask, other=0.0).to(
+            queries0.dtype
+        )
+        values1 = tl.load(v_base + dims1[None, :], mask=v_mask, other=0.0).to(
+            queries0.dtype
+        )
+        values2 = tl.load(v_base + dims2[None, :], mask=v_mask, other=0.0).to(
+            queries0.dtype
+        )
+        tile_max = tl.maximum(running_max, tl.max(scores, axis=1))
+        empty = tile_max == NEGATIVE_INFINITY
+        shift = tl.where(empty, 0.0, tile_max)
+        rescale = tl.where(empty, 1.0, tl.math.exp2(running_max - shift))
+        probabilities = tl.math.exp2(scores - shift[:, None])
+        running_sum = running_sum * rescale + tl.sum(probabilities, axis=1)
+        p = probabilities.to(queries0.dtype)
+        acc0 = acc0 * rescale[:, None] + tl.dot(p, values0, out_dtype=tl.float32)
+        acc1 = acc1 * rescale[:, None] + tl.dot(p, values1, out_dtype=tl.float32)
+        acc2 = acc2 * rescale[:, None] + tl.dot(p, values2, out_dtype=tl.float32)
+        running_max = tile_max
+
+    selected = running_sum > 0
+    inv_sum = tl.div_rn(1.0, tl.where(selected, running_sum, 1.0))
+    output0 = tl.where(selected[:, None], acc0 * inv_sum[:, None], 0.0) * v_scale
+    output1 = tl.where(selected[:, None], acc1 * inv_sum[:, None], 0.0) * v_scale
+    output2 = tl.where(selected[:, None], acc2 * inv_sum[:, None], 0.0) * v_scale
+    out_base = (
+        out_ptr
+        + split * stride_out_split
+        + query * stride_out_token
+        + (group * heads_per_group + heads)[:, None] * stride_out_head
+    )
+    tl.store(
+        out_base + dims0[None, :],
+        output0.to(out_ptr.dtype.element_ty),
+        mask=head_ok[:, None],
+    )
+    tl.store(
+        out_base + dims1[None, :],
+        output1.to(out_ptr.dtype.element_ty),
+        mask=head_ok[:, None],
+    )
+    tl.store(
+        out_base + dims2[None, :],
+        output2.to(out_ptr.dtype.element_ty),
+        mask=head_ok[:, None],
+    )
+    tl.store(
+        lse_ptr
+        + split * stride_lse_split
+        + query * stride_lse_token
+        + group * heads_per_group
+        + heads,
+        tl.where(
+            selected,
+            running_max * LN2 + tl.log(running_sum),
+            NEGATIVE_INFINITY,
+        ),
+        mask=head_ok,
+    )
+
+
+@triton.jit
+def _sparse_attn_prefill_tiled_dsplit_bf16_kernel(
     q_ptr,
     k_ptr,
     v_ptr,
@@ -838,40 +817,511 @@ def _sparse_attn_prefill_tiled_dsplit_kernel(
     )
 
 
-def _as_query_space(
-    values: torch.Tensor,
-    *,
-    total_q: int,
-    num_kv_groups: int,
-    name: str,
-) -> torch.Tensor:
-    """Accept length ``Q`` or group-major ``G*Q`` (identical per group) as query ids."""
-    count = int(values.numel())
-    expected_rows = num_kv_groups * total_q
-    if count == total_q:
-        return values.reshape(total_q)
-    if count != expected_rows:
-        raise ValueError(f"expected {total_q} or {expected_rows} {name}, got {count}")
-    viewed = values.reshape(num_kv_groups, total_q)
-    if num_kv_groups > 1 and not torch.equal(viewed, viewed[0].expand_as(viewed)):
-        raise ValueError(
-            f"{name} must repeat the same query-space values across KV groups"
+# FP8 192-dim kernels. Gathered K/V are widened through fp32.
+@triton.jit
+def _widen_fp8_kv(raw, ref):
+    """Widen a gathered fp8 K/V tile to the query dtype through fp32.
+
+    A direct cast of fp8 lowers to a software byte unpack. Going through fp32
+    emits ``v_cvt_pk_f32_fp8`` and then packs the query dtype.
+    """
+    return raw.to(tl.float32).to(ref.dtype)
+
+
+@triton.jit
+def _sparse_attn_prefill_dsplit_fp8_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    packed_ptr,
+    counts_ptr,
+    out_ptr,
+    lse_ptr,
+    stride_q_token,
+    stride_q_head,
+    stride_k_token,
+    stride_k_group,
+    stride_v_token,
+    stride_v_group,
+    stride_packed_row,
+    stride_out_split,
+    stride_out_token,
+    stride_out_head,
+    stride_lse_split,
+    stride_lse_token,
+    softmax_scale,
+    v_scale,
+    total_q,
+    topk: tl.constexpr,
+    heads_per_group: tl.constexpr,
+    head_dim: tl.constexpr,
+    region_size: tl.constexpr,
+    slots_per_split: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_D1: tl.constexpr,
+    BLOCK_D2: tl.constexpr,
+    BLOCK_D3: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+) -> None:
+    """FP8-cache prefill specialized for an exact three-chunk head dimension.
+
+    ``head_dim=192`` launches as ``64+64+64`` MMACs (not a 256-padded tile).
+    K gathers and QK dot precede the V gathers and softmax/PV dot. The first
+    tile initializes the online softmax accumulators; subsequent tiles use a
+    two-way unrolled loop. Padded heads have masked query loads and stores.
+    Split windows partition the packed row; ``slots < window_end`` keeps the last
+    ``BLOCK_R`` tile out of the next split.
+
+    ``v_scale`` and the ``k_scale`` already folded into ``softmax_scale``
+    dequantize the FP8 cache on the fp32 side. K/V widen through fp32 for
+    packed hardware conversion.
+    """
+    tl.static_assert(BLOCK_D1 + BLOCK_D2 + BLOCK_D3 == head_dim)
+    query = tl.program_id(0)
+    group = tl.program_id(1)
+    split = tl.program_id(2)
+    row = group * total_q + query
+    count = tl.load(counts_ptr + row).to(tl.int32)
+
+    heads = tl.arange(0, BLOCK_H)
+    dims0 = tl.arange(0, BLOCK_D1)
+    dims1 = BLOCK_D1 + tl.arange(0, BLOCK_D2)
+    dims2 = BLOCK_D1 + BLOCK_D2 + tl.arange(0, BLOCK_D3)
+    head_ok = heads < heads_per_group
+    q_base = (
+        q_ptr
+        + query * stride_q_token
+        + (group * heads_per_group + heads)[:, None] * stride_q_head
+    )
+    queries0 = tl.load(q_base + dims0[None, :], mask=head_ok[:, None], other=0.0)
+    queries1 = tl.load(q_base + dims1[None, :], mask=head_ok[:, None], other=0.0)
+    queries2 = tl.load(q_base + dims2[None, :], mask=head_ok[:, None], other=0.0)
+
+    scale = softmax_scale * LOG2E
+    offsets_in_region = tl.arange(0, region_size)
+    window_begin = split * slots_per_split
+    window_end = window_begin + slots_per_split
+
+    # The first tile initializes the online softmax without rescaling an all-zero
+    # accumulator. Even an empty split executes this masked tile and produces
+    # zero output and -inf LSE.
+    base = window_begin
+    slots = base + tl.arange(0, BLOCK_R)
+    slot_ok = (slots < count) & (slots < topk) & (slots < window_end)
+    meta = tl.load(
+        packed_ptr + row * stride_packed_row + slots, mask=slot_ok, other=-1
+    )
+    physical = meta & REGION_ID_MASK
+    valid = meta >> REGION_VALID_SHIFT
+    live = slot_ok & (meta >= 0) & (valid > 0)
+    tokens = tl.reshape(
+        physical[:, None] * region_size + offsets_in_region[None, :],
+        (BLOCK_R * region_size,),
+    )
+    token_ok = tl.reshape(
+        live[:, None] & (offsets_in_region[None, :] < valid[:, None]),
+        (BLOCK_R * region_size,),
+    )
+    safe_tokens = tl.where(token_ok, tokens, 0)
+    token_head_ok = token_ok[None, :]
+    k_base = k_ptr + safe_tokens[None, :] * stride_k_token + group * stride_k_group
+    keys0 = _widen_fp8_kv(
+        tl.load(k_base + dims0[:, None], mask=token_ok[None, :], other=0.0),
+        queries0,
+    )
+    keys1 = _widen_fp8_kv(
+        tl.load(k_base + dims1[:, None], mask=token_ok[None, :], other=0.0),
+        queries1,
+    )
+    keys2 = _widen_fp8_kv(
+        tl.load(k_base + dims2[:, None], mask=token_ok[None, :], other=0.0),
+        queries2,
+    )
+    scores = (
+        tl.dot(queries0, keys0, out_dtype=tl.float32)
+        + tl.dot(queries1, keys1, out_dtype=tl.float32)
+        + tl.dot(queries2, keys2, out_dtype=tl.float32)
+    ) * scale
+    scores = tl.where(token_head_ok, scores, NEGATIVE_INFINITY)
+    v_base = v_ptr + safe_tokens[:, None] * stride_v_token + group * stride_v_group
+    values0 = _widen_fp8_kv(
+        tl.load(v_base + dims0[None, :], mask=token_ok[:, None], other=0.0),
+        queries0,
+    )
+    values1 = _widen_fp8_kv(
+        tl.load(v_base + dims1[None, :], mask=token_ok[:, None], other=0.0),
+        queries1,
+    )
+    values2 = _widen_fp8_kv(
+        tl.load(v_base + dims2[None, :], mask=token_ok[:, None], other=0.0),
+        queries2,
+    )
+    running_max = tl.max(scores, axis=1)
+    empty = running_max == NEGATIVE_INFINITY
+    shift = tl.where(empty, 0.0, running_max)
+    probabilities = tl.math.exp2(scores - shift[:, None])
+    running_sum = tl.sum(probabilities, axis=1)
+    p = probabilities.to(queries0.dtype)
+    acc0 = tl.dot(p, values0, out_dtype=tl.float32)
+    acc1 = tl.dot(p, values1, out_dtype=tl.float32)
+    acc2 = tl.dot(p, values2, out_dtype=tl.float32)
+
+    # Short windows can have fewer iterations than the unroll factor after
+    # the first tile; the HCU loop-unroll pass rejects those specializations.
+    # Keep the two-way FP8 schedule for the long production windows.
+    for base in tl.range(
+        window_begin + BLOCK_R,
+        window_end,
+        BLOCK_R,
+        loop_unroll_factor=2 if slots_per_split >= 4 * BLOCK_R else 1,
+    ):
+        slots = base + tl.arange(0, BLOCK_R)
+        slot_ok = (slots < count) & (slots < topk) & (slots < window_end)
+        meta = tl.load(
+            packed_ptr + row * stride_packed_row + slots, mask=slot_ok, other=-1
         )
-    return viewed[0].contiguous()
+        physical = meta & REGION_ID_MASK
+        valid = meta >> REGION_VALID_SHIFT
+        live = slot_ok & (meta >= 0) & (valid > 0)
+
+        tokens = tl.reshape(
+            physical[:, None] * region_size + offsets_in_region[None, :],
+            (BLOCK_R * region_size,),
+        )
+        token_ok = tl.reshape(
+            live[:, None] & (offsets_in_region[None, :] < valid[:, None]),
+            (BLOCK_R * region_size,),
+        )
+        safe_tokens = tl.where(token_ok, tokens, 0)
+        # Padded heads are masked on query loads and output stores.
+        token_head_ok = token_ok[None, :]
+        k_base = (
+            k_ptr
+            + safe_tokens[None, :] * stride_k_token
+            + group * stride_k_group
+        )
+        keys0 = _widen_fp8_kv(
+            tl.load(k_base + dims0[:, None], mask=token_ok[None, :], other=0.0),
+            queries0,
+        )
+        keys1 = _widen_fp8_kv(
+            tl.load(k_base + dims1[:, None], mask=token_ok[None, :], other=0.0),
+            queries1,
+        )
+        keys2 = _widen_fp8_kv(
+            tl.load(k_base + dims2[:, None], mask=token_ok[None, :], other=0.0),
+            queries2,
+        )
+        scores = (
+            tl.dot(queries0, keys0, out_dtype=tl.float32)
+            + tl.dot(queries1, keys1, out_dtype=tl.float32)
+            + tl.dot(queries2, keys2, out_dtype=tl.float32)
+        ) * scale
+        scores = tl.where(token_head_ok, scores, NEGATIVE_INFINITY)
+        v_base = (
+            v_ptr
+            + safe_tokens[:, None] * stride_v_token
+            + group * stride_v_group
+        )
+        values0 = _widen_fp8_kv(
+            tl.load(v_base + dims0[None, :], mask=token_ok[:, None], other=0.0),
+            queries0,
+        )
+        values1 = _widen_fp8_kv(
+            tl.load(v_base + dims1[None, :], mask=token_ok[:, None], other=0.0),
+            queries1,
+        )
+        values2 = _widen_fp8_kv(
+            tl.load(v_base + dims2[None, :], mask=token_ok[:, None], other=0.0),
+            queries2,
+        )
+        tile_max = tl.maximum(running_max, tl.max(scores, axis=1))
+        empty = tile_max == NEGATIVE_INFINITY
+        shift = tl.where(empty, 0.0, tile_max)
+        rescale = tl.where(empty, 1.0, tl.math.exp2(running_max - shift))
+        probabilities = tl.math.exp2(scores - shift[:, None])
+        running_sum = running_sum * rescale + tl.sum(probabilities, axis=1)
+        p = probabilities.to(queries0.dtype)
+        acc0 = acc0 * rescale[:, None] + tl.dot(p, values0, out_dtype=tl.float32)
+        acc1 = acc1 * rescale[:, None] + tl.dot(p, values1, out_dtype=tl.float32)
+        acc2 = acc2 * rescale[:, None] + tl.dot(p, values2, out_dtype=tl.float32)
+        running_max = tile_max
+
+    selected = running_sum > 0
+    inv_sum = tl.div_rn(1.0, tl.where(selected, running_sum, 1.0))
+    norm = inv_sum * v_scale
+    output0 = tl.where(selected[:, None], acc0 * norm[:, None], 0.0)
+    output1 = tl.where(selected[:, None], acc1 * norm[:, None], 0.0)
+    output2 = tl.where(selected[:, None], acc2 * norm[:, None], 0.0)
+    out_base = (
+        out_ptr
+        + split * stride_out_split
+        + query * stride_out_token
+        + (group * heads_per_group + heads)[:, None] * stride_out_head
+    )
+    tl.store(
+        out_base + dims0[None, :],
+        output0.to(out_ptr.dtype.element_ty),
+        mask=head_ok[:, None],
+    )
+    tl.store(
+        out_base + dims1[None, :],
+        output1.to(out_ptr.dtype.element_ty),
+        mask=head_ok[:, None],
+    )
+    tl.store(
+        out_base + dims2[None, :],
+        output2.to(out_ptr.dtype.element_ty),
+        mask=head_ok[:, None],
+    )
+    tl.store(
+        lse_ptr
+        + split * stride_lse_split
+        + query * stride_lse_token
+        + group * heads_per_group
+        + heads,
+        tl.where(
+            selected,
+            (running_max + tl.math.log2(running_sum)) * LN2,
+            NEGATIVE_INFINITY,
+        ),
+        mask=head_ok,
+    )
 
 
-# CUDA tile builder. Four kernels stay because Triton has no grid-wide barrier:
-# scan request cuts (1 CTA, Q chunked), mark (many CTA), compact one CTA per
-# group-tile, mask (many CTA). Q<=4096, logical<4096, union<=1024, block_q<=256.
-# CPU / oversized / overflow keep the PyTorch path below.
-_TILE_BUILD_MAX_Q = 4096
-_TILE_BUILD_MAX_REGIONS = 4096
-_TILE_BUILD_UNION_CAP = 1024
-_TILE_BUILD_BLOCK = 512
-_TILE_BUILD_MASK_WORDS = 8
-_TILE_BUILD_WARPS = 16
+@triton.jit
+def _sparse_attn_prefill_tiled_dsplit_fp8_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    list_ptr,
+    logical_list_ptr,
+    lengths_ptr,
+    mask_ptr,
+    q_start_ptr,
+    q_count_ptr,
+    q_positions_ptr,
+    out_ptr,
+    lse_ptr,
+    stride_q_token,
+    stride_q_head,
+    stride_k_token,
+    stride_k_group,
+    stride_v_token,
+    stride_v_group,
+    stride_list_tile,
+    stride_list_slot,
+    stride_logical_tile,
+    stride_logical_slot,
+    stride_mask_tile,
+    stride_mask_word,
+    stride_mask_slot,
+    stride_out_split,
+    stride_out_token,
+    stride_out_head,
+    stride_lse_split,
+    stride_lse_token,
+    softmax_scale,
+    v_scale,
+    total_q,
+    num_kv_groups,
+    num_splits,
+    slots_per_split,
+    heads_per_group: tl.constexpr,
+    head_dim: tl.constexpr,
+    region_size: tl.constexpr,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_D1: tl.constexpr,
+    BLOCK_D2: tl.constexpr,
+    BLOCK_D3: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+) -> None:
+    """Tiled prefill specialized for an exact three-chunk head dimension.
+
+    ``head_dim=192`` launches as ``64+64+64`` MMACs instead of a 256-padded tile.
+    Inner-loop schedule: cluster the three K gathers, QK, then the three V
+    gathers, then softmax / PV. K is loaded already transposed for ``tl.dot``.
+    Online softmax is log2; the epilogue shares one reciprocal per query. Split
+    windows partition the union list the same way as
+    :func:`_sparse_attn_prefill_tiled_kernel`.
+    """
+    tl.static_assert(BLOCK_D1 + BLOCK_D2 + BLOCK_D3 == head_dim)
+    tile = tl.program_id(0)
+    group = tl.program_id(1)
+    combo = tl.program_id(2)
+    head = combo // num_splits
+    split = combo % num_splits
+    group_tile = tile * num_kv_groups + group
+
+    q_local = tl.arange(0, BLOCK_Q)
+    q_start = tl.load(q_start_ptr + tile).to(tl.int32)
+    q_count = tl.load(q_count_ptr + tile).to(tl.int32)
+    q_index = q_start + q_local
+    q_ok = (q_local < q_count) & (q_index < total_q)
+
+    dims0 = tl.arange(0, BLOCK_D1)
+    dims1 = BLOCK_D1 + tl.arange(0, BLOCK_D2)
+    dims2 = BLOCK_D1 + BLOCK_D2 + tl.arange(0, BLOCK_D3)
+    q_base = (
+        q_ptr
+        + q_index[:, None] * stride_q_token
+        + (group * heads_per_group + head) * stride_q_head
+    )
+    queries0 = tl.load(q_base + dims0[None, :], mask=q_ok[:, None], other=0.0)
+    queries1 = tl.load(q_base + dims1[None, :], mask=q_ok[:, None], other=0.0)
+    queries2 = tl.load(q_base + dims2[None, :], mask=q_ok[:, None], other=0.0)
+
+    scale = softmax_scale * LOG2E
+    running_max = tl.full((BLOCK_Q,), NEGATIVE_INFINITY, dtype=tl.float32)
+    running_sum = tl.zeros((BLOCK_Q,), dtype=tl.float32)
+    acc0 = tl.zeros((BLOCK_Q, BLOCK_D1), dtype=tl.float32)
+    acc1 = tl.zeros((BLOCK_Q, BLOCK_D2), dtype=tl.float32)
+    acc2 = tl.zeros((BLOCK_Q, BLOCK_D3), dtype=tl.float32)
+
+    positions = tl.load(
+        q_positions_ptr + q_index,
+        mask=q_ok,
+        other=-1,
+    ).to(tl.int32)
+    words_of_q = q_local // 32
+    bits_of_q = q_local % 32
+    offsets_in_region = tl.arange(0, region_size)
+    union_count = tl.load(lengths_ptr + group_tile).to(tl.int32)
+    window_begin = split * slots_per_split
+    window_end = window_begin + slots_per_split
+
+    for base in tl.range(window_begin, window_end, BLOCK_R):
+        slots = base + tl.arange(0, BLOCK_R)
+        slot_ok = (slots < union_count) & (slots < window_end)
+        physical = tl.load(
+            list_ptr + group_tile * stride_list_tile + slots * stride_list_slot,
+            mask=slot_ok,
+            other=0,
+        ).to(tl.int32)
+        logical = tl.load(
+            logical_list_ptr
+            + group_tile * stride_logical_tile
+            + slots * stride_logical_slot,
+            mask=slot_ok,
+            other=0,
+        ).to(tl.int32)
+        words = tl.load(
+            mask_ptr
+            + group_tile * stride_mask_tile
+            + words_of_q[:, None] * stride_mask_word
+            + slots[None, :] * stride_mask_slot,
+            mask=q_ok[:, None] & slot_ok[None, :],
+            other=0,
+        )
+        selected = ((words >> bits_of_q[:, None]) & 1) == 1
+
+        tokens = tl.reshape(
+            physical[:, None] * region_size + offsets_in_region[None, :],
+            (BLOCK_R * region_size,),
+        )
+        token_pos = tl.reshape(
+            logical[:, None] * region_size + offsets_in_region[None, :],
+            (BLOCK_R * region_size,),
+        )
+        token_live = tl.reshape(
+            tl.broadcast_to(slot_ok[:, None], (BLOCK_R, region_size)),
+            (BLOCK_R * region_size,),
+        )
+        causal = token_pos[None, :] <= positions[:, None]
+        keep = causal & token_live[None, :] & q_ok[:, None]
+        keep = keep & tl.reshape(
+            tl.broadcast_to(selected[:, :, None], (BLOCK_Q, BLOCK_R, region_size)),
+            (BLOCK_Q, BLOCK_R * region_size),
+        )
+
+        safe_tokens = tl.where(token_live, tokens, 0)
+        k_base = (
+            k_ptr + safe_tokens[None, :] * stride_k_token + group * stride_k_group
+        )
+        k_mask = token_live[None, :]
+        keys0 = _widen_fp8_kv(
+            tl.load(k_base + dims0[:, None], mask=k_mask, other=0.0), queries0
+        )
+        keys1 = _widen_fp8_kv(
+            tl.load(k_base + dims1[:, None], mask=k_mask, other=0.0), queries0
+        )
+        keys2 = _widen_fp8_kv(
+            tl.load(k_base + dims2[:, None], mask=k_mask, other=0.0), queries0
+        )
+        scores = (
+            tl.dot(queries0, keys0, out_dtype=tl.float32)
+            + tl.dot(queries1, keys1, out_dtype=tl.float32)
+            + tl.dot(queries2, keys2, out_dtype=tl.float32)
+        ) * scale
+        scores = tl.where(keep, scores, NEGATIVE_INFINITY)
+
+        v_base = (
+            v_ptr + safe_tokens[:, None] * stride_v_token + group * stride_v_group
+        )
+        v_mask = token_live[:, None]
+        values0 = _widen_fp8_kv(
+            tl.load(v_base + dims0[None, :], mask=v_mask, other=0.0), queries0
+        )
+        values1 = _widen_fp8_kv(
+            tl.load(v_base + dims1[None, :], mask=v_mask, other=0.0), queries0
+        )
+        values2 = _widen_fp8_kv(
+            tl.load(v_base + dims2[None, :], mask=v_mask, other=0.0), queries0
+        )
+        tile_max = tl.maximum(running_max, tl.max(scores, axis=1))
+        empty = tile_max == NEGATIVE_INFINITY
+        shift = tl.where(empty, 0.0, tile_max)
+        rescale = tl.where(empty, 1.0, tl.math.exp2(running_max - shift))
+        probabilities = tl.math.exp2(scores - shift[:, None])
+        running_sum = running_sum * rescale + tl.sum(probabilities, axis=1)
+        p = probabilities.to(queries0.dtype)
+        acc0 = acc0 * rescale[:, None] + tl.dot(p, values0, out_dtype=tl.float32)
+        acc1 = acc1 * rescale[:, None] + tl.dot(p, values1, out_dtype=tl.float32)
+        acc2 = acc2 * rescale[:, None] + tl.dot(p, values2, out_dtype=tl.float32)
+        running_max = tile_max
+
+    selected_any = running_sum > 0
+    inv_sum = tl.div_rn(1.0, tl.where(selected_any, running_sum, 1.0))
+    output0 = tl.where(selected_any[:, None], acc0 * inv_sum[:, None], 0.0) * v_scale
+    output1 = tl.where(selected_any[:, None], acc1 * inv_sum[:, None], 0.0) * v_scale
+    output2 = tl.where(selected_any[:, None], acc2 * inv_sum[:, None], 0.0) * v_scale
+    out_base = (
+        out_ptr
+        + split * stride_out_split
+        + q_index[:, None] * stride_out_token
+        + (group * heads_per_group + head) * stride_out_head
+    )
+    tl.store(
+        out_base + dims0[None, :],
+        output0.to(out_ptr.dtype.element_ty),
+        mask=q_ok[:, None],
+    )
+    tl.store(
+        out_base + dims1[None, :],
+        output1.to(out_ptr.dtype.element_ty),
+        mask=q_ok[:, None],
+    )
+    tl.store(
+        out_base + dims2[None, :],
+        output2.to(out_ptr.dtype.element_ty),
+        mask=q_ok[:, None],
+    )
+    tl.store(
+        lse_ptr
+        + split * stride_lse_split
+        + q_index * stride_lse_token
+        + group * heads_per_group
+        + head,
+        tl.where(
+            selected_any,
+            running_max * LN2 + tl.log(running_sum),
+            NEGATIVE_INFINITY,
+        ),
+        mask=q_ok,
+    )
 
 
+# Query-tile metadata. Four kernels: Triton has no grid-wide barrier.
 @triton.jit
 def _prefill_tile_scan_kernel(
     request_ptr,
@@ -1053,6 +1503,74 @@ def _prefill_tile_mask_kernel(
         tl.full((BLOCK,), 1, dtype=tl.int32) << (q_local % 32),
         mask=ok,
     )
+
+
+def _cache_is_fp8(dtype: torch.dtype) -> bool:
+    """True for an fp8 KV cache. Query dtype stays the compute dtype.
+
+    Pass the actual cache tensor dtype. Occupancy JSON also matches on dtype,
+    but a caller-supplied ``config`` can override that match, so kernel
+    selection does not read the cache family from the config.
+    """
+    return bool(dtype.is_floating_point and dtype.itemsize == 1)
+
+
+def _require_matching_kv_dtypes(
+    key_cache: torch.Tensor, value_cache: torch.Tensor
+) -> None:
+    """Reject K/V caches that are not the same dtype."""
+    if key_cache.dtype != value_cache.dtype:
+        raise ValueError(
+            "key/value cache dtype mismatch: "
+            f"{key_cache.dtype} vs {value_cache.dtype}"
+        )
+
+
+def _prefill_head_dim_split(head_dim: int) -> tuple[int, int, int] | None:
+    """``(D1, D2, D3)`` pow2 MMAC chunks covering ``head_dim``, or ``None``.
+
+    ``head_dim=192`` is launched as ``64+64+64`` rather than ``128+64``: three
+    64-wide MMACs use fewer VGPRs than one 128-wide tile plus one 64-wide tile.
+    """
+    if head_dim <= 0 or head_dim & (head_dim - 1) == 0:
+        return None
+    d1 = 1 << (head_dim.bit_length() - 1)
+    d2 = head_dim - d1
+    if d1 == 128 and d2 == 64:
+        return 64, 64, 64
+    return None
+
+
+def _as_query_space(
+    values: torch.Tensor,
+    *,
+    total_q: int,
+    num_kv_groups: int,
+    name: str,
+) -> torch.Tensor:
+    """Accept length ``Q`` or group-major ``G*Q`` (identical per group) as query ids."""
+    count = int(values.numel())
+    expected_rows = num_kv_groups * total_q
+    if count == total_q:
+        return values.reshape(total_q)
+    if count != expected_rows:
+        raise ValueError(f"expected {total_q} or {expected_rows} {name}, got {count}")
+    viewed = values.reshape(num_kv_groups, total_q)
+    if num_kv_groups > 1 and not torch.equal(viewed, viewed[0].expand_as(viewed)):
+        raise ValueError(
+            f"{name} must repeat the same query-space values across KV groups"
+        )
+    return viewed[0].contiguous()
+
+
+# Device tile builder: Q<=4096, logical<4096, union<=1024, block_q<=256.
+# CPU / oversized / overflow keep the PyTorch path below.
+_TILE_BUILD_MAX_Q = 4096
+_TILE_BUILD_MAX_REGIONS = 4096
+_TILE_BUILD_UNION_CAP = 1024
+_TILE_BUILD_BLOCK = 512
+_TILE_BUILD_MASK_WORDS = 8
+_TILE_BUILD_WARPS = 16
 
 
 class _PrefillTileWorkspace:
@@ -1738,12 +2256,14 @@ def _run_tiled_prefill(
     the fp32 output; ``k_scale`` must already be folded into ``softmax_scale``.
 
     ``AUTO_KV_SPLITS`` in the launch JSON partitions the union list across extra
-    CTAs and merges with :func:`merge_split_states`. ``head_dim=192`` uses the
-    64+64+64 dsplit kernel; other widths keep the padded tiled kernel.
+    CTAs and merges with :func:`merge_split_states`. ``head_dim=192`` selects
+    a BF16 or FP8 64+64+64 dsplit kernel from the actual KV-cache dtype;
+    other head dimensions share the original padded tiled fallback.
     """
     total_q, num_heads, head_dim = query.shape
     if num_heads % num_kv_groups:
         raise ValueError(f"{num_heads} heads do not divide into {num_kv_groups} groups")
+    _require_matching_kv_dtypes(key_cache, value_cache)
     _require_contiguous_last_dim(query, "query")
     _require_contiguous_last_dim(key_cache, "key_cache")
     _require_contiguous_last_dim(value_cache, "value_cache")
@@ -1873,9 +2393,15 @@ def _run_tiled_prefill(
     )
     grid = (num_tiles, num_kv_groups, heads_per_group * num_splits)
     dim_split = _prefill_head_dim_split(head_dim)
+    fp8_cache = _cache_is_fp8(key_cache.dtype)
     if dim_split is not None:
         d1, d2, d3 = dim_split
-        _sparse_attn_prefill_tiled_dsplit_kernel[grid](
+        kernel = (
+            _sparse_attn_prefill_tiled_dsplit_fp8_kernel
+            if fp8_cache
+            else _sparse_attn_prefill_tiled_dsplit_bf16_kernel
+        )
+        kernel[grid](
             *common_args,
             BLOCK_D1=d1,
             BLOCK_D2=d2,
@@ -1884,6 +2410,7 @@ def _run_tiled_prefill(
             **extra,
         )
     else:
+        # The original padded tiled kernel is shared by BF16 and FP8.
         _sparse_attn_prefill_tiled_kernel[grid](
             *common_args,
             BLOCK_D=block_d,
@@ -1980,6 +2507,7 @@ def sparse_attention_prefill(
         raise ValueError(
             f"key/value cache shape mismatch: {tuple(key_cache.shape)} vs {tuple(value_cache.shape)}"
         )
+    _require_matching_kv_dtypes(key_cache, value_cache)
     _require_contiguous_last_dim(query, "query")
     _require_contiguous_last_dim(key_cache, "key_cache")
     _require_contiguous_last_dim(value_cache, "value_cache")
@@ -2129,7 +2657,12 @@ def sparse_attention_prefill(
     dim_split = _prefill_head_dim_split(head_dim)
     if dim_split is not None:
         d1, d2, d3 = dim_split
-        _sparse_attn_prefill_dsplit_kernel[(total_q, num_kv_groups, num_splits)](
+        kernel = (
+            _sparse_attn_prefill_dsplit_fp8_kernel
+            if _cache_is_fp8(key_cache.dtype)
+            else _sparse_attn_prefill_dsplit_bf16_kernel
+        )
+        kernel[(total_q, num_kv_groups, num_splits)](
             *common_args,
             BLOCK_D1=d1,
             BLOCK_D2=d2,
@@ -2138,6 +2671,7 @@ def sparse_attention_prefill(
             **extra,
         )
     else:
+        # Other head dims stay on the generic padded fallback for both dtypes.
         _sparse_attn_prefill_kernel[(total_q, num_kv_groups, num_splits)](
             *common_args,
             **common_meta,

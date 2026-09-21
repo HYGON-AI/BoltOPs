@@ -207,6 +207,65 @@ def test_tiled_prefill_matches_scalar(empty_rows: bool, distinct_group_regions: 
 
 
 @C.GPU_REQUIRED
+@pytest.mark.parametrize("fp8_cache", [False, True], ids=["bf16", "fp8"])
+@pytest.mark.parametrize("head_dim", [128, 192])
+def test_prefill_dtype_routing_matches_torch(fp8_cache: bool, head_dim: int):
+    """Scalar fallback/192 specialization and both tiled paths agree with Torch."""
+    if fp8_cache and getattr(torch, "float8_e4m3fn", None) is None:
+        pytest.skip("torch.float8_e4m3fn is not available")
+    data = _make_prefill_case(
+        total_q=20, seq_regions=16, topk=8, empty_rows=True, seed=61
+    )
+    query = data["query"][..., :head_dim].contiguous()
+    key = data["key_cache"][..., :head_dim].contiguous()
+    value = data["value_cache"][..., :head_dim].contiguous()
+    k_scale, v_scale = (2.0, 0.5) if fp8_cache else (1.0, 1.0)
+    if fp8_cache:
+        key = C.quantize_kv_fp8(key, k_scale)
+        value = C.quantize_kv_fp8(value, v_scale)
+    logical = torch.where(
+        data["packed"] >= 0,
+        data["packed"] & PREFILL_REGION_ID_MASK,
+        torch.full_like(data["packed"], -1),
+    )
+    positions = torch.full(
+        (query.shape[0],),
+        data["seq_regions"] * data["region_size"] - 1,
+        device=query.device,
+        dtype=torch.int32,
+    )
+    common = dict(
+        query=query,
+        key_cache=key,
+        value_cache=value,
+        packed_regions=data["packed"],
+        region_counts=data["counts"],
+        num_kv_groups=data["groups"],
+        region_size=data["region_size"],
+        softmax_scale=head_dim**-0.5,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+    expected_out, expected_lse = ref_sparse_attention(**common)
+    for tiled in (False, True):
+        options = (
+            dict(logical_regions=logical, q_positions=positions, block_q=16)
+            if tiled
+            else {}
+        )
+        out, lse = triton_sparse_attention_prefill(
+            **common,
+            **options,
+            config={"AUTO_KV_SPLITS": 3, "BLOCK_R": 4, "num_warps": 4},
+        )
+        torch.cuda.synchronize()
+        _assert_prefill_close(
+            out, lse, expected_out, expected_lse,
+            what=f"{'tiled' if tiled else 'scalar'} vs Torch",
+        )
+
+
+@C.GPU_REQUIRED
 def test_tiled_prefill_request_boundary_distinct_groups_matches_scalar():
     data = _make_prefill_case(
         total_q=24,
@@ -582,6 +641,18 @@ def test_prefill_launch_options_follow_backend_capabilities(monkeypatch):
         "empty_arrive_after_mmac": True,
         "max_memory_cluster_dwords": 16,
     }
+
+
+def test_sparse_prefill_rejects_mixed_cache_dtypes():
+    query = torch.empty((1, 8, 192), dtype=torch.bfloat16)
+    key_cache = torch.empty((8, 1, 192), dtype=torch.bfloat16)
+    value_cache = torch.empty((8, 1, 192), dtype=torch.float16)
+    packed = torch.full((1, 1), -1, dtype=torch.int32)
+    counts = torch.zeros((1,), dtype=torch.int32)
+    with pytest.raises(ValueError, match="cache dtype mismatch"):
+        triton_sparse_attention_prefill(
+            query, key_cache, value_cache, packed, counts, num_kv_groups=1
+        )
 
 
 def test_sparse_prefill_rejects_strided_head_dim():

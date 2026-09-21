@@ -18,17 +18,18 @@
         "dtype": "bfloat16"
       },
       "config": {
-        "AUTO_KV_SPLITS": 72,
-        "BALANCE_LIVE": false,
+        "AUTO_KV_SPLITS": 70,
         "BLOCK_R": 2,
         "BLOCK_H": 16,
+        "SPLIT_MAJOR": true,
         "num_warps": 1,
         "num_stages": 3,
         "waves_per_eu": 2,
         "kpack": 2,
-        "enable_v_mmac_cluster": 2,
+        "enable_v_mmac_cluster": 0,
         "misched_regpressure": true,
-        "empty_arrive_after_mmac": true
+        "empty_arrive_after_mmac": true,
+        "hcu_use_gfx946_sched_model_v2": true
       }
     },
     {
@@ -44,18 +45,20 @@
         "dtype": "bfloat16"
       },
       "config": {
-        "AUTO_KV_SPLITS": 2,
-        "BALANCE_LIVE": false,
-        "BLOCK_R": 4,
+        "AUTO_KV_SPLITS": 6,
+        "BLOCK_R": 2,
         "BLOCK_H": 16,
         "num_warps": 1,
-        "num_stages": 1,
+        "num_stages": 2,
         "waves_per_eu": 2,
         "kpack": 2,
         "enable_v_mmac_cluster": 2,
-        "misched_regpressure": false,
+        "misched_regpressure": true,
         "empty_arrive_after_mmac": true,
-        "amdgpu_enable_max_ilp_scheduling_strategy": true
+        "amdgpu_enable_max_ilp_scheduling_strategy": true,
+        "PIPELINE_KV": true,
+        "hcu_use_gfx946_sched_model_v2": true,
+        "BALANCE_LIVE": true
       }
     },
     {
@@ -71,16 +74,17 @@
         "dtype": "bfloat16"
       },
       "config": {
-        "AUTO_KV_SPLITS": 72,
-        "BALANCE_LIVE": false,
+        "AUTO_KV_SPLITS": 70,
         "BLOCK_R": 8,
         "BLOCK_H": 16,
+        "SPLIT_MAJOR": true,
+        "NARROW_INDEX": true,
         "num_warps": 2,
         "num_stages": 1,
-        "waves_per_eu": 1,
+        "waves_per_eu": 2,
         "kpack": 1,
         "enable_v_mmac_cluster": 2,
-        "misched_regpressure": false,
+        "misched_regpressure": true,
         "empty_arrive_after_mmac": true,
         "hcu_use_gfx946_sched_model_v2": true
       }
@@ -98,10 +102,10 @@
         "dtype": "bfloat16"
       },
       "config": {
-        "AUTO_KV_SPLITS": 54,
-        "BALANCE_LIVE": false,
+        "AUTO_KV_SPLITS": 52,
         "BLOCK_R": 2,
         "BLOCK_H": 16,
+        "SPLIT_MAJOR": true,
         "num_warps": 2,
         "num_stages": 3,
         "waves_per_eu": 1,
@@ -109,7 +113,9 @@
         "enable_v_mmac_cluster": 2,
         "misched_regpressure": false,
         "empty_arrive_after_mmac": true,
-        "hcu_use_gfx946_sched_model_v2": true
+        "hcu_use_gfx946_sched_model_v2": true,
+        "amdgpu_enable_max_ilp_scheduling_strategy": true,
+        "schedule_hint": "memory-bound-attention"
       }
     },
     {
@@ -125,18 +131,19 @@
         "dtype": "bfloat16"
       },
       "config": {
-        "AUTO_KV_SPLITS": 36,
-        "BALANCE_LIVE": false,
+        "AUTO_KV_SPLITS": 35,
         "BLOCK_R": 2,
         "BLOCK_H": 16,
+        "SPLIT_MAJOR": true,
+        "NARROW_INDEX": true,
         "num_warps": 1,
         "num_stages": 2,
-        "waves_per_eu": 1,
+        "waves_per_eu": 2,
         "kpack": 2,
         "enable_v_mmac_cluster": 2,
         "misched_regpressure": false,
-        "empty_arrive_after_mmac": true,
-        "hcu_use_gfx946_sched_model_v2": true,
+        "empty_arrive_after_mmac": false,
+        "hcu_use_gfx946_sched_model_v2": false,
         "amdgpu_enable_max_ilp_scheduling_strategy": true
       }
     },
@@ -154,9 +161,9 @@
       },
       "config": {
         "AUTO_KV_SPLITS": 18,
-        "BALANCE_LIVE": false,
         "BLOCK_R": 2,
         "BLOCK_H": 16,
+        "SPLIT_MAJOR": true,
         "num_warps": 1,
         "num_stages": 1,
         "waves_per_eu": 2,
@@ -180,10 +187,8 @@
         "dtype": "bfloat16"
       },
       "config": {
-        "PIPELINE_KV": true,
-        "AUTO_KV_SPLITS": 4,
-        "BALANCE_LIVE": false,
-        "BLOCK_R": 4,
+        "AUTO_KV_SPLITS": 10,
+        "BLOCK_R": 2,
         "BLOCK_H": 16,
         "num_warps": 2,
         "num_stages": 1,
@@ -191,8 +196,7 @@
         "kpack": 1,
         "enable_v_mmac_cluster": 2,
         "misched_regpressure": false,
-        "empty_arrive_after_mmac": true,
-        "amdgpu_enable_max_ilp_scheduling_strategy": true
+        "empty_arrive_after_mmac": true
       }
     },
     {
@@ -209,126 +213,136 @@
       },
       "config": {
         "PIPELINE_KV": true,
-        "AUTO_KV_SPLITS": 2,
-        "BALANCE_LIVE": false,
+        "AUTO_KV_SPLITS": 10,
         "BLOCK_R": 4,
         "BLOCK_H": 16,
+        "SPLIT_MAJOR": true,
+        "NARROW_INDEX": true,
         "num_warps": 2,
         "num_stages": 1,
-        "waves_per_eu": 2,
-        "kpack": 1,
+        "waves_per_eu": 1,
+        "kpack": 2,
         "enable_v_mmac_cluster": 2,
         "misched_regpressure": false,
         "empty_arrive_after_mmac": true,
-        "amdgpu_enable_max_ilp_scheduling_strategy": true
-      }
-    },
-    {
-      "match": {
-        "h_q": 8,
-        "h_kv": 1,
-        "topk": 513,
-        "d": 192,
-        "num_splits": 1,
-        "region_size": 8,
-        "dtype": "float8_e4m3fn",
-        "s_q": 1,
-        "s_kv": 16384
-      },
-      "config": {
-        "PIPELINE_KV": true,
-        "AUTO_KV_SPLITS": 144,
-        "BALANCE_LIVE": false,
-        "BLOCK_R": 4,
-        "BLOCK_H": 16,
-        "num_warps": 2,
-        "num_stages": 1,
-        "waves_per_eu": 2,
-        "kpack": 1,
-        "enable_v_mmac_cluster": 0,
-        "misched_regpressure": false,
-        "empty_arrive_after_mmac": false,
         "hcu_use_gfx946_sched_model_v2": true,
         "amdgpu_enable_max_ilp_scheduling_strategy": true
       }
     },
     {
       "match": {
+        "s_q": 1,
+        "s_kv": 16384,
         "h_q": 8,
         "h_kv": 1,
         "topk": 513,
         "d": 192,
         "num_splits": 1,
         "region_size": 8,
-        "dtype": "float8_e4m3fn",
-        "s_q": 4,
-        "s_kv": 31929
+        "dtype": "float8_e4m3fn"
       },
       "config": {
-        "AUTO_KV_SPLITS": 72,
-        "BALANCE_LIVE": false,
+        "PIPELINE_KV": true,
+        "AUTO_KV_SPLITS": 144,
         "BLOCK_R": 4,
         "BLOCK_H": 16,
-        "num_warps": 1,
+        "SPLIT_MAJOR": true,
+        "NARROW_INDEX": true,
+        "num_warps": 2,
         "num_stages": 1,
-        "waves_per_eu": 1,
-        "kpack": 2,
+        "waves_per_eu": 2,
+        "kpack": 1,
         "enable_v_mmac_cluster": 0,
-        "misched_regpressure": false,
+        "misched_regpressure": true,
         "empty_arrive_after_mmac": false,
-        "hcu_use_gfx946_sched_model_v2": true
+        "hcu_use_gfx946_sched_model_v2": false,
+        "amdgpu_enable_max_ilp_scheduling_strategy": true,
+        "schedule_hint": "memory-bound-attention"
       }
     },
     {
       "match": {
+        "s_q": 4,
+        "s_kv": 31929,
         "h_q": 8,
         "h_kv": 1,
         "topk": 513,
         "d": 192,
         "num_splits": 1,
         "region_size": 8,
-        "dtype": "float8_e4m3fn",
-        "s_q": 8,
-        "s_kv": 31929
+        "dtype": "float8_e4m3fn"
       },
       "config": {
-        "AUTO_KV_SPLITS": 36,
-        "BALANCE_LIVE": false,
-        "BLOCK_R": 2,
+        "AUTO_KV_SPLITS": 72,
+        "BLOCK_R": 4,
         "BLOCK_H": 16,
+        "SPLIT_MAJOR": true,
         "num_warps": 1,
         "num_stages": 2,
         "waves_per_eu": 2,
         "kpack": 2,
         "enable_v_mmac_cluster": 0,
         "misched_regpressure": false,
-        "empty_arrive_after_mmac": false
+        "empty_arrive_after_mmac": false,
+        "hcu_use_gfx946_sched_model_v2": true,
+        "NARROW_INDEX": true,
+        "schedule_hint": "memory-bound-attention"
       }
     },
     {
       "match": {
+        "s_q": 8,
+        "s_kv": 31929,
         "h_q": 8,
         "h_kv": 1,
         "topk": 513,
         "d": 192,
         "num_splits": 1,
         "region_size": 8,
-        "dtype": "float8_e4m3fn",
+        "dtype": "float8_e4m3fn"
+      },
+      "config": {
+        "AUTO_KV_SPLITS": 70,
+        "BLOCK_R": 2,
+        "BLOCK_H": 16,
+        "NARROW_INDEX": true,
+        "num_warps": 1,
+        "num_stages": 2,
+        "waves_per_eu": 2,
+        "kpack": 1,
+        "enable_v_mmac_cluster": 0,
+        "misched_regpressure": true,
+        "empty_arrive_after_mmac": false,
+        "use_block_pingpong": true
+      }
+    },
+    {
+      "match": {
         "s_q": 4,
-        "s_kv": 16384
+        "s_kv": 16384,
+        "h_q": 8,
+        "h_kv": 1,
+        "topk": 513,
+        "d": 192,
+        "num_splits": 1,
+        "region_size": 8,
+        "dtype": "float8_e4m3fn"
       },
       "config": {
         "AUTO_KV_SPLITS": 72,
-        "BALANCE_LIVE": false,
         "BLOCK_R": 4,
         "BLOCK_H": 16,
+        "SPLIT_MAJOR": true,
+        "NARROW_INDEX": true,
         "num_warps": 1,
-        "num_stages": 1,
+        "num_stages": 2,
         "waves_per_eu": 1,
         "kpack": 2,
         "enable_v_mmac_cluster": 0,
         "misched_regpressure": false,
-        "empty_arrive_after_mmac": false
+        "empty_arrive_after_mmac": false,
+        "hcu_use_gfx946_sched_model_v2": true,
+        "BALANCE_LIVE": false
       }
     }
   ]
