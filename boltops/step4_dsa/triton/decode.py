@@ -36,6 +36,27 @@ NEGATIVE_INFINITY = tl.constexpr(float("-inf"))
 LOG2E = tl.constexpr(1.4426950408889634)
 LN2 = tl.constexpr(0.6931471805599453)
 
+
+def _cache_is_fp8(dtype: torch.dtype) -> bool:
+    """True for an fp8 KV cache. Query dtype stays the compute dtype."""
+    return bool(dtype.is_floating_point and dtype.itemsize == 1)
+
+
+@triton.jit
+def _widen_kv(raw, ref, FP8_CACHE: tl.constexpr):
+    """Widen a gathered K/V tile to the compute dtype.
+
+    On gfx938 a direct fp8 cast is sunk into a byte-wide LDS reload
+    (``ds_read_u8``) before the bf16 MMAC. Rounding through fp32, with a
+    multiply so the cast is not sunk, keeps ``v_cvt_pk_f32_fp8`` in registers
+    and stores bf16 into shared memory. ``FP8_CACHE`` is constexpr, so a bf16
+    cache keeps the direct cast and does not compile the round trip.
+    """
+    if FP8_CACHE:
+        return (raw.to(tl.float32) * 1.0).to(ref.dtype)
+    return raw.to(ref.dtype)
+
+
 @triton.jit
 def _sparse_attn_decode_kernel(
     q_ptr,
@@ -71,6 +92,9 @@ def _sparse_attn_decode_kernel(
     BLOCK_R: tl.constexpr,
     BALANCE_LIVE: tl.constexpr = False,
     APPLY_V_SCALE: tl.constexpr = False,
+    SPLIT_MAJOR: tl.constexpr = False,
+    NARROW_INDEX: tl.constexpr = False,
+    FP8_CACHE: tl.constexpr = False,
 ) -> None:
     """One decode query against one KV group's selected regions, over one slot window.
 
@@ -98,12 +122,20 @@ def _sparse_attn_decode_kernel(
     log (``running_max * ln2 + log(sum)``), so the merge-kernel contract is
     unchanged.
     """
-    request = tl.program_id(0)
-    group = tl.program_id(1)
-    split = tl.program_id(2)
+    if SPLIT_MAJOR:
+        split = tl.program_id(0)
+        request = tl.program_id(1)
+        group = tl.program_id(2)
+    else:
+        request = tl.program_id(0)
+        group = tl.program_id(1)
+        split = tl.program_id(2)
     row = group * num_reqs + request
     count = tl.load(counts_ptr + row).to(tl.int32)
-    kv_seqlen = tl.load(seqlens_ptr + request).to(tl.int64)
+    if NARROW_INDEX:
+        kv_seqlen = tl.load(seqlens_ptr + request).to(tl.int32)
+    else:
+        kv_seqlen = tl.load(seqlens_ptr + request).to(tl.int64)
 
     heads = tl.arange(0, BLOCK_H)
     dims = tl.arange(0, BLOCK_D)
@@ -128,7 +160,8 @@ def _sparse_attn_decode_kernel(
     offsets_in_region = tl.arange(0, region_size)
     if BALANCE_LIVE:
         # Balance device-resident row lengths without a host read or metadata copy.
-        slots_per_split = tl.cdiv(tl.minimum(count, topk), tl.num_programs(2))
+        num_live_splits = tl.num_programs(0) if SPLIT_MAJOR else tl.num_programs(2)
+        slots_per_split = tl.cdiv(tl.minimum(count, topk), num_live_splits)
     window_begin = split * slots_per_split
     window_end = window_begin + slots_per_split
     for base in tl.range(window_begin, window_end, BLOCK_R):
@@ -137,8 +170,12 @@ def _sparse_attn_decode_kernel(
         meta = tl.load(
             packed_ptr + row * stride_packed_row + slots, mask=slot_ok, other=-1
         )
-        physical = (meta >> DECODE_PHYS_SHIFT) & DECODE_LOW_MASK
-        start_token = meta & DECODE_LOW_MASK
+        if NARROW_INDEX:
+            physical = (meta >> DECODE_PHYS_SHIFT).to(tl.int32)
+            start_token = meta.to(tl.int32)
+        else:
+            physical = (meta >> DECODE_PHYS_SHIFT) & DECODE_LOW_MASK
+            start_token = meta & DECODE_LOW_MASK
         valid = tl.minimum(tl.maximum(kv_seqlen - start_token, 0), region_size)
         live = slot_ok & (valid > 0)
 
@@ -168,8 +205,8 @@ def _sparse_attn_decode_kernel(
             mask=token_ok[:, None] & dim_ok[None, :],
             other=0.0,
         )
-        keys = keys.to(queries.dtype)
-        values = values.to(queries.dtype)
+        keys = _widen_kv(keys, queries, FP8_CACHE)
+        values = _widen_kv(values, queries, FP8_CACHE)
 
         scores = tl.dot(queries, keys, out_dtype=tl.float32) * scale
         scores = tl.where(token_ok[None, :] & head_ok[:, None], scores, NEGATIVE_INFINITY)
@@ -212,8 +249,9 @@ def _sparse_attn_decode_kernel(
     )
 
 
+# BF16 192-dim kernels. Direct cast of gathered K/V to the query dtype.
 @triton.jit
-def _sparse_attn_decode_dsplit_kernel(
+def _sparse_attn_decode_dsplit_bf16_kernel(
     q_ptr,
     k_ptr,
     v_ptr,
@@ -249,8 +287,12 @@ def _sparse_attn_decode_dsplit_kernel(
     BLOCK_R: tl.constexpr,
     BALANCE_LIVE: tl.constexpr = False,
     APPLY_V_SCALE: tl.constexpr = False,
+    SPLIT_MAJOR: tl.constexpr = False,
+    NARROW_INDEX: tl.constexpr = False,
 ) -> None:
-    """Same contract as ``_sparse_attn_decode_kernel``; non-pow2 ``head_dim`` fast path.
+    """BF16 192-dim decode. Gathered K/V use a direct cast to the query dtype.
+
+    Same contract as ``_sparse_attn_decode_kernel``; non-pow2 ``head_dim`` fast path.
 
     Two differences, both performance-only (bit-level output differs by fp
     rounding order, not semantics):
@@ -276,12 +318,20 @@ def _sparse_attn_decode_dsplit_kernel(
     leftover ``BLOCK_D`` is ignored.
     """
     tl.static_assert(BLOCK_D1 + BLOCK_D2 + BLOCK_D3 == head_dim)
-    request = tl.program_id(0)
-    group = tl.program_id(1)
-    split = tl.program_id(2)
+    if SPLIT_MAJOR:
+        split = tl.program_id(0)
+        request = tl.program_id(1)
+        group = tl.program_id(2)
+    else:
+        request = tl.program_id(0)
+        group = tl.program_id(1)
+        split = tl.program_id(2)
     row = group * num_reqs + request
     count = tl.load(counts_ptr + row).to(tl.int32)
-    kv_seqlen = tl.load(seqlens_ptr + request).to(tl.int64)
+    if NARROW_INDEX:
+        kv_seqlen = tl.load(seqlens_ptr + request).to(tl.int32)
+    else:
+        kv_seqlen = tl.load(seqlens_ptr + request).to(tl.int64)
 
     heads = tl.arange(0, BLOCK_H)
     dims0 = tl.arange(0, BLOCK_D1)
@@ -309,7 +359,8 @@ def _sparse_attn_decode_dsplit_kernel(
     offsets_in_region = tl.arange(0, region_size)
     if BALANCE_LIVE:
         # Balance device-resident row lengths without a host read or metadata copy.
-        slots_per_split = tl.cdiv(tl.minimum(count, topk), tl.num_programs(2))
+        num_live_splits = tl.num_programs(0) if SPLIT_MAJOR else tl.num_programs(2)
+        slots_per_split = tl.cdiv(tl.minimum(count, topk), num_live_splits)
     window_begin = split * slots_per_split
     window_end = window_begin + slots_per_split
     for base in tl.range(window_begin, window_end, BLOCK_R):
@@ -318,8 +369,12 @@ def _sparse_attn_decode_dsplit_kernel(
         meta = tl.load(
             packed_ptr + row * stride_packed_row + slots, mask=slot_ok, other=-1
         )
-        physical = (meta >> DECODE_PHYS_SHIFT) & DECODE_LOW_MASK
-        start_token = meta & DECODE_LOW_MASK
+        if NARROW_INDEX:
+            physical = (meta >> DECODE_PHYS_SHIFT).to(tl.int32)
+            start_token = meta.to(tl.int32)
+        else:
+            physical = (meta >> DECODE_PHYS_SHIFT) & DECODE_LOW_MASK
+            start_token = meta & DECODE_LOW_MASK
         valid = tl.minimum(tl.maximum(kv_seqlen - start_token, 0), region_size)
         live = slot_ok & (valid > 0)
 
@@ -418,7 +473,7 @@ def _sparse_attn_decode_dsplit_kernel(
 
 
 @triton.jit
-def _sparse_attn_decode_dsplit_pipelined_kernel(
+def _sparse_attn_decode_dsplit_pipelined_bf16_kernel(
     q_ptr,
     k_ptr,
     v_ptr,
@@ -454,10 +509,12 @@ def _sparse_attn_decode_dsplit_pipelined_kernel(
     BLOCK_R: tl.constexpr,
     BALANCE_LIVE: tl.constexpr = False,
     APPLY_V_SCALE: tl.constexpr = False,
+    SPLIT_MAJOR: tl.constexpr = False,
+    NARROW_INDEX: tl.constexpr = False,
 ) -> None:
-    """``_sparse_attn_decode_dsplit_kernel`` with register-level software pipelining.
+    """BF16 register-pipelined 192-dim decode.
 
-    Same contract and math as the dsplit kernel; only the loop schedule
+    Same contract and math as ``_sparse_attn_decode_dsplit_bf16_kernel``; only the loop schedule
     differs. The metadata word and the K/V tiles for iteration ``i + 1`` are
     loaded into loop-carried registers while iteration ``i`` runs its dots, so
     the ``meta -> address -> K/V -> MMAC`` chain of one tile overlaps the
@@ -475,12 +532,20 @@ def _sparse_attn_decode_dsplit_pipelined_kernel(
     unchanged.
     """
     tl.static_assert(BLOCK_D1 + BLOCK_D2 + BLOCK_D3 == head_dim)
-    request = tl.program_id(0)
-    group = tl.program_id(1)
-    split = tl.program_id(2)
+    if SPLIT_MAJOR:
+        split = tl.program_id(0)
+        request = tl.program_id(1)
+        group = tl.program_id(2)
+    else:
+        request = tl.program_id(0)
+        group = tl.program_id(1)
+        split = tl.program_id(2)
     row = group * num_reqs + request
     count = tl.load(counts_ptr + row).to(tl.int32)
-    kv_seqlen = tl.load(seqlens_ptr + request).to(tl.int64)
+    if NARROW_INDEX:
+        kv_seqlen = tl.load(seqlens_ptr + request).to(tl.int32)
+    else:
+        kv_seqlen = tl.load(seqlens_ptr + request).to(tl.int64)
 
     heads = tl.arange(0, BLOCK_H)
     dims0 = tl.arange(0, BLOCK_D1)
@@ -508,7 +573,8 @@ def _sparse_attn_decode_dsplit_pipelined_kernel(
     offsets_in_region = tl.arange(0, region_size)
     if BALANCE_LIVE:
         # Balance device-resident row lengths without a host read or metadata copy.
-        slots_per_split = tl.cdiv(tl.minimum(count, topk), tl.num_programs(2))
+        num_live_splits = tl.num_programs(0) if SPLIT_MAJOR else tl.num_programs(2)
+        slots_per_split = tl.cdiv(tl.minimum(count, topk), num_live_splits)
     window_begin = split * slots_per_split
     window_end = window_begin + slots_per_split
 
@@ -518,8 +584,12 @@ def _sparse_attn_decode_dsplit_pipelined_kernel(
     meta = tl.load(
         packed_ptr + row * stride_packed_row + slots, mask=slot_ok, other=-1
     )
-    physical = (meta >> DECODE_PHYS_SHIFT) & DECODE_LOW_MASK
-    start_token = meta & DECODE_LOW_MASK
+    if NARROW_INDEX:
+        physical = (meta >> DECODE_PHYS_SHIFT).to(tl.int32)
+        start_token = meta.to(tl.int32)
+    else:
+        physical = (meta >> DECODE_PHYS_SHIFT) & DECODE_LOW_MASK
+        start_token = meta & DECODE_LOW_MASK
     valid = tl.minimum(tl.maximum(kv_seqlen - start_token, 0), region_size)
     live = slot_ok & (valid > 0)
     safe_physical = tl.where(live, physical, 0)
@@ -564,8 +634,12 @@ def _sparse_attn_decode_dsplit_pipelined_kernel(
         meta = tl.load(
             packed_ptr + row * stride_packed_row + slots, mask=slot_ok, other=-1
         )
-        physical = (meta >> DECODE_PHYS_SHIFT) & DECODE_LOW_MASK
-        start_token = meta & DECODE_LOW_MASK
+        if NARROW_INDEX:
+            physical = (meta >> DECODE_PHYS_SHIFT).to(tl.int32)
+            start_token = meta.to(tl.int32)
+        else:
+            physical = (meta >> DECODE_PHYS_SHIFT) & DECODE_LOW_MASK
+            start_token = meta & DECODE_LOW_MASK
         valid = tl.minimum(tl.maximum(kv_seqlen - start_token, 0), region_size)
         live = slot_ok & (valid > 0)
         safe_physical = tl.where(live, physical, 0)
@@ -661,6 +735,532 @@ def _sparse_attn_decode_dsplit_pipelined_kernel(
     )
 
 
+# Separate launch entry points keep dtype-specific compilation and dispatch explicit.
+# The shared JIT bodies contain the identical metadata, softmax, and scheduling
+# logic; only the K/V widening path is specialized by each entry point.
+
+
+# FP8 192-dim kernels. Gathered K/V are widened through fp32.
+@triton.jit
+def _widen_fp8_kv(raw, ref):
+    """Widen a gathered fp8 K/V tile to the query dtype through fp32.
+
+    On gfx938 a direct fp8 cast is sunk into a byte-wide LDS reload
+    (``ds_read_u8``) before the bf16 MMAC. Rounding through fp32, with a
+    multiply so the cast is not sunk, keeps ``v_cvt_pk_f32_fp8`` in registers
+    and stores bf16 into shared memory.
+    """
+    return (raw.to(tl.float32) * 1.0).to(ref.dtype)
+
+
+@triton.jit
+def _sparse_attn_decode_dsplit_fp8_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    packed_ptr,
+    counts_ptr,
+    seqlens_ptr,
+    out_ptr,
+    lse_ptr,
+    stride_q_token,
+    stride_q_head,
+    stride_k_token,
+    stride_k_group,
+    stride_v_token,
+    stride_v_group,
+    stride_packed_row,
+    stride_out_split,
+    stride_out_token,
+    stride_out_head,
+    stride_lse_split,
+    stride_lse_token,
+    softmax_scale,
+    v_scale,
+    num_reqs,
+    topk: tl.constexpr,
+    heads_per_group: tl.constexpr,
+    head_dim: tl.constexpr,
+    region_size: tl.constexpr,
+    slots_per_split: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_D1: tl.constexpr,
+    BLOCK_D2: tl.constexpr,
+    BLOCK_D3: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    BALANCE_LIVE: tl.constexpr = False,
+    APPLY_V_SCALE: tl.constexpr = False,
+    SPLIT_MAJOR: tl.constexpr = False,
+    NARROW_INDEX: tl.constexpr = False,
+) -> None:
+    """FP8 192-dim decode. Gathered K/V are widened through fp32.
+
+    Same contract as ``_sparse_attn_decode_kernel``; non-pow2 ``head_dim`` fast path.
+
+    Two differences, both performance-only (bit-level output differs by fp
+    rounding order, not semantics):
+
+    - ``head_dim`` is covered by three pow2 chunks ``BLOCK_D1 + BLOCK_D2 +
+      BLOCK_D3 == head_dim`` (e.g. 192 = 64 + 64 + 64) instead of one padded
+      ``BLOCK_D = next_pow2(head_dim)`` or a 128+64 pair. QK is
+      ``dot(q0, k0) + dot(q1, k1) + dot(q2, k2)`` and the PV accumulator is
+      split the same way. Three 64-wide MMACs use fewer VGPRs than one 128-wide
+      tile plus one 64-wide tile. This also removes the padding share of the
+      K/V LDS tiles, the MMACs and the accumulator rescale (25% for 192), and
+      the ``dims < head_dim`` mask disappears because the chunks cover the head
+      exactly.
+    - The online softmax runs in the log2 domain: ``log2(e)`` is folded into
+      the softmax scale and ``exp2`` replaces ``exp``. The stored LSE is
+      converted back to natural log (``running_max * ln2 + log(sum)``), so the
+      merge-kernel contract is unchanged.
+
+    Launched by :func:`sparse_attention_decode` when ``head_dim`` splits into
+    three 64-wide chunks (currently ``head_dim=192``); otherwise the original
+    kernel runs. Occupancy JSONs omit ``BLOCK_D`` / ``BLOCK_D1`` / ``BLOCK_D2``
+    / ``BLOCK_D3`` on this path; the chunks are derived from ``head_dim``. A
+    leftover ``BLOCK_D`` is ignored.
+    """
+    tl.static_assert(BLOCK_D1 + BLOCK_D2 + BLOCK_D3 == head_dim)
+    if SPLIT_MAJOR:
+        split = tl.program_id(0)
+        request = tl.program_id(1)
+        group = tl.program_id(2)
+    else:
+        request = tl.program_id(0)
+        group = tl.program_id(1)
+        split = tl.program_id(2)
+    row = group * num_reqs + request
+    count = tl.load(counts_ptr + row).to(tl.int32)
+    if NARROW_INDEX:
+        kv_seqlen = tl.load(seqlens_ptr + request).to(tl.int32)
+    else:
+        kv_seqlen = tl.load(seqlens_ptr + request).to(tl.int64)
+
+    heads = tl.arange(0, BLOCK_H)
+    dims0 = tl.arange(0, BLOCK_D1)
+    dims1 = BLOCK_D1 + tl.arange(0, BLOCK_D2)
+    dims2 = BLOCK_D1 + BLOCK_D2 + tl.arange(0, BLOCK_D3)
+    head_ok = heads < heads_per_group
+
+    q_base = (
+        q_ptr
+        + request * stride_q_token
+        + (group * heads_per_group + heads)[:, None] * stride_q_head
+    )
+    queries0 = tl.load(q_base + dims0[None, :], mask=head_ok[:, None], other=0.0)
+    queries1 = tl.load(q_base + dims1[None, :], mask=head_ok[:, None], other=0.0)
+    queries2 = tl.load(q_base + dims2[None, :], mask=head_ok[:, None], other=0.0)
+
+    scale = softmax_scale * LOG2E
+
+    running_max = tl.full((BLOCK_H,), NEGATIVE_INFINITY, dtype=tl.float32)
+    running_sum = tl.zeros((BLOCK_H,), dtype=tl.float32)
+    acc0 = tl.zeros((BLOCK_H, BLOCK_D1), dtype=tl.float32)
+    acc1 = tl.zeros((BLOCK_H, BLOCK_D2), dtype=tl.float32)
+    acc2 = tl.zeros((BLOCK_H, BLOCK_D3), dtype=tl.float32)
+
+    offsets_in_region = tl.arange(0, region_size)
+    if BALANCE_LIVE:
+        # Balance device-resident row lengths without a host read or metadata copy.
+        num_live_splits = tl.num_programs(0) if SPLIT_MAJOR else tl.num_programs(2)
+        slots_per_split = tl.cdiv(tl.minimum(count, topk), num_live_splits)
+    window_begin = split * slots_per_split
+    window_end = window_begin + slots_per_split
+    for base in tl.range(window_begin, window_end, BLOCK_R):
+        slots = base + tl.arange(0, BLOCK_R)
+        slot_ok = (slots < count) & (slots < topk) & (slots < window_end)
+        meta = tl.load(
+            packed_ptr + row * stride_packed_row + slots, mask=slot_ok, other=-1
+        )
+        if NARROW_INDEX:
+            physical = (meta >> DECODE_PHYS_SHIFT).to(tl.int32)
+            start_token = meta.to(tl.int32)
+        else:
+            physical = (meta >> DECODE_PHYS_SHIFT) & DECODE_LOW_MASK
+            start_token = meta & DECODE_LOW_MASK
+        valid = tl.minimum(tl.maximum(kv_seqlen - start_token, 0), region_size)
+        live = slot_ok & (valid > 0)
+
+        safe_physical = tl.where(live, physical, 0)
+        tokens = tl.reshape(
+            safe_physical[:, None] * region_size + offsets_in_region[None, :],
+            (BLOCK_R * region_size,),
+        )
+        token_ok = tl.reshape(
+            live[:, None] & (offsets_in_region[None, :] < valid[:, None]),
+            (BLOCK_R * region_size,),
+        )
+
+        k_base = k_ptr + tokens[None, :] * stride_k_token + group * stride_k_group
+        keys0 = _widen_fp8_kv(
+            tl.load(k_base + dims0[:, None], mask=token_ok[None, :], other=0.0),
+            queries0,
+        )
+        keys1 = _widen_fp8_kv(
+            tl.load(k_base + dims1[:, None], mask=token_ok[None, :], other=0.0),
+            queries0,
+        )
+        keys2 = _widen_fp8_kv(
+            tl.load(k_base + dims2[:, None], mask=token_ok[None, :], other=0.0),
+            queries0,
+        )
+        v_base = v_ptr + tokens[:, None] * stride_v_token + group * stride_v_group
+        values0 = _widen_fp8_kv(
+            tl.load(v_base + dims0[None, :], mask=token_ok[:, None], other=0.0),
+            queries0,
+        )
+        values1 = _widen_fp8_kv(
+            tl.load(v_base + dims1[None, :], mask=token_ok[:, None], other=0.0),
+            queries0,
+        )
+        values2 = _widen_fp8_kv(
+            tl.load(v_base + dims2[None, :], mask=token_ok[:, None], other=0.0),
+            queries0,
+        )
+
+        scores = (
+            tl.dot(queries0, keys0, out_dtype=tl.float32)
+            + tl.dot(queries1, keys1, out_dtype=tl.float32)
+            + tl.dot(queries2, keys2, out_dtype=tl.float32)
+        ) * scale
+        scores = tl.where(
+            token_ok[None, :] & head_ok[:, None], scores, NEGATIVE_INFINITY
+        )
+
+        tile_max = tl.maximum(running_max, tl.max(scores, axis=1))
+        empty = tile_max == NEGATIVE_INFINITY
+        shift = tl.where(empty, 0.0, tile_max)
+        rescale = tl.where(empty, 1.0, tl.math.exp2(running_max - shift))
+        probabilities = tl.math.exp2(scores - shift[:, None])
+        running_sum = running_sum * rescale + tl.sum(probabilities, axis=1)
+        p = probabilities.to(queries0.dtype)
+        acc0 = acc0 * rescale[:, None] + tl.dot(p, values0, out_dtype=tl.float32)
+        acc1 = acc1 * rescale[:, None] + tl.dot(p, values1, out_dtype=tl.float32)
+        acc2 = acc2 * rescale[:, None] + tl.dot(p, values2, out_dtype=tl.float32)
+        running_max = tile_max
+
+    selected = running_sum > 0
+    # Reuse one reciprocal per head instead of dividing every output element.
+    inv_sum = tl.div_rn(1.0, tl.where(selected, running_sum, 1.0))
+    output0 = tl.where(selected[:, None], acc0 * inv_sum[:, None], 0.0)
+    output1 = tl.where(selected[:, None], acc1 * inv_sum[:, None], 0.0)
+    output2 = tl.where(selected[:, None], acc2 * inv_sum[:, None], 0.0)
+    if APPLY_V_SCALE:
+        output0 = output0 * v_scale
+        output1 = output1 * v_scale
+        output2 = output2 * v_scale
+    out_base = (
+        out_ptr
+        + split * stride_out_split
+        + request * stride_out_token
+        + (group * heads_per_group + heads)[:, None] * stride_out_head
+    )
+    tl.store(
+        out_base + dims0[None, :],
+        output0.to(out_ptr.dtype.element_ty),
+        mask=head_ok[:, None],
+    )
+    tl.store(
+        out_base + dims1[None, :],
+        output1.to(out_ptr.dtype.element_ty),
+        mask=head_ok[:, None],
+    )
+    tl.store(
+        out_base + dims2[None, :],
+        output2.to(out_ptr.dtype.element_ty),
+        mask=head_ok[:, None],
+    )
+    tl.store(
+        lse_ptr
+        + split * stride_lse_split
+        + request * stride_lse_token
+        + group * heads_per_group
+        + heads,
+        tl.where(selected, running_max * LN2 + tl.log(running_sum), NEGATIVE_INFINITY),
+        mask=head_ok,
+    )
+
+
+@triton.jit
+def _sparse_attn_decode_dsplit_pipelined_fp8_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    packed_ptr,
+    counts_ptr,
+    seqlens_ptr,
+    out_ptr,
+    lse_ptr,
+    stride_q_token,
+    stride_q_head,
+    stride_k_token,
+    stride_k_group,
+    stride_v_token,
+    stride_v_group,
+    stride_packed_row,
+    stride_out_split,
+    stride_out_token,
+    stride_out_head,
+    stride_lse_split,
+    stride_lse_token,
+    softmax_scale,
+    v_scale,
+    num_reqs,
+    topk: tl.constexpr,
+    heads_per_group: tl.constexpr,
+    head_dim: tl.constexpr,
+    region_size: tl.constexpr,
+    slots_per_split: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_D1: tl.constexpr,
+    BLOCK_D2: tl.constexpr,
+    BLOCK_D3: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    BALANCE_LIVE: tl.constexpr = False,
+    APPLY_V_SCALE: tl.constexpr = False,
+    SPLIT_MAJOR: tl.constexpr = False,
+    NARROW_INDEX: tl.constexpr = False,
+) -> None:
+    """FP8 register-pipelined 192-dim decode. Gathered K/V are widened through fp32.
+
+    Same contract and math as ``_sparse_attn_decode_dsplit_fp8_kernel``; only the loop schedule
+    differs. The metadata word and the K/V tiles for iteration ``i + 1`` are
+    loaded into loop-carried registers while iteration ``i`` runs its dots, so
+    the ``meta -> address -> K/V -> MMAC`` chain of one tile overlaps the
+    previous tile's compute instead of serialising behind it. The backend's
+    ``num_stages > 1`` LDS pipeliner produces far slower code for this loop on
+    gfx938, which is why the overlap is expressed in source.
+
+    Double-buffering K/V in registers doubles their live range, so this kernel
+    is meant to run with a halved ``BLOCK_R`` (e.g. 4 instead of 8): the two
+    half-tiles in flight then cost the same registers as one full tile in the
+    non-pipelined kernel, and latency hiding comes from the overlap rather
+    than tile width. Selected per shape via ``PIPELINE_KV`` in the occupancy
+    JSON (host-only key, typically together with ``AUTO_KV_SPLITS``); the
+    prefetch beyond the last tile is fully masked, so window semantics are
+    unchanged.
+    """
+    tl.static_assert(BLOCK_D1 + BLOCK_D2 + BLOCK_D3 == head_dim)
+    if SPLIT_MAJOR:
+        split = tl.program_id(0)
+        request = tl.program_id(1)
+        group = tl.program_id(2)
+    else:
+        request = tl.program_id(0)
+        group = tl.program_id(1)
+        split = tl.program_id(2)
+    row = group * num_reqs + request
+    count = tl.load(counts_ptr + row).to(tl.int32)
+    if NARROW_INDEX:
+        kv_seqlen = tl.load(seqlens_ptr + request).to(tl.int32)
+    else:
+        kv_seqlen = tl.load(seqlens_ptr + request).to(tl.int64)
+
+    heads = tl.arange(0, BLOCK_H)
+    dims0 = tl.arange(0, BLOCK_D1)
+    dims1 = BLOCK_D1 + tl.arange(0, BLOCK_D2)
+    dims2 = BLOCK_D1 + BLOCK_D2 + tl.arange(0, BLOCK_D3)
+    head_ok = heads < heads_per_group
+
+    q_base = (
+        q_ptr
+        + request * stride_q_token
+        + (group * heads_per_group + heads)[:, None] * stride_q_head
+    )
+    queries0 = tl.load(q_base + dims0[None, :], mask=head_ok[:, None], other=0.0)
+    queries1 = tl.load(q_base + dims1[None, :], mask=head_ok[:, None], other=0.0)
+    queries2 = tl.load(q_base + dims2[None, :], mask=head_ok[:, None], other=0.0)
+
+    scale = softmax_scale * LOG2E
+
+    running_max = tl.full((BLOCK_H,), NEGATIVE_INFINITY, dtype=tl.float32)
+    running_sum = tl.zeros((BLOCK_H,), dtype=tl.float32)
+    acc0 = tl.zeros((BLOCK_H, BLOCK_D1), dtype=tl.float32)
+    acc1 = tl.zeros((BLOCK_H, BLOCK_D2), dtype=tl.float32)
+    acc2 = tl.zeros((BLOCK_H, BLOCK_D3), dtype=tl.float32)
+
+    offsets_in_region = tl.arange(0, region_size)
+    if BALANCE_LIVE:
+        # Balance device-resident row lengths without a host read or metadata copy.
+        num_live_splits = tl.num_programs(0) if SPLIT_MAJOR else tl.num_programs(2)
+        slots_per_split = tl.cdiv(tl.minimum(count, topk), num_live_splits)
+    window_begin = split * slots_per_split
+    window_end = window_begin + slots_per_split
+
+    # Prologue: stage the first tile into registers.
+    slots = window_begin + tl.arange(0, BLOCK_R)
+    slot_ok = (slots < count) & (slots < topk) & (slots < window_end)
+    meta = tl.load(
+        packed_ptr + row * stride_packed_row + slots, mask=slot_ok, other=-1
+    )
+    if NARROW_INDEX:
+        physical = (meta >> DECODE_PHYS_SHIFT).to(tl.int32)
+        start_token = meta.to(tl.int32)
+    else:
+        physical = (meta >> DECODE_PHYS_SHIFT) & DECODE_LOW_MASK
+        start_token = meta & DECODE_LOW_MASK
+    valid = tl.minimum(tl.maximum(kv_seqlen - start_token, 0), region_size)
+    live = slot_ok & (valid > 0)
+    safe_physical = tl.where(live, physical, 0)
+    tokens = tl.reshape(
+        safe_physical[:, None] * region_size + offsets_in_region[None, :],
+        (BLOCK_R * region_size,),
+    )
+    token_ok = tl.reshape(
+        live[:, None] & (offsets_in_region[None, :] < valid[:, None]),
+        (BLOCK_R * region_size,),
+    )
+    k_base = k_ptr + tokens[None, :] * stride_k_token + group * stride_k_group
+    keys0 = _widen_fp8_kv(
+        tl.load(k_base + dims0[:, None], mask=token_ok[None, :], other=0.0),
+        queries0,
+    )
+    keys1 = _widen_fp8_kv(
+        tl.load(k_base + dims1[:, None], mask=token_ok[None, :], other=0.0),
+        queries0,
+    )
+    keys2 = _widen_fp8_kv(
+        tl.load(k_base + dims2[:, None], mask=token_ok[None, :], other=0.0),
+        queries0,
+    )
+    v_base = v_ptr + tokens[:, None] * stride_v_token + group * stride_v_group
+    values0 = _widen_fp8_kv(
+        tl.load(v_base + dims0[None, :], mask=token_ok[:, None], other=0.0),
+        queries0,
+    )
+    values1 = _widen_fp8_kv(
+        tl.load(v_base + dims1[None, :], mask=token_ok[:, None], other=0.0),
+        queries0,
+    )
+    values2 = _widen_fp8_kv(
+        tl.load(v_base + dims2[None, :], mask=token_ok[:, None], other=0.0),
+        queries0,
+    )
+
+    for base in tl.range(window_begin, window_end, BLOCK_R):
+        cur_ok = token_ok
+        cur_k0, cur_k1, cur_k2 = keys0, keys1, keys2
+        cur_v0, cur_v1, cur_v2 = values0, values1, values2
+
+        # Stage tile i+1 before tile i computes. Past the window every lane is
+        # masked (``slot_ok`` is False), so no out-of-range access is issued.
+        slots = base + BLOCK_R + tl.arange(0, BLOCK_R)
+        slot_ok = (slots < count) & (slots < topk) & (slots < window_end)
+        meta = tl.load(
+            packed_ptr + row * stride_packed_row + slots, mask=slot_ok, other=-1
+        )
+        if NARROW_INDEX:
+            physical = (meta >> DECODE_PHYS_SHIFT).to(tl.int32)
+            start_token = meta.to(tl.int32)
+        else:
+            physical = (meta >> DECODE_PHYS_SHIFT) & DECODE_LOW_MASK
+            start_token = meta & DECODE_LOW_MASK
+        valid = tl.minimum(tl.maximum(kv_seqlen - start_token, 0), region_size)
+        live = slot_ok & (valid > 0)
+        safe_physical = tl.where(live, physical, 0)
+        tokens = tl.reshape(
+            safe_physical[:, None] * region_size + offsets_in_region[None, :],
+            (BLOCK_R * region_size,),
+        )
+        token_ok = tl.reshape(
+            live[:, None] & (offsets_in_region[None, :] < valid[:, None]),
+            (BLOCK_R * region_size,),
+        )
+        k_base = k_ptr + tokens[None, :] * stride_k_token + group * stride_k_group
+        keys0 = _widen_fp8_kv(
+            tl.load(k_base + dims0[:, None], mask=token_ok[None, :], other=0.0),
+            queries0,
+        )
+        keys1 = _widen_fp8_kv(
+            tl.load(k_base + dims1[:, None], mask=token_ok[None, :], other=0.0),
+            queries0,
+        )
+        keys2 = _widen_fp8_kv(
+            tl.load(k_base + dims2[:, None], mask=token_ok[None, :], other=0.0),
+            queries0,
+        )
+        v_base = v_ptr + tokens[:, None] * stride_v_token + group * stride_v_group
+        values0 = _widen_fp8_kv(
+            tl.load(v_base + dims0[None, :], mask=token_ok[:, None], other=0.0),
+            queries0,
+        )
+        values1 = _widen_fp8_kv(
+            tl.load(v_base + dims1[None, :], mask=token_ok[:, None], other=0.0),
+            queries0,
+        )
+        values2 = _widen_fp8_kv(
+            tl.load(v_base + dims2[None, :], mask=token_ok[:, None], other=0.0),
+            queries0,
+        )
+
+        scores = (
+            tl.dot(queries0, cur_k0, out_dtype=tl.float32)
+            + tl.dot(queries1, cur_k1, out_dtype=tl.float32)
+            + tl.dot(queries2, cur_k2, out_dtype=tl.float32)
+        ) * scale
+        scores = tl.where(
+            cur_ok[None, :] & head_ok[:, None], scores, NEGATIVE_INFINITY
+        )
+
+        tile_max = tl.maximum(running_max, tl.max(scores, axis=1))
+        empty = tile_max == NEGATIVE_INFINITY
+        shift = tl.where(empty, 0.0, tile_max)
+        rescale = tl.where(empty, 1.0, tl.math.exp2(running_max - shift))
+        probabilities = tl.math.exp2(scores - shift[:, None])
+        running_sum = running_sum * rescale + tl.sum(probabilities, axis=1)
+        p = probabilities.to(queries0.dtype)
+        acc0 = acc0 * rescale[:, None] + tl.dot(p, cur_v0, out_dtype=tl.float32)
+        acc1 = acc1 * rescale[:, None] + tl.dot(p, cur_v1, out_dtype=tl.float32)
+        acc2 = acc2 * rescale[:, None] + tl.dot(p, cur_v2, out_dtype=tl.float32)
+        running_max = tile_max
+
+    selected = running_sum > 0
+    # Reuse one reciprocal per head instead of dividing every output element.
+    inv_sum = tl.div_rn(1.0, tl.where(selected, running_sum, 1.0))
+    output0 = tl.where(selected[:, None], acc0 * inv_sum[:, None], 0.0)
+    output1 = tl.where(selected[:, None], acc1 * inv_sum[:, None], 0.0)
+    output2 = tl.where(selected[:, None], acc2 * inv_sum[:, None], 0.0)
+    if APPLY_V_SCALE:
+        output0 = output0 * v_scale
+        output1 = output1 * v_scale
+        output2 = output2 * v_scale
+    out_base = (
+        out_ptr
+        + split * stride_out_split
+        + request * stride_out_token
+        + (group * heads_per_group + heads)[:, None] * stride_out_head
+    )
+    tl.store(
+        out_base + dims0[None, :],
+        output0.to(out_ptr.dtype.element_ty),
+        mask=head_ok[:, None],
+    )
+    tl.store(
+        out_base + dims1[None, :],
+        output1.to(out_ptr.dtype.element_ty),
+        mask=head_ok[:, None],
+    )
+    tl.store(
+        out_base + dims2[None, :],
+        output2.to(out_ptr.dtype.element_ty),
+        mask=head_ok[:, None],
+    )
+    tl.store(
+        lse_ptr
+        + split * stride_lse_split
+        + request * stride_lse_token
+        + group * heads_per_group
+        + heads,
+        tl.where(selected, running_max * LN2 + tl.log(running_sum), NEGATIVE_INFINITY),
+        mask=head_ok,
+    )
+
+
+# Separate launch entry points keep dtype-specific compilation and dispatch explicit.
+# The shared JIT bodies contain the identical metadata, softmax, and scheduling
+# logic; only the K/V widening path is specialized by each entry point.
+
+
 def _decode_head_dim_split(head_dim: int) -> tuple[int, int, int] | None:
     """``(D1, D2, D3)`` pow2 MMAC chunks covering ``head_dim``, or ``None``.
 
@@ -684,14 +1284,22 @@ _CONFIG_DIR = os.path.join(
     "config",
     "sparse_attn_decode",
 )
-# Shared by both kernels. ``BLOCK_D`` is only in the padded-kernel JSON;
+# Shared by the padded fallback and the BF16/FP8 dsplit launch kernels.
+# ``BLOCK_D`` is only in the padded-kernel JSON;
 # dsplit occupancy files omit it (and never carry ``BLOCK_D1`` / ``BLOCK_D2``
 # / ``BLOCK_D3``).
 # ``AUTO_KV_SPLITS`` is host-only: pins the s1 auto-path launch grid; never a
 # kernel constexpr. ``PIPELINE_KV`` is host-only too: on the dsplit path it
 # selects the register-pipelined kernel (typically with a halved ``BLOCK_R``).
+# ``SPLIT_MAJOR`` transposes the program grid to make split the contiguous
+# launch dimension; it is a kernel constexpr shared by all decode variants.
+# ``NARROW_INDEX`` uses int32 for sequence/token indices after unpacking int64
+# metadata. It is independent of launch order and must only be enabled when the
+# represented sequence and physical-token ranges fit in signed int32.
 _HOST_CONFIG_KEYS = frozenset({"AUTO_KV_SPLITS", "PIPELINE_KV", "APPLY_V_SCALE"})
-_COMMON_KERNEL_CONFIG_KEYS = frozenset({"BLOCK_R", "BLOCK_H", "BALANCE_LIVE"})
+_COMMON_KERNEL_CONFIG_KEYS = frozenset(
+    {"BLOCK_R", "BLOCK_H", "BALANCE_LIVE", "SPLIT_MAJOR", "NARROW_INDEX"}
+)
 _PADDED_KERNEL_CONFIG_KEYS = _COMMON_KERNEL_CONFIG_KEYS | {"BLOCK_D"}
 _ALL_KERNEL_CONFIG_KEYS = _PADDED_KERNEL_CONFIG_KEYS | {"BLOCK_D1", "BLOCK_D2", "BLOCK_D3"}
 _HOST_OR_KERNEL_CONFIG_KEYS = _ALL_KERNEL_CONFIG_KEYS | _HOST_CONFIG_KEYS
@@ -970,6 +1578,10 @@ def sparse_attention_decode(
             are ignored.
             ``BALANCE_LIVE`` balances valid slots across automatic splits. It is
             ignored for explicit splits or partial outputs to preserve their windows.
+            ``SPLIT_MAJOR`` maps split to the contiguous launch dimension and request
+            to the second dimension; it changes scheduling only, not tensor layout.
+            ``NARROW_INDEX`` uses signed int32 after unpacking sequence and physical
+            token indices. Enable it only when both represented ranges fit int32.
         k_scale, v_scale: per-tensor dequantization scales for an fp8 cache, i.e. the
             true tensor is ``cache * scale``. Both default to 1.0. ``k_scale`` is
             folded into ``softmax_scale`` on the host; ``v_scale`` multiplies the
@@ -1110,6 +1722,8 @@ def sparse_attention_decode(
         v_scale,
         num_reqs,
     )
+    split_major = bool(launch and launch.get("SPLIT_MAJOR", False))
+    fp8_cache = _cache_is_fp8(key_cache.dtype)
     common_meta = dict(
         topk=topk,
         heads_per_group=heads_per_group,
@@ -1121,18 +1735,32 @@ def sparse_attention_decode(
         BALANCE_LIVE=bool(launch and launch.get("BALANCE_LIVE", False))
         and auto_kv_split and not return_partials and num_splits > 1,
         APPLY_V_SCALE=apply_v_scale,
+        SPLIT_MAJOR=split_major,
+        NARROW_INDEX=bool(launch and launch.get("NARROW_INDEX", False)),
+    )
+    kernel_grid = (
+        (num_splits, num_reqs, num_kv_groups)
+        if split_major
+        else (num_reqs, num_kv_groups, num_splits)
     )
     if d_split is not None:
         # Non-pow2 head_dim (e.g. 192): padding-free 64+64+64 kernel.
         # Occupancy JSON omits ``BLOCK_D``; chunks come from ``head_dim``.
-        # ``PIPELINE_KV`` selects the register-pipelined variant of the same
-        # kernel (identical math; K/V tiles staged one iteration ahead).
-        dsplit_kernel = (
-            _sparse_attn_decode_dsplit_pipelined_kernel
-            if launch and launch.get("PIPELINE_KV")
-            else _sparse_attn_decode_dsplit_kernel
-        )
-        dsplit_kernel[(num_reqs, num_kv_groups, num_splits)](
+        # ``PIPELINE_KV`` selects that dtype's independent register-pipelined
+        # kernel. Its math matches the non-pipelined kernel; K/V is staged one
+        # iteration ahead.
+        pipelined = bool(launch and launch.get("PIPELINE_KV"))
+        if fp8_cache:
+            dsplit_kernel = (
+                _sparse_attn_decode_dsplit_pipelined_fp8_kernel
+                if pipelined else _sparse_attn_decode_dsplit_fp8_kernel
+            )
+        else:
+            dsplit_kernel = (
+                _sparse_attn_decode_dsplit_pipelined_bf16_kernel
+                if pipelined else _sparse_attn_decode_dsplit_bf16_kernel
+            )
+        dsplit_kernel[kernel_grid](
             *common_args,
             **common_meta,
             BLOCK_D1=d_split[0],
@@ -1143,10 +1771,11 @@ def sparse_attention_decode(
     else:
         # Padded-kernel JSON still has ``BLOCK_D``; missing it uses the default tile.
         block_d = int(launch.get("BLOCK_D", default_d)) if launch else default_d
-        _sparse_attn_decode_kernel[(num_reqs, num_kv_groups, num_splits)](
+        _sparse_attn_decode_kernel[kernel_grid](
             *common_args,
             **common_meta,
             BLOCK_D=block_d,
+            FP8_CACHE=fp8_cache,
             **extra,
         )
     if num_splits == 1:

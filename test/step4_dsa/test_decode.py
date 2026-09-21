@@ -111,6 +111,8 @@ def test_decode_launch_options_follow_backend_capabilities(monkeypatch):
         "BLOCK_D2": 64,
         "BLOCK_D3": 64,
         "BALANCE_LIVE": True,
+        "SPLIT_MAJOR": True,
+        "NARROW_INDEX": True,
         "num_warps": 2,
         "num_stages": 1,
         "waves_per_eu": 3,
@@ -134,6 +136,8 @@ def test_decode_launch_options_follow_backend_capabilities(monkeypatch):
         "BLOCK_H": 16,
         "BLOCK_D": 128,
         "BALANCE_LIVE": True,
+        "SPLIT_MAJOR": True,
+        "NARROW_INDEX": True,
         **expected_options,
     }
     assert decode._decode_head_dim_split(192) == (64, 64, 64)
@@ -143,13 +147,16 @@ def test_decode_launch_options_follow_backend_capabilities(monkeypatch):
         "BLOCK_R": 8,
         "BLOCK_H": 16,
         "BALANCE_LIVE": True,
+        "SPLIT_MAJOR": True,
+        "NARROW_INDEX": True,
         **expected_options,
     }
 
 
 @C.GPU_REQUIRED
 @pytest.mark.parametrize("empty_rows", [False, True])
-def test_sparse_decode_matches_ref(empty_rows: bool):
+@pytest.mark.parametrize("split_major", [False, True])
+def test_sparse_decode_matches_ref(empty_rows: bool, split_major: bool):
     data = _make_decode_case(
         num_reqs=4, topk=8, context_len=256, empty_rows=empty_rows, seed=61
     )
@@ -165,6 +172,13 @@ def test_sparse_decode_matches_ref(empty_rows: bool):
         softmax_scale=data["scale"],
         num_splits=1,
         block_regions=4,
+        config={
+            "BLOCK_R": 2,
+            "BLOCK_H": 16,
+            "SPLIT_MAJOR": split_major,
+            "num_warps": 1,
+            "num_stages": 1,
+        },
     )
     ref_out, ref_lse = ref_sparse_attention_decode(
         data["query"],
@@ -182,6 +196,46 @@ def test_sparse_decode_matches_ref(empty_rows: bool):
     lse_check = compare(lse, ref_lse, rtol=LSE_RTOL, atol=LSE_ATOL)
     assert out_check.passed, out_check.format()
     assert lse_check.passed, lse_check.format()
+
+
+@C.GPU_REQUIRED
+def test_sparse_decode_narrow_index_at_kv_seqlen_65536():
+    data = _make_decode_case(
+        num_reqs=1, topk=2, context_len=65536, empty_rows=False, seed=63
+    )
+    starts = torch.tensor(
+        [65528, 65520], device=data["packed"].device, dtype=torch.int64
+    ).expand(data["packed"].shape[0], -1)
+    physical_bits = (data["packed"] >> DECODE_PHYS_SHIFT) << DECODE_PHYS_SHIFT
+    data["packed"].copy_(physical_bits | starts)
+
+    out, lse = triton_sparse_attention_decode(
+        data["query"],
+        data["key_cache"],
+        data["value_cache"],
+        data["packed"],
+        data["counts"],
+        data["kv_seqlens"],
+        num_kv_groups=data["groups"],
+        region_size=data["region_size"],
+        softmax_scale=data["scale"],
+        num_splits=1,
+        block_regions=2,
+        config={"NARROW_INDEX": True, "BLOCK_R": 2},
+    )
+    ref_out, ref_lse = ref_sparse_attention_decode(
+        data["query"],
+        data["key_cache"],
+        data["value_cache"],
+        data["packed"],
+        data["counts"],
+        data["kv_seqlens"],
+        num_kv_groups=data["groups"],
+        region_size=data["region_size"],
+        softmax_scale=data["scale"],
+    )
+    torch.testing.assert_close(out, ref_out.to(out.dtype), rtol=OUT_RTOL, atol=OUT_ATOL)
+    torch.testing.assert_close(lse, ref_lse, rtol=LSE_RTOL, atol=LSE_ATOL)
 
 
 @C.GPU_REQUIRED
@@ -409,11 +463,18 @@ def test_sparse_decode_accepts_padded_head_dim():
 
 
 @C.GPU_REQUIRED
-def test_sparse_decode_bf16_kv_scales_match_ref():
+@pytest.mark.parametrize("head_dim", [128, 192])
+@pytest.mark.parametrize("pipeline_kv", [False, True])
+def test_sparse_decode_bf16_kv_scales_match_ref(pipeline_kv: bool, head_dim: int):
     data = _make_decode_case(
         num_reqs=4, topk=8, context_len=256, empty_rows=False, seed=70
     )
+    data["query"] = data["query"][..., :head_dim]
+    data["key_cache"] = data["key_cache"][..., :head_dim]
+    data["value_cache"] = data["value_cache"][..., :head_dim]
+    data["scale"] = head_dim**-0.5
     k_scale, v_scale = 2.0, 0.5
+    config = {"BLOCK_R": 2, "BLOCK_H": 16, "PIPELINE_KV": True} if pipeline_kv else {}
     out, lse = triton_sparse_attention_decode(
         data["query"],
         data["key_cache"],
@@ -426,6 +487,7 @@ def test_sparse_decode_bf16_kv_scales_match_ref():
         softmax_scale=data["scale"],
         num_splits=1,
         block_regions=4,
+        config=config,
         k_scale=k_scale,
         v_scale=v_scale,
     )
@@ -450,16 +512,22 @@ def test_sparse_decode_bf16_kv_scales_match_ref():
 
 
 @C.GPU_REQUIRED
+@pytest.mark.parametrize("head_dim", [128, 192])
 @pytest.mark.parametrize("k_scale,v_scale", [(1.0, 1.0), (2.0, 0.5)])
 @pytest.mark.parametrize("pipeline_kv", [False, True])
 def test_sparse_decode_fp8_kv_cache_matches_ref(
-    k_scale: float, v_scale: float, pipeline_kv: bool
+    k_scale: float, v_scale: float, pipeline_kv: bool, head_dim: int
 ):
     if getattr(torch, "float8_e4m3fn", None) is None:
         pytest.skip("torch.float8_e4m3fn is not available")
     data = _make_decode_case(
         num_reqs=4, topk=8, context_len=256, empty_rows=False, seed=71
     )
+    # Also exercise the shared padded fallback (128) alongside 192-dim paths.
+    data["query"] = data["query"][..., :head_dim]
+    data["key_cache"] = data["key_cache"][..., :head_dim]
+    data["value_cache"] = data["value_cache"][..., :head_dim]
+    data["scale"] = head_dim**-0.5
     key_fp8 = C.quantize_kv_fp8(data["key_cache"], k_scale)
     value_fp8 = C.quantize_kv_fp8(data["value_cache"], v_scale)
     config = {"BLOCK_R": 2, "BLOCK_H": 16}

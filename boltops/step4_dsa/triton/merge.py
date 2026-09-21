@@ -14,6 +14,7 @@ from boltops.step4_dsa.triton.common import _require_contiguous_last_dim
 NEGATIVE_INFINITY = tl.constexpr(float("-inf"))
 LOG2E = tl.constexpr(1.4426950408889634)
 
+
 @triton.jit
 def _merge_split_states_kernel(
     partial_out_ptr,
@@ -85,6 +86,68 @@ def _merge_split_states_kernel(
     )
 
 
+@triton.jit
+def _merge_split_states_dgrid_kernel(
+    partial_out_ptr,
+    partial_lse_ptr,
+    out_ptr,
+    lse_ptr,
+    stride_po_split,
+    stride_po_token,
+    stride_po_head,
+    stride_pl_split,
+    stride_pl_token,
+    stride_out_token,
+    stride_out_head,
+    stride_lse_token,
+    num_splits,
+    head_dim: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+) -> None:
+    """Merge one 64-wide head-dimension tile per program."""
+    token = tl.program_id(0)
+    head = tl.program_id(1)
+    dim_tile = tl.program_id(2)
+
+    splits = tl.arange(0, BLOCK_S)
+    split_ok = splits < num_splits
+    partial_lse = tl.load(
+        partial_lse_ptr + splits * stride_pl_split + token * stride_pl_token + head,
+        mask=split_ok,
+        other=NEGATIVE_INFINITY,
+    )
+    peak = tl.max(partial_lse)
+    empty = peak == NEGATIVE_INFINITY
+    shift = tl.where(empty, 0.0, peak)
+    weights = tl.where(split_ok, tl.math.exp2((partial_lse - shift) * LOG2E), 0.0)
+    total = tl.sum(weights)
+    inv_total = tl.div_rn(1.0, tl.maximum(total, 1.0e-20))
+
+    dims = dim_tile * BLOCK_D + tl.arange(0, BLOCK_D)
+    dim_ok = dims < head_dim
+    states = tl.load(
+        partial_out_ptr
+        + splits[:, None] * stride_po_split
+        + token * stride_po_token
+        + head * stride_po_head
+        + dims[None, :],
+        mask=split_ok[:, None] & dim_ok[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    merged = tl.sum(states * weights[:, None], axis=0) * inv_total
+    tl.store(
+        out_ptr + token * stride_out_token + head * stride_out_head + dims,
+        merged.to(out_ptr.dtype.element_ty),
+        mask=dim_ok,
+    )
+    if dim_tile == 0:
+        tl.store(
+            lse_ptr + token * stride_lse_token + head,
+            tl.where(empty, NEGATIVE_INFINITY, shift + tl.log(total)),
+        )
+
+
 def merge_split_states(
     partial_out: torch.Tensor,
     partial_lse: torch.Tensor,
@@ -120,6 +183,35 @@ def merge_split_states(
             (tokens, num_heads), device=partial_out.device, dtype=torch.float32
         )
     block_s = triton.next_power_of_2(num_splits)
+    block_d = 64
+    if tokens <= 32:
+        # Small-token decode/prefill does not expose enough workgroups to fill
+        # the device. Split the 192-wide head across D to triple grid size.
+        # For larger token counts the repeated LSE reduction/load costs more
+        # than the extra parallelism, so retain the original kernel below.
+        num_dim_tiles = triton.cdiv(head_dim, block_d)
+        _merge_split_states_dgrid_kernel[(tokens, num_heads, num_dim_tiles)](
+            partial_out,
+            partial_lse,
+            out,
+            lse,
+            partial_out.stride(0),
+            partial_out.stride(1),
+            partial_out.stride(2),
+            partial_lse.stride(0),
+            partial_lse.stride(1),
+            out.stride(0),
+            out.stride(1),
+            lse.stride(0),
+            num_splits,
+            head_dim=head_dim,
+            BLOCK_S=block_s,
+            BLOCK_D=block_d,
+            num_warps=1,
+            num_stages=1,
+        )
+        return out, lse
+
     # Prefill merge is 1024 tiny workgroups (Q=128, H=8, S=18). Default HIP
     # num_warps=4 launched 4096 waves of 255 instructions and spent 50% of
     # cycles No-Eligible. One warp is enough for S<=32; large decode S keeps
@@ -147,8 +239,8 @@ def merge_split_states(
         num_splits,
         head_dim=head_dim,
         BLOCK_S=block_s,
-        BLOCK_D=64,
-        N_D=triton.cdiv(head_dim, 64),
+        BLOCK_D=block_d,
+        N_D=triton.cdiv(head_dim, block_d),
         num_warps=num_warps,
         num_stages=1,
     )

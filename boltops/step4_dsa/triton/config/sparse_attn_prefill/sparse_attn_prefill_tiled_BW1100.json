@@ -49,17 +49,18 @@
       "config": {
         "AUTO_KV_SPLITS": 18,
         "BLOCK_Q": 128,
-        "BLOCK_R": 4,
+        "BLOCK_R": 8,
         "num_warps": 4,
         "num_stages": 1,
-        "waves_per_eu": 1,
-        "empty_arrive_after_mmac": false,
-        "kpack": 2,
+        "waves_per_eu": 3,
+        "kpack": 1,
         "enable_v_mmac_cluster": 0,
-        "amdgpu_enable_max_ilp_scheduling_strategy": true,
-        "misched_regpressure": false
+        "empty_arrive_after_mmac": false,
+        "misched_regpressure": true,
+        "schedule_hint": "attention",
+        "amdgpu_enable_max_ilp_scheduling_strategy": true
       },
-      "latency_ms": 0.12314030408859253
+      "latency_ms": 0.0906534194946289
     }
   ]
 }
