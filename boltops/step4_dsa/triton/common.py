@@ -8,23 +8,66 @@ that call them; this module is Python-only.
 from __future__ import annotations
 
 import importlib
+import os
+from collections.abc import Callable
 
 import torch
 
+# Occupancy JSON is keyed by a stable product family, not the marketing string
+# ``torch.cuda.get_device_name()`` returns. Board renames that share one SKU
+# (BW1101 and BW1100) keep a single ``*_BW1100.json``; do not copy the file.
+# Longer tokens are matched first so BW1100 does not collapse into BW200.
+_CONFIG_SKU_ALIASES: dict[str, str] = {
+    "bw1101": "BW1100",
+    "bw1100": "BW1100",
+    "bw200": "BW200",
+    "k100": "K100_AI",
+}
+_CONFIG_SKU_TOKENS = tuple(sorted(_CONFIG_SKU_ALIASES, key=len, reverse=True))
+
+
+def _canonical_config_sku(device_name: str) -> str:
+    """Map a marketing / board name onto the SKU used in config filenames."""
+    compact = (
+        device_name.lower()
+        .replace(" ", "")
+        .replace("_", "")
+        .replace("-", "")
+        .replace(",", "")
+    )
+    for token in _CONFIG_SKU_TOKENS:
+        if token in compact:
+            return _CONFIG_SKU_ALIASES[token]
+    return device_name.replace(" ", "_")
+
+
+def _config_sku_candidates(device_name: str) -> tuple[str, ...]:
+    """Filenames to try: canonical family first, then the raw board slug."""
+    canonical = _canonical_config_sku(device_name)
+    raw = device_name.replace(" ", "_")
+    if raw == canonical:
+        return (canonical,)
+    return (canonical, raw)
+
+
+def _config_path_for_device(
+    config_dir: str,
+    filename_for: Callable[[str], str],
+    device: str,
+) -> str | None:
+    """Return the first existing occupancy JSON for ``device``, or ``None``."""
+    for sku in _config_sku_candidates(device):
+        path = os.path.join(config_dir, filename_for(sku))
+        if os.path.isfile(path):
+            return path
+    return None
+
 
 def _device_name_for_config() -> str:
+    """Canonical product SKU used when reading or writing occupancy JSON."""
     if not torch.cuda.is_available():
         return "unknown"
-    name = torch.cuda.get_device_name().replace(" ", "_")
-    compact = name.lower().replace("_", "").replace("-", "")
-    # BW1100 must win over the BW200 substring check used by GEMM loaders.
-    if "bw1100" in compact:
-        return "BW1100"
-    if "bw200" in compact:
-        return "BW200"
-    if "k100" in compact:
-        return "K100_AI"
-    return name
+    return _canonical_config_sku(torch.cuda.get_device_name())
 
 
 def _dtype_tag(dtype: torch.dtype) -> str:
@@ -32,6 +75,15 @@ def _dtype_tag(dtype: torch.dtype) -> str:
         return "bf16"
     if dtype == torch.float16:
         return "fp16"
+    return str(dtype).replace("torch.", "")
+
+
+def _occupancy_dtype(dtype: torch.dtype) -> str:
+    """Occupancy JSON ``dtype`` token: torch dtype name without ``torch.``.
+
+    Lookup keys this off the KV cache, not the query. Query stays bfloat16 on
+    the FP8 serving path; ``float8_e4m3fn`` is what distinguishes that path.
+    """
     return str(dtype).replace("torch.", "")
 
 

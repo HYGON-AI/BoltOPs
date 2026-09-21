@@ -12,6 +12,7 @@ import triton.language as tl
 from boltops.step4_dsa.triton.common import _require_contiguous_last_dim
 
 NEGATIVE_INFINITY = tl.constexpr(float("-inf"))
+LOG2E = tl.constexpr(1.4426950408889634)
 
 @triton.jit
 def _merge_split_states_kernel(
@@ -31,6 +32,7 @@ def _merge_split_states_kernel(
     head_dim: tl.constexpr,
     BLOCK_S: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    N_D: tl.constexpr,
 ) -> None:
     """Combine per-split attention states into one, weighting by the partial lse.
 
@@ -45,9 +47,7 @@ def _merge_split_states_kernel(
     head = tl.program_id(1)
 
     splits = tl.arange(0, BLOCK_S)
-    dims = tl.arange(0, BLOCK_D)
     split_ok = splits < num_splits
-    dim_ok = dims < head_dim
 
     partial_lse = tl.load(
         partial_lse_ptr + splits * stride_pl_split + token * stride_pl_token + head,
@@ -57,25 +57,28 @@ def _merge_split_states_kernel(
     peak = tl.max(partial_lse)
     empty = peak == NEGATIVE_INFINITY
     shift = tl.where(empty, 0.0, peak)
-    weights = tl.where(split_ok, tl.exp(partial_lse - shift), 0.0)
+    weights = tl.where(split_ok, tl.math.exp2((partial_lse - shift) * LOG2E), 0.0)
     total = tl.sum(weights)
+    inv_total = tl.div_rn(1.0, tl.maximum(total, 1.0e-20))
 
-    states = tl.load(
-        partial_out_ptr
-        + splits[:, None] * stride_po_split
-        + token * stride_po_token
-        + head * stride_po_head
-        + dims[None, :],
-        mask=split_ok[:, None] & dim_ok[None, :],
-        other=0.0,
-    ).to(tl.float32)
-    merged = tl.sum(states * weights[:, None], axis=0) / tl.maximum(total, 1.0e-20)
-
-    tl.store(
-        out_ptr + token * stride_out_token + head * stride_out_head + dims,
-        merged.to(out_ptr.dtype.element_ty),
-        mask=dim_ok,
-    )
+    for i in tl.static_range(0, N_D):
+        dims = i * BLOCK_D + tl.arange(0, BLOCK_D)
+        dim_ok = dims < head_dim
+        states = tl.load(
+            partial_out_ptr
+            + splits[:, None] * stride_po_split
+            + token * stride_po_token
+            + head * stride_po_head
+            + dims[None, :],
+            mask=split_ok[:, None] & dim_ok[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        merged = tl.sum(states * weights[:, None], axis=0) * inv_total
+        tl.store(
+            out_ptr + token * stride_out_token + head * stride_out_head + dims,
+            merged.to(out_ptr.dtype.element_ty),
+            mask=dim_ok,
+        )
     tl.store(
         lse_ptr + token * stride_lse_token + head,
         tl.where(empty, NEGATIVE_INFINITY, shift + tl.log(total)),
@@ -83,13 +86,18 @@ def _merge_split_states_kernel(
 
 
 def merge_split_states(
-    partial_out: torch.Tensor, partial_lse: torch.Tensor
+    partial_out: torch.Tensor,
+    partial_lse: torch.Tensor,
+    *,
+    out: torch.Tensor | None = None,
+    lse: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Reduce ``[splits, tokens, heads, dim]`` partial states to ``[tokens, heads, dim]``.
 
     ``partial_out`` and the allocated ``out`` must be contiguous in the last
     dimension (``stride(-1) == 1``); the kernel addresses ``head_dim`` as
-    ``base + d``.
+    ``base + d``. Pass ``out`` / ``lse`` to write the reduction in place and
+    skip the extra allocation.
 
     Semantics follow ``merge_variable_split_nat_lse_states_sm90_gqa`` -- "nat" being the
     natural-log lse the sparse kernels emit. The upstream kernel additionally supports a
@@ -100,17 +108,26 @@ def merge_split_states(
     """
     num_splits, tokens, num_heads, head_dim = partial_out.shape
     _require_contiguous_last_dim(partial_out, "partial_out")
-    out = torch.empty((tokens, num_heads, head_dim), device=partial_out.device, dtype=partial_out.dtype)
+    if out is None:
+        out = torch.empty(
+            (tokens, num_heads, head_dim),
+            device=partial_out.device,
+            dtype=partial_out.dtype,
+        )
     _require_contiguous_last_dim(out, "out")
-    lse = torch.empty((tokens, num_heads), device=partial_out.device, dtype=torch.float32)
+    if lse is None:
+        lse = torch.empty(
+            (tokens, num_heads), device=partial_out.device, dtype=torch.float32
+        )
     block_s = triton.next_power_of_2(num_splits)
-    # Prefill merge is 1024 tiny workgroups (Q=128, H=8, S=4). Default HIP
+    # Prefill merge is 1024 tiny workgroups (Q=128, H=8, S=18). Default HIP
     # num_warps=4 launched 4096 waves of 255 instructions and spent 50% of
-    # cycles No-Eligible. One warp is enough for S<=8; large decode S keeps
-    # more warps so BLOCK_S*BLOCK_D states still fit.
-    if block_s <= 8:
+    # cycles No-Eligible. One warp is enough for S<=32; large decode S keeps
+    # more warps so BLOCK_S*BLOCK_D tiles still fit. Walk D in 64-wide power-of-two
+    # tiles so a 192-wide head does not pad to 256.
+    if block_s <= 32:
         num_warps = 1
-    elif block_s <= 32:
+    elif block_s <= 64:
         num_warps = 2
     else:
         num_warps = 4
@@ -130,7 +147,8 @@ def merge_split_states(
         num_splits,
         head_dim=head_dim,
         BLOCK_S=block_s,
-        BLOCK_D=triton.next_power_of_2(head_dim),
+        BLOCK_D=64,
+        N_D=triton.cdiv(head_dim, 64),
         num_warps=num_warps,
         num_stages=1,
     )

@@ -22,8 +22,10 @@ import triton
 import triton.language as tl
 
 from boltops.step4_dsa.triton.common import (
+    _config_path_for_device,
     _device_name_for_config,
     _fit_block_regions,
+    _occupancy_dtype,
     _require_contiguous_last_dim,
 )
 from boltops.utility.triton_capability import get_triton_capabilities
@@ -57,6 +59,7 @@ def _sparse_attn_decode_kernel(
     stride_lse_split,
     stride_lse_token,
     softmax_scale,
+    v_scale,
     num_reqs,
     topk: tl.constexpr,
     heads_per_group: tl.constexpr,
@@ -67,6 +70,7 @@ def _sparse_attn_decode_kernel(
     BLOCK_D: tl.constexpr,
     BLOCK_R: tl.constexpr,
     BALANCE_LIVE: tl.constexpr = False,
+    APPLY_V_SCALE: tl.constexpr = False,
 ) -> None:
     """One decode query against one KV group's selected regions, over one slot window.
 
@@ -164,6 +168,8 @@ def _sparse_attn_decode_kernel(
             mask=token_ok[:, None] & dim_ok[None, :],
             other=0.0,
         )
+        keys = keys.to(queries.dtype)
+        values = values.to(queries.dtype)
 
         scores = tl.dot(queries, keys, out_dtype=tl.float32) * scale
         scores = tl.where(token_ok[None, :] & head_ok[:, None], scores, NEGATIVE_INFINITY)
@@ -184,6 +190,8 @@ def _sparse_attn_decode_kernel(
     # Reuse one reciprocal per head instead of dividing every output element.
     inv_sum = tl.div_rn(1.0, tl.where(selected, running_sum, 1.0))
     output = tl.where(selected[:, None], accumulator * inv_sum[:, None], 0.0)
+    if APPLY_V_SCALE:
+        output = output * v_scale
     tl.store(
         out_ptr
         + split * stride_out_split
@@ -227,6 +235,7 @@ def _sparse_attn_decode_dsplit_kernel(
     stride_lse_split,
     stride_lse_token,
     softmax_scale,
+    v_scale,
     num_reqs,
     topk: tl.constexpr,
     heads_per_group: tl.constexpr,
@@ -239,6 +248,7 @@ def _sparse_attn_decode_dsplit_kernel(
     BLOCK_D3: tl.constexpr,
     BLOCK_R: tl.constexpr,
     BALANCE_LIVE: tl.constexpr = False,
+    APPLY_V_SCALE: tl.constexpr = False,
 ) -> None:
     """Same contract as ``_sparse_attn_decode_kernel``; non-pow2 ``head_dim`` fast path.
 
@@ -324,13 +334,25 @@ def _sparse_attn_decode_dsplit_kernel(
         )
 
         k_base = k_ptr + tokens[None, :] * stride_k_token + group * stride_k_group
-        keys0 = tl.load(k_base + dims0[:, None], mask=token_ok[None, :], other=0.0)
-        keys1 = tl.load(k_base + dims1[:, None], mask=token_ok[None, :], other=0.0)
-        keys2 = tl.load(k_base + dims2[:, None], mask=token_ok[None, :], other=0.0)
+        keys0 = tl.load(k_base + dims0[:, None], mask=token_ok[None, :], other=0.0).to(
+            queries0.dtype
+        )
+        keys1 = tl.load(k_base + dims1[:, None], mask=token_ok[None, :], other=0.0).to(
+            queries0.dtype
+        )
+        keys2 = tl.load(k_base + dims2[:, None], mask=token_ok[None, :], other=0.0).to(
+            queries0.dtype
+        )
         v_base = v_ptr + tokens[:, None] * stride_v_token + group * stride_v_group
-        values0 = tl.load(v_base + dims0[None, :], mask=token_ok[:, None], other=0.0)
-        values1 = tl.load(v_base + dims1[None, :], mask=token_ok[:, None], other=0.0)
-        values2 = tl.load(v_base + dims2[None, :], mask=token_ok[:, None], other=0.0)
+        values0 = tl.load(v_base + dims0[None, :], mask=token_ok[:, None], other=0.0).to(
+            queries0.dtype
+        )
+        values1 = tl.load(v_base + dims1[None, :], mask=token_ok[:, None], other=0.0).to(
+            queries0.dtype
+        )
+        values2 = tl.load(v_base + dims2[None, :], mask=token_ok[:, None], other=0.0).to(
+            queries0.dtype
+        )
 
         scores = (
             tl.dot(queries0, keys0, out_dtype=tl.float32)
@@ -347,7 +369,7 @@ def _sparse_attn_decode_dsplit_kernel(
         rescale = tl.where(empty, 1.0, tl.math.exp2(running_max - shift))
         probabilities = tl.math.exp2(scores - shift[:, None])
         running_sum = running_sum * rescale + tl.sum(probabilities, axis=1)
-        p = probabilities.to(values0.dtype)
+        p = probabilities.to(queries0.dtype)
         acc0 = acc0 * rescale[:, None] + tl.dot(p, values0, out_dtype=tl.float32)
         acc1 = acc1 * rescale[:, None] + tl.dot(p, values1, out_dtype=tl.float32)
         acc2 = acc2 * rescale[:, None] + tl.dot(p, values2, out_dtype=tl.float32)
@@ -359,6 +381,10 @@ def _sparse_attn_decode_dsplit_kernel(
     output0 = tl.where(selected[:, None], acc0 * inv_sum[:, None], 0.0)
     output1 = tl.where(selected[:, None], acc1 * inv_sum[:, None], 0.0)
     output2 = tl.where(selected[:, None], acc2 * inv_sum[:, None], 0.0)
+    if APPLY_V_SCALE:
+        output0 = output0 * v_scale
+        output1 = output1 * v_scale
+        output2 = output2 * v_scale
     out_base = (
         out_ptr
         + split * stride_out_split
@@ -414,6 +440,7 @@ def _sparse_attn_decode_dsplit_pipelined_kernel(
     stride_lse_split,
     stride_lse_token,
     softmax_scale,
+    v_scale,
     num_reqs,
     topk: tl.constexpr,
     heads_per_group: tl.constexpr,
@@ -426,6 +453,7 @@ def _sparse_attn_decode_dsplit_pipelined_kernel(
     BLOCK_D3: tl.constexpr,
     BLOCK_R: tl.constexpr,
     BALANCE_LIVE: tl.constexpr = False,
+    APPLY_V_SCALE: tl.constexpr = False,
 ) -> None:
     """``_sparse_attn_decode_dsplit_kernel`` with register-level software pipelining.
 
@@ -504,13 +532,25 @@ def _sparse_attn_decode_dsplit_pipelined_kernel(
         (BLOCK_R * region_size,),
     )
     k_base = k_ptr + tokens[None, :] * stride_k_token + group * stride_k_group
-    keys0 = tl.load(k_base + dims0[:, None], mask=token_ok[None, :], other=0.0)
-    keys1 = tl.load(k_base + dims1[:, None], mask=token_ok[None, :], other=0.0)
-    keys2 = tl.load(k_base + dims2[:, None], mask=token_ok[None, :], other=0.0)
+    keys0 = tl.load(k_base + dims0[:, None], mask=token_ok[None, :], other=0.0).to(
+        queries0.dtype
+    )
+    keys1 = tl.load(k_base + dims1[:, None], mask=token_ok[None, :], other=0.0).to(
+        queries0.dtype
+    )
+    keys2 = tl.load(k_base + dims2[:, None], mask=token_ok[None, :], other=0.0).to(
+        queries0.dtype
+    )
     v_base = v_ptr + tokens[:, None] * stride_v_token + group * stride_v_group
-    values0 = tl.load(v_base + dims0[None, :], mask=token_ok[:, None], other=0.0)
-    values1 = tl.load(v_base + dims1[None, :], mask=token_ok[:, None], other=0.0)
-    values2 = tl.load(v_base + dims2[None, :], mask=token_ok[:, None], other=0.0)
+    values0 = tl.load(v_base + dims0[None, :], mask=token_ok[:, None], other=0.0).to(
+        queries0.dtype
+    )
+    values1 = tl.load(v_base + dims1[None, :], mask=token_ok[:, None], other=0.0).to(
+        queries0.dtype
+    )
+    values2 = tl.load(v_base + dims2[None, :], mask=token_ok[:, None], other=0.0).to(
+        queries0.dtype
+    )
 
     for base in tl.range(window_begin, window_end, BLOCK_R):
         cur_ok = token_ok
@@ -538,13 +578,25 @@ def _sparse_attn_decode_dsplit_pipelined_kernel(
             (BLOCK_R * region_size,),
         )
         k_base = k_ptr + tokens[None, :] * stride_k_token + group * stride_k_group
-        keys0 = tl.load(k_base + dims0[:, None], mask=token_ok[None, :], other=0.0)
-        keys1 = tl.load(k_base + dims1[:, None], mask=token_ok[None, :], other=0.0)
-        keys2 = tl.load(k_base + dims2[:, None], mask=token_ok[None, :], other=0.0)
+        keys0 = tl.load(k_base + dims0[:, None], mask=token_ok[None, :], other=0.0).to(
+            queries0.dtype
+        )
+        keys1 = tl.load(k_base + dims1[:, None], mask=token_ok[None, :], other=0.0).to(
+            queries0.dtype
+        )
+        keys2 = tl.load(k_base + dims2[:, None], mask=token_ok[None, :], other=0.0).to(
+            queries0.dtype
+        )
         v_base = v_ptr + tokens[:, None] * stride_v_token + group * stride_v_group
-        values0 = tl.load(v_base + dims0[None, :], mask=token_ok[:, None], other=0.0)
-        values1 = tl.load(v_base + dims1[None, :], mask=token_ok[:, None], other=0.0)
-        values2 = tl.load(v_base + dims2[None, :], mask=token_ok[:, None], other=0.0)
+        values0 = tl.load(v_base + dims0[None, :], mask=token_ok[:, None], other=0.0).to(
+            queries0.dtype
+        )
+        values1 = tl.load(v_base + dims1[None, :], mask=token_ok[:, None], other=0.0).to(
+            queries0.dtype
+        )
+        values2 = tl.load(v_base + dims2[None, :], mask=token_ok[:, None], other=0.0).to(
+            queries0.dtype
+        )
 
         scores = (
             tl.dot(queries0, cur_k0, out_dtype=tl.float32)
@@ -561,7 +613,7 @@ def _sparse_attn_decode_dsplit_pipelined_kernel(
         rescale = tl.where(empty, 1.0, tl.math.exp2(running_max - shift))
         probabilities = tl.math.exp2(scores - shift[:, None])
         running_sum = running_sum * rescale + tl.sum(probabilities, axis=1)
-        p = probabilities.to(cur_v0.dtype)
+        p = probabilities.to(queries0.dtype)
         acc0 = acc0 * rescale[:, None] + tl.dot(p, cur_v0, out_dtype=tl.float32)
         acc1 = acc1 * rescale[:, None] + tl.dot(p, cur_v1, out_dtype=tl.float32)
         acc2 = acc2 * rescale[:, None] + tl.dot(p, cur_v2, out_dtype=tl.float32)
@@ -573,6 +625,10 @@ def _sparse_attn_decode_dsplit_pipelined_kernel(
     output0 = tl.where(selected[:, None], acc0 * inv_sum[:, None], 0.0)
     output1 = tl.where(selected[:, None], acc1 * inv_sum[:, None], 0.0)
     output2 = tl.where(selected[:, None], acc2 * inv_sum[:, None], 0.0)
+    if APPLY_V_SCALE:
+        output0 = output0 * v_scale
+        output1 = output1 * v_scale
+        output2 = output2 * v_scale
     out_base = (
         out_ptr
         + split * stride_out_split
@@ -634,7 +690,7 @@ _CONFIG_DIR = os.path.join(
 # ``AUTO_KV_SPLITS`` is host-only: pins the s1 auto-path launch grid; never a
 # kernel constexpr. ``PIPELINE_KV`` is host-only too: on the dsplit path it
 # selects the register-pipelined kernel (typically with a halved ``BLOCK_R``).
-_HOST_CONFIG_KEYS = frozenset({"AUTO_KV_SPLITS", "PIPELINE_KV"})
+_HOST_CONFIG_KEYS = frozenset({"AUTO_KV_SPLITS", "PIPELINE_KV", "APPLY_V_SCALE"})
 _COMMON_KERNEL_CONFIG_KEYS = frozenset({"BLOCK_R", "BLOCK_H", "BALANCE_LIVE"})
 _PADDED_KERNEL_CONFIG_KEYS = _COMMON_KERNEL_CONFIG_KEYS | {"BLOCK_D"}
 _ALL_KERNEL_CONFIG_KEYS = _PADDED_KERNEL_CONFIG_KEYS | {"BLOCK_D1", "BLOCK_D2", "BLOCK_D3"}
@@ -704,8 +760,8 @@ def _decode_config_match_score(
 
 @functools.lru_cache(maxsize=None)
 def _load_decode_device_configs(device: str) -> dict[str, Any]:
-    path = os.path.join(_CONFIG_DIR, _decode_config_filename(device))
-    if not os.path.exists(path):
+    path = _config_path_for_device(_CONFIG_DIR, _decode_config_filename, device)
+    if path is None:
         return {}
     try:
         with open(path) as handle:
@@ -752,7 +808,8 @@ def _load_sparse_attn_decode_config(
     applies to query/key/value, while ``h_kv`` comes from ``key_cache`` and is
     equivalent to the public ``num_kv_groups`` argument. Physical cache capacity
     (``key_cache.shape[0]``) is excluded; actual work is represented by ``s_kv``
-    from the maximum runtime sequence length and by ``topk``.
+    from the maximum runtime sequence length and by ``topk``. ``dtype`` is the
+    KV-cache dtype (``bfloat16`` or ``float8_e4m3fn``), not the query.
     """
     device_tag = _device_name_for_config()
     data = _load_decode_device_configs(device_tag)
@@ -765,7 +822,7 @@ def _load_sparse_attn_decode_config(
         "d": int(query.shape[2]),
         "num_splits": int(num_splits),
         "region_size": int(region_size),
-        "dtype": str(query.dtype).replace("torch.", ""),
+        "dtype": _occupancy_dtype(key_cache.dtype),
     }
     selected = None
     selected_score: tuple[int, int, float] | None = None
@@ -863,6 +920,8 @@ def sparse_attention_decode(
     min_slots_per_split: int = 8,
     auto_kv_split: bool | None = None,
     return_partials: bool | None = None,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Sparse attention for one query token per request.
 
@@ -872,6 +931,7 @@ def sparse_attention_decode(
             kernel addresses ``head_dim`` as ``base + d``.
         key_cache, value_cache: ``[tokens, num_kv_groups, head_dim]``, pages flattened.
             Same last-dim rule as ``query``. Allocated ``out`` is checked the same way.
+            May hold ``float8_e4m3``; see ``k_scale``/``v_scale``.
         packed_regions: ``[num_kv_groups * num_reqs, topk]`` **int64**, each slot
             ``start_token | (phys_region << 32)``. Note this is a different packing from
             prefill's int32 ``phys_region | (valid_tokens << 24)``: decode carries the
@@ -910,6 +970,12 @@ def sparse_attention_decode(
             are ignored.
             ``BALANCE_LIVE`` balances valid slots across automatic splits. It is
             ignored for explicit splits or partial outputs to preserve their windows.
+        k_scale, v_scale: per-tensor dequantization scales for an fp8 cache, i.e. the
+            true tensor is ``cache * scale``. Both default to 1.0. ``k_scale`` is
+            folded into ``softmax_scale`` on the host; ``v_scale`` multiplies the
+            fp32 output when it is not 1.0 (``APPLY_V_SCALE``) and is split-safe.
+            Staging uses the query element size, because K/V are widened to the
+            query dtype immediately after the load.
 
     Returns:
         ``num_splits==1``: merged ``(out [num_reqs, num_heads, head_dim],
@@ -940,6 +1006,9 @@ def sparse_attention_decode(
     heads_per_group = num_heads // num_kv_groups
     topk = int(packed_regions.shape[1])
     scale = softmax_scale if softmax_scale is not None else head_dim**-0.5
+    scale = scale * float(k_scale)
+    v_scale = float(v_scale)
+    apply_v_scale = v_scale != 1.0
     if auto_kv_split is None:
         auto_kv_split = num_splits is None or int(num_splits) == 1
     if auto_kv_split:
@@ -1001,7 +1070,7 @@ def sparse_attention_decode(
         slots_per_split=slots_per_split,
         block_regions=block_regions,
         region_size=region_size,
-        element_size=key_cache.element_size(),
+        element_size=query.element_size(),
     )
     extra: dict[str, Any] = {}
     d_split = _decode_head_dim_split(head_dim)
@@ -1038,6 +1107,7 @@ def sparse_attention_decode(
         lse.stride(0),
         lse.stride(1),
         scale,
+        v_scale,
         num_reqs,
     )
     common_meta = dict(
@@ -1050,6 +1120,7 @@ def sparse_attention_decode(
         BLOCK_R=block_r,
         BALANCE_LIVE=bool(launch and launch.get("BALANCE_LIVE", False))
         and auto_kv_split and not return_partials and num_splits > 1,
+        APPLY_V_SCALE=apply_v_scale,
     )
     if d_split is not None:
         # Non-pow2 head_dim (e.g. 192): padding-free 64+64+64 kernel.

@@ -265,6 +265,8 @@ def ref_sparse_attention(
     num_kv_groups: int,
     region_size: int,
     softmax_scale: float,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Reference sparse attention, ported from the sparse-attention forward unit test.
 
@@ -278,6 +280,8 @@ def ref_sparse_attention(
       precondition, not a property of the math.
     * there is **no causal mask** here. ``valid_tokens`` in the packed metadata is the
       only thing bounding what a query sees.
+
+    ``k_scale`` / ``v_scale`` dequantize an fp8 cache as ``cache.float() * scale``.
     """
     total_q, num_heads, head_dim = query.shape
     heads_per_group = num_heads // num_kv_groups
@@ -287,8 +291,8 @@ def ref_sparse_attention(
     )
 
     for group in range(num_kv_groups):
-        keys = key_cache[:, group].float()
-        values = value_cache[:, group].float()
+        keys = key_cache[:, group].float() * k_scale
+        values = value_cache[:, group].float() * v_scale
         head_slice = slice(group * heads_per_group, (group + 1) * heads_per_group)
         for q_index in range(total_q):
             row = group * total_q + q_index
@@ -327,6 +331,8 @@ def ref_sparse_attention_decode(
     num_kv_groups: int,
     region_size: int,
     softmax_scale: float,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Reference sparse decode, ported from the decode unit test's reference.
 
@@ -345,6 +351,8 @@ def ref_sparse_attention_decode(
     * the gathered spans are concatenated with **no dedup**. Prefill's reference calls
       ``.unique()``; this one does not, so a duplicated region really would be counted
       twice. Distinctness is a precondition of the selector, not of the kernel.
+
+    ``k_scale`` / ``v_scale`` dequantize an fp8 cache as ``cache.float() * scale``.
     """
     num_reqs, num_heads, _ = query.shape
     heads_per_group = num_heads // num_kv_groups
@@ -354,8 +362,8 @@ def ref_sparse_attention_decode(
     )
 
     for group in range(num_kv_groups):
-        keys = key_cache[:, group].float()
-        values = value_cache[:, group].float()
+        keys = key_cache[:, group].float() * k_scale
+        values = value_cache[:, group].float() * v_scale
         head_slice = slice(group * heads_per_group, (group + 1) * heads_per_group)
         for request in range(num_reqs):
             row = group * num_reqs + request

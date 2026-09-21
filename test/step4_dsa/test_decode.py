@@ -406,3 +406,96 @@ def test_sparse_decode_accepts_padded_head_dim():
     lse_check = compare(lse, ref_lse, rtol=LSE_RTOL, atol=LSE_ATOL)
     assert out_check.passed, out_check.format()
     assert lse_check.passed, lse_check.format()
+
+
+@C.GPU_REQUIRED
+def test_sparse_decode_bf16_kv_scales_match_ref():
+    data = _make_decode_case(
+        num_reqs=4, topk=8, context_len=256, empty_rows=False, seed=70
+    )
+    k_scale, v_scale = 2.0, 0.5
+    out, lse = triton_sparse_attention_decode(
+        data["query"],
+        data["key_cache"],
+        data["value_cache"],
+        data["packed"],
+        data["counts"],
+        data["kv_seqlens"],
+        num_kv_groups=data["groups"],
+        region_size=data["region_size"],
+        softmax_scale=data["scale"],
+        num_splits=1,
+        block_regions=4,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+    ref_out, ref_lse = ref_sparse_attention_decode(
+        data["query"],
+        data["key_cache"],
+        data["value_cache"],
+        data["packed"],
+        data["counts"],
+        data["kv_seqlens"],
+        num_kv_groups=data["groups"],
+        region_size=data["region_size"],
+        softmax_scale=data["scale"],
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+    torch.cuda.synchronize()
+    out_check = compare(out.float(), ref_out.float(), rtol=OUT_RTOL, atol=OUT_ATOL)
+    lse_check = compare(lse, ref_lse, rtol=LSE_RTOL, atol=LSE_ATOL)
+    assert out_check.passed, out_check.format()
+    assert lse_check.passed, lse_check.format()
+
+
+@C.GPU_REQUIRED
+@pytest.mark.parametrize("k_scale,v_scale", [(1.0, 1.0), (2.0, 0.5)])
+@pytest.mark.parametrize("pipeline_kv", [False, True])
+def test_sparse_decode_fp8_kv_cache_matches_ref(
+    k_scale: float, v_scale: float, pipeline_kv: bool
+):
+    if getattr(torch, "float8_e4m3fn", None) is None:
+        pytest.skip("torch.float8_e4m3fn is not available")
+    data = _make_decode_case(
+        num_reqs=4, topk=8, context_len=256, empty_rows=False, seed=71
+    )
+    key_fp8 = C.quantize_kv_fp8(data["key_cache"], k_scale)
+    value_fp8 = C.quantize_kv_fp8(data["value_cache"], v_scale)
+    config = {"BLOCK_R": 2, "BLOCK_H": 16}
+    if pipeline_kv:
+        config["PIPELINE_KV"] = True
+    out, lse = triton_sparse_attention_decode(
+        data["query"],
+        key_fp8,
+        value_fp8,
+        data["packed"],
+        data["counts"],
+        data["kv_seqlens"],
+        num_kv_groups=data["groups"],
+        region_size=data["region_size"],
+        softmax_scale=data["scale"],
+        num_splits=1,
+        block_regions=4,
+        config=config,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+    ref_out, ref_lse = ref_sparse_attention_decode(
+        data["query"],
+        key_fp8,
+        value_fp8,
+        data["packed"],
+        data["counts"],
+        data["kv_seqlens"],
+        num_kv_groups=data["groups"],
+        region_size=data["region_size"],
+        softmax_scale=data["scale"],
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+    torch.cuda.synchronize()
+    out_check = compare(out.float(), ref_out.float(), rtol=OUT_RTOL, atol=OUT_ATOL)
+    lse_check = compare(lse, ref_lse, rtol=LSE_RTOL, atol=LSE_ATOL)
+    assert out_check.passed, out_check.format()
+    assert lse_check.passed, lse_check.format()
