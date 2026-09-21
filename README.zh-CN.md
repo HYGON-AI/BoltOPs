@@ -12,7 +12,6 @@ Backend Optimized Low-latency Triton/TileLang Operators
 
 ![BoltOp is Fastest](docs/boltop_is_fastest.jpg)
 
-
 |            | 名称              |
 | ---------- | ----------------- |
 | 仓库       | `BoltOPs`         |
@@ -20,9 +19,6 @@ Backend Optimized Low-latency Triton/TileLang Operators
 | PyPI / pip | `boltops`         |
 | Wheel      | `boltops-*.whl`   |
 | Import     | `boltops`         |
-
-
-
 
 ## 安装
 
@@ -151,29 +147,23 @@ out, lse = triton_sparse_attention_decode(
 from boltops.generic.triton.attn_res import attn_res as triton_impl
 ```
 
-
-
 ## 公开算子（+待开发算子）
-
 
 | 算子类别                                                                            | 接口名                                                                                                                                                                                                                                    | DSLs                | 维护者                                           | 出厂后端                         | 介绍和文档                                                                                              |
 | ------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------- | --------------------------------------------- | ---------------------------- | -------------------------------------------------------------------------------------------------- |
 | Generic                                                                         | `attn_res` `fused_mamba_state_scatter_with_mask`<br>`causal_conv1d_fn`<br>`causal_conv1d_update`                                                                                                                                                                                        | Triton ✅ TileLang ❌ | Triton @all                                   | Triton                       | [docs](docs/ops/generic/generic.md)                                                                |
 | FLA/KDA 系列                                                                      | `chunk_gla_fwd_o_gk` `chunk_kda_fwd_intra` `chunk_kda_fwd_intra_token_parallel` `fused_kda_gate` `fused_kda_gate_chunk_cumsum` `fused_recurrent_kda` `fused_recurrent_kda_fwd` `fused_recurrent_kda_packed_decode` `recompute_w_u_fwd` | Triton ✅ TileLang ❌ | Triton @liji                                  | Triton                       | [docs](docs/ops/fla/kda.md)                                                                        |
-| FLA/GDN 系列                                                                      |                                                                                                                                                                                                                                        |                     | Trtion @huangteng                             |                              |                                                                                                    |
+| FLA/GDN 系列                                                                      |                                                                                                                                                                                                                                        |                     | Triton @liji<br />TileLang @huangteng |                              |                                                                                                    |
 | MoE 系列                                                                          | `fused_experts` `moe_activation`                                                                                                                                                                                                       | Triton ✅ TileLang ❌ | Triton @zhenxin TileLang @xxx                 | Triton（`fused_experts` 混合策略） | [文档](docs/ops/fused_moe/fused_moe.md) [性能实测](docs/ops/fused_moe/performance_report.md) [调参指南](boltops/tools/fused_moe_triton_tune/tune_moe_triton_user_guide.md) |
-| FA 系列（UnifiedAttention / PagedAttention / ExtendAttention / SagedAttention/...） |                                                                                                                                                                                                                                        |                     | Triton @huangshuang @sunchunhao @fangzx |                              |                                                                                                    |
-| MLA / FlashMLA / Sparse MLA                                                     | `decode_attention_fwd` `decode_attention_fwd_grouped` `decode_attention_fwd_normal` `compute_num_kv_splits`                                                                                                                              | Triton ✅ TileLang ❌ | Triton @xukang                                | Triton                       | [docs](docs/ops/mla.md)（目前 dense MLA decode；FlashMLA / Sparse 待迁）                              |
-| Qwen Sparse GQA                                                                 | `qwen_sparse_kv_extraction_compact_hcu_fa_triton` `sparse_gqa_packed_decode_triton`                                                                                                                              | Triton ✅ TileLang ❌ | Triton                                         | Triton                       | [docs](docs/ops/fa/sparse_gqa.md)                                                                    |
+| FA 系列（UnifiedAttention / PagedAttention / ExtendAttention / SagedAttention/...） |                                                                                                                                                                                                                                        |                     | Triton @huangshuang @sunchunhao |                              |                                                                                                    |
+| MLA / FlashMLA / Sparse MLA                                                     | `decode_attention_fwd` `decode_attention_fwd_grouped` `decode_attention_fwd_normal` `compute_num_kv_splits`                                                                                                                              | Triton ✅ TileLang ❌ | Triton @huangshuang @sunchunhao | Triton                       | [docs](docs/ops/mla.md)（目前 dense MLA decode；FlashMLA / Sparse 待迁）                              |
+| Qwen Sparse GQA                                                                 | `qwen_sparse_kv_extraction_compact_hcu_fa_triton` `sparse_gqa_packed_decode_triton`                                                                                                                              | Triton ✅ TileLang ❌ | Triton @huangshuang @sunchunhao | Triton                       | [docs](docs/ops/fa/sparse_gqa.md)                                                                    |
 | Step-4 DSA                                                                      | `triton_build_rope_cache` `triton_indexer_norm_rope` `triton_csa_*` `triton_indexer_logits` `triton_region_topk_ids` `triton_topk_select_and_pack` `triton_*_sparse_meta` `triton_sparse_attention_*` `triton_merge_split_states`           | Triton ✅ TileLang ❌ | Triton @xukang @duyubo                                 | Triton                       | [docs](docs/ops/step4_dsa.md)                                                                      |
-| MQA Logits（prefill）                                                             | `triton_mqa_logits`（fp8 传 scales；fp16/bf16 不传）                                                                                                                                                                                     | Triton ✅ TileLang ❌ | Triton @fangzx                            | Triton                       | [文档](docs/ops/mqa_logits.md)（prefill；paged 待迁）                                                      |
+| MQA Logits                                                             | `triton_mqa_logits`（fp8 传 scales；fp16/bf16 不传）                                                                                                                                                                                     | Triton ✅ TileLang ❌ | Triton @fangzx                            | Triton                       | [文档](docs/ops/mqa_logits.md)（prefill；paged 待迁）                                                      |
 | MHC                                                                             | `mhc_pre_big_fuse` `pre_big_fuse_tilelang` `mhc_post_fwd` `hc_split_sinkhorn` `mhc_fused_tilelang`                                                                                                                                      | TileLang ✅          | TileLang @zhouweiwang                        | TileLang                     | [docs](docs/ops/mhc.md)                                                                            |
 | IHC                                                                             | `ihc_pre` `ihc_post` `ihc_head`                                                                                                                                                                                                         | TileLang ✅          | TileLang @zhouweiwang                        | TileLang                     | [docs](docs/ops/ihc.md)                                                                            |
 | Gemm/AwqGemm 系列                                                                 | `matmul_persistent` `gemm_a16w16` `w8a8_triton_block_scaled_mm` `triton_scaled_mm` `awq_gemm_triton` `gemm_a8w8_blockscale` `gemm_afp4wfp4` `batched_gemm_a16wfp4` `w8a8_block_int8_matmul`                                            | Triton ✅ TileLang ❌ | Triton @xukang @duyubo                        | Triton                       | [docs](docs/ops/gemm.md)                                                                           |
 | DeepGemm 系列                                                                     |                                                                                                                                                                                                                                        |                     | Triton @zhenxin Tilelang @zhouweiwang         |                              |                                                                                                    |
-
-
-
 
 ## 目录
 
@@ -198,21 +188,17 @@ test/                # 正确性 + 可选 --bench 性能；不进入 wheel
 build_wheel.sh       # 打 wheel
 ```
 
-
-
 ## 开发
 
 1. **关于 BoltOPs 算子的定位**
-  由于是 DSL 语言开发的算子库，我们一定是在保证通用性的基础上去追求特定 size 下的性能，这是开发初衷。当然，具体到某一个算子，针对特定 size 或场景，可以由不同 kernel + DSL语言 混合实现以追求极致性能优化。
+   由于是 DSL 语言开发的算子库，我们一定是在保证通用性的基础上去追求特定 size 下的性能，这是开发初衷。当然，具体到某一个算子，针对特定 size 或场景，可以由不同 kernel + DSL语言 混合实现以追求极致性能优化。
 2. **关于 Triton 和 TileLang**
-  二者都是类 Python DSL，目前看是相互补充、相互协作的关系，在 BoltOPs 里也应有所体现：
-
+   二者都是类 Python DSL，目前看是相互补充、相互协作的关系，在 BoltOPs 里也应有所体现：
 
 |     | Triton                                          | TileLang                                                  |
 | --- | ----------------------------------------------- | --------------------------------------------------------- |
 | 特点  | 生态好、兼容性好，性能拉升快；简单改动能达到手写 HIPC / asm 约 80% 及以上水平 | 新起之秀，提供 warp / thread 级细粒度接口，开发速度快；面向具体场景手写可对标 HIPC / asm |
 | 局限  | 再往上抠极致较难                                        | 生态与通用性不如 Triton                                           |
-
 
    因此同一算子可以并存 Triton / TileLang 实现，出厂后端按 bake-off 结果选择（或混合策略）。
 3. **关于算子接口定义**
