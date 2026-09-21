@@ -30,6 +30,8 @@ htmlcov/
 
 # Triton / local caches
 .triton/
+boltops/fused_moe/triton/configs/triton_*/tuned_fmoe_triton_*.lock
+boltops/fused_moe/triton/configs/triton_*/tuned_fmoe_*.writer-lock/
 *.ptx
 *.cubin
 *.hsaco

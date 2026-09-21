@@ -3,6 +3,7 @@ import torch
 import torch.profiler as tpf
 import os
 import copy
+import functools
 import numpy as np
 import pandas as pd
 from boltops.utility import logger
@@ -33,6 +34,7 @@ def perftest(
     num_iters=101, num_warmup=2, testGraph=False, num_rotate_args=0, needTrace=False
 ):
     def decorator(func):
+        @functools.wraps(func)
         def wrapper(*args, **kwargs):
             num = num_rotate_args
             if num < 1:

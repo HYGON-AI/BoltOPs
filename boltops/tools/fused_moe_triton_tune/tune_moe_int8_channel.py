@@ -18,6 +18,7 @@ from typing import List, Dict, Optional
 try:
     from boltops.tools.fused_moe_triton_tune.common import (
         get_env_int,
+        random_int8_weights,
         parse_batch_sizes_from_env,
         resolve_device_settings,
         build_compile_group_ids,
@@ -31,6 +32,7 @@ except ImportError:
     try:
         from boltops.tools.fused_moe_triton_tune.common import (
             get_env_int,
+            random_int8_weights,
             parse_batch_sizes_from_env,
             resolve_device_settings,
             build_compile_group_ids,
@@ -43,6 +45,7 @@ except ImportError:
     except ImportError:
         from boltops.tools.fused_moe_triton_tune.common import (
             get_env_int,
+            random_int8_weights,
             parse_batch_sizes_from_env,
             resolve_device_settings,
             build_compile_group_ids,
@@ -229,8 +232,6 @@ def input_helper(
 
     torch.manual_seed(seed)
     factor_for_scale = 1e-2
-    int8_max = 127
-    int8_min = -128
     e_sum = e + num_shared_experts
     inter_dim = 2 * n if IS_GATED else n
     final_topk = topk + num_shared_experts
@@ -238,11 +239,10 @@ def input_helper(
     a = torch.randn((m, k), dtype=dtype, device=device) / 10
     e_per_rank = e // ep_size
 
-    # 生成全局权重（bf16 格式，后续量化为 int8）
-    w1_global_fp32 = (torch.rand((e_sum, inter_dim, k), dtype=torch.float32, device=device) - 0.5) * 2
-    w2_global_fp32 = (torch.rand((e_sum, k, n), dtype=torch.float32, device=device) - 0.5) * 2
-    w1_global = (w1_global_fp32 * int8_max).clamp(min=int8_min, max=int8_max).to(torch.int8)
-    w2_global = (w2_global_fp32 * int8_max).clamp(min=int8_min, max=int8_max).to(torch.int8)
+    # Keep the original random distribution and RNG order without retaining
+    # both full FP32 weights (which exceeds device memory for large E/N).
+    w1_global = random_int8_weights((e_sum, inter_dim, k), device)
+    w2_global = random_int8_weights((e_sum, k, n), device)
 
     # Per-channel scale
     w1_s_global = torch.rand(e_sum, inter_dim, device=device) * factor_for_scale

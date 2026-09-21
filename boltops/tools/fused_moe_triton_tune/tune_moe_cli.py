@@ -309,6 +309,7 @@ def run_benchmark_step(
     tp: int,
     ep_size: int,
     break_on_error: bool,
+    strict_csv: bool = True,
 ) -> int:
     print("--------------------------------")
     print("Step4: Run benchmark/correctness")
@@ -329,6 +330,22 @@ def run_benchmark_step(
             print(f"错误: {message}", file=sys.stderr)
             return bench_rc
         print(f"警告: {message}")
+
+    if bench_rc == 0:
+        print("Step5: Export measured full-MoE performance CSV")
+        csv_env = bench_env.copy()
+        csv_env["BENCHMARK_MODE"] = "0"
+        csv_cmd = [sys.executable, "-m", "boltops.tools.fused_moe_triton_tune.performance_csv",
+                   "--test-type", Path(test_script_name).stem.removeprefix("tune_moe_")]
+        if not strict_csv:
+            csv_cmd.append("--allow-missing-config")
+        csv_rc = run_cmd(
+            csv_cmd,
+            cwd=script_dir, env=csv_env, check=False,
+        )
+        if csv_rc != 0:
+            print("错误: JSON 已保留，但性能 CSV 补测失败，请修复后重跑 --benchmark", file=sys.stderr)
+            return csv_rc
 
     print("--------------------------------")
     print(f"All steps for TP={tp}, EP_SIZE={ep_size} completed")
@@ -1137,6 +1154,7 @@ def main() -> int:
                 tp=tp,
                 ep_size=args.ep_size,
                 break_on_error=break_on_error,
+                strict_csv=False,
             )
             if bench_ret != 0:
                 return bench_ret
