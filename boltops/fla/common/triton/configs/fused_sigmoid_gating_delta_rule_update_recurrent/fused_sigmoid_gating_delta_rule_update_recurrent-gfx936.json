@@ -1,0 +1,136 @@
+{
+  "config": {
+    "default": {
+      "BV": 32,
+      "num_warps": 1
+    },
+    "T=4,H=4,HV=16": {
+      "BV": 32,
+      "num_warps": 4
+    },
+    "T=16,H=4,HV=16": {
+      "BV": 16,
+      "num_warps": 1
+    },
+    "T=32,H=4,HV=16": {
+      "BV": 32,
+      "num_warps": 1
+    },
+    "T=64,H=4,HV=16": {
+      "BV": 32,
+      "num_warps": 1
+    },
+    "T=128,H=4,HV=16": {
+      "BV": 32,
+      "num_warps": 1
+    },
+    "T=192,H=4,HV=16": {
+      "BV": 32,
+      "num_warps": 1
+    },
+    "T=4,H=2,HV=8": {
+      "BV": 16,
+      "num_warps": 4
+    },
+    "T=16,H=2,HV=8": {
+      "BV": 32,
+      "num_warps": 4
+    },
+    "T=32,H=2,HV=8": {
+      "BV": 16,
+      "num_warps": 1
+    },
+    "T=64,H=2,HV=8": {
+      "BV": 16,
+      "num_warps": 1
+    },
+    "T=128,H=2,HV=8": {
+      "BV": 16,
+      "num_warps": 1
+    },
+    "T=192,H=2,HV=8": {
+      "BV": 16,
+      "num_warps": 1
+    },
+    "T=1,H=96,HV=96": {
+      "BV": 64,
+      "num_warps": 4,
+      "num_stages": 3
+    },
+    "T=2,H=96,HV=96": {
+      "BV": 64,
+      "num_warps": 4,
+      "num_stages": 3
+    },
+    "T=4,H=96,HV=96": {
+      "BV": 64,
+      "num_warps": 4,
+      "num_stages": 3
+    },
+    "T=8,H=96,HV=96": {
+      "BV": 64,
+      "num_warps": 4,
+      "num_stages": 3
+    },
+    "T=1,H=48,HV=48": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "T=2,H=48,HV=48": {
+      "BV": 64,
+      "num_warps": 4,
+      "num_stages": 3
+    },
+    "T=4,H=48,HV=48": {
+      "BV": 64,
+      "num_warps": 4,
+      "num_stages": 3
+    },
+    "T=8,H=48,HV=48": {
+      "BV": 64,
+      "num_warps": 4,
+      "num_stages": 3
+    },
+    "T=1,H=24,HV=24": {
+      "BV": 64,
+      "num_warps": 4,
+      "num_stages": 3
+    },
+    "T=2,H=24,HV=24": {
+      "BV": 64,
+      "num_warps": 4,
+      "num_stages": 3
+    },
+    "T=4,H=24,HV=24": {
+      "BV": 64,
+      "num_warps": 4,
+      "num_stages": 3
+    },
+    "T=8,H=24,HV=24": {
+      "BV": 64,
+      "num_warps": 4,
+      "num_stages": 3
+    },
+    "T=1,H=12,HV=12": {
+      "BV": 64,
+      "num_warps": 4,
+      "num_stages": 3
+    },
+    "T=2,H=12,HV=12": {
+      "BV": 64,
+      "num_warps": 4,
+      "num_stages": 3
+    },
+    "T=4,H=12,HV=12": {
+      "BV": 64,
+      "num_warps": 4,
+      "num_stages": 3
+    },
+    "T=8,H=12,HV=12": {
+      "BV": 64,
+      "num_warps": 4,
+      "num_stages": 3
+    }
+  }
+}

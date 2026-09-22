@@ -6,7 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
-from ...common.triton.math import exp2
+from boltops.fla.common.triton.math import exp2
 
 
 RCP_LN2 = 1.4426950408889634

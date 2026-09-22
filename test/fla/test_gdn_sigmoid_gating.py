@@ -26,10 +26,10 @@ GPU_REQUIRED = pytest.mark.skipif(
 
 
 def test_public_sigmoid_signatures_match_backends() -> None:
-    from boltops.fla.gdn.triton.fused_sigmoid_gating import (
+    from boltops.fla.common.triton.fused_sigmoid_gating import (
         fused_sigmoid_gating_delta_rule_update as ordinary_backend,
     )
-    from boltops.fla.gdn.triton.fused_sigmoid_gating_recurrent import (
+    from boltops.fla.common.triton.fused_sigmoid_gating_recurrent import (
         fused_sigmoid_gating_delta_rule_update_recurrent as recurrent_backend,
     )
 
@@ -378,7 +378,7 @@ def test_bench_sigmoid_update_bandwidth(
 @GPU_REQUIRED
 @pytest.mark.bench
 @pytest.mark.parametrize("N", [1, 8, 32, 48], ids=lambda x: f"N{x}")
-def test_bench_recurrent_target_verify_bandwidth(
+def test_bench_recurrent_speculative_verify_bandwidth(
     N: int,
     bench_warmup: int,
     bench_repeat: int,

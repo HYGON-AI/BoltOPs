@@ -16,8 +16,9 @@ import triton
 import triton.language as tl
 
 from .chunk_intra_token_parallel import chunk_kda_fwd_intra_token_parallel
-from ...common.triton.math import exp2
-from ...common.triton.utils import (
+from .config_utils import dtype_name, get_kda_tuned_config
+from boltops.fla.common.triton.math import exp2
+from boltops.fla.common.triton.utils import (
     current_platform,
     gather,
     is_gather_supported,
@@ -55,6 +56,27 @@ def get_chunk_kda_inter_solve_config(
     is_varlen: bool,
     safe_gate: bool,
     fuse_diag: bool = False,
+    *,
+    b: int,
+    dtype: torch.dtype,
+) -> dict[str, int]:
+    return get_kda_tuned_config(
+        "chunk_kda_inter_solve",
+        f"B={b},dtype={dtype_name(dtype)},T={T},H={H},HV={HV},varlen={is_varlen},"
+        f"safe_gate={safe_gate},fuse_diag={fuse_diag}",
+        fallback=static_chunk_kda_inter_solve_config(
+            T, H, HV, is_varlen, safe_gate, fuse_diag
+        ),
+    )
+
+
+def static_chunk_kda_inter_solve_config(
+    T: int,
+    H: int,
+    HV: int,
+    is_varlen: bool,
+    safe_gate: bool,
+    fuse_diag: bool = False,
 ) -> dict[str, int]:
     """Select one of four offline configs for the inter/solve kernel.
 
@@ -82,6 +104,25 @@ def get_chunk_kda_inter_solve_config(
 
 
 def get_chunk_kda_intra_sub_chunk_config(
+    T: int,
+    H: int,
+    HV: int,
+    K: int,
+    is_varlen: bool,
+    *,
+    b: int,
+    dtype: torch.dtype,
+) -> dict[str, int | bool]:
+    return get_kda_tuned_config(
+        "chunk_kda_intra_sub_chunk",
+        f"B={b},dtype={dtype_name(dtype)},T={T},H={H},HV={HV},K={K},varlen={is_varlen}",
+        fallback=static_chunk_kda_intra_sub_chunk_config(
+            T, H, HV, K, is_varlen
+        ),
+    )
+
+
+def static_chunk_kda_intra_sub_chunk_config(
     T: int, H: int, HV: int, K: int, is_varlen: bool
 ) -> dict[str, int | bool]:
     """Select one of three offline configs for the polynomial sibling."""
@@ -1055,6 +1096,8 @@ def chunk_kda_fwd_intra(
             HV=HV,
             K=K,
             is_varlen=cu_seqlens is not None,
+            b=B,
+            dtype=k.dtype,
         )
         chunk_kda_fwd_kernel_intra_sub_chunk_poly_solve_optimized[grid](
             q=q,
@@ -1124,6 +1167,8 @@ def chunk_kda_fwd_intra(
         is_varlen=cu_seqlens is not None,
         safe_gate=diagonal_is_presolved,
         fuse_diag=fuse_diag,
+        b=B,
+        dtype=k.dtype,
     )
     chunk_kda_fwd_kernel_inter_solve_fused[grid](
         q=q,

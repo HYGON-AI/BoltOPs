@@ -6,7 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
-from ...common.triton.utils import prepare_chunk_indices
+from boltops.fla.common.triton.utils import prepare_chunk_indices
 
 
 # Offline-tuned on Hygon BW1000_H.  Generic retains its own configurations

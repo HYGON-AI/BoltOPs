@@ -1,1 +1,1 @@
-"""Triton helpers shared across FLA sub-families."""
+"""Triton code shared by more than one FLA operator family."""

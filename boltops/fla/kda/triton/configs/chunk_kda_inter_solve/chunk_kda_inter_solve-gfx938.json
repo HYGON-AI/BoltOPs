@@ -1,0 +1,9 @@
+{
+  "config": {
+    "B=1,dtype=bf16,T=2048,H=24,HV=24,varlen=False,safe_gate=False,fuse_diag=True": {
+      "BK": 64,
+      "num_warps": 1,
+      "num_stages": 1
+    }
+  }
+}

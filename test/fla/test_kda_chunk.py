@@ -124,16 +124,20 @@ def test_state_output_fused_selector_is_kda_specific() -> None:
 
 def test_kda_prefill_config_selectors_cover_k128_fixed_and_varlen() -> None:
     assert get_chunk_kda_intra_sub_chunk_config(
-        T=8192, H=96, HV=96, K=128, is_varlen=False
+        T=8192, H=96, HV=96, K=128, is_varlen=False,
+        b=1, dtype=torch.bfloat16,
     )["BK"] == 128
     assert get_chunk_kda_intra_sub_chunk_config(
-        T=8192, H=96, HV=96, K=128, is_varlen=True
+        T=8192, H=96, HV=96, K=128, is_varlen=True,
+        b=1, dtype=torch.bfloat16,
     )["BK"] == 128
     assert get_chunk_state_config(
-        N=1, H=96, V=128, K=128, is_varlen=False
+        N=1, H=96, V=128, K=128, is_varlen=False,
+        b=1, dtype=torch.bfloat16,
     ) == CHUNK_STATE_CONFIGS[0]
     assert get_chunk_state_config(
-        N=2, H=96, V=128, K=128, is_varlen=True
+        N=2, H=96, V=128, K=128, is_varlen=True,
+        b=1, dtype=torch.bfloat16,
     ) == CHUNK_STATE_CONFIGS[1]
 
     q128 = torch.empty(1, 8192, 96, 128, dtype=torch.bfloat16, device="meta")

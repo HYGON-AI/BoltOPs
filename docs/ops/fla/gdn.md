@@ -20,7 +20,7 @@ from boltops.fla.gdn import (
 |---|---|---|
 | `fused_recurrent_gated_delta_rule_packed_decode` | 单 token packed QKV decode | `output, updated_state` |
 | `fused_sigmoid_gating_delta_rule_update` | continuous batching 和线性 speculative decode | `output, final_state` |
-| `fused_sigmoid_gating_delta_rule_update_recurrent` | target-verify、tree cache 和中间状态缓存 | `output` |
+| `fused_sigmoid_gating_delta_rule_update_recurrent` | 全参数 kernel 入口（decode + speculative verify、tree cache、中间状态缓存）；verify preset 由框架 adapter 控制 | `output` |
 | `chunk_gated_delta_rule_fwd_h` | Chunk state propagation | `h, v_new, final_state` |
 | `chunk_fwd_o` | Chunk state项和局部 attention项合并 | `output` |
 
@@ -44,7 +44,7 @@ o_t     = scale * q_t @ S_t
 
 State物理布局分为两类：
 
-- packed decode、普通 sigmoid和 recurrent target-verify接口固定为
+- packed decode、普通 sigmoid和 recurrent speculative verify 接口固定为
   `[cache_slots, HV, V, K]`
 - chunk接口通过 `transpose_state_layout` 选择：
   - `True`：`[cache_slots, H, V, K]`
@@ -179,7 +179,10 @@ output, final_state = fused_sigmoid_gating_delta_rule_update(
 `is_kda=True` 时，`a` 改为每 key维 gate，shape为 `[B,T,HV,K]`，
 `dt_bias` 含 `HV*K` 个元素。
 
-### 3.3 Target-verify/tree recurrent update
+### 3.3 Recurrent speculative verify
+
+> 这是 Boltops 的全参数 kernel 入口。SGLang adapter 中的 `target_verify`
+> 方法应在本模块之上封装 verify preset。
 
 ```python
 def fused_sigmoid_gating_delta_rule_update_recurrent(
@@ -198,17 +201,21 @@ def fused_sigmoid_gating_delta_rule_update_recurrent(
     use_qk_l2norm_in_kernel=False,
     cu_seqlens=None,
     is_kda=False,
+    lower_bound=None,
     disable_state_update=False,
     intermediate_states_buffer=None,
     intermediate_state_indices=None,
     cache_steps=None,
     retrieve_parent_token=None,
+    cache_ring=False,
+    replayssm_rawv=None,
+    replayssm_rawk=None,
+    replayssm_g=None,
+    replayssm_beta=None,
     kernel_cfg=None,
 ):
     ...
 ```
-
-该接口与普通 speculative接口保持独立，用于 target-verify协议：
 
 - `initial_state_indices[N]` 选择每条 sequence的正式 state
 - `intermediate_states_buffer` shape为
@@ -216,6 +223,20 @@ def fused_sigmoid_gating_delta_rule_update_recurrent(
 - `intermediate_state_indices[N]` 选择每条 sequence的中间状态 cache行
 - `retrieve_parent_token[N,steps]` 给出 tree中每个 token的 parent step
 - `disable_state_update=True` 时只写 intermediate cache，不回写正式 state
+- `is_kda=True` 且 `lower_bound` 非空时使用 safe gate
+  `g = lower_bound * sigmoid(exp(A_log) * (a + dt_bias))`；否则
+  `g = -exp(A_log) * softplus(a + dt_bias)`
+- state slot 使用 `initial_state_source.stride(0)` 作为 slot pitch（支持
+  envelope/page-major view），索引按 int64 计算
+- gate 输入的 token 步长取自 `a.stride()`（KDA packed `[1,T,HV,K]` 为 `HV*K`）
+- `intermediate_states_buffer` 存在时，每 request 的实际 scratch 步数取
+  `buffer.stride(0) // (HV*K*V)`（adaptive spec：分配 pitch 可大于运行时
+  draft count），否则回退 `cache_steps`
+- `cache_ring=True` 且传入 ReplaySSM per-layer ring view（`replayssm_rawv`
+  `[slots,HV,L,V]`、`replayssm_rawk` `[slots,H,L,K]`、KDA `replayssm_g`
+  `[slots,HV,L,K]` / GDN `[slots,HV,L]`、`replayssm_beta` `[slots,HV,L]`，
+  均 fp32/bf16 见文档）时，逐 step 融合写入 pre-norm k、raw v、gate、beta，
+  用于 commit 阶段 replay/fold，替代 per-step state 快照
 - 返回值只有 output；正式 state和中间状态通过传入 tensor体现副作用
 
 ```python
@@ -369,7 +390,7 @@ sequence在自己的 chunk边界重新累计 gate。
 - 所有计算 tensor必须位于同一 CUDA/HIP device
 - q/k/v/w/u及 gate应采用标准连续布局；packed QKV允许 token stride大于行宽
 - state dtype由上层 cache配置决定：vLLM的 GDN `mamba_ssm_cache_dtype="auto"`
-  默认跟随模型 dtype，BF16模型使用 BF16 state；SGLang的 target-verify temporal
+  默认跟随模型 dtype，BF16模型使用 BF16 state；SGLang的 speculative verify temporal
   state默认使用 FP32
 - chunk默认 `chunk_size=64`，当前接口要求 `K <= 256`
 - `chunk_indices` 可由调用方预先生成并复用；其每一行是
@@ -400,7 +421,7 @@ PYTHONPATH=. TILELANG_CACHE_DIR=./cache pytest -q -s test/fla \
 # Packed decode
 pytest -q test/fla/test_gdn_packed_decode.py
 
-# 普通 sigmoid和 recurrent/target-verify/tree cache
+# 普通 sigmoid和 recurrent/speculative verify/tree cache
 pytest -q test/fla/test_gdn_sigmoid_gating.py
 
 # Chunk h/o
@@ -409,7 +430,7 @@ pytest -q test/fla/test_gdn_chunk.py
 
 性能输出规则：
 
-- packed decode、普通 sigmoid、target-verify主要受 state/cache流量限制，报告
+- packed decode、普通 sigmoid、speculative verify 主要受 state/cache流量限制，报告
   latency和逻辑有效带宽 `GB/s`
 - chunk h、chunk o及二者端到端为矩阵计算密集型，报告 latency和 `TFLOPS`
 - 性能测试只测 Bolt当前实现，不运行 reference、不计算 speedup，也不设置固定性能阈值

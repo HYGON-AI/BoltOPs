@@ -206,9 +206,104 @@ PYTHONPATH=. pytest -q test/fla/test_kda_*.py
 
 测试职责、算子、源码文件和性能证据见各自独立算子文档。
 
-## 8. 为什么 `chunk_size` 固定为 64
+## 8. Tune config
 
-`FLA_CHUNK_SIZE = 64`（`boltops/fla/common/triton/utils.py`）。这不是历史包袱，
+KDA prefill 支持 per-arch / per-shape / per-dtype JSON tuning config。配置只覆盖
+launch 参数（如 `BK/BV/BT/BS/num_warps/num_stages`），不改变 kernel 数学语义。
+loader 采用精确 key 匹配；没有文件、没有 key 或 JSON malformed 时，
+回落到各 kernel 内的 static selector。不会做 nearest-key 匹配，避免相邻 shape
+意外拿到非法或劣化 tile。JSON 里的未知 launch key 也会被拒绝并回落。
+
+配置文件位于：
+
+```text
+boltops/fla/kda/triton/configs/<kernel>/<kernel>-<arch>.json
+```
+
+当前 prefill 主链路可 tune：
+
+- `recompute_w_u_fwd`
+- `chunk_gla_fwd_o_gk`
+- `kda_gate_chunk_cumsum`
+- `chunk_kda_inter_solve`
+- `chunk_kda_state_output_fused`
+
+内置 named shape presets：
+
+```text
+t512             B=1,T=512,H=24,K=V=128,bf16
+t2048            B=1,T=2048,H=24,K=V=128,bf16
+t4096            B=1,T=4096,H=24,K=V=128,bf16
+t8192            B=1,T=8192,H=24,K=V=128,bf16
+t16384           B=1,T=16384,H=24,K=V=128,bf16
+varlen_t8192     B=1,total T=8192,H=24,K=V=128,bf16,varlen
+batch4_t2048     B=4,T=2048,H=24,K=V=128,bf16
+wide_h48_t8192   B=1,T=8192,H=48,K=V=128,bf16
+```
+
+另有 standalone/fallback 路径可 tune：
+
+- `kda_gate_fwd`
+- `chunk_kda_state`
+- `chunk_kda_intra_token_parallel`
+
+生成方式：
+
+```bash
+python scripts/benchmarks/fla/benchmark_kda_prefill.py \
+  --shape t512 --shape t2048 --shape t4096 \
+  --shape varlen_t8192 --shape batch4_t2048 \
+  --kernel mainline --warmup 1 --repeat 2 --write-configs
+```
+
+key 包含 `B` 和 `dtype`；inter-solve key 还包含 `safe_gate` / `fuse_diag`。
+脚本会把 correctness smoke 通过的 best config 合入对应 JSON。
+`--output-csv` 可保留全量测量记录；`--list-shapes` 可查看全部 preset。
+
+生成后可用 `--e2e-only` 比较 static fallback 和 JSON config 的完整
+`chunk_kda_with_fused_gate_fwd` 延迟。当前 `gfx936/bf16` 下：
+
+| preset | static | JSON config | speedup |
+|---|---:|---:|---:|
+| `t512` | 0.681 ms | 0.546 ms | 1.249x |
+| `t2048` | 0.703 ms | 0.600 ms | 1.171x |
+| `t4096` | 1.051 ms | 1.052 ms | 0.999x |
+| `varlen_t8192` | 1.941 ms | 1.789 ms | 1.085x |
+| `batch4_t2048` | 7.333 ms | 7.206 ms | 1.018x |
+
+`t4096` 没有收益，保留配置是为了覆盖该规模并记录实测结果；后续可按新硬件
+或新 candidate 重新调优。
+
+`gfx938/bf16`（BW1100，72 CU）已在 8 个 preset 上全量调优（每 kernel
+24-36 个 candidate，correctness smoke 全部通过）。该机器是共享主机，e2e
+wall-clock 受周期性平台干扰（秒级 1-3x 尖峰）不可复现，因此下表只收录
+**同一测量窗口内** per-kernel 对 static fallback 的对比，且要求跨两次独立
+tuning run 方向一致、增益 >= 5% 才落盘；未达标的 shape/kernel 不写 key，
+由 static selector 兜底：
+
+| preset | kernel | static (us) | tuned (us) | speedup |
+|---|---|---:|---:|---:|
+| `t2048` | `chunk_kda_inter_solve` | 131.3 | 124.6 | 1.05x |
+| `t2048` | `chunk_gla_fwd_o_gk` | 96.8 | 81.3 | 1.19x |
+| `t8192` | `chunk_kda_state` | 876.2 | 781.5 | 1.12x |
+| `t8192` | `chunk_gla_fwd_o_gk` | 339.7 | 305.2 | 1.11x |
+| `t16384` | `chunk_kda_state` | 2049.4 | 1594.3 | 1.28x |
+| `varlen_t8192` | `chunk_kda_state` | 1227.0 | 550.0 | 2.23x |
+| `batch4_t2048` | `chunk_kda_state` | 2346.8 | 1619.3 | 1.45x |
+| `batch4_t2048` | `chunk_gla_fwd_o_gk` | 1321.9 | 1196.2 | 1.11x |
+| `batch4_t2048` | `chunk_kda_state_output_fused` | 2219.3 | 1941.4 | 1.14x |
+| `wide_h48_t8192` | `chunk_kda_state` | 1554.1 | 1077.3 | 1.44x |
+| `t8192` / `t16384` / `varlen_t8192` / `batch4_t2048` | `kda_gate_fwd` | — | — | 1.07-1.09x |
+
+static selector 在 gfx938 上的两个明显短板正是调优的主要收益来源：
+`chunk_kda_state` 的 varlen 分支固定 `num_stages=2`（单 stage 快 2.2x），
+以及 H=48 宽头 shape 下 `BV=64` tile 全面优于 static 的 `BV=32/64` 选择。
+其余 kernel（`recompute_w_u_fwd`、`kda_gate_chunk_cumsum`、
+`chunk_kda_state_output_fused` 等）在 gfx938 上与 static 持平，未落盘。
+
+## 9. 为什么 `chunk_size` 固定为 64
+
+`FLA_CHUNK_SIZE = 64`（`boltops/fla/common/triton/utils.py`，FLA common）。这不是历史包袱，
 是两条反向曲线的交点：
 
 * intra 的工作量 ∝ `T x BT`（`Aqk`/`Akk` 是 `[B,T,H,BT]`），**BT 越小越便宜**。
@@ -238,7 +333,7 @@ BT=32 同样是净亏（约 +0.6 ms）。
 后三个 chunk 上并相互覆写——越界列偏移被 `boundary_check` 裁掉，所以既不报错
 也不崩，只是结果错。
 
-## 9. Launch 开销与 `TRITON_FAST_JIT`
+## 10. Launch 开销与 `TRITON_FAST_JIT`
 
 Prefill 每次前向下发 8 个 Triton kernel。短序列下真正的瓶颈不是 GPU，而是
 host 侧的下发开销：BW1100 上 `T=512, H=16, K=V=128` 的 device 时间约 0.25 ms，
@@ -271,7 +366,8 @@ Hygon 后端提供了 Cython binder + saved-kernel 磁盘缓存来绕过这一�
 | Token-parallel intra | `boltops/fla/kda/triton/chunk_intra_token_parallel.py` |
 | State/fusion | `boltops/fla/kda/triton/chunk_state.py` |
 | Recurrent decode | `boltops/fla/kda/triton/fused_recurrent.py` |
-| Lean `heuristics` | `boltops/fla/common/triton/heuristics.py` |
+| Shared varlen/platform helpers | `boltops/fla/common/triton/utils.py` |
+| Tune-config loader | `boltops/fla/kda/triton/config_utils.py` |
 | Correctness tests | `test/fla/test_kda_*.py` |
 
 ## 附录 B. 溯源

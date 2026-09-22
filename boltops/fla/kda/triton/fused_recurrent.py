@@ -12,7 +12,9 @@ import torch
 import triton
 import triton.language as tl
 
-from ...common.triton.math import exp, log
+from boltops.fla.common.triton.math import exp, log
+
+from .config_utils import dtype_name, get_kda_tuned_config
 
 cdiv = triton.cdiv
 next_power_of_2 = triton.next_power_of_2
@@ -40,7 +42,22 @@ FUSED_RECURRENT_KDA_PACKED_DECODE_CONFIGS = (
 )
 
 
-def get_kda_gate_beta_config(T: int, H: int, _D: int) -> dict[str, int]:
+def get_kda_gate_beta_config(
+    T: int,
+    H: int,
+    _D: int,
+    *,
+    b: int,
+    dtype: torch.dtype,
+) -> dict[str, int]:
+    return get_kda_tuned_config(
+        "kda_gate_beta",
+        f"B={b},dtype={dtype_name(dtype)},T={T},H={H}",
+        fallback=static_kda_gate_beta_config(T, H, _D),
+    )
+
+
+def static_kda_gate_beta_config(T: int, H: int, _D: int) -> dict[str, int]:
     if T >= 16:
         return KDA_GATE_BETA_CONFIGS[2]
     if T >= 6 and H >= 24:
@@ -51,6 +68,21 @@ def get_kda_gate_beta_config(T: int, H: int, _D: int) -> dict[str, int]:
 
 
 def get_fused_recurrent_kda_config(
+    B: int,
+    _T: int,
+    H: int,
+    use_gate_in_kernel: bool,
+    *,
+    dtype: torch.dtype,
+) -> dict[str, int]:
+    return get_kda_tuned_config(
+        "fused_recurrent_kda",
+        f"B={B},dtype={dtype_name(dtype)},T={_T},H={H},gate={use_gate_in_kernel}",
+        fallback=static_fused_recurrent_kda_config(B, _T, H, use_gate_in_kernel),
+    )
+
+
+def static_fused_recurrent_kda_config(
     B: int,
     _T: int,
     H: int,
@@ -73,6 +105,21 @@ def get_fused_recurrent_kda_config(
 
 
 def get_fused_recurrent_kda_packed_decode_config(
+    B: int,
+    H: int,
+    K: int,
+    V: int,
+    *,
+    dtype: torch.dtype,
+) -> dict[str, int]:
+    return get_kda_tuned_config(
+        "fused_recurrent_kda_packed_decode",
+        f"B={B},dtype={dtype_name(dtype)},H={H},K={K},V={V}",
+        fallback=static_fused_recurrent_kda_packed_decode_config(B, H, K, V),
+    )
+
+
+def static_fused_recurrent_kda_packed_decode_config(
     B: int,
     H: int,
     K: int,
@@ -174,7 +221,9 @@ def _fused_kda_gate_beta(
     gate = torch.empty((B, T, H, D), dtype=torch.float32, device=raw_g.device)
     beta = torch.empty((B, T, H), dtype=torch.float32, device=raw_beta.device)
 
-    config = get_kda_gate_beta_config(T, H, D)
+    config = get_kda_gate_beta_config(
+        T, H, D, b=B, dtype=raw_g.dtype,
+    )
     grid = (cdiv(T, config["BT"]), H)
     _kda_gate_beta_fwd_kernel[grid](
         raw_g=raw_g,
@@ -425,7 +474,7 @@ def fused_recurrent_kda_fwd(
         scale = K**-0.5
 
     config = get_fused_recurrent_kda_config(
-        N, T, H, use_gate_in_kernel
+        N, T, H, use_gate_in_kernel, dtype=q.dtype
     )
     grid = (cdiv(V, config["BV"]) * N * H,)
     fused_recurrent_kda_fwd_kernel[grid](
@@ -766,7 +815,9 @@ def fused_recurrent_kda_packed_decode(
         scale = K**-0.5
 
     out = torch.empty((1, B, H, V), dtype=mixed_qkv.dtype, device=device)
-    config = get_fused_recurrent_kda_packed_decode_config(B, H, K, V)
+    config = get_fused_recurrent_kda_packed_decode_config(
+        B, H, K, V, dtype=mixed_qkv.dtype
+    )
     use_direct_3d = (
         lower_bound is not None
         and K == 128
