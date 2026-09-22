@@ -1,0 +1,40 @@
+{
+  "config": {
+    "B=1,dtype=bf16,T=8192,H=24,K=128,V=128,varlen=False": {
+      "BK": 64,
+      "BV": 128,
+      "num_warps": 4,
+      "num_stages": 2
+    },
+    "B=1,dtype=bf16,T=512,H=24,K=128,V=128,varlen=False": {
+      "BK": 64,
+      "BV": 128,
+      "num_warps": 4,
+      "num_stages": 2
+    },
+    "B=1,dtype=bf16,T=2048,H=24,K=128,V=128,varlen=False": {
+      "BK": 64,
+      "BV": 64,
+      "num_warps": 4,
+      "num_stages": 2
+    },
+    "B=1,dtype=bf16,T=4096,H=24,K=128,V=128,varlen=False": {
+      "BK": 64,
+      "BV": 128,
+      "num_warps": 4,
+      "num_stages": 2
+    },
+    "B=1,dtype=bf16,T=8192,H=24,K=128,V=128,varlen=True": {
+      "BK": 64,
+      "BV": 128,
+      "num_warps": 4,
+      "num_stages": 2
+    },
+    "B=4,dtype=bf16,T=8192,H=24,K=128,V=128,varlen=False": {
+      "BK": 64,
+      "BV": 128,
+      "num_warps": 4,
+      "num_stages": 1
+    }
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "config": {
+    "B=1,dtype=bf16,T=8192,H=24": {
+      "BT": 32,
+      "num_warps": 8,
+      "num_stages": 3
+    },
+    "B=1,dtype=bf16,T=16384,H=24": {
+      "BT": 32,
+      "num_warps": 8,
+      "num_stages": 3
+    },
+    "B=4,dtype=bf16,T=2048,H=24": {
+      "BT": 64,
+      "num_warps": 2,
+      "num_stages": 1
+    }
+  }
+}

@@ -13,12 +13,13 @@ import torch
 import triton
 import triton.language as tl
 
-from ...common.triton.math import exp, exp2
-from ...common.triton.utils import (
+from boltops.fla.common.triton.math import exp, exp2
+from boltops.fla.common.triton.utils import (
     FLA_CHUNK_SIZE,
     prepare_chunk_indices,
     prepare_chunk_offsets,
 )
+from .config_utils import dtype_name, get_kda_tuned_config
 
 # BW1100
 _NUM_CU = 72
@@ -30,6 +31,24 @@ CHUNK_STATE_CONFIGS: tuple[dict[str, int], ...] = (
 
 
 def get_chunk_state_config(
+    N: int,
+    H: int,
+    V: int,
+    K: int,
+    is_varlen: bool,
+    T: int | None = None,
+    *,
+    b: int | None = None,
+    dtype: torch.dtype | None = None,
+) -> dict[str, int]:
+    return get_kda_tuned_config(
+        "chunk_kda_state",
+        f"B={b},dtype={dtype_name(dtype)},N={N},H={H},V={V},K={K},T={T},varlen={is_varlen}",
+        fallback=static_chunk_state_config(N, H, V, K, is_varlen, T),
+    )
+
+
+def static_chunk_state_config(
     N: int,
     H: int,
     V: int,
@@ -66,7 +85,21 @@ def get_chunk_state_config(
 
 
 
-def get_fused_state_output_config(n_programs: int, V: int) -> dict[str, int]:
+def get_fused_state_output_config(
+    n_programs: int,
+    V: int,
+    *,
+    b: int | None = None,
+    dtype: torch.dtype | None = None,
+) -> dict[str, int]:
+    return get_kda_tuned_config(
+        "chunk_kda_state_output_fused",
+        f"B={b},dtype={dtype_name(dtype)},programs={n_programs},V={V}",
+        fallback=static_fused_state_output_config(n_programs, V),
+    )
+
+
+def static_fused_state_output_config(n_programs: int, V: int) -> dict[str, int]:
     """Pick the V-block for the fused state/output kernel.
 
     The fused grid is ``(V/BV, N*H)``.  Splitting V costs real bandwidth --
@@ -348,29 +381,33 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                     b_h4 *= exp(b_gk_last4)[None, :]
         b_v = b_v.to(k.dtype.element_ty)
 
+        # Keep the state update in the ``v.T @ k`` operand order.  The
+        # mathematically equivalent ``k @ v``-then-transpose form makes the
+        # output transpose the dominant layout conversion and prevents HCU
+        # from selecting the efficient An/Bt matrix LDS reads.
         p_k = tl.make_block_ptr(
-            k, (K, T), (1, stride_k), (0, i_t * BT), (64, BT), (0, 1)
+            k, (T, K), (stride_k, 1), (i_t * BT, 0), (BT, 64), (1, 0)
         )
         b_k = tl.load(p_k, boundary_check=(0, 1))
-        b_h1 += tl.trans(tl.dot(b_k, b_v))
+        b_h1 += tl.dot(tl.trans(b_v), b_k)
         if K > 64:
             p_k = tl.make_block_ptr(
-                k, (K, T), (1, stride_k), (64, i_t * BT), (64, BT), (0, 1)
+                k, (T, K), (stride_k, 1), (i_t * BT, 64), (BT, 64), (1, 0)
             )
             b_k = tl.load(p_k, boundary_check=(0, 1))
-            b_h2 += tl.trans(tl.dot(b_k, b_v))
+            b_h2 += tl.dot(tl.trans(b_v), b_k)
         if K > 128:
             p_k = tl.make_block_ptr(
-                k, (K, T), (1, stride_k), (128, i_t * BT), (64, BT), (0, 1)
+                k, (T, K), (stride_k, 1), (i_t * BT, 128), (BT, 64), (1, 0)
             )
             b_k = tl.load(p_k, boundary_check=(0, 1))
-            b_h3 += tl.trans(tl.dot(b_k, b_v))
+            b_h3 += tl.dot(tl.trans(b_v), b_k)
         if K > 192:
             p_k = tl.make_block_ptr(
-                k, (K, T), (1, stride_k), (192, i_t * BT), (64, BT), (0, 1)
+                k, (T, K), (stride_k, 1), (i_t * BT, 192), (BT, 64), (1, 0)
             )
             b_k = tl.load(p_k, boundary_check=(0, 1))
-            b_h4 += tl.trans(tl.dot(b_k, b_v))
+            b_h4 += tl.dot(tl.trans(b_v), b_k)
     # epilogue
     if STORE_FINAL_STATE:
         p_ht = tl.make_block_ptr(ht, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0))
@@ -569,6 +606,10 @@ def chunk_kda_fwd_kernel_state_output_fused(
 
         for i_k in tl.static_range(0, K // 64 if K % 64 == 0 else K // 64 + 1):
             i_k0 = i_k * 64
+            # The fused kernel keeps the original output-transpose form.  The
+            # local-output and state-update dots share ``b_v``; changing only
+            # the state dot's operand order perturbs their shared scheduling
+            # and loses the fusion win despite the standalone-kernel gain.
             p_k = tl.make_block_ptr(
                 k_base, (K, T), (1, stride_qk), (i_k0, i_t * BT),
                 (64, BT), (0, 1)
@@ -653,11 +694,16 @@ def chunk_kda_fwd_state_output_fused(
         kg.new_empty(N, H, V, K, dtype=torch.float32)
         if output_final_state else None
     )
-    config = get_chunk_state_config(N, H, V, K, cu_seqlens is not None, T=T)
+    config = get_chunk_state_config(
+        N, H, V, K, cu_seqlens is not None, T=T,
+        b=B, dtype=kg.dtype,
+    )
     # The fused path keeps both the state and output tiles live; its dot-heavy
     # body benefits from one additional wave of issue parallelism at K=256.
     if K <= 128 and V >= 64:
-        config = get_fused_state_output_config(N * H, V)
+        config = get_fused_state_output_config(
+            N * H, V, b=B, dtype=kg.dtype,
+        )
     elif K >= 256:
         config = {**config, "num_warps": 4}
     else:
@@ -727,7 +773,10 @@ def chunk_gated_delta_rule_fwd_h(
     )
 
     v_new = torch.empty_like(u) if save_new_value else None
-    config = get_chunk_state_config(N, H, V, K, cu_seqlens is not None, T=T)
+    config = get_chunk_state_config(
+        N, H, V, K, cu_seqlens is not None, T=T,
+        b=B, dtype=k.dtype,
+    )
 
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), N * H)

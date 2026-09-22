@@ -15,15 +15,16 @@ import triton
 import triton.language as tl
 
 from .chunk_intra import chunk_kda_fwd_intra
+from .config_utils import dtype_name, get_kda_tuned_config
 from .chunk_state import (
     chunk_gated_delta_rule_fwd_h,
     chunk_kda_fwd_state_output_fused,
 )
 from .prefill_optimized import can_run_prefill_optimized, prefill_optimized_fwd
-from ...common.triton.cumsum import chunk_local_cumsum
-from ...common.triton.l2norm import l2norm_fwd
-from ...common.triton.math import exp2, log
-from ...common.triton.utils import FLA_CHUNK_SIZE, prepare_chunk_indices
+from boltops.fla.common.triton.cumsum import chunk_local_cumsum
+from boltops.fla.common.triton.l2norm import l2norm_fwd
+from boltops.fla.common.triton.math import exp2, log
+from boltops.fla.common.triton.utils import FLA_CHUNK_SIZE, prepare_chunk_indices
 
 RCP_LN2 = 1.4426950408889634
 cdiv = triton.cdiv
@@ -61,6 +62,23 @@ KDA_GATE_FWD_CONFIGS = (
 
 
 def get_recompute_w_u_fwd_config(
+    _T: int,
+    _H: int,
+    _K: int,
+    V: int,
+    _is_varlen: bool,
+    *,
+    b: int,
+    dtype: torch.dtype,
+) -> dict:
+    return get_kda_tuned_config(
+        "recompute_w_u_fwd",
+        f"B={b},dtype={dtype_name(dtype)},T={_T},H={_H},K={_K},V={V},varlen={_is_varlen}",
+        fallback=static_recompute_w_u_fwd_config(_T, _H, _K, V, _is_varlen),
+    )
+
+
+def static_recompute_w_u_fwd_config(
     _T: int, _H: int, _K: int, V: int, _is_varlen: bool
 ) -> dict:
     if V < 128:
@@ -69,6 +87,23 @@ def get_recompute_w_u_fwd_config(
 
 
 def get_chunk_gla_fwd_o_config(
+    T: int,
+    H: int,
+    K: int,
+    V: int,
+    is_varlen: bool,
+    *,
+    b: int,
+    dtype: torch.dtype,
+) -> dict:
+    return get_kda_tuned_config(
+        "chunk_gla_fwd_o_gk",
+        f"B={b},dtype={dtype_name(dtype)},T={T},H={H},K={K},V={V},varlen={is_varlen}",
+        fallback=static_chunk_gla_fwd_o_config(T, H, K, V, is_varlen),
+    )
+
+
+def static_chunk_gla_fwd_o_config(
     T: int, H: int, K: int, V: int, is_varlen: bool
 ) -> dict:
     del T, H, is_varlen
@@ -83,6 +118,22 @@ def get_chunk_gla_fwd_o_config(
 
 
 def get_kda_gate_chunk_cumsum_vector_config(
+    T: int,
+    H: int,
+    S: int,
+    is_varlen: bool,
+    *,
+    b: int,
+    dtype: torch.dtype,
+) -> dict:
+    return get_kda_tuned_config(
+        "kda_gate_chunk_cumsum",
+        f"B={b},dtype={dtype_name(dtype)},T={T},H={H},S={S},varlen={is_varlen}",
+        fallback=static_kda_gate_chunk_cumsum_vector_config(T, H, S, is_varlen),
+    )
+
+
+def static_kda_gate_chunk_cumsum_vector_config(
     T: int, H: int, S: int, is_varlen: bool
 ) -> dict:
     del is_varlen  # the index math differs, the tile economics do not
@@ -103,7 +154,22 @@ def get_kda_gate_chunk_cumsum_vector_config(
     return config
 
 
-def get_kda_gate_fwd_config(T: int, H: int, _D: int) -> dict:
+def get_kda_gate_fwd_config(
+    T: int,
+    H: int,
+    _D: int,
+    *,
+    b: int,
+    dtype: torch.dtype,
+) -> dict:
+    return get_kda_tuned_config(
+        "kda_gate_fwd",
+        f"B={b},dtype={dtype_name(dtype)},T={T},H={H}",
+        fallback=static_kda_gate_fwd_config(T, H, _D),
+    )
+
+
+def static_kda_gate_fwd_config(T: int, H: int, _D: int) -> dict:
     if H <= 3 or T <= 512:
         return KDA_GATE_FWD_CONFIGS[0]
     # ``T`` is flattened B*T at this call site.  Long prefill launches on
@@ -544,7 +610,8 @@ def recompute_w_u_fwd(
         u = torch.empty_like(v)
     kg = torch.empty_like(k) if gk is not None else None
     config = get_recompute_w_u_fwd_config(
-        T, H, K, V, cu_seqlens is not None
+        T, H, K, V, cu_seqlens is not None,
+        b=B, dtype=k.dtype,
     )
     use_beta_factored_head_first = (
         k.dtype == torch.bfloat16
@@ -941,7 +1008,8 @@ def chunk_gla_fwd_o_gk(
         chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
     NT = cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     config = get_chunk_gla_fwd_o_config(
-        T, H, K, V, cu_seqlens is not None
+        T, H, K, V, cu_seqlens is not None,
+        b=B, dtype=q.dtype,
     )
     use_tri32 = _use_chunk_gla_fwd_o_local_tri32(
         q, v, g, h, A, BT, cu_seqlens
@@ -1124,7 +1192,8 @@ def fused_kda_gate_chunk_cumsum(
     y = torch.empty_like(raw_g, dtype=output_dtype or raw_g.dtype)
     beta_out = torch.empty(raw_beta.shape, device=raw_beta.device, dtype=torch.float32)
     config = get_kda_gate_chunk_cumsum_vector_config(
-        T, H, D, cu_seqlens is not None
+        T, H, D, cu_seqlens is not None,
+        b=B, dtype=raw_g.dtype,
     )
     # For each (chunk, head), program 0 computes beta without extending a gate
     # tile's critical path. The remaining programs cover the gate dimension.
@@ -1476,7 +1545,9 @@ def fused_kda_gate(
     assert H * head_k_dim == HD
 
     y = torch.empty_like(g, dtype=torch.float32)
-    config = get_kda_gate_fwd_config(T, H, head_k_dim)
+    config = get_kda_gate_fwd_config(
+        T, H, head_k_dim, b=g.shape[0], dtype=g.dtype
+    )
     grid = (cdiv(T, config["BT"]), H)
 
     kda_gate_fwd_kernel[grid](

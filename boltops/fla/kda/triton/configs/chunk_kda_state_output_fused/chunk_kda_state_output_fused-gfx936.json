@@ -1,0 +1,19 @@
+{
+  "config": {
+    "B=1,dtype=bf16,programs=24,V=128": {
+      "BV": 64,
+      "num_warps": 8,
+      "num_stages": 2
+    },
+    "B=1,dtype=bf16,programs=48,V=128": {
+      "BV": 128,
+      "num_warps": 16,
+      "num_stages": 2
+    },
+    "B=4,dtype=bf16,programs=96,V=128": {
+      "BV": 64,
+      "num_warps": 8,
+      "num_stages": 1
+    }
+  }
+}

@@ -240,7 +240,11 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         p_o += HV * V
         p_v += HV * V
         p_b += HV
-        p_a += HV
+        # KDA gate input is [B, T, HV, K]: the token pitch is HV*K, not HV.
+        if IS_KDA:
+            p_a += HV * K
+        else:
+            p_a += HV
 
 
 def fused_sigmoid_gating_delta_rule_update(

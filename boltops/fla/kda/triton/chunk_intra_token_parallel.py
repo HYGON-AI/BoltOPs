@@ -15,8 +15,9 @@ import torch
 import triton
 import triton.language as tl
 
-from ...common.triton.math import exp2
-from ...common.triton.utils import prepare_chunk_indices
+from boltops.fla.common.triton.math import exp2
+from boltops.fla.common.triton.utils import prepare_chunk_indices
+from .config_utils import dtype_name, get_kda_tuned_config
 
 
 CHUNK_KDA_INTRA_TOKEN_PARALLEL_CONFIGS: tuple[dict[str, int], ...] = (
@@ -27,6 +28,22 @@ CHUNK_KDA_INTRA_TOKEN_PARALLEL_CONFIGS: tuple[dict[str, int], ...] = (
 
 
 def get_chunk_kda_intra_token_parallel_config(
+    T: int,
+    H: int,
+    HV: int,
+    is_varlen: bool,
+    *,
+    b: int,
+    dtype: torch.dtype,
+) -> dict[str, int]:
+    return get_kda_tuned_config(
+        "chunk_kda_intra_token_parallel",
+        f"B={b},dtype={dtype_name(dtype)},T={T},H={H},HV={HV},varlen={is_varlen}",
+        fallback=static_chunk_kda_intra_token_parallel_config(T, H, HV, is_varlen),
+    )
+
+
+def static_chunk_kda_intra_token_parallel_config(
     T: int, H: int, HV: int, is_varlen: bool
 ) -> dict[str, int]:
     """Select a BW1000_H config without runtime autotuning.
@@ -280,6 +297,8 @@ def chunk_kda_fwd_intra_token_parallel(
             H=H,
             HV=HV,
             is_varlen=cu_seqlens is not None,
+            b=B,
+            dtype=q.dtype,
         )
         if cu_seqlens is None:
             chunk_indices = None
