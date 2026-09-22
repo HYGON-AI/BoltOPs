@@ -13,6 +13,12 @@ from boltops.generic import (
     attn_res,
     fused_mamba_state_scatter_with_mask,
 )
+from boltops.qsa import (
+    expand_qsa_block_indices,
+    qsa_mqa_paged,
+    qsa_select_paged_tokens,
+    qsa_sparse_paged_attention,
+)
 from boltops.fla.kda import recompute_w_u_fwd as recompute_w_u_fwd_kda
 from boltops.fla.gdn import recompute_w_u_fwd as recompute_w_u_fwd_gdn
 from boltops.mqa_logits import (
@@ -82,6 +88,10 @@ def test_version():
 def test_operator_package_exports():
     assert callable(attn_res)
     assert callable(triton_mqa_logits)
+    assert callable(qsa_mqa_paged)
+    assert callable(qsa_select_paged_tokens)
+    assert callable(expand_qsa_block_indices)
+    assert callable(qsa_sparse_paged_attention)
     assert callable(tilelang_qsa_mqa_decode)
     assert callable(tilelang_qsa_mqa_prefill)
     assert callable(fused_mamba_state_scatter_with_mask)

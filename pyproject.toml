@@ -44,6 +44,8 @@ packages = [
     "boltops.generic",
     "boltops.generic.triton",
     "boltops.generic.triton.causal_conv1d",
+    "boltops.qsa",
+    "boltops.qsa.triton",
     "boltops.fused_moe",
     "boltops.fused_moe.triton",
     "boltops.fused_moe.triton.configs",

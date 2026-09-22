@@ -3,20 +3,10 @@
 from .attn_res import attn_res
 from .causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 from .mamba_state_scatter import fused_mamba_state_scatter_with_mask
-from .qsa import (
-    expand_qsa_block_indices,
-    qsa_mqa_paged,
-    qsa_select_paged_tokens,
-    qsa_sparse_paged_attention,
-)
 
 __all__ = [
     "attn_res",
     "causal_conv1d_fn",
     "causal_conv1d_update",
     "fused_mamba_state_scatter_with_mask",
-    "qsa_mqa_paged",
-    "expand_qsa_block_indices",
-    "qsa_select_paged_tokens",
-    "qsa_sparse_paged_attention",
 ]

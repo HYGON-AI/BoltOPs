@@ -1,4 +1,4 @@
-"""Correctness and input-contract tests for generic QSA operators."""
+"""Correctness and input-contract tests for QSA operators."""
 
 from __future__ import annotations
 
@@ -7,15 +7,15 @@ import pytest
 import torch
 import triton
 
-from boltops.generic import (
+from boltops.qsa import (
     expand_qsa_block_indices,
     qsa_mqa_paged,
     qsa_select_paged_tokens,
     qsa_sparse_paged_attention,
 )
-from boltops.generic.triton.qsa import (
-    _qsa_mqa_paged_kernel,
+from boltops.qsa.triton.qsa import (
     TUNED_TARGET_SEGMENTS,
+    _qsa_mqa_paged_kernel,
     _select_qsa_mqa_config,
     _select_qsa_sparse_block_m,
     _select_qsa_sparse_config,
@@ -44,8 +44,8 @@ def test_qsa_config_selector_covers_required_range():
 
 
 def test_qsa_decode_merge_selector_uses_measured_launch():
-    """Small decode gets extra dim programs; larger decode stays full-head."""
-    for rows, expected_dim_tile in ((1, 64), (8, 64), (9, 256), (512, 256)):
+    """Tiny decode gets extra dim programs; measured decode stays full-head."""
+    for rows, expected_dim_tile in ((1, 64), (8, 256), (9, 256), (512, 256)):
         config = _select_qsa_sparse_config(rows, 1, 2051, 256)
         assert config["merge_warps"] == 1
         assert config["merge_dim_tile"] == expected_dim_tile
@@ -54,8 +54,8 @@ def test_qsa_decode_merge_selector_uses_measured_launch():
 def test_public_sparse_launch_config_matches_selector():
     """The public API must not silently rebuild a different merge policy."""
     cases = [
-        (4, 16, 64, 4, 64),
-        (40, 64, 8, 2, 256),
+        (4, 32, 16, 2, 256),
+        (40, 32, 1, 2, 256),
         (1024, 16, 1, 2, 256),
     ]
     for rows, block_n, target_splits, warps, dim_tile in cases:
@@ -70,8 +70,10 @@ def test_public_sparse_launch_config_matches_selector():
 
 
 def test_tuned_long_prefill_segment_is_authoritative():
-    """The measured table must not be silently overridden by public API."""
-    _, _, values = TUNED_TARGET_SEGMENTS[0]
+    """The measured long-prefill table must not be silently overridden."""
+    prefill = [segment for segment in TUNED_TARGET_SEGMENTS if segment[0] >= 513]
+    assert prefill, "expected a tuned segment covering long prefill rows"
+    _, _, values = prefill[0]
     assert values[:3] == (16, 1, 2)
 
 
@@ -81,9 +83,9 @@ def test_qsa_sparse_hcu_gqa_uses_mma_compatible_block_m():
     assert _select_qsa_sparse_block_m(4, 128) == 4
 
 
-def test_qsa_configs_are_merged_into_kernel_module():
-    """Dispatch policy and measured segments live beside the QSA kernels."""
-    from boltops.generic.triton import qsa
+def test_qsa_configs_live_with_kernels():
+    """Dispatch policy and measured segments live with the QSA kernels."""
+    from boltops.qsa.triton import qsa
 
     assert qsa.TUNED_TARGET_SEGMENTS
     assert qsa._select_qsa_mqa_config(512, 65536, 128, 4)["use_grouped_mma"]

@@ -13,14 +13,6 @@ from __future__ import annotations
 
 import torch
 
-from .qsa import (
-    expand_qsa_block_indices,
-    qsa_mqa_paged,
-    qsa_select_paged_tokens,
-    qsa_sparse_paged_attention,
-)
-
-
 def attn_res(
     prefix: torch.Tensor,
     blocks: torch.Tensor,
@@ -77,8 +69,4 @@ __all__ = [
     "causal_conv1d_fn",
     "causal_conv1d_update",
     "fused_mamba_state_scatter_with_mask",
-    "qsa_mqa_paged",
-    "expand_qsa_block_indices",
-    "qsa_select_paged_tokens",
-    "qsa_sparse_paged_attention",
 ]

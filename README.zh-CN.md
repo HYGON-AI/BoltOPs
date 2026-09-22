@@ -73,6 +73,12 @@ from boltops.fa.sparse_gqa import (
 from boltops.mqa_logits import (
     triton_mqa_logits,
 )
+from boltops.qsa import (
+    qsa_mqa_paged,
+    qsa_select_paged_tokens,
+    expand_qsa_block_indices,
+    qsa_sparse_paged_attention,
+)
 from boltops.step4_dsa import (
     triton_indexer_logits,
     triton_sparse_attention_prefill,
@@ -160,6 +166,7 @@ from boltops.generic.triton.attn_res import attn_res as triton_impl
 | Qwen Sparse GQA                                                                 | `qwen_sparse_kv_extraction_compact_hcu_fa_triton` `sparse_gqa_packed_decode_triton`                                                                                                                              | Triton ✅ TileLang ❌ | Triton @huangshuang @sunchunhao | Triton                       | [docs](docs/ops/fa/sparse_gqa.md)                                                                    |
 | Step-4 DSA                                                                      | `triton_build_rope_cache` `triton_indexer_norm_rope` `triton_csa_*` `triton_indexer_logits` `triton_region_topk_ids` `triton_topk_select_and_pack` `triton_*_sparse_meta` `triton_sparse_attention_*` `triton_merge_split_states`           | Triton ✅ TileLang ❌ | Triton @xukang @duyubo                                 | Triton                       | [docs](docs/ops/step4_dsa.md)                                                                      |
 | MQA Logits                                                             | `triton_mqa_logits`（fp8 传 scales；fp16/bf16 不传）                                                                                                                                                                                     | Triton ✅ TileLang ❌ | Triton @fangzx                            | Triton                       | [文档](docs/ops/mqa_logits.md)（prefill；paged 待迁）                                                      |
+| QSA（分页打分 / 选择 / 稀疏注意力）                                                             | `qsa_mqa_paged` `qsa_select_paged_tokens` `expand_qsa_block_indices` `qsa_sparse_paged_attention`                                                                                                                                | Triton ✅ TileLang ❌ |                                    | Triton             | [docs](docs/ops/qsa.md)（四步分页流水线；TileLang 打分入口在 `boltops.mqa_logits`）                     |
 | MHC                                                                             | `mhc_pre_big_fuse` `pre_big_fuse_tilelang` `mhc_post_fwd` `hc_split_sinkhorn` `mhc_fused_tilelang`                                                                                                                                      | TileLang ✅          | TileLang @zhouweiwang                        | TileLang                     | [docs](docs/ops/mhc.md)                                                                            |
 | IHC                                                                             | `ihc_pre` `ihc_post` `ihc_head`                                                                                                                                                                                                         | TileLang ✅          | TileLang @zhouweiwang                        | TileLang                     | [docs](docs/ops/ihc.md)                                                                            |
 | Gemm/AwqGemm 系列                                                                 | `matmul_persistent` `gemm_a16w16` `w8a8_triton_block_scaled_mm` `triton_scaled_mm` `awq_gemm_triton` `gemm_a8w8_blockscale` `gemm_afp4wfp4` `batched_gemm_a16wfp4` `w8a8_block_int8_matmul`                                            | Triton ✅ TileLang ❌ | Triton @xukang @duyubo                        | Triton                       | [docs](docs/ops/gemm.md)                                                                           |
