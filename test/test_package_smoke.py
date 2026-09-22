@@ -37,6 +37,13 @@ from boltops.fa.sparse_gqa import (
     qwen_sparse_kv_extraction_compact_hcu_fa_triton,
     sparse_gqa_packed_decode_triton,
 )
+from boltops.fa.extend_attention import (
+    build_unified_kv_indices,
+    can_use_dense_prefill_fp8,
+    dense_prefill_attention_fwd,
+    extend_attention_fwd,
+    extend_attention_fwd_unified,
+)
 from boltops.ihc import ihc_head, ihc_post, ihc_pre
 from boltops.step4_dsa import (
     triton_build_rope_cache,
@@ -62,6 +69,9 @@ from boltops.mhc import (
 from boltops.tools.fused_moe_triton_tune.tune_moe_cli import main as moe_tune_main
 from boltops.tools.sparse_gqa_triton_tune.tune_sparse_gqa import (
     main as sparse_gqa_tune_main,
+)
+from boltops.tools.extend_attention_triton_tune.tune_extend_attention import (
+    main as extend_attention_tune_main,
 )
 
 
@@ -103,6 +113,11 @@ def test_operator_package_exports():
     assert callable(compute_num_kv_splits)
     assert callable(qwen_sparse_kv_extraction_compact_hcu_fa_triton)
     assert callable(sparse_gqa_packed_decode_triton)
+    assert callable(build_unified_kv_indices)
+    assert callable(can_use_dense_prefill_fp8)
+    assert callable(dense_prefill_attention_fwd)
+    assert callable(extend_attention_fwd)
+    assert callable(extend_attention_fwd_unified)
     assert callable(triton_build_rope_cache)
     assert callable(triton_indexer_norm_rope)
     assert callable(triton_csa_region_layout)
@@ -145,3 +160,7 @@ def test_moe_tune_cli_is_packaged():
 
 def test_sparse_gqa_tune_cli_is_packaged():
     assert callable(sparse_gqa_tune_main)
+
+
+def test_extend_attention_tune_cli_is_packaged():
+    assert callable(extend_attention_tune_main)
