@@ -1,0 +1,118 @@
+{
+    "key": [
+        "batch_size",
+        "max_len_extend",
+        "kv_group_num",
+        "Lq",
+        "Lv",
+        "USE_CUSTOM_MASK",
+        "IS_CAUSAL",
+        "SKIP_PREFIX_CUSTOM_MASK",
+        "HAS_SINK",
+        "SLIDING_WINDOW_SIZE",
+        "xai_temperature_len",
+        "Q_Extend",
+        "K_Extend",
+        "V_Extend",
+        "O_Extend",
+        "K_Buffer",
+        "V_Buffer",
+        "qo_indptr",
+        "kv_indptr",
+        "kv_indices",
+        "mask_ptr",
+        "mask_indptr",
+        "sink_ptr",
+        "window_kv_offset_ptr"
+    ],
+    "config": {
+        "(16, 3, 16, 192, 128, False, True, True, False, -1, -1, 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.int32', 'torch.int32', 'torch.int64')": {
+            "BLOCK_M": 16,
+            "BLOCK_N": 64,
+            "waves_per_eu": 1,
+            "matrix_instr_nonkdim": 16,
+            "sched_latency": "mmac5-ds10",
+            "kpack": 1,
+            "USE_MLS": false,
+            "num_warps": 4,
+            "num_stages": 2
+        },
+        "(32, 3, 16, 192, 128, False, True, True, False, -1, -1, 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.int32', 'torch.int32', 'torch.int64')": {
+            "BLOCK_M": 32,
+            "BLOCK_N": 64,
+            "waves_per_eu": 1,
+            "matrix_instr_nonkdim": 16,
+            "sched_latency": "mmac5-ds10",
+            "kpack": 1,
+            "USE_MLS": false,
+            "num_warps": 4,
+            "num_stages": 2
+        },
+        "(64, 3, 16, 192, 128, False, True, True, False, -1, -1, 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.int32', 'torch.int32', 'torch.int64')": {
+            "BLOCK_M": 64,
+            "BLOCK_N": 64,
+            "waves_per_eu": 1,
+            "matrix_instr_nonkdim": 16,
+            "sched_latency": "none",
+            "kpack": 1,
+            "USE_MLS": false,
+            "num_warps": 4,
+            "num_stages": 1
+        },
+        "(64, 3, 8, 192, 128, False, True, True, True, 128, -1, 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.int32', 'torch.int32', 'torch.int64', 'torch.float32')": {
+            "BLOCK_M": 32,
+            "BLOCK_N": 64,
+            "waves_per_eu": 1,
+            "matrix_instr_nonkdim": 16,
+            "sched_latency": "mmac5-ds10",
+            "kpack": 1,
+            "USE_MLS": false,
+            "num_warps": 4,
+            "num_stages": 1
+        },
+        "(64, 4, 16, 192, 128, False, True, True, False, -1, -1, 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.int32', 'torch.int32', 'torch.int32')": {
+            "BLOCK_M": 64,
+            "BLOCK_N": 64,
+            "waves_per_eu": 1,
+            "matrix_instr_nonkdim": 16,
+            "sched_latency": "none",
+            "kpack": 1,
+            "USE_MLS": false,
+            "num_warps": 4,
+            "num_stages": 1
+        },
+        "(64, 4, 16, 192, 128, True, True, True, False, -1, -1, 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.int32', 'torch.int32', 'torch.int32', 'torch.bool', 'torch.int32')": {
+            "BLOCK_M": 64,
+            "BLOCK_N": 64,
+            "waves_per_eu": 1,
+            "matrix_instr_nonkdim": 16,
+            "sched_latency": "none",
+            "kpack": 1,
+            "USE_MLS": false,
+            "num_warps": 4,
+            "num_stages": 1
+        },
+        "(64, 4, 8, 192, 128, False, True, True, True, 128, -1, 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.int32', 'torch.int32', 'torch.int32', 'torch.bfloat16')": {
+            "BLOCK_M": 32,
+            "BLOCK_N": 64,
+            "waves_per_eu": 1,
+            "matrix_instr_nonkdim": 16,
+            "sched_latency": "none",
+            "kpack": 1,
+            "USE_MLS": false,
+            "num_warps": 4,
+            "num_stages": 1
+        },
+        "(64, 4, 8, 192, 128, True, True, True, True, 128, -1, 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.int32', 'torch.int32', 'torch.int32', 'torch.bool', 'torch.int32', 'torch.bfloat16', 'torch.int32')": {
+            "BLOCK_M": 64,
+            "BLOCK_N": 64,
+            "waves_per_eu": 1,
+            "matrix_instr_nonkdim": 16,
+            "sched_latency": "none",
+            "kpack": 1,
+            "USE_MLS": false,
+            "num_warps": 4,
+            "num_stages": 1
+        }
+    }
+}

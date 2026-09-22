@@ -36,6 +36,7 @@ dev = [
 [project.scripts]
 boltops-fused-moe-tune-cli = "boltops.tools.fused_moe_triton_tune.tune_moe_cli:main"
 boltops-sparse-gqa-tune-cli = "boltops.tools.sparse_gqa_triton_tune.tune_sparse_gqa:main"
+boltops-extend-attention-tune-cli = "boltops.tools.extend_attention_triton_tune.tune_extend_attention:main"
 
 [tool.setuptools]
 packages = [
@@ -61,6 +62,8 @@ packages = [
     "boltops.fa",
     "boltops.fa.sparse_gqa",
     "boltops.fa.sparse_gqa.triton",
+    "boltops.fa.extend_attention",
+    "boltops.fa.extend_attention.triton",
     "boltops.mqa_logits",
     "boltops.mqa_logits.triton",
     "boltops.mqa_logits.tilelang",
@@ -97,6 +100,7 @@ packages = [
     "boltops.tools",
     "boltops.tools.fused_moe_triton_tune",
     "boltops.tools.sparse_gqa_triton_tune",
+    "boltops.tools.extend_attention_triton_tune",
 ]
 
 [tool.setuptools.dynamic]
@@ -112,6 +116,7 @@ boltops = [
     "mla/triton/SOURCE.md",
     "mla/triton/configs/**/*.json",
     "fa/sparse_gqa/triton/configs/triton_*/*.json",
+    "fa/extend_attention/triton/configs/triton_*/*.json",
     "mqa_logits/triton/SOURCE.md",
     "mqa_logits/triton/PERFORMANCE.md",
     "mqa_logits/triton/configs/triton_*/*.json",
@@ -122,6 +127,8 @@ boltops = [
     "tools/fused_moe_triton_tune/*.md",
     "tools/sparse_gqa_triton_tune/*.sh",
     "tools/sparse_gqa_triton_tune/*.md",
+    "tools/extend_attention_triton_tune/*.md",
+    "tools/extend_attention_triton_tune/*.sh",
 ]
 
 [tool.pytest.ini_options]
