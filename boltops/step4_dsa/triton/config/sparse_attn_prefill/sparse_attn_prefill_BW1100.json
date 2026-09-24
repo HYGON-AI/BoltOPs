@@ -43,15 +43,15 @@
         "dtype": "bfloat16"
       },
       "config": {
-        "AUTO_KV_SPLITS": 72,
-        "BLOCK_R": 8,
+        "AUTO_KV_SPLITS": 144,
+        "BLOCK_R": 4,
         "BLOCK_H": 16,
         "num_warps": 1,
         "num_stages": 1,
         "waves_per_eu": 3,
-        "kpack": 2,
+        "kpack": 1,
         "enable_v_mmac_cluster": 2,
-        "empty_arrive_after_mmac": false,
+        "empty_arrive_after_mmac": true,
         "misched_regpressure": false,
         "schedule_hint": "attention",
         "hcu_use_gfx946_sched_model_v2": true,
@@ -70,17 +70,19 @@
         "dtype": "bfloat16"
       },
       "config": {
-        "AUTO_KV_SPLITS": 18,
-        "BLOCK_R": 8,
+        "AUTO_KV_SPLITS": 72,
+        "BLOCK_R": 4,
         "BLOCK_H": 16,
-        "num_warps": 2,
+        "num_warps": 1,
         "num_stages": 1,
         "waves_per_eu": 3,
-        "kpack": 2,
+        "kpack": 1,
         "enable_v_mmac_cluster": 2,
         "empty_arrive_after_mmac": true,
         "misched_regpressure": false,
-        "schedule_hint": "attention"
+        "schedule_hint": "attention",
+        "hcu_use_gfx946_sched_model_v2": true,
+        "amdgpu_enable_max_ilp_scheduling_strategy": true
       }
     },
     {
@@ -95,17 +97,19 @@
         "dtype": "bfloat16"
       },
       "config": {
-        "AUTO_KV_SPLITS": 18,
-        "BLOCK_R": 8,
+        "AUTO_KV_SPLITS": 36,
+        "BLOCK_R": 4,
         "BLOCK_H": 16,
-        "num_warps": 2,
+        "num_warps": 1,
         "num_stages": 1,
-        "waves_per_eu": 1,
+        "waves_per_eu": 3,
         "kpack": 1,
         "enable_v_mmac_cluster": 2,
         "empty_arrive_after_mmac": true,
         "misched_regpressure": false,
-        "schedule_hint": "attention"
+        "schedule_hint": "attention",
+        "hcu_use_gfx946_sched_model_v2": true,
+        "amdgpu_enable_max_ilp_scheduling_strategy": true
       }
     },
     {
@@ -120,17 +124,19 @@
         "dtype": "bfloat16"
       },
       "config": {
-        "AUTO_KV_SPLITS": 8,
-        "BLOCK_R": 8,
+        "AUTO_KV_SPLITS": 18,
+        "BLOCK_R": 4,
         "BLOCK_H": 16,
-        "num_warps": 2,
+        "num_warps": 1,
         "num_stages": 1,
         "waves_per_eu": 3,
-        "kpack": 2,
+        "kpack": 1,
         "enable_v_mmac_cluster": 2,
         "empty_arrive_after_mmac": true,
         "misched_regpressure": false,
-        "schedule_hint": "attention"
+        "schedule_hint": "attention",
+        "hcu_use_gfx946_sched_model_v2": true,
+        "amdgpu_enable_max_ilp_scheduling_strategy": true
       }
     },
     {
@@ -145,7 +151,7 @@
         "dtype": "bfloat16"
       },
       "config": {
-        "AUTO_KV_SPLITS": 8,
+        "AUTO_KV_SPLITS": 9,
         "BLOCK_R": 4,
         "BLOCK_H": 16,
         "num_warps": 1,
@@ -172,17 +178,19 @@
         "dtype": "bfloat16"
       },
       "config": {
-        "AUTO_KV_SPLITS": 3,
-        "BLOCK_R": 8,
+        "AUTO_KV_SPLITS": 4,
+        "BLOCK_R": 4,
         "BLOCK_H": 16,
-        "num_warps": 2,
+        "num_warps": 1,
         "num_stages": 1,
-        "waves_per_eu": 2,
+        "waves_per_eu": 3,
         "kpack": 1,
         "enable_v_mmac_cluster": 2,
         "empty_arrive_after_mmac": true,
         "misched_regpressure": false,
-        "schedule_hint": "attention"
+        "schedule_hint": "attention",
+        "hcu_use_gfx946_sched_model_v2": true,
+        "amdgpu_enable_max_ilp_scheduling_strategy": true
       }
     },
     {
@@ -198,16 +206,18 @@
       },
       "config": {
         "AUTO_KV_SPLITS": 1,
-        "BLOCK_R": 8,
+        "BLOCK_R": 4,
         "BLOCK_H": 16,
-        "num_warps": 2,
+        "num_warps": 1,
         "num_stages": 1,
         "waves_per_eu": 3,
         "kpack": 1,
-        "enable_v_mmac_cluster": 1,
+        "enable_v_mmac_cluster": 2,
         "empty_arrive_after_mmac": true,
         "misched_regpressure": false,
-        "schedule_hint": "attention"
+        "schedule_hint": "attention",
+        "hcu_use_gfx946_sched_model_v2": true,
+        "amdgpu_enable_max_ilp_scheduling_strategy": true
       }
     },
     {
