@@ -204,11 +204,9 @@ output, final_state = fused_sigmoid_gating_delta_rule_update(
 ### 3.3 Recurrent speculative verify
 
 > 全参数 kernel 入口，与 SGLang `fla/fused_sigmoid_gating_recurrent` 中的
-> `fused_sigmoid_gating_delta_rule_update` 同名同签名，位于
-> `boltops.fla.common.triton.fused_sigmoid_gating_recurrent` 模块级（不在
-> gdn facade 中导出，避免遮蔽同名的 vLLM decode 算子）。decode +
-> speculative verify、tree cache、中间状态缓存；verify preset 由框架 adapter
-> 的 `target_verify` 方法在此之上封装。
+> `fused_sigmoid_gating_delta_rule_update` 同名同签名。它是 GDN/KDA 共享
+> kernel，因此实现位于 `boltops.fla.common.triton.fused_sigmoid_gating_recurrent`
+> 模块级；gdn facade 只导出本家族的 vLLM decode ABI。
 
 ```python
 from boltops.fla.common.triton.fused_sigmoid_gating_recurrent import (

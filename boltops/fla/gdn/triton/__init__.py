@@ -1,6 +1,6 @@
 """Triton backend for Gated DeltaNet operators."""
 
-from boltops.fla.common.triton.fused_sigmoid_gating import (
+from .fused_sigmoid_gating import (
     fused_sigmoid_gating_delta_rule_update,
     fused_sigmoid_gating_delta_rule_update_kernel,
 )
