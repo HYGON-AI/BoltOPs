@@ -289,6 +289,7 @@ def fused_recurrent_kda_fwd_kernel(
     HAS_DT_BIAS: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
     FAST_L2_NORM: tl.constexpr,
+    NULL_STATE_INDEX: tl.constexpr,
     num_stages: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -315,7 +316,7 @@ def fused_recurrent_kda_fwd_kernel(
         tl.int64
     )
     p_out = out + bos * stride_out_token + i_h * V + o_v
-    if state_index <= 0:
+    if state_index <= NULL_STATE_INDEX:
         tl.store(p_out, tl.zeros([BV], dtype=tl.float32), mask=m_v)
         return
 
@@ -395,7 +396,7 @@ def fused_recurrent_kda_fwd_kernel(
         final_state_index = tl.load(state_indices + i_n * stride_indices_seq + i_t).to(
             tl.int64
         )
-        if final_state_index > 0:
+        if final_state_index > NULL_STATE_INDEX:
             p_final_state = (
                 state
                 + final_state_index * stride_state_token
@@ -436,8 +437,16 @@ def fused_recurrent_kda_fwd(
     use_gate_in_kernel: bool = False,
     use_beta_sigmoid_in_kernel: bool = False,
     out: torch.Tensor | None = None,
+    null_state_index: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Launch recurrent KDA with dense inner dimensions and row strides."""
+    """Launch recurrent KDA with dense inner dimensions and row strides.
+
+    ``null_state_index`` selects the state-index ABI: ``0`` (the default,
+    vLLM NULL_BLOCK_ID) treats indices ``<= 0`` as invalid, so valid slots
+    are 1-based; ``-1`` (SGLang) treats only negative indices as invalid --
+    SGLang's allocator never hands slot 0 to a live request and reserves it
+    as the dummy write target for padded requests.
+    """
     B, T, H, K = q.shape
     V = v.shape[-1]
     assert B == 1 and k.shape == q.shape
@@ -459,6 +468,8 @@ def fused_recurrent_kda_fwd(
     assert beta.stride(2) == 1
     assert q.stride(1) == k.stride(1) == v.stride(1)
     assert initial_state.stride()[1:] == (V * K, K, 1)
+    if null_state_index not in (-1, 0):
+        raise ValueError("null_state_index must be 0 (vLLM ABI) or -1 (SGLang ABI).")
     N = cu_seqlens.numel() - 1
     if ssm_state_indices.ndim == 1:
         assert T == N
@@ -509,6 +520,7 @@ def fused_recurrent_kda_fwd(
         USE_GATE_IN_KERNEL=use_gate_in_kernel,
         APPLY_BETA_SIGMOID=use_beta_sigmoid_in_kernel,
         FAST_L2_NORM=H >= 24,
+        NULL_STATE_INDEX=null_state_index,
         **config,
     )
     return out, initial_state
@@ -529,11 +541,18 @@ def fused_recurrent_kda(
     num_accepted_tokens: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
     fuse_gate: bool | None = None,
+    null_state_index: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run recurrent KDA from raw gate and beta inputs.
 
     This vLLM wrapper applies the gate activation and beta sigmoid, selecting
     whether to materialize them before launching the recurrent kernel.
+
+    ``null_state_index`` selects the state-index ABI: ``0`` (the default,
+    vLLM NULL_BLOCK_ID) treats indices ``<= 0`` as invalid; ``-1`` (SGLang)
+    treats only negative indices as invalid -- SGLang reserves slot 0 as the
+    dummy write target for padded requests and never allocates it to a live
+    request.
     """
     if fuse_gate is None:
         # gfx950: always fuse the gate.
@@ -569,6 +588,7 @@ def fused_recurrent_kda(
         use_gate_in_kernel=fuse_gate,
         use_beta_sigmoid_in_kernel=fuse_gate,
         out=out,
+        null_state_index=null_state_index,
     )
 
 
@@ -596,6 +616,7 @@ def fused_recurrent_kda_packed_decode_kernel(
     SOFTPLUS_THRESHOLD: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
     FAST_L2_NORM: tl.constexpr,
+    NULL_STATE_INDEX: tl.constexpr,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
@@ -608,7 +629,7 @@ def fused_recurrent_kda_packed_decode_kernel(
 
     state_idx = tl.load(state_indices + i_n).to(tl.int64)
     p_out = out + (i_n * H + i_h) * V + o_v
-    if state_idx <= 0:
+    if state_idx <= NULL_STATE_INDEX:
         tl.store(p_out, tl.zeros([BV], dtype=tl.float32), mask=mask_v)
         return
 
@@ -689,6 +710,7 @@ def fused_recurrent_kda_packed_decode_3d_kernel(
     BK: tl.constexpr,
     BV: tl.constexpr,
     FAST_L2_NORM: tl.constexpr,
+    NULL_STATE_INDEX: tl.constexpr,
 ):
     """Bounded-gate packed decode with direct (V tile, head, token) IDs."""
     i_v, i_h, i_n = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -699,7 +721,7 @@ def fused_recurrent_kda_packed_decode_3d_kernel(
 
     state_idx = tl.load(state_indices + i_n).to(tl.int64)
     p_out = out + (i_n * H + i_h) * V + o_v
-    if state_idx <= 0:
+    if state_idx <= NULL_STATE_INDEX:
         tl.store(p_out, 0.0, mask=mask_v)
         return
 
@@ -767,8 +789,17 @@ def fused_recurrent_kda_packed_decode(
     initial_state: torch.Tensor,
     state_indices: torch.Tensor,
     scale: float | None = None,
+    null_state_index: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run one-token KDA decode directly from packed post-conv QKV."""
+    """Run one-token KDA decode directly from packed post-conv QKV.
+
+    ``null_state_index`` selects the state-index ABI so both frameworks can
+    call the same entry: ``0`` (the default, vLLM NULL_BLOCK_ID) treats
+    indices ``<= 0`` as invalid and valid slots are 1-based; ``-1`` (SGLang)
+    treats only negative indices as invalid -- SGLang reserves slot 0 as the
+    dummy write target for padded requests and never allocates it to a live
+    request.
+    """
     if mixed_qkv.ndim != 2 or mixed_qkv.stride(-1) != 1:
         raise ValueError("`mixed_qkv` must be 2D and contiguous in its last dim.")
     if raw_g.ndim != 4 or raw_g.shape[0] != 1:
@@ -813,6 +844,8 @@ def fused_recurrent_kda_packed_decode(
     BK = next_power_of_2(K)
     if scale is None:
         scale = K**-0.5
+    if null_state_index not in (-1, 0):
+        raise ValueError("null_state_index must be 0 (vLLM ABI) or -1 (SGLang ABI).")
 
     out = torch.empty((1, B, H, V), dtype=mixed_qkv.dtype, device=device)
     config = get_fused_recurrent_kda_packed_decode_config(
@@ -847,6 +880,7 @@ def fused_recurrent_kda_packed_decode(
             V=V,
             BK=BK,
             FAST_L2_NORM=H >= 24,
+            NULL_STATE_INDEX=null_state_index,
             **config,
         )
     else:
@@ -882,6 +916,7 @@ def fused_recurrent_kda_packed_decode(
             SOFTPLUS_THRESHOLD=20.0,
             USE_LOWER_BOUND=lower_bound is not None,
             FAST_L2_NORM=H >= 24,
+            NULL_STATE_INDEX=null_state_index,
             **config,
         )
     return out, initial_state

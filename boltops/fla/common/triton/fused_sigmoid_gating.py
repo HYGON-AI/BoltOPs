@@ -127,6 +127,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     IS_CONTINUOUS_BATCHING: tl.constexpr,
     IS_SPEC_DECODING: tl.constexpr,
     IS_KDA: tl.constexpr,
+    NULL_STATE_INDEX: tl.constexpr,
 ):
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_hv = i_nh // HV, i_nh % HV
@@ -184,7 +185,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t).to(
                 tl.int64
             )
-            if state_idx < 0:
+            if state_idx <= NULL_STATE_INDEX:
                 return
             p_h0 = h0 + state_idx * stride_init_state_token
         else:
@@ -226,7 +227,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             final_state_idx = tl.load(
                 ssm_state_indices + i_n * stride_indices_seq + i_t
             ).to(tl.int64)
-            if final_state_idx >= 0:
+            if final_state_idx > NULL_STATE_INDEX:
                 p_ht = ht + final_state_idx * stride_final_state_token
                 p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
                 tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
@@ -265,8 +266,19 @@ def fused_sigmoid_gating_delta_rule_update(
     num_accepted_tokens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
     is_kda: bool = False,
+    null_state_index: int = 0,
     kernel_cfg: dict | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fused sigmoid-gating + recurrent delta-rule update (decode).
+
+    This is the vLLM-named decode operator; its default ABI matches vLLM.
+    ``null_state_index`` selects the state-index ABI so both frameworks can
+    call the same entry: ``0`` (the default, vLLM NULL_BLOCK_ID) treats
+    indices ``<= 0`` as invalid and valid slots are 1-based; ``-1`` (SGLang)
+    treats only negative ``ssm_state_indices`` values as invalid -- SGLang
+    reserves slot 0 as the dummy write target for padded requests and never
+    allocates it to a live request.
+    """
     global HAS_DUMPED_SIGMOID_GATING_KERNEL_METADATA
 
     B, T, H, K, V = *k.shape, v.shape[-1]
@@ -288,6 +300,8 @@ def fused_sigmoid_gating_delta_rule_update(
 
     if initial_state is None:
         raise ValueError("initial_state must not be None.")
+    if null_state_index not in (-1, 0):
+        raise ValueError("null_state_index must be 0 (vLLM ABI) or -1 (SGLang ABI).")
 
     if cu_seqlens is not None and q.shape[0] != 1:
         raise ValueError(
@@ -345,6 +359,7 @@ def fused_sigmoid_gating_delta_rule_update(
         INPLACE_FINAL_STATE=inplace_final_state,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         IS_KDA=is_kda,
+        NULL_STATE_INDEX=null_state_index,
         num_warps=num_warps,
         num_stages=1,
     )

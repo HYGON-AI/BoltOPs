@@ -12,7 +12,6 @@ from boltops.fla.gdn import (
     chunk_gated_delta_rule_fwd_h,
     fused_recurrent_gated_delta_rule_packed_decode,
     fused_sigmoid_gating_delta_rule_update,
-    fused_sigmoid_gating_delta_rule_update_recurrent,
 )
 ```
 
@@ -20,11 +19,34 @@ from boltops.fla.gdn import (
 |---|---|---|
 | `fused_recurrent_gated_delta_rule_packed_decode` | 单 token packed QKV decode | `output, updated_state` |
 | `fused_sigmoid_gating_delta_rule_update` | continuous batching 和线性 speculative decode | `output, final_state` |
-| `fused_sigmoid_gating_delta_rule_update_recurrent` | 全参数 kernel 入口（decode + speculative verify、tree cache、中间状态缓存）；verify preset 由框架 adapter 控制 | `output` |
 | `chunk_gated_delta_rule_fwd_h` | Chunk state propagation | `h, v_new, final_state` |
 | `chunk_fwd_o` | Chunk state项和局部 attention项合并 | `output` |
 
 当前范围均为 forward-only，不包含 backward。
+
+### State index ABI（`null_state_index`）
+
+boltops 同时兼容 vLLM 和 SGLang 两类调用方的 state slot 约定，统一通过
+`null_state_index` 参数选择（仅支持 `0` 或 `-1`，kernel 侧是 constexpr，
+无运行时开销）：
+
+| 取值 | 含义 | 对应框架 |
+|---|---|---|
+| `0` | `<= 0` 为无效 slot（NULL_BLOCK_ID=0），有效 slot 从 1 开始 | vLLM |
+| `-1` | 仅负数无效；slot 0 有效（SGLang 将其保留为 padding 请求的 dummy 写入目标，不分配给 live 请求，live slot 从 1 分配） | SGLang |
+
+各入口默认值与上游同名算子一致：
+
+| 入口 | 默认 `null_state_index` | 上游来源 |
+|---|---|---|
+| KDA decode（`fused_recurrent_kda*`，见 kda.md） | `0` | vLLM kimi_k3 KDA |
+| `fused_sigmoid_gating_delta_rule_update`（gdn 包，vLLM decode 算子） | `0` | vLLM `flash_linear_attention/ops/fused_sigmoid_gating` |
+| `fused_sigmoid_gating_delta_rule_update`（`fla.common.triton.fused_sigmoid_gating_recurrent`，SGLang decode/verify 共享算子） | `-1` | SGLang `fla/fused_sigmoid_gating_recurrent` |
+| `fused_recurrent_gated_delta_rule_packed_decode` | `-1` | SGLang `fla/fused_recurrent` |
+| `chunk_gated_delta_rule_fwd_h`（含 state pool） | `-1` | SGLang `fla/chunk_delta_h` |
+| KDA prefill（`chunk_kda`/`chunk_kda_with_fused_gate` 及 KDA state 阶段，含 state pool） | `-1` | SGLang `fla/kda`（`chunk_kda_fwd` 经 `chunk_delta_h` 用池） |
+
+框架 adapter 必须按自己 state pool 的编号方式显式传参，不能依赖默认值混用。
 
 ## 2. 数学语义和布局
 
@@ -80,7 +102,7 @@ def fused_recurrent_gated_delta_rule_packed_decode(
 | `A_log` / `dt_bias` | `[HV]` | FP32/输入 dtype | gate参数 |
 | `initial_state` | `[slots,HV,V,K]` | FP32 | 原地更新的 cache |
 | `out` | `[B,1,HV,V]` | 同输入 | 调用方提供的输出 buffer |
-| `ssm_state_indices` | `[B]` | int32/int64 | cache slot；负数表示 padding |
+| `ssm_state_indices` | `[B]` | int32/int64 | cache slot；无效判定见 `null_state_index`（默认 `-1`：负数表示 padding，slot 0 有效） |
 
 调用示例：
 
@@ -181,11 +203,19 @@ output, final_state = fused_sigmoid_gating_delta_rule_update(
 
 ### 3.3 Recurrent speculative verify
 
-> 这是 Boltops 的全参数 kernel 入口。SGLang adapter 中的 `target_verify`
-> 方法应在本模块之上封装 verify preset。
+> 全参数 kernel 入口，与 SGLang `fla/fused_sigmoid_gating_recurrent` 中的
+> `fused_sigmoid_gating_delta_rule_update` 同名同签名，位于
+> `boltops.fla.common.triton.fused_sigmoid_gating_recurrent` 模块级（不在
+> gdn facade 中导出，避免遮蔽同名的 vLLM decode 算子）。decode +
+> speculative verify、tree cache、中间状态缓存；verify preset 由框架 adapter
+> 的 `target_verify` 方法在此之上封装。
 
 ```python
-def fused_sigmoid_gating_delta_rule_update_recurrent(
+from boltops.fla.common.triton.fused_sigmoid_gating_recurrent import (
+    fused_sigmoid_gating_delta_rule_update,
+)
+
+def fused_sigmoid_gating_delta_rule_update(
     A_log,
     a,
     dt_bias,
@@ -240,7 +270,7 @@ def fused_sigmoid_gating_delta_rule_update_recurrent(
 - 返回值只有 output；正式 state和中间状态通过传入 tensor体现副作用
 
 ```python
-output = fused_sigmoid_gating_delta_rule_update_recurrent(
+output = fused_sigmoid_gating_delta_rule_update(
     A_log,
     a,
     dt_bias,
@@ -477,7 +507,7 @@ repeat=50
 | `N=4, T=1, H=4, HV=16, K=128, V=128, BF16, state=BF16` | 18.56 us / 228.18 GB/s | 18.88 us / 224.37 GB/s |
 | `N=4, T=4, H=4, HV=16, K=128, V=128, BF16, state=BF16` | 32.53 us / 327.46 GB/s | 40.92 us / 260.25 GB/s |
 
-### `fused_sigmoid_gating_delta_rule_update_recurrent`
+### `fused_sigmoid_gating_delta_rule_update`（recurrent verify 全参数）
 
 | Shape | gfx936 | gfx938 |
 |---|---:|---:|

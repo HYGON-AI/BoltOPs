@@ -93,7 +93,8 @@ Q/K normalization 是 intra 与 decode 阶段共用的预处理，分别在对�
 | `g`/`gk` | `[B,T,H,K]` | FP32/BF16 | log2 gate；具体入口见算子文档 |
 | `beta` | `[B,T,H]` | FP32/BF16 | 已 sigmoid 的更新系数 |
 | `A`/`Aqk`/`Akk` | `[B,T,H,BT]` | BF16/FP32 | chunk 内系数矩阵 |
-| `initial_state` | `[slots,H,V,K]` | FP32 | 可选输入 state，通常原地更新 |
+| `initial_state` | `[slots,H,V,K]` | FP32 | 可选输入 state（state pool），通常原地更新 |
+| `initial_state_indices` | `[N]` | int32/int64 | 可选；每 sequence 的 pool 行，无效判定由 `null_state_index` 选择（默认 `-1` = SGLang 约定，仅负数无效、slot 0 为保留 dummy 行；`0` = vLLM NULL_BLOCK_ID，`<=0` 无效） |
 | `cu_seqlens` | `[N+1]` | int32/int64 | varlen 序列边界 |
 | `chunk_indices` | `[NT,2]` | int32/int64 | 可选 `(sequence, local_chunk)` 映射 |
 
@@ -113,7 +114,7 @@ packed QKV：
 | `raw_g` | `[1,tokens,H,K]` | raw key-wise gate |
 | `raw_beta` | `[1,tokens,H]` | raw beta |
 | `initial_state` | `[cache_slots,H,V,K]` | FP32 cache |
-| `state_indices` | `[tokens]` | 每个 token 的 cache slot；无效 slot 不更新 |
+| `state_indices` | `[tokens]` | 每个 token 的 cache slot；无效判定由 `null_state_index` 选择（默认 `0` = vLLM NULL_BLOCK_ID，`<=0` 无效、slot 从 1 开始；`-1` = SGLang 约定，仅负数无效、slot 0 为保留 dummy 行），adapter 按自己 pool 编号方式显式传参；无效 slot 仅输出写零、不更新 state |
 | 返回 `output` | `[1,tokens,H,V]` | 与输入 value dtype 相同 |
 
 返回的 state 与输入 `initial_state` 是同一个原地更新的 tensor；调用方必须保证

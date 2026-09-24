@@ -62,6 +62,11 @@ FP32：
 `K=128,BT=64,BC=16` 时该 kernel **不再单独 launch**：其计算已被折进 inter
 solve（见 4.3 的 `FUSE_DIAG`）。它仍是 token-parallel 路径与 A/B 对照的实现。
 
+q/k 的 in-kernel l2norm write-back（内部 `normalize_qk=True` 选项）只存在于
+该 kernel。`FUSE_DIAG` 下它不再 launch，wrapper 会在 inter solve 前用公共
+l2norm helper 对调用方的 q/k buffer **原地**归一化，保证 recompute_w_u 与
+state/output 阶段读到的行与 sub-chunk write-back 路径一致。
+
 ### 4.3 Inter solve
 
 `chunk_kda_fwd_kernel_inter_solve_fused` 计算 off-diagonal `Aqk/Akk`，消费

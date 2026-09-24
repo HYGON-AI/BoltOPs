@@ -9,10 +9,10 @@ import torch
 
 triton = pytest.importorskip("triton")
 
-from boltops.fla.gdn import (
-    fused_sigmoid_gating_delta_rule_update,
-    fused_sigmoid_gating_delta_rule_update_recurrent,
+from boltops.fla.common.triton.fused_sigmoid_gating_recurrent import (
+    fused_sigmoid_gating_delta_rule_update as fused_sigmoid_gating_delta_rule_update_verify,
 )
+from boltops.fla.gdn import fused_sigmoid_gating_delta_rule_update
 from ._gdn_reference import (
     naive_gdn_gate,
     naive_kda_gate,
@@ -29,9 +29,6 @@ def test_public_sigmoid_signatures_match_backends() -> None:
     from boltops.fla.common.triton.fused_sigmoid_gating import (
         fused_sigmoid_gating_delta_rule_update as ordinary_backend,
     )
-    from boltops.fla.common.triton.fused_sigmoid_gating_recurrent import (
-        fused_sigmoid_gating_delta_rule_update_recurrent as recurrent_backend,
-    )
 
     def parameters(fn):
         return [
@@ -40,7 +37,6 @@ def test_public_sigmoid_signatures_match_backends() -> None:
         ]
 
     assert parameters(fused_sigmoid_gating_delta_rule_update) == parameters(ordinary_backend)
-    assert parameters(fused_sigmoid_gating_delta_rule_update_recurrent) == parameters(recurrent_backend)
 
 
 def _gate_for_tokens(
@@ -198,6 +194,82 @@ def test_sigmoid_update_matches_fla_torch_reference(
         torch.testing.assert_close(actual_final, expected_compact, atol=3e-2, rtol=2e-2)
 
 
+
+@GPU_REQUIRED
+@pytest.mark.parametrize(
+    ("null_state_index", "indices"),
+    [
+        pytest.param(0, [0, 1], id="vllm-null-zero"),
+        pytest.param(-1, [0, -1], id="sglang-null-negative"),
+    ],
+)
+def test_verify_update_state_index_abi(
+    null_state_index: int, indices: list[int]
+) -> None:
+    """SGLang shared decode/verify entry honors both state-index ABIs."""
+    torch.manual_seed(112)
+    N, H, HV, K, V, pool = 2, 2, 4, 32, 32, 2
+    dtype = torch.bfloat16
+    q = torch.randn(1, N, H, K, device=DEVICE, dtype=dtype) * 0.2
+    k = torch.randn_like(q) * 0.2
+    v = torch.randn(1, N, HV, V, device=DEVICE, dtype=dtype) * 0.2
+    a = torch.randn(1, N, HV, device=DEVICE, dtype=dtype) * 0.2
+    b = torch.randn(1, N, HV, device=DEVICE, dtype=dtype) * 0.2
+    A_log = torch.randn(HV, device=DEVICE, dtype=torch.float32) * 0.1
+    dt_bias = torch.randn(HV, device=DEVICE, dtype=dtype) * 0.1
+    state_before = torch.randn(
+        pool, HV, V, K, device=DEVICE, dtype=torch.float32
+    ) * 0.01
+    state_actual = state_before.clone()
+    cu_seqlens = torch.arange(0, N + 1, device=DEVICE, dtype=torch.int32)
+
+    actual_output = fused_sigmoid_gating_delta_rule_update_verify(
+        A_log,
+        a,
+        dt_bias,
+        1.0,
+        20.0,
+        q,
+        k,
+        v,
+        b,
+        initial_state_source=state_actual,
+        initial_state_indices=torch.tensor(
+            indices, device=DEVICE, dtype=torch.int32
+        ),
+        scale=K**-0.5,
+        cu_seqlens=cu_seqlens,
+        use_qk_l2norm_in_kernel=True,
+        null_state_index=null_state_index,
+    )
+
+    gate = naive_gdn_gate(
+        a[0], A_log, dt_bias, softplus_beta=1.0, softplus_threshold=20.0
+    )
+    expected_output = torch.zeros_like(v)
+    expected_cache = state_before.clone()
+    for seq in range(N):
+        state_index = int(indices[seq])
+        if state_index <= null_state_index:
+            continue  # invalid slot: zero output, state untouched
+        state = expected_cache[state_index].clone()
+        out, state = _one_step(
+            q[0, seq],
+            k[0, seq],
+            v[0, seq],
+            b[0, seq].float().sigmoid(),
+            gate[seq],
+            state,
+            scale=K**-0.5,
+            use_l2norm=True,
+        )
+        expected_output[0, seq] = out
+        expected_cache[state_index] = state
+
+    torch.testing.assert_close(actual_output, expected_output, atol=3e-2, rtol=2e-2)
+    torch.testing.assert_close(state_actual, expected_cache, atol=3e-2, rtol=2e-2)
+
+
 @GPU_REQUIRED
 @pytest.mark.parametrize(
     ("tree", "disable_state_update", "is_kda"),
@@ -236,7 +308,7 @@ def test_recurrent_sigmoid_update_matches_fla_torch_reference(
     if tree:
         parents = torch.tensor([[0, 0, 0], [0, 0, 1]], device=DEVICE, dtype=torch.int32)
 
-    actual = fused_sigmoid_gating_delta_rule_update_recurrent(
+    actual = fused_sigmoid_gating_delta_rule_update_verify(
         A_log,
         a,
         dt_bias,
@@ -400,7 +472,7 @@ def test_bench_recurrent_speculative_verify_bandwidth(
     intermediate_indices = torch.arange(N, device=DEVICE, dtype=torch.int32)
 
     def run() -> None:
-        fused_sigmoid_gating_delta_rule_update_recurrent(
+        fused_sigmoid_gating_delta_rule_update_verify(
             A_log, a, dt_bias, 1.0, 20.0, q, k, v, b,
             state, state_indices,
             use_qk_l2norm_in_kernel=True,

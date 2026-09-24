@@ -15,11 +15,14 @@ from boltops.fla.kda import chunk_gated_delta_rule_fwd_h
 h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
     k=kg, w=w, u=u, gk=gk,
     initial_state=initial_state,
+    initial_state_indices=initial_state_indices,
     output_final_state=False,
+    inplace_final_state=False,
     cu_seqlens=cu_seqlens,
     chunk_indices=chunk_indices,
     chunk_size=64,
     use_exp2=True,
+    null_state_index=-1,
 )
 ```
 
@@ -28,7 +31,10 @@ h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
 | `k/w/kg` | `[B,T,H,K]` | key-side intermediates |
 | `u/v_new` | `[B,T,H,V]` | value/update intermediates |
 | `gk` | `[B,T,H,K]` | `chunk_local_cumsum` 后的 FP32 log2 gate |
-| `initial_state` | `[slots,H,V,K]` | FP32，可选 |
+| `initial_state` | `[slots,H,V,K]` | FP32，可选；state pool |
+| `initial_state_indices` | `[N]` | int32/int64，可选；每 sequence 的 pool 行 |
+| `inplace_final_state` | bool | 默认 `False`；`True` 时 final state 写回索引到的 pool 行，第三个返回值即 pool 本身 |
+| `null_state_index` | int | 默认 `-1`（SGLang 约定：仅负数无效，slot 0 为保留 dummy 行）；`0` = vLLM NULL_BLOCK_ID（`<=0` 无效，slot 从 1 开始） |
 | `h` | `[B,NT,H,V,K]` | per-chunk state |
 | `v_new` | `[B,T,H,V]` | decayed value |
 
@@ -36,8 +42,24 @@ h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
 
 fixed 使用规则 chunk；varlen 使用 `cu_seqlens`、chunk offset 和
 `chunk_indices`，chunk 不跨 sequence。KDA orchestration 只有一个 H；standalone
-wrapper 为兼容上游 vLLM 保留 `Hg != H` grouped-key 协议。KDA 不接受 GDN 的
-`initial_state_indices`。
+wrapper 为兼容上游 vLLM 保留 `Hg != H` grouped-key 协议。
+
+### 3.1 State pool（`initial_state_indices`）
+
+与 GDN `chunk_gated_delta_rule_fwd_h` 相同的池索引语义（见
+[gdn.md 的 State index ABI 一节](../gdn.md)）：
+
+- `initial_state_indices` 把每个 sequence 映射到 pool 的一行；无效行由
+  `null_state_index` 判定（默认 `-1`，SGLang 约定；SGLang KDA prefill 即此
+  用法），无效行的初始 state 按零处理且不写回；
+- `inplace_final_state=True` 时 final state 直接写回索引行（返回 pool 本身），
+  与 SGLang `chunk_kda_fwd` 的 `inplace_update=True` 默认行为对齐；调用方必须
+  保证并发 sequence 不共享同一有效行；
+- pool 行内必须 row-contiguous（stride 后三维为 `[V*K,K,1]`），行间距
+  `stride(0)` 可以是 envelope-strided（大于 `H*V*K`，如 page-major 池）；
+- 同 kernel 的 state/output 融合 fast path
+  （`chunk_kda_fwd_state_output_fused`）支持同样的池参数，orchestration
+  （`chunk_kda`/`chunk_kda_with_fused_gate`）会把三个参数透传到两条路径。
 
 模型的 raw gate 可以是 BF16；进入 state/output kernel 前应经过
 `chunk_local_cumsum` 并物化为 FP32，这与上游调用约定一致。

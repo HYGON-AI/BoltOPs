@@ -1236,12 +1236,15 @@ def _chunk_kda_fwd_with_cumulative_g(
     beta: torch.Tensor,
     scale: float,
     initial_state: torch.Tensor | None,
-    output_final_state: bool,
+    initial_state_indices: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    inplace_final_state: bool = False,
     cu_seqlens: torch.Tensor | None = None,
     chunk_indices: torch.Tensor | None = None,
     chunk_size: int = FLA_CHUNK_SIZE,
     safe_gate: bool = False,
     normalize_qk: bool = False,
+    null_state_index: int = -1,
 ):
     Aqk, A = chunk_kda_fwd_intra(
         q=q, k=k, gk=g, beta=beta, scale=scale,
@@ -1268,15 +1271,22 @@ def _chunk_kda_fwd_with_cumulative_g(
             o=v,
             scale=scale,
             initial_state=initial_state,
+            initial_state_indices=initial_state_indices,
             output_final_state=output_final_state,
+            inplace_final_state=inplace_final_state,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
             chunk_size=chunk_size,
+            null_state_index=null_state_index,
         )
     h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
         k=kg, w=w, u=u, gk=g, initial_state=initial_state,
-        output_final_state=output_final_state, cu_seqlens=cu_seqlens,
+        initial_state_indices=initial_state_indices,
+        output_final_state=output_final_state,
+        inplace_final_state=inplace_final_state,
+        cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices, use_exp2=True,
+        null_state_index=null_state_index,
     )
     o = chunk_gla_fwd_o_gk(
         q=q, v=v_new, g=g, A=Aqk, h=h, o=v, scale=scale,
@@ -1294,8 +1304,11 @@ def chunk_kda_fwd(
     beta: torch.Tensor,
     scale: float,
     initial_state: torch.Tensor | None,
-    output_final_state: bool,
+    initial_state_indices: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    inplace_final_state: bool = False,
     cu_seqlens: torch.Tensor | None = None,
+    null_state_index: int = -1,
 ):
     chunk_size = FLA_CHUNK_SIZE
     chunk_indices = (
@@ -1313,8 +1326,10 @@ def chunk_kda_fwd(
     return _chunk_kda_fwd_with_cumulative_g(
         q=q, k=k, v=v, g=g, beta=beta, scale=scale,
         initial_state=initial_state, output_final_state=output_final_state,
+        initial_state_indices=initial_state_indices,
+        inplace_final_state=inplace_final_state,
         cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
-        chunk_size=chunk_size,
+        chunk_size=chunk_size, null_state_index=null_state_index,
     )
 
 
@@ -1328,10 +1343,13 @@ def chunk_kda_with_fused_gate_fwd(
     g_bias: torch.Tensor | None,
     scale: float,
     initial_state: torch.Tensor | None,
-    output_final_state: bool,
+    initial_state_indices: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    inplace_final_state: bool = False,
     lower_bound: float | None = None,
     cu_seqlens: torch.Tensor | None = None,
     normalize_qk: bool = False,
+    null_state_index: int = -1,
 ):
     chunk_size = FLA_CHUNK_SIZE
     chunk_indices = (
@@ -1346,9 +1364,11 @@ def chunk_kda_with_fused_gate_fwd(
     return _chunk_kda_fwd_with_cumulative_g(
         q=q, k=k, v=v, g=g, beta=beta, scale=scale,
         initial_state=initial_state, output_final_state=output_final_state,
+        initial_state_indices=initial_state_indices,
+        inplace_final_state=inplace_final_state,
         cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
         chunk_size=chunk_size, safe_gate=lower_bound is not None,
-        normalize_qk=normalize_qk,
+        normalize_qk=normalize_qk, null_state_index=null_state_index,
     )
 
 
@@ -1360,9 +1380,12 @@ def chunk_kda(
     beta: torch.Tensor,
     scale: float | None = None,
     initial_state: torch.Tensor | None = None,
+    initial_state_indices: torch.Tensor | None = None,
     output_final_state: bool = False,
+    inplace_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
     cu_seqlens: torch.Tensor | None = None,
+    null_state_index: int = -1,
     **kwargs,
 ):
     del kwargs
@@ -1371,11 +1394,21 @@ def chunk_kda(
     if use_qk_l2norm_in_kernel:
         q = l2norm_fwd(q.contiguous())
         k = l2norm_fwd(k.contiguous())
+    if initial_state is not None and initial_state.stride()[1:] != (
+        initial_state.shape[-2] * initial_state.shape[-1],
+        initial_state.shape[-1],
+        1,
+    ):
+        initial_state = initial_state.contiguous()
     return chunk_kda_fwd(
         q=q, k=k, v=v.contiguous(), g=g.contiguous(), beta=beta.contiguous(),
         scale=scale,
-        initial_state=initial_state.contiguous() if initial_state is not None else None,
-        output_final_state=output_final_state, cu_seqlens=cu_seqlens,
+        initial_state=initial_state,
+        initial_state_indices=initial_state_indices,
+        output_final_state=output_final_state,
+        inplace_final_state=inplace_final_state,
+        cu_seqlens=cu_seqlens,
+        null_state_index=null_state_index,
     )
 
 
@@ -1389,23 +1422,34 @@ def chunk_kda_with_fused_gate(
     g_bias: torch.Tensor | None,
     scale: float | None = None,
     initial_state: torch.Tensor | None = None,
+    initial_state_indices: torch.Tensor | None = None,
     output_final_state: bool = False,
+    inplace_final_state: bool = False,
     lower_bound: float | None = None,
     use_qk_l2norm_in_kernel: bool = False,
     cu_seqlens: torch.Tensor | None = None,
+    null_state_index: int = -1,
     **kwargs,
 ):
     del kwargs
     if scale is None:
         scale = k.shape[-1] ** -0.5
-    if q.shape[1] <= 1024 and q.shape[2] <= 64 and can_run_prefill_optimized(
-        q,
-        k,
-        v,
-        raw_g,
-        raw_beta,
-        lower_bound=lower_bound,
-        cu_seqlens=cu_seqlens,
+    # The fixed-schedule prefill is single-sequence: route pooled or
+    # in-place state through the standard pipeline instead.
+    if (
+        initial_state_indices is None
+        and not inplace_final_state
+        and q.shape[1] <= 1024
+        and q.shape[2] <= 64
+        and can_run_prefill_optimized(
+            q,
+            k,
+            v,
+            raw_g,
+            raw_beta,
+            lower_bound=lower_bound,
+            cu_seqlens=cu_seqlens,
+        )
     ):
         return prefill_optimized_fwd(
             q=q,
@@ -1430,8 +1474,10 @@ def chunk_kda_with_fused_gate(
         # computing Aqk/Akk. Keep contiguous storage for its write-back; other
         # shapes retain the standalone l2norm path below.
         if q.shape[-1] == 128 and k.shape[-1] == 128 and q.shape[1] % 64 == 0:
-            # The intra kernel writes the normalized rows for recompute/output
-            # consumers, so do not alias the caller's q/k tensors.
+            # The intra stage writes the normalized rows back into these
+            # buffers (in-kernel when the sub-chunk kernel runs, in place via
+            # the l2norm helper otherwise) for recompute/output consumers,
+            # so do not alias the caller's q/k tensors.
             # If q is already contiguous, clone directly (1 copy).  If not,
             # .contiguous() creates a fresh private buffer — no second clone.
             q = q.clone() if q.is_contiguous() else q.contiguous()
@@ -1440,13 +1486,23 @@ def chunk_kda_with_fused_gate(
         else:
             q = l2norm_fwd(q.contiguous())
             k = l2norm_fwd(k.contiguous())
+    if initial_state is not None and initial_state.stride()[1:] != (
+        initial_state.shape[-2] * initial_state.shape[-1],
+        initial_state.shape[-1],
+        1,
+    ):
+        initial_state = initial_state.contiguous()
     return chunk_kda_with_fused_gate_fwd(
         q=q, k=k, v=v.contiguous(), raw_g=raw_g.contiguous(),
         raw_beta=raw_beta, A_log=A_log, g_bias=g_bias, scale=scale,
-        initial_state=initial_state.contiguous() if initial_state is not None else None,
-        output_final_state=output_final_state, lower_bound=lower_bound,
+        initial_state=initial_state,
+        initial_state_indices=initial_state_indices,
+        output_final_state=output_final_state,
+        inplace_final_state=inplace_final_state,
+        lower_bound=lower_bound,
         cu_seqlens=cu_seqlens,
         normalize_qk=normalize_qk,
+        null_state_index=null_state_index,
     )
 
 
