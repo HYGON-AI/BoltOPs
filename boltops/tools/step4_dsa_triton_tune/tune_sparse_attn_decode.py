@@ -381,7 +381,6 @@ def _discover_occupancy_jobs(config_dir: Path) -> list[dict]:
                 continue
             required = (
                 "s_q",
-                "s_kv",
                 "h_q",
                 "h_kv",
                 "topk",
@@ -394,7 +393,7 @@ def _discover_occupancy_jobs(config_dir: Path) -> list[dict]:
             jobs.append(
                 {
                     "batch": int(match["s_q"]),
-                    "context": int(match["s_kv"]),
+                    "context": int(match.get("s_kv", 65536)),
                     "splits": int(match["num_splits"]),
                     "topk": int(match["topk"]) - 1,
                     "heads": int(match["h_q"]),
@@ -482,7 +481,6 @@ def _run_one(
     output = output or Path(_CONFIG_DIR) / _decode_config_filename(device_tag)
     match_key = {
         "s_q": named_batch,
-        "s_kv": named_context,
         "h_q": int(data["query"].shape[1]),
         "h_kv": int(data["key_cache"].shape[1]),
         "topk": packed_width,

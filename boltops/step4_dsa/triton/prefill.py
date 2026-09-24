@@ -111,7 +111,8 @@ def _sparse_attn_prefill_kernel(
     offsets_in_region = tl.arange(0, region_size)
     window_begin = split * slots_per_split
     window_end = window_begin + slots_per_split
-    for base in tl.range(window_begin, window_end, BLOCK_R):
+    row_end = tl.minimum(window_end, tl.minimum(count, topk))
+    for base in tl.range(window_begin, row_end, BLOCK_R):
         slots = base + tl.arange(0, BLOCK_R)
         slot_ok = (slots < count) & (slots < topk) & (slots < window_end)
         meta = tl.load(
@@ -476,7 +477,9 @@ def _sparse_attn_prefill_dsplit_bf16_kernel(
     offsets_in_region = tl.arange(0, region_size)
     window_begin = split * slots_per_split
     window_end = window_begin + slots_per_split
-    for base in tl.range(window_begin, window_end, BLOCK_R):
+    # Skip tiles after this row's last selected region; preserve the split boundary.
+    row_end = tl.minimum(window_end, tl.minimum(count, topk))
+    for base in tl.range(window_begin, row_end, BLOCK_R):
         slots = base + tl.arange(0, BLOCK_R)
         slot_ok = (slots < count) & (slots < topk) & (slots < window_end)
         meta = tl.load(
@@ -968,12 +971,25 @@ def _sparse_attn_prefill_dsplit_fp8_kernel(
 
     # Short windows can have fewer iterations than the unroll factor after
     # the first tile; the HCU loop-unroll pass rejects those specializations.
-    # Keep the two-way FP8 schedule for the long production windows.
+    # Odd iterations leave an epilogue that spills registers. Keep two-way
+    # unrolling only when the remaining loop iterations are even and >= 2.
+    # Round the dynamic stop to full pairs: the HCU unroller requires at least
+    # two remaining iterations, and masked slots in the rounded-up pair are inert.
+    row_end = tl.minimum(window_end, tl.minimum(count, topk))
+    if ((slots_per_split - 1) // BLOCK_R) >= 2 and ((slots_per_split - 1) // BLOCK_R) % 2 == 0:
+        remaining = tl.maximum(0, row_end - (window_begin + BLOCK_R))
+        pairs = tl.maximum(1, (remaining + 2 * BLOCK_R - 1) // (2 * BLOCK_R))
+        row_end = tl.minimum(window_end, window_begin + BLOCK_R + pairs * 2 * BLOCK_R)
     for base in tl.range(
         window_begin + BLOCK_R,
-        window_end,
+        row_end,
         BLOCK_R,
-        loop_unroll_factor=2 if slots_per_split >= 4 * BLOCK_R else 1,
+        loop_unroll_factor=(
+            2
+            if ((slots_per_split - 1) // BLOCK_R) >= 2
+            and ((slots_per_split - 1) // BLOCK_R) % 2 == 0
+            else 1
+        ),
     ):
         slots = base + tl.arange(0, BLOCK_R)
         slot_ok = (slots < count) & (slots < topk) & (slots < window_end)

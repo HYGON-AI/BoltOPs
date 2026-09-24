@@ -7,64 +7,7 @@
   "configs": [
     {
       "match": {
-        "s_q": 4,
-        "s_kv": 16384,
-        "h_q": 8,
-        "h_kv": 1,
-        "topk": 513,
-        "d": 192,
-        "num_splits": 1,
-        "region_size": 8,
-        "dtype": "bfloat16"
-      },
-      "config": {
-        "AUTO_KV_SPLITS": 70,
-        "BLOCK_R": 2,
-        "BLOCK_H": 16,
-        "SPLIT_MAJOR": true,
-        "num_warps": 1,
-        "num_stages": 3,
-        "waves_per_eu": 2,
-        "kpack": 2,
-        "enable_v_mmac_cluster": 0,
-        "misched_regpressure": true,
-        "empty_arrive_after_mmac": true,
-        "hcu_use_gfx946_sched_model_v2": true
-      }
-    },
-    {
-      "match": {
-        "s_q": 128,
-        "s_kv": 16384,
-        "h_q": 8,
-        "h_kv": 1,
-        "topk": 513,
-        "d": 192,
-        "num_splits": 1,
-        "region_size": 8,
-        "dtype": "bfloat16"
-      },
-      "config": {
-        "AUTO_KV_SPLITS": 6,
-        "BLOCK_R": 2,
-        "BLOCK_H": 16,
-        "num_warps": 1,
-        "num_stages": 2,
-        "waves_per_eu": 2,
-        "kpack": 2,
-        "enable_v_mmac_cluster": 2,
-        "misched_regpressure": true,
-        "empty_arrive_after_mmac": true,
-        "amdgpu_enable_max_ilp_scheduling_strategy": true,
-        "PIPELINE_KV": true,
-        "hcu_use_gfx946_sched_model_v2": true,
-        "BALANCE_LIVE": true
-      }
-    },
-    {
-      "match": {
         "s_q": 1,
-        "s_kv": 65536,
         "h_q": 8,
         "h_kv": 1,
         "topk": 513,
@@ -92,7 +35,6 @@
     {
       "match": {
         "s_q": 4,
-        "s_kv": 65536,
         "h_q": 8,
         "h_kv": 1,
         "topk": 513,
@@ -121,7 +63,6 @@
     {
       "match": {
         "s_q": 8,
-        "s_kv": 65536,
         "h_q": 8,
         "h_kv": 1,
         "topk": 513,
@@ -150,7 +91,6 @@
     {
       "match": {
         "s_q": 32,
-        "s_kv": 65536,
         "h_q": 8,
         "h_kv": 1,
         "topk": 513,
@@ -177,7 +117,6 @@
     {
       "match": {
         "s_q": 64,
-        "s_kv": 65536,
         "h_q": 8,
         "h_kv": 1,
         "topk": 513,
@@ -202,7 +141,6 @@
     {
       "match": {
         "s_q": 128,
-        "s_kv": 65536,
         "h_q": 8,
         "h_kv": 1,
         "topk": 513,
@@ -212,27 +150,25 @@
         "dtype": "bfloat16"
       },
       "config": {
-        "PIPELINE_KV": true,
-        "AUTO_KV_SPLITS": 10,
-        "BLOCK_R": 4,
+        "AUTO_KV_SPLITS": 6,
+        "BLOCK_R": 2,
         "BLOCK_H": 16,
-        "SPLIT_MAJOR": true,
-        "NARROW_INDEX": true,
-        "num_warps": 2,
-        "num_stages": 1,
-        "waves_per_eu": 1,
+        "num_warps": 1,
+        "num_stages": 2,
+        "waves_per_eu": 2,
         "kpack": 2,
         "enable_v_mmac_cluster": 2,
-        "misched_regpressure": false,
+        "misched_regpressure": true,
         "empty_arrive_after_mmac": true,
+        "amdgpu_enable_max_ilp_scheduling_strategy": true,
+        "PIPELINE_KV": true,
         "hcu_use_gfx946_sched_model_v2": true,
-        "amdgpu_enable_max_ilp_scheduling_strategy": true
+        "FORCE_MIN_SLOTS_DIVISIBLE": true
       }
     },
     {
       "match": {
         "s_q": 1,
-        "s_kv": 16384,
         "h_q": 8,
         "h_kv": 1,
         "topk": 513,
@@ -263,7 +199,6 @@
     {
       "match": {
         "s_q": 4,
-        "s_kv": 31929,
         "h_q": 8,
         "h_kv": 1,
         "topk": 513,
@@ -292,7 +227,6 @@
     {
       "match": {
         "s_q": 8,
-        "s_kv": 31929,
         "h_q": 8,
         "h_kv": 1,
         "topk": 513,
@@ -314,35 +248,6 @@
         "misched_regpressure": true,
         "empty_arrive_after_mmac": false,
         "use_block_pingpong": true
-      }
-    },
-    {
-      "match": {
-        "s_q": 4,
-        "s_kv": 16384,
-        "h_q": 8,
-        "h_kv": 1,
-        "topk": 513,
-        "d": 192,
-        "num_splits": 1,
-        "region_size": 8,
-        "dtype": "float8_e4m3fn"
-      },
-      "config": {
-        "AUTO_KV_SPLITS": 72,
-        "BLOCK_R": 4,
-        "BLOCK_H": 16,
-        "SPLIT_MAJOR": true,
-        "NARROW_INDEX": true,
-        "num_warps": 1,
-        "num_stages": 2,
-        "waves_per_eu": 1,
-        "kpack": 2,
-        "enable_v_mmac_cluster": 0,
-        "misched_regpressure": false,
-        "empty_arrive_after_mmac": false,
-        "hcu_use_gfx946_sched_model_v2": true,
-        "BALANCE_LIVE": false
       }
     }
   ]

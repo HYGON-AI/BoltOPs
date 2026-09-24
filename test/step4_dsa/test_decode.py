@@ -20,6 +20,49 @@ LSE_RTOL, LSE_ATOL = 1e-3, 1e-3
 DECODE_PHYS_SHIFT = 32
 
 
+def test_decode_config_match_rejects_unavailable_sequence_length():
+    from boltops.step4_dsa.triton.decode import _decode_config_match_score
+
+    shape = {"s_q": 4, "topk": 513}
+    assert _decode_config_match_score({"s_q": 4}, shape) is not None
+    assert _decode_config_match_score({"s_kv": 65536}, shape) is None
+    assert _decode_config_match_score({"s_kv_min": 1024}, shape) is None
+    assert _decode_config_match_score({"s_kv_max": 65536}, shape) is None
+
+
+def test_decode_config_lookup_uses_shape_without_sequence_length(monkeypatch):
+    from boltops.step4_dsa.triton import decode
+
+    monkeypatch.setattr(decode, "_device_name_for_config", lambda: "test")
+    monkeypatch.setattr(
+        decode,
+        "_load_decode_device_configs",
+        lambda device: {
+            "configs": [
+                {
+                    "match": {
+                        "s_q": 4,
+                        "topk": 513,
+                        "dtype": "bfloat16",
+                        "s_kv": 65536,
+                    },
+                    "config": {"BLOCK_R": 2},
+                },
+                {
+                    "match": {"s_q": 4, "topk": 513, "dtype": "bfloat16"},
+                    "config": {"BLOCK_R": 4},
+                },
+            ]
+        },
+    )
+    query = torch.empty((4, 8, 192), dtype=torch.bfloat16)
+    key_cache = torch.empty((1, 1, 192), dtype=torch.bfloat16)
+    packed_regions = torch.empty((4, 513), dtype=torch.int64)
+    assert decode._load_sparse_attn_decode_config(
+        query, key_cache, packed_regions, num_splits=1, region_size=8
+    )["BLOCK_R"] == 4
+
+
 def _make_decode_case(
     *,
     num_reqs: int,

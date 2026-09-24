@@ -1337,7 +1337,11 @@ def _decode_config_filename(device: str) -> str:
 def _decode_config_match_score(
     match: dict[str, Any], shape: dict[str, Any]
 ) -> tuple[int, int, float] | None:
-    """Return match specificity, or ``None`` when a shape does not match."""
+    """Return match specificity, or ``None`` when a shape does not match.
+
+    A key missing from ``shape`` (including legacy ``s_kv`` constraints) is a
+    mismatch, not a wildcard.
+    """
     exact = 0
     bounds = 0
     widths: dict[str, dict[str, float]] = {}
@@ -1406,7 +1410,6 @@ def _load_sparse_attn_decode_config(
     query: torch.Tensor,
     key_cache: torch.Tensor,
     packed_regions: torch.Tensor,
-    kv_seqlens: torch.Tensor,
     num_splits: int,
     region_size: int,
 ) -> dict[str, Any] | None:
@@ -1415,15 +1418,14 @@ def _load_sparse_attn_decode_config(
     Equivalent dimensions are represented once: ``d`` comes from ``query`` and
     applies to query/key/value, while ``h_kv`` comes from ``key_cache`` and is
     equivalent to the public ``num_kv_groups`` argument. Physical cache capacity
-    (``key_cache.shape[0]``) is excluded; actual work is represented by ``s_kv``
-    from the maximum runtime sequence length and by ``topk``. ``dtype`` is the
-    KV-cache dtype (``bfloat16`` or ``float8_e4m3fn``), not the query.
+    (``key_cache.shape[0]``) and runtime sequence lengths are excluded; actual
+    work is represented by query batch ``s_q``, ``topk``, and ``region_size``.
+    ``dtype`` is the KV-cache dtype (``bfloat16`` or ``float8_e4m3fn``), not the query.
     """
     device_tag = _device_name_for_config()
     data = _load_decode_device_configs(device_tag)
     shape = {
         "s_q": int(query.shape[0]),
-        "s_kv": int(kv_seqlens.max().item()),
         "h_q": int(query.shape[1]),
         "h_kv": int(key_cache.shape[1]),
         "topk": int(packed_regions.shape[1]),
@@ -1557,10 +1559,12 @@ def sparse_attention_decode(
             caller asked for ``num_splits>1``). ``True`` / ``False`` overrides.
         config: launch override. ``None`` loads
             ``config/sparse_attn_decode/sparse_attn_decode_{device}.json`` and
-            selects the most specific entry matching the runtime tensor shape,
-            sequence length, and caller-facing split count. If an explicit
-            ``num_splits>1`` entry is absent, selection retries with ``num_splits=1``
-            before using the built-in default tile. A mapping is filtered to
+            selects the most specific entry matching runtime tensor dimensions,
+            cache dtype, region size, and caller-facing split count. Runtime
+            sequence length is not a match key, so lookup does not read GPU
+            tensor values. If an explicit ``num_splits>1`` entry is absent,
+            selection retries with ``num_splits=1`` before using the built-in
+            default tile. A mapping is filtered to
             kernel fields plus portable Triton launch options (no shared-memory
             shrink). Standard ``num_warps`` / ``num_stages`` fields are accepted;
             additional HIP compiler fields such as ``waves_per_eu`` or
@@ -1638,7 +1642,6 @@ def sparse_attention_decode(
             query,
             key_cache,
             packed_regions,
-            kv_seqlens,
             config_splits,
             region_size,
         )
@@ -1647,7 +1650,6 @@ def sparse_attention_decode(
                 query,
                 key_cache,
                 packed_regions,
-                kv_seqlens,
                 1,
                 region_size,
             )
