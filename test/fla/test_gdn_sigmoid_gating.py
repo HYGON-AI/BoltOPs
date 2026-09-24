@@ -26,7 +26,7 @@ GPU_REQUIRED = pytest.mark.skipif(
 
 
 def test_public_sigmoid_signatures_match_backends() -> None:
-    from boltops.fla.common.triton.fused_sigmoid_gating import (
+    from boltops.fla.gdn.triton.fused_sigmoid_gating import (
         fused_sigmoid_gating_delta_rule_update as ordinary_backend,
     )
 
