@@ -108,6 +108,7 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
     BV: tl.constexpr,
     SOFTPLUS_THRESHOLD: tl.constexpr,
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
+    NULL_STATE_INDEX: tl.constexpr,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_hv = i_nh // HV, i_nh % HV
@@ -121,7 +122,7 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
     state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq).to(tl.int64)
     p_o = o + (i_n * HV + i_hv) * V + o_v
 
-    if state_idx < 0:
+    if state_idx <= NULL_STATE_INDEX:
         zero = tl.zeros([BV], dtype=tl.float32).to(p_o.dtype.element_ty)
         tl.store(p_o, zero, mask=mask_v)
         return
@@ -177,8 +178,18 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     out: torch.Tensor,
     ssm_state_indices: torch.Tensor,
     use_qk_l2norm_in_kernel: bool = False,
+    null_state_index: int = -1,
     kernel_cfg: dict | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """One-token GDN decode from packed post-conv QKV.
+
+    ``null_state_index`` selects the state-index ABI so both frameworks can
+    call the same entry: ``-1`` (the default, SGLang) treats only negative
+    indices as invalid -- SGLang reserves slot 0 as the dummy write target
+    for padded requests and never allocates it to a live request; ``0``
+    (vLLM NULL_BLOCK_ID) treats indices ``<= 0`` as invalid and valid slots
+    are 1-based.
+    """
     global HAS_DUMPED_PACKED_DECODE_KERNEL_METADATA
 
     if mixed_qkv.ndim != 2:
@@ -199,6 +210,8 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     B = mixed_qkv.shape[0]
     if a.shape[0] != B or b.shape[0] != B or ssm_state_indices.shape[0] != B:
         raise ValueError("Batch dimensions of mixed_qkv/a/b/ssm_state_indices must match.")
+    if null_state_index not in (-1, 0):
+        raise ValueError("null_state_index must be 0 (vLLM ABI) or -1 (SGLang ABI).")
 
     HV, V, K = initial_state.shape[-3:]
     if a.shape[1] != HV or b.shape[1] != HV:
@@ -257,6 +270,7 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         BV=BV,
         SOFTPLUS_THRESHOLD=20.0,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+        NULL_STATE_INDEX=null_state_index,
         num_warps=cfg["num_warps"],
         num_stages=cfg["num_stages"],
     )

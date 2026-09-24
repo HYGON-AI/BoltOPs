@@ -66,6 +66,13 @@ o, final_state = chunk_kda_with_fused_gate_fwd(
 `chunk_kda` 和 `chunk_kda_with_fused_gate` 是带默认参数的 facade；阶段 wrapper
 仍可单独调用，用于中间 tensor 调试、复用或独立 benchmark。
 
+四个 prefill 入口（`chunk_kda_fwd`/`chunk_kda_with_fused_gate_fwd`/
+`chunk_kda`/`chunk_kda_with_fused_gate`）都接受 state pool 参数
+`initial_state_indices`、`inplace_final_state`、`null_state_index`（语义见
+[State 阶段](./kda_prefill_state.md)）。`chunk_kda_with_fused_gate` 的
+fixed-schedule prefill（`prefill_optimized_fwd`）是单 sequence 路径，传入
+`initial_state_indices` 或 `inplace_final_state=True` 时自动回退标准 pipeline。
+
 ## 3. fixed/varlen
 
 - fixed：`cu_seqlens=None`，每个 batch row 长度均为 `T`，阶段可用规则 chunk id

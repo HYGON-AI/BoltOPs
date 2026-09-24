@@ -72,11 +72,20 @@ def chunk_kda_with_fused_gate_fwd(
     g_bias: torch.Tensor | None,
     scale: float,
     initial_state: torch.Tensor | None,
-    output_final_state: bool,
+    initial_state_indices: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    inplace_final_state: bool = False,
     lower_bound: float | None = None,
     cu_seqlens: torch.Tensor | None = None,
+    null_state_index: int = -1,
 ):
-    """Expose the fused-gate prefill contract without implementation options."""
+    """Expose the fused-gate prefill contract without implementation options.
+
+    The state-pool protocol parameters (``initial_state_indices``,
+    ``inplace_final_state``, ``null_state_index``) are part of the public
+    contract and are forwarded; implementation options such as
+    ``normalize_qk`` are not.
+    """
     from .chunk import chunk_kda_with_fused_gate_fwd as impl
 
     return impl(
@@ -89,9 +98,12 @@ def chunk_kda_with_fused_gate_fwd(
         g_bias,
         scale,
         initial_state,
+        initial_state_indices,
         output_final_state,
+        inplace_final_state,
         lower_bound,
         cu_seqlens,
+        null_state_index=null_state_index,
     )
 
 __all__ = [

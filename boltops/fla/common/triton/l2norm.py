@@ -30,15 +30,23 @@ def l2norm_fwd_kernel(
 
 
 def l2norm_fwd(
-    x: torch.Tensor, eps: float = 1e-6, output_dtype: torch.dtype | None = None
+    x: torch.Tensor,
+    eps: float = 1e-6,
+    output_dtype: torch.dtype | None = None,
+    out: torch.Tensor | None = None,
 ):
     x_shape_og = x.shape
     x = x.view(-1, x.shape[-1])
-    # allocate output
-    if output_dtype is None:
-        y = torch.empty_like(x)
+    if out is None:
+        y = (
+            torch.empty_like(x, dtype=output_dtype)
+            if output_dtype is not None
+            else torch.empty_like(x)
+        )
     else:
-        y = torch.empty_like(x, dtype=output_dtype)
+        # ``out`` may alias ``x``: each row is fully loaded before it is
+        # stored, so in-place normalization is safe.
+        y = out
     assert y.stride(-1) == 1
     T, D = x.shape[0], x.shape[-1]
     MAX_FUSED_SIZE = 65536 // x.element_size()

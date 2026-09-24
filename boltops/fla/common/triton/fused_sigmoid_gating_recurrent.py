@@ -2,14 +2,14 @@
 
 """Fused sigmoid-gating + recurrent delta-rule update (decode and verify).
 
-KDA+GDN shared recurrent verify kernel. The public kernel entry is
-``fused_sigmoid_gating_delta_rule_update_recurrent``: it supports decode and
-verify with tunable softplus params and ``disable_state_update``. Framework
+KDA+GDN shared recurrent decode+verify kernel. The full-parameter entry
+``fused_sigmoid_gating_delta_rule_update`` keeps the SGLang
+``fla/fused_sigmoid_gating_recurrent`` name: it supports decode and verify
+with tunable softplus params and ``disable_state_update``. Framework
 adapters own named verify entries and their presets.
 
-The supported input contract is documented in
-``docs/ops/fla/kda/kda_recurrent_verify.md``; framework adapters own fallback
-decisions.
+The supported input contract is documented in ``docs/ops/fla/gdn.md``
+(section 3.3); framework adapters own fallback decisions.
 
 Implements the SGLang ``fused_sigmoid_gating_delta_rule_update`` logical
 interface for Kimi K3 / GDN speculative verify:
@@ -23,7 +23,7 @@ interface for Kimi K3 / GDN speculative verify:
 - chain and tree verify (``retrieve_parent_token``);
 - ReplaySSM fused ring write (``cache_ring``).
 
-See ``docs/ops/fla/kda/kda_recurrent_verify.md`` for the full operator contract.
+See ``docs/ops/fla/gdn.md`` (section 3.3) for the full operator contract.
 """
 
 from __future__ import annotations
@@ -54,12 +54,12 @@ def _load_fused_sigmoid_gating_recurrent_configs() -> dict:
     device_name = arch_info.get_arch()
     path = os.path.join(
         _CONFIGS_PATH,
-        "fused_sigmoid_gating_delta_rule_update_recurrent",
-        f"fused_sigmoid_gating_delta_rule_update_recurrent-{device_name}.json",
+        "fused_sigmoid_gating_recurrent",
+        f"fused_sigmoid_gating_recurrent-{device_name}.json",
     )
     if not os.path.exists(path):
         logger.warning(
-            f"fused_sigmoid_gating_delta_rule_update_recurrent config not found at {path}, "
+            f"fused_sigmoid_gating_recurrent config not found at {path}, "
             f"using default {_DEFAULT_FUSED_SIGMOID_GATING_REC_CONFIG}."
         )
         return {}
@@ -106,7 +106,7 @@ def _get_fused_sigmoid_gating_recurrent_config(T: int, H: int, HV: int) -> dict:
 
 
 @triton.jit(do_not_specialize=["T"])
-def fused_sigmoid_gating_delta_rule_update_recurrent_kernel(
+def fused_sigmoid_gating_delta_rule_update_kernel(
     A_log,
     a,
     dt_bias,
@@ -168,6 +168,7 @@ def fused_sigmoid_gating_delta_rule_update_recurrent_kernel(
     CACHE_INTERMEDIATE_STATES: tl.constexpr = False,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr = False,
     CACHE_RING: tl.constexpr = False,
+    NULL_STATE_INDEX: tl.constexpr = -1,
 ):
     """
     Fused kernel that combines sigmoid gating computation with recurrent delta rule update.
@@ -219,7 +220,7 @@ def fused_sigmoid_gating_delta_rule_update_recurrent_kernel(
         # where the per-slot pitch spans more than HV*K*V. int64: envelope
         # pitches overflow an int32 index product for large slot counts.
         slot_idx = tl.load(h0_indices + i_n).to(tl.int64)
-        if slot_idx >= 0:
+        if slot_idx > NULL_STATE_INDEX:
             p_h0 = (
                 h0_source
                 + slot_idx * stride_h0_source
@@ -311,7 +312,7 @@ def fused_sigmoid_gating_delta_rule_update_recurrent_kernel(
         # (writing them would smash the next slot's ring).
         if CACHE_RING:
             b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
-            if slot_idx >= 0 and step_idx < MAX_CACHE_LEN:
+            if slot_idx > NULL_STATE_INDEX and step_idx < MAX_CACHE_LEN:
                 tl.store(
                     replayssm_rawv
                     + slot_idx * stride_rawv_slot
@@ -419,7 +420,7 @@ def fused_sigmoid_gating_delta_rule_update_recurrent_kernel(
     # Store final state back to h0_source with bounds checking
     if not DISABLE_STATE_UPDATE:
         if USE_INITIAL_STATE:
-            if slot_idx >= 0:
+            if slot_idx > NULL_STATE_INDEX:
                 p_h0 = (
                     h0_source
                     + slot_idx * stride_h0_source
@@ -430,7 +431,7 @@ def fused_sigmoid_gating_delta_rule_update_recurrent_kernel(
                 tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=mask_h)
 
 
-def fused_sigmoid_gating_delta_rule_update_recurrent(
+def fused_sigmoid_gating_delta_rule_update(
     A_log: torch.Tensor,
     a: torch.Tensor,
     dt_bias: torch.Tensor,
@@ -461,6 +462,7 @@ def fused_sigmoid_gating_delta_rule_update_recurrent(
     replayssm_rawk: Optional[torch.Tensor] = None,
     replayssm_g: Optional[torch.Tensor] = None,
     replayssm_beta: Optional[torch.Tensor] = None,
+    null_state_index: int = -1,
     kernel_cfg: Optional[dict] = None,
 ) -> torch.Tensor:
     """
@@ -472,6 +474,13 @@ def fused_sigmoid_gating_delta_rule_update_recurrent(
     - decode: standard single-step update with state write-back
     - speculative verify: multi-step with intermediate state caching, optional tree attention,
                      optional state update disable, and optional ReplaySSM ring write
+
+    ``null_state_index`` selects the state-index ABI so both frameworks can
+    call the same entry: ``-1`` (the default, SGLang) treats only negative
+    ``initial_state_indices`` values as invalid -- SGLang reserves slot 0 as
+    the dummy write target for padded requests and never allocates it to a
+    live request; ``0`` (vLLM NULL_BLOCK_ID) treats indices ``<= 0`` as
+    invalid and valid slots are 1-based.
 
     Returns a single attention output tensor ``[1, total_tokens, HV, V]``
     (the SGLang verify dispatcher does not consume a final-state tuple).
@@ -507,6 +516,8 @@ def fused_sigmoid_gating_delta_rule_update_recurrent(
         raise ValueError(
             f"q.shape[0] must be 1 when using cu_seqlens, got {q.shape[0]}."
         )
+    if null_state_index not in (-1, 0):
+        raise ValueError("null_state_index must be 0 (vLLM ABI) or -1 (SGLang ABI).")
     if retrieve_parent_token is not None:
         if retrieve_parent_token.dim() != 2:
             raise ValueError(
@@ -598,7 +609,7 @@ def fused_sigmoid_gating_delta_rule_update_recurrent(
     NP2_T = triton.next_power_of_2(T)
 
     grid = (NK, NV, N * HV)
-    compiled_kernel = fused_sigmoid_gating_delta_rule_update_recurrent_kernel[grid](
+    compiled_kernel = fused_sigmoid_gating_delta_rule_update_kernel[grid](
         A_log=A_log,
         a=a,
         dt_bias=dt_bias,
@@ -657,6 +668,7 @@ def fused_sigmoid_gating_delta_rule_update_recurrent(
         CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_parent_token is not None,
         CACHE_RING=cache_ring,
+        NULL_STATE_INDEX=null_state_index,
         num_warps=num_warps,
         num_stages=num_stages,
     )

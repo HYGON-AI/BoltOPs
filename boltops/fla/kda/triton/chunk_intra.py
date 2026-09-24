@@ -17,6 +17,7 @@ import triton.language as tl
 
 from .chunk_intra_token_parallel import chunk_kda_fwd_intra_token_parallel
 from .config_utils import dtype_name, get_kda_tuned_config
+from boltops.fla.common.triton.l2norm import l2norm_fwd
 from boltops.fla.common.triton.math import exp2
 from boltops.fla.common.triton.utils import (
     current_platform,
@@ -174,7 +175,13 @@ def _diag_block_products(
 
 @triton.jit
 def _invert_strict_lower(A, BC: tl.constexpr):
-    """Invert ``I - A`` for strict-lower ``A`` via its nilpotent polynomial.
+    """Invert ``I + A`` for strict-lower ``A`` via its nilpotent polynomial.
+
+    The caller passes the *raw* diagonal block (strictly lower
+    ``beta * (k k^T) exp(dg)``), so the result is ``sum_{i=0}^{BC-1} (-A)^i``
+    -- the same matrix the upstream forward-substitution loop computes for
+    ``(I + A)^-1`` (upstream negates the raw block first, which is why its
+    ``solve_tril`` is written as an ``I - A`` inversion).
 
     Every input and intermediate stays FP32: the published inverse is BF16 but
     narrowing between products compounds the error along the A2/A4/A8 chain.
@@ -1079,6 +1086,14 @@ def chunk_kda_fwd_intra(
     # token-parallel wrapper still retains its raw-Akkd contract.
     use_poly_solve = K == 128 and BT == 64 and BC == 16
     fuse_diag = use_poly_solve and FUSE_INTRA_DIAGONAL
+    if normalize_qk and not (use_poly_solve and not fuse_diag):
+        # Only the sub-chunk polynomial kernel carries the in-kernel
+        # q/k write-back.  Under ``FUSE_DIAG`` that kernel is not launched
+        # (the inter+solve kernel builds the diagonal itself), so normalize
+        # the caller's rows in place here; the downstream inter diagonal,
+        # recompute_w_u, and state/output kernels all read the same buffers.
+        l2norm_fwd(q, out=q)
+        l2norm_fwd(k, out=k)
     # Separate fp32 buffer for diagonal 16x16 blocks (for precision in solve_tril)
     Akkd = (
         k.new_empty(1, dtype=torch.float32)

@@ -96,6 +96,7 @@ def launch_chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     use_exp2: bool,
     transpose_state_layout: bool,
     inplace_final_state: bool,
+    null_state_index: int,
     kernel_cfg: dict | None,
 ):
     def grid(meta):
@@ -132,6 +133,7 @@ def launch_chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         TRANSPOSE_STATE=transpose_state_layout,
         INPLACE_FINAL_STATE=inplace_final_state,
         STATE_ROWS=initial_state.shape[0] if initial_state is not None else 0,
+        NULL_STATE_INDEX=null_state_index,
         num_warps=cfg["num_warps"],
         num_stages=cfg["num_stages"],
     )
@@ -177,6 +179,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     TRANSPOSE_STATE: tl.constexpr,
     INPLACE_FINAL_STATE: tl.constexpr,
     STATE_ROWS: tl.constexpr,
+    NULL_STATE_INDEX: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
@@ -218,7 +221,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     i_s = i_n
     if USE_INITIAL_STATE_INDICES:
         i_s = tl.load(initial_state_indices + i_n).to(tl.int32)
-    valid_initial_state = (i_s >= 0) & (i_s < STATE_ROWS)
+    valid_initial_state = (i_s > NULL_STATE_INDEX) & (i_s < STATE_ROWS)
 
     if USE_INITIAL_STATE:
         if valid_initial_state:
@@ -464,9 +467,17 @@ def chunk_gated_delta_rule_fwd_h(
     chunk_indices: torch.LongTensor | None = None,
     use_exp2: bool = False,
     transpose_state_layout: bool = True,
+    null_state_index: int = -1,
     kernel_cfg: dict | None = None,
 ):
     """Compute chunk states and optionally persist the final recurrent state.
+
+    ``null_state_index`` selects the state-index ABI for
+    ``initial_state_indices`` so both frameworks can call the same entry:
+    ``-1`` (the default, SGLang) treats only negative indices as invalid --
+    SGLang reserves slot 0 as the dummy write target for padded requests and
+    never allocates it to a live request; ``0`` (vLLM NULL_BLOCK_ID) treats
+    indices ``<= 0`` as invalid and valid slots are 1-based.
 
     With ``inplace_final_state=True``, the kernel writes directly into
     ``initial_state`` and the third return value is that same tensor object.
@@ -476,6 +487,8 @@ def chunk_gated_delta_rule_fwd_h(
     B, T, Hg, K, V = *k.shape, u.shape[-1]
     H = u.shape[-2]
     BT = chunk_size
+    if null_state_index not in (-1, 0):
+        raise ValueError("null_state_index must be 0 (vLLM ABI) or -1 (SGLang ABI).")
 
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
@@ -548,6 +561,7 @@ def chunk_gated_delta_rule_fwd_h(
         use_exp2=use_exp2,
         transpose_state_layout=transpose_state_layout,
         inplace_final_state=inplace_final_state,
+        null_state_index=null_state_index,
         kernel_cfg=kernel_cfg,
     )
     return h, v_new, final_state

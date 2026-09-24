@@ -48,6 +48,25 @@ dispatch，`ssm_state_indices` 为一维 `[N]` 或单序列多 token 的二维 `
 `N` 是 sequence/token-batch 数，不是 tensor batch `B=1`。Packed decode 使用
 `state_indices:[tokens]`，不使用 Prefill 的 `cu_seqlens`。
 
+**State index ABI（`null_state_index`）**：KDA 全部 decode 入口
+（`fused_recurrent_kda_fwd` / `fused_recurrent_kda` /
+`fused_recurrent_kda_packed_decode`）与 GDN/共享 decode/verify 入口一样，
+通过 `null_state_index` 参数兼容两种框架约定（constexpr，无运行时开销）：
+
+- `0`（KDA decode 入口默认，vLLM NULL_BLOCK_ID 约定）：`<= 0` 为无效
+  slot（slot 0 保留），有效 slot 从 1 开始；
+- `-1`（SGLang 约定）：仅负数无效。SGLang 的 allocator 永不把 slot 0
+  分配给 live 请求，保留它作为 padding 请求的 dummy 写入目标，因此
+  "slot 0 有效"即 dummy 行可读写。
+
+无效 slot 仅对 output 写零、不读不写 state。framework adapter 必须按自己
+state pool 的编号方式显式传参：vLLM adapter 传 `0`（KDA 入口默认即 `0`），
+SGLang adapter 传 `-1`。各入口默认值与上游同名算子一致：gdn 包的
+`fused_sigmoid_gating_delta_rule_update`（vLLM decode 算子）默认 `0`；
+SGLang 共享 decode/verify 入口（`fla.common.triton.fused_sigmoid_gating_recurrent`）
+与 `fused_recurrent_gated_delta_rule_packed_decode`、`chunk_gated_delta_rule_fwd_h`
+默认 `-1`，vLLM adapter 调用这些入口时必须显式传 `null_state_index=0`。
+
 ## 4. 子路径、配置与 fallback
 
 - decode gate/beta 使用 `_kda_gate_beta_fwd_kernel`，配置为 `BT2/w2/s3`、

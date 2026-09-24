@@ -112,6 +112,88 @@ def _packed_decode_bytes(
     )
 
 
+
+@GPU_REQUIRED
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_packed_decode_state_index_abi_vllm(dtype: torch.dtype) -> None:
+    """vLLM ABI (null_state_index=0): slot 0 is NULL, valid slots 1-based."""
+    torch.manual_seed(102)
+    B, H, HV, K, V, state_rows = 2, 2, 4, 32, 24, 2
+    qkv_dim = 2 * H * K + HV * V
+    mixed_qkv = torch.randn(B, qkv_dim, device=DEVICE, dtype=dtype) * 0.2
+    a = torch.randn(B, HV, device=DEVICE, dtype=dtype) * 0.2
+    b = torch.randn(B, HV, device=DEVICE, dtype=dtype) * 0.2
+    A_log = torch.randn(HV, device=DEVICE, dtype=torch.float32) * 0.1
+    dt_bias = torch.randn(HV, device=DEVICE, dtype=dtype) * 0.1
+    indices = torch.tensor([0, 1], device=DEVICE, dtype=torch.int32)
+    state_before = torch.randn(
+        state_rows, HV, V, K, device=DEVICE, dtype=torch.float32
+    ) * 0.02
+    state_actual = state_before.clone()
+    output = torch.empty(B, 1, HV, V, device=DEVICE, dtype=dtype)
+
+    actual, returned_state = fused_recurrent_gated_delta_rule_packed_decode(
+        mixed_qkv,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        K**-0.5,
+        state_actual,
+        output,
+        indices,
+        use_qk_l2norm_in_kernel=True,
+        null_state_index=0,
+    )
+
+    expected_output = torch.zeros_like(output)
+    expected_state = state_before.clone()
+    q, k, v = torch.split(mixed_qkv, [H * K, H * K, HV * V], dim=-1)
+    gate = naive_gdn_gate(a, A_log, dt_bias)
+    beta = b.float().sigmoid()
+    for token, state_index in enumerate(indices.tolist()):
+        if state_index <= 0:
+            continue
+        ref_out, ref_state_kv = naive_recurrent_gated_delta_rule(
+            q[token : token + 1].view(1, 1, H, K),
+            k[token : token + 1].view(1, 1, H, K),
+            v[token : token + 1].view(1, 1, HV, V),
+            beta[token : token + 1].view(1, 1, HV),
+            gate[token : token + 1].view(1, 1, HV),
+            scale=K**-0.5,
+            initial_state=expected_state[state_index : state_index + 1].transpose(-1, -2),
+            output_final_state=True,
+            use_qk_l2norm=True,
+        )
+        expected_output[token] = ref_out[0]
+        expected_state[state_index] = ref_state_kv[0].transpose(-1, -2)
+
+    assert actual is output
+    assert returned_state is state_actual
+    torch.testing.assert_close(actual, expected_output, atol=3e-2, rtol=2e-2)
+    torch.testing.assert_close(state_actual, expected_state, atol=3e-2, rtol=2e-2)
+
+
+@GPU_REQUIRED
+def test_packed_decode_rejects_invalid_null_state_index() -> None:
+    torch.manual_seed(103)
+    B, H, HV, K, V = 1, 2, 4, 32, 24
+    qkv_dim = 2 * H * K + HV * V
+    mixed_qkv = torch.randn(B, qkv_dim, device=DEVICE, dtype=torch.bfloat16)
+    a = torch.randn(B, HV, device=DEVICE, dtype=torch.bfloat16)
+    b = torch.randn(B, HV, device=DEVICE, dtype=torch.bfloat16)
+    A_log = torch.randn(HV, device=DEVICE, dtype=torch.float32)
+    dt_bias = torch.randn(HV, device=DEVICE, dtype=torch.bfloat16)
+    state = torch.zeros(1, HV, V, K, device=DEVICE, dtype=torch.float32)
+    indices = torch.zeros(B, device=DEVICE, dtype=torch.int32)
+    output = torch.empty(B, 1, HV, V, device=DEVICE, dtype=torch.bfloat16)
+    for bad in (1, -2):
+        with pytest.raises(ValueError, match="null_state_index"):
+            fused_recurrent_gated_delta_rule_packed_decode(
+                mixed_qkv, a, b, A_log, dt_bias, K**-0.5,
+                state, output, indices, null_state_index=bad,
+            )
+
 @GPU_REQUIRED
 @pytest.mark.bench
 @pytest.mark.parametrize("B", [1, 8, 32, 64], ids=lambda x: f"B{x}")

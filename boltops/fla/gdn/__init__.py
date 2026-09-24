@@ -10,9 +10,11 @@ Entry kinds (deliberately minimal):
 
 - **Lazy re-exports** (``_LAZY_EXPORTS``): the public name resolves to the
   implementation object itself -- one source of truth for the signature.
-  ``fused_sigmoid_gating_delta_rule_update_recurrent`` is the shared kernel's
-  full-parameter entry; SGLang-specific ``target_verify`` adapters belong in
-  the calling framework, not in this facade.
+  The KDA+GDN shared decode+verify kernel keeps the SGLang
+  ``fused_sigmoid_gating_delta_rule_update`` name in
+  :mod:`boltops.fla.common.triton.fused_sigmoid_gating_recurrent` and is
+  imported at module level by framework adapters; it is not re-exported here
+  because that name is this package's vLLM decode operator.
 """
 
 from __future__ import annotations
@@ -27,7 +29,6 @@ __all__ = [
     "chunk_gated_delta_rule_fwd_h",
     "fused_recurrent_gated_delta_rule_packed_decode",
     "fused_sigmoid_gating_delta_rule_update",
-    "fused_sigmoid_gating_delta_rule_update_recurrent",
     "recompute_w_u_fwd",
 ]
 
@@ -41,7 +42,6 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "chunk_gated_delta_rule_fwd_h": (".triton", "chunk_gated_delta_rule_fwd_h"),
     "fused_recurrent_gated_delta_rule_packed_decode": (".triton", "fused_recurrent_gated_delta_rule_packed_decode"),
     "fused_sigmoid_gating_delta_rule_update": (".triton", "fused_sigmoid_gating_delta_rule_update"),
-    "fused_sigmoid_gating_delta_rule_update_recurrent": (".triton", "fused_sigmoid_gating_delta_rule_update_recurrent"),
     "recompute_w_u_fwd": (".triton", "recompute_w_u_fwd"),
 }
 

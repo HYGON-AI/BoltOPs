@@ -85,8 +85,6 @@ def _get_recurrence_launch_config(
         "num_warps": 1,
         "num_stages": 1,
     }
-    if torch.version.hip is not None:
-        config["amdgpu_enable_max_ilp_scheduling_strategy"] = True
     return config
 
 

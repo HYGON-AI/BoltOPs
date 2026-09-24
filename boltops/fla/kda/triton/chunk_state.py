@@ -144,6 +144,7 @@ def static_fused_state_output_config(n_programs: int, V: int) -> dict[str, int]:
         "USE_G": lambda args: args["g"] is not None,
         "USE_GK": lambda args: args["gk"] is not None,
         "USE_INITIAL_STATE": lambda args: args["h0"] is not None,
+        "USE_INITIAL_STATE_INDICES": lambda args: args["initial_state_indices"] is not None,
         "STORE_FINAL_STATE": lambda args: args["ht"] is not None,
         "SAVE_NEW_VALUE": lambda args: args["v_new"] is not None,
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
@@ -159,6 +160,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     gk,
     h,
     h0,
+    initial_state_indices,
     ht,
     cu_seqlens,
     chunk_offsets,
@@ -172,6 +174,12 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     USE_G: tl.constexpr,
     USE_GK: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,
+    USE_INITIAL_STATE_INDICES: tl.constexpr,
+    INPLACE_FINAL_STATE: tl.constexpr,
+    STATE_ROWS: tl.constexpr,
+    NULL_STATE_INDEX: tl.constexpr,
+    STRIDE_INIT_STATE: tl.constexpr,
+    STRIDE_FINAL_STATE: tl.constexpr,
     STORE_FINAL_STATE: tl.constexpr,
     SAVE_NEW_VALUE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
@@ -212,13 +220,24 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     stride_h = H * V * K
     stride_k = Hg * K
     stride_w = H * K
+    i_s = i_n.to(tl.int64)
+    if USE_INITIAL_STATE_INDICES:
+        i_s = tl.load(initial_state_indices + i_n).to(tl.int64)
+    valid_initial_state = (i_s > NULL_STATE_INDEX) & (i_s < STATE_ROWS)
+    i_ht = i_n.to(tl.int64)
+    valid_final_state = True
+    if INPLACE_FINAL_STATE:
+        i_ht = i_s
+        valid_final_state = valid_initial_state
     if USE_INITIAL_STATE:
-        h0 = h0 + i_nh * V * K
+        if valid_initial_state:
+            h0 = h0 + i_s * STRIDE_INIT_STATE + i_h * V * K
     if STORE_FINAL_STATE:
-        ht = ht + i_nh * V * K
+        if valid_final_state:
+            ht = ht + i_ht * STRIDE_FINAL_STATE + i_h * V * K
 
     # load initial state
-    if USE_INITIAL_STATE:
+    if USE_INITIAL_STATE and valid_initial_state:
         p_h0_1 = tl.make_block_ptr(h0, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0))
         b_h1 += tl.load(p_h0_1, boundary_check=(0, 1)).to(tl.float32)
         if K > 64:
@@ -409,7 +428,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             b_k = tl.load(p_k, boundary_check=(0, 1))
             b_h4 += tl.dot(tl.trans(b_v), b_k)
     # epilogue
-    if STORE_FINAL_STATE:
+    if STORE_FINAL_STATE and valid_final_state:
         p_ht = tl.make_block_ptr(ht, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0))
         tl.store(p_ht, b_h1.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
         if K > 64:
@@ -432,6 +451,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
 @triton.heuristics(
     {
         "USE_INITIAL_STATE": lambda args: args["h0"] is not None,
+        "USE_INITIAL_STATE_INDICES": lambda args: args["initial_state_indices"] is not None,
         "STORE_FINAL_STATE": lambda args: args["ht"] is not None,
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
@@ -446,6 +466,7 @@ def chunk_kda_fwd_kernel_state_output_fused(
     Aqk,
     o,
     h0,
+    initial_state_indices,
     ht,
     cu_seqlens,
     chunk_indices,
@@ -457,6 +478,12 @@ def chunk_kda_fwd_kernel_state_output_fused(
     BT: tl.constexpr,
     BV: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,
+    USE_INITIAL_STATE_INDICES: tl.constexpr,
+    INPLACE_FINAL_STATE: tl.constexpr,
+    STATE_ROWS: tl.constexpr,
+    NULL_STATE_INDEX: tl.constexpr,
+    STRIDE_INIT_STATE: tl.constexpr,
+    STRIDE_FINAL_STATE: tl.constexpr,
     STORE_FINAL_STATE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
@@ -474,6 +501,15 @@ def chunk_kda_fwd_kernel_state_output_fused(
         bos, eos = i_n * T, i_n * T + T
         NT = tl.cdiv(T, BT)
 
+    i_s = i_n.to(tl.int64)
+    if USE_INITIAL_STATE_INDICES:
+        i_s = tl.load(initial_state_indices + i_n).to(tl.int64)
+    valid_initial_state = (i_s > NULL_STATE_INDEX) & (i_s < STATE_ROWS)
+    i_ht = i_n.to(tl.int64)
+    valid_final_state = True
+    if INPLACE_FINAL_STATE:
+        i_ht = i_s
+        valid_final_state = valid_initial_state
     b_h1 = tl.zeros([BV, 64], dtype=tl.float32)
     if K > 64:
         b_h2 = tl.zeros([BV, 64], dtype=tl.float32)
@@ -482,8 +518,8 @@ def chunk_kda_fwd_kernel_state_output_fused(
     if K > 192:
         b_h4 = tl.zeros([BV, 64], dtype=tl.float32)
 
-    if USE_INITIAL_STATE:
-        h0 += i_nh * V * K
+    if USE_INITIAL_STATE and valid_initial_state:
+        h0 = h0 + i_s * STRIDE_INIT_STATE + i_h * V * K
         p_h0 = tl.make_block_ptr(
             h0, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0)
         )
@@ -624,8 +660,8 @@ def chunk_kda_fwd_kernel_state_output_fused(
             else:
                 b_h4 += tl.trans(tl.dot(b_k, b_v))
 
-    if STORE_FINAL_STATE:
-        ht += i_nh * V * K
+    if STORE_FINAL_STATE and valid_final_state:
+        ht = ht + i_ht * STRIDE_FINAL_STATE + i_h * V * K
         p_ht = tl.make_block_ptr(
             ht, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0)
         )
@@ -657,10 +693,13 @@ def chunk_kda_fwd_state_output_fused(
     o: torch.Tensor,
     scale: float,
     initial_state: torch.Tensor | None = None,
+    initial_state_indices: torch.Tensor | None = None,
     output_final_state: bool = False,
+    inplace_final_state: bool = False,
     cu_seqlens: torch.Tensor | None = None,
     chunk_indices: torch.Tensor | None = None,
     chunk_size: int = FLA_CHUNK_SIZE,
+    null_state_index: int = -1,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Fuse KDA chunk state propagation and output.
 
@@ -669,6 +708,11 @@ def chunk_kda_fwd_state_output_fused(
     slower: it forces an extra ``Ab`` tile and matmul into the serial chunk
     loop, and this kernel runs at ~700 GB/s, so it has no bandwidth headroom
     to trade for arithmetic.
+
+    Pool handling matches ``chunk_gated_delta_rule_fwd_h``:
+    ``initial_state_indices`` maps each sequence to a pool row, and
+    ``inplace_final_state=True`` writes the final state back into the
+    indexed rows (``null_state_index`` selects the slot ABI).
     """
     B, T, H, K = q.shape
     if kg.shape != (B, T, H, K):
@@ -690,10 +734,32 @@ def chunk_kda_fwd_state_output_fused(
         N, NT = B, triton.cdiv(T, BT)
     else:
         N, NT = len(cu_seqlens) - 1, len(chunk_indices)
-    final_state = (
-        kg.new_empty(N, H, V, K, dtype=torch.float32)
-        if output_final_state else None
-    )
+    if null_state_index not in (-1, 0):
+        raise ValueError("null_state_index must be 0 (vLLM ABI) or -1 (SGLang ABI).")
+    if inplace_final_state and initial_state is None:
+        raise ValueError("initial_state is required when inplace_final_state=True.")
+    if inplace_final_state and not output_final_state:
+        raise ValueError(
+            "output_final_state must be True when inplace_final_state=True."
+        )
+    if initial_state_indices is not None:
+        if initial_state is None:
+            raise ValueError("initial_state_indices requires initial_state.")
+        if initial_state_indices.ndim != 1 or len(initial_state_indices) != N:
+            raise ValueError(f"initial_state_indices must have shape ({N},).")
+        if initial_state_indices.device != kg.device:
+            raise ValueError(
+                "initial_state_indices and kg must be on the same device."
+            )
+        if initial_state_indices.dtype not in (torch.int32, torch.int64):
+            raise TypeError("initial_state_indices must have int32 or int64 dtype.")
+    if inplace_final_state:
+        final_state = initial_state
+    else:
+        final_state = (
+            kg.new_empty(N, H, V, K, dtype=torch.float32)
+            if output_final_state else None
+        )
     config = get_chunk_state_config(
         N, H, V, K, cu_seqlens is not None, T=T,
         b=B, dtype=kg.dtype,
@@ -721,6 +787,7 @@ def chunk_kda_fwd_state_output_fused(
         Aqk=Aqk,
         o=o,
         h0=initial_state,
+        initial_state_indices=initial_state_indices,
         ht=final_state,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
@@ -730,6 +797,13 @@ def chunk_kda_fwd_state_output_fused(
         K=K,
         V=V,
         BT=BT,
+        INPLACE_FINAL_STATE=inplace_final_state,
+        STATE_ROWS=initial_state.shape[0] if initial_state is not None else 0,
+        NULL_STATE_INDEX=null_state_index,
+        STRIDE_INIT_STATE=initial_state.stride(0) if initial_state is not None else 0,
+        STRIDE_FINAL_STATE=(
+            initial_state.stride(0) if inplace_final_state else H * V * K
+        ),
         **config,
     )
     return o, final_state
@@ -742,14 +816,33 @@ def chunk_gated_delta_rule_fwd_h(
     g: torch.Tensor | None = None,
     gk: torch.Tensor | None = None,
     initial_state: torch.Tensor | None = None,
+    initial_state_indices: torch.Tensor | None = None,
     output_final_state: bool = False,
+    inplace_final_state: bool = False,
     chunk_size: int = FLA_CHUNK_SIZE,
     save_new_value: bool = True,
     cu_seqlens: torch.Tensor | None = None,
     chunk_indices: torch.Tensor | None = None,
     chunk_offsets: torch.Tensor | None = None,
     use_exp2: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    null_state_index: int = -1,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """Compute KDA chunk states with optional pooled initial/final states.
+
+    ``initial_state_indices`` maps each sequence to a row of the
+    ``initial_state`` pool.  ``null_state_index`` selects the state-index ABI
+    so both frameworks can call the same entry: ``-1`` (the default, SGLang)
+    treats only negative indices as invalid -- SGLang reserves slot 0 as the
+    dummy write target for padded requests and never allocates it to a live
+    request; ``0`` (vLLM NULL_BLOCK_ID) treats indices ``<= 0`` as invalid
+    and valid slots are 1-based.
+
+    With ``inplace_final_state=True`` the kernel writes the final state back
+    into the indexed pool rows and the third return value is that same
+    tensor object.  The caller must ensure that
+    ``initial_state_indices`` contains no duplicate valid indices in this
+    mode, or concurrent sequences may race on one row.
+    """
     # This kernel is slightly different from fla to support Q/K with different head numbers.
     # In fla, Q/K always have the same head number, so Hg is always equal to H.
     B, T, Hg, K, V = *k.shape, u.shape[-1]
@@ -766,11 +859,34 @@ def chunk_gated_delta_rule_fwd_h(
         if chunk_offsets is None:
             chunk_offsets = prepare_chunk_offsets(cu_seqlens, BT)
     assert K <= 256, "current kernel does not support head dimension larger than 256."
+    if null_state_index not in (-1, 0):
+        raise ValueError("null_state_index must be 0 (vLLM ABI) or -1 (SGLang ABI).")
+    if inplace_final_state and initial_state is None:
+        raise ValueError("initial_state is required when inplace_final_state=True.")
+    if inplace_final_state and not output_final_state:
+        raise ValueError(
+            "output_final_state must be True when inplace_final_state=True."
+        )
+    if initial_state_indices is not None:
+        if initial_state is None:
+            raise ValueError("initial_state_indices requires initial_state.")
+        if initial_state_indices.ndim != 1 or len(initial_state_indices) != N:
+            raise ValueError(f"initial_state_indices must have shape ({N},).")
+        if initial_state_indices.device != k.device:
+            raise ValueError(
+                "initial_state_indices and k must be on the same device."
+            )
+        if initial_state_indices.dtype not in (torch.int32, torch.int64):
+            raise TypeError("initial_state_indices must have int32 or int64 dtype.")
 
     h = k.new_empty(B, NT, H, V, K)
-    final_state = (
-        k.new_empty(N, H, V, K, dtype=torch.float32) if output_final_state else None
-    )
+    if inplace_final_state:
+        final_state = initial_state
+    else:
+        final_state = (
+            k.new_empty(N, H, V, K, dtype=torch.float32)
+            if output_final_state else None
+        )
 
     v_new = torch.empty_like(u) if save_new_value else None
     config = get_chunk_state_config(
@@ -790,6 +906,7 @@ def chunk_gated_delta_rule_fwd_h(
         gk=gk,
         h=h,
         h0=initial_state,
+        initial_state_indices=initial_state_indices,
         ht=final_state,
         cu_seqlens=cu_seqlens,
         chunk_offsets=chunk_offsets,
@@ -800,6 +917,13 @@ def chunk_gated_delta_rule_fwd_h(
         V=V,
         BT=BT,
         USE_EXP2=use_exp2,
+        INPLACE_FINAL_STATE=inplace_final_state,
+        STATE_ROWS=initial_state.shape[0] if initial_state is not None else 0,
+        NULL_STATE_INDEX=null_state_index,
+        STRIDE_INIT_STATE=initial_state.stride(0) if initial_state is not None else 0,
+        STRIDE_FINAL_STATE=(
+            initial_state.stride(0) if inplace_final_state else H * V * K
+        ),
         **config,
     )
     return h, v_new, final_state

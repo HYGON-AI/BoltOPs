@@ -100,7 +100,6 @@ from boltops.fla.gdn import (
     chunk_gated_delta_rule_fwd_h,
     fused_recurrent_gated_delta_rule_packed_decode,
     fused_sigmoid_gating_delta_rule_update,
-    fused_sigmoid_gating_delta_rule_update_recurrent,
     recompute_w_u_fwd as recompute_w_u_fwd_gdn,
 )
 
