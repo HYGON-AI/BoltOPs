@@ -23,12 +23,14 @@ all = ["triton", "tilelang"]
 tune = [
     "triton",
     "pytest",
+    "PyYAML",
     "numpy",
     "pandas",
     "matplotlib",
 ]
 dev = [
     "pytest",
+    "PyYAML",
     "numpy",
     "pandas",
 ]
@@ -66,6 +68,8 @@ packages = [
     "boltops.fa.sparse_gqa.triton",
     "boltops.fa.extend_attention",
     "boltops.fa.extend_attention.triton",
+    "boltops.fa.unified_attention",
+    "boltops.fa.unified_attention.triton",
     "boltops.mqa_logits",
     "boltops.mqa_logits.triton",
     "boltops.mqa_logits.tilelang",
@@ -104,6 +108,7 @@ packages = [
     "boltops.tools.fused_moe_triton_tune",
     "boltops.tools.sparse_gqa_triton_tune",
     "boltops.tools.extend_attention_triton_tune",
+    "boltops.tools.unified_attention_triton_tune",
 ]
 
 [tool.setuptools.dynamic]
@@ -121,6 +126,8 @@ boltops = [
     "mla/triton/configs/**/*.json",
     "fa/sparse_gqa/triton/configs/triton_*/*.json",
     "fa/extend_attention/triton/configs/triton_*/*.json",
+    "tools/unified_attention_triton_tune/*.yaml",
+    "fa/unified_attention/triton/configs/triton_*/*.json",
     "mqa_logits/triton/SOURCE.md",
     "mqa_logits/triton/PERFORMANCE.md",
     "mqa_logits/triton/configs/triton_*/*.json",

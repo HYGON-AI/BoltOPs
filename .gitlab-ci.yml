@@ -124,7 +124,7 @@ build:test-wheel:
     - |
       printf 'torch==%s\nnumpy==1.24.3\n' "${TORCH_VERSION}" > /tmp/boltops-constraints.txt
       cat /tmp/boltops-constraints.txt
-    - python -m pip install --constraint /tmp/boltops-constraints.txt "torch==${TORCH_VERSION}" triton pytest "numpy==1.24.3" pandas build wheel ciupload cismi ninja
+    - python -m pip install --constraint /tmp/boltops-constraints.txt "torch==${TORCH_VERSION}" triton pytest PyYAML "numpy==1.24.3" pandas build wheel ciupload cismi ninja
     - python -m pip show torch triton
     # Match TileLang CI: apache-tvm-ffi comes from Aliyun, while the constraint
     # makes pip choose the TileLang wheel compatible with this Torch matrix job.

@@ -1,0 +1,23 @@
+{
+  "key": [
+    "num_seqs",
+    "num_query_tokens",
+    "max_seqlen_q",
+    "max_seqlen_k",
+    "num_queries_per_kv"
+  ],
+  "config": {
+    "(1, 49, 49, 4096, 16)": {
+      "BLOCK_M": 16,
+      "TILE_SIZE": 32,
+      "num_warps": 2,
+      "num_stages": 2
+    },
+    "(3, 563, 511, 4096, 16)": {
+      "BLOCK_M": 32,
+      "TILE_SIZE": 32,
+      "num_warps": 2,
+      "num_stages": 1
+    }
+  }
+}
