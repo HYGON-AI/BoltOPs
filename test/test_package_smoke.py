@@ -50,6 +50,15 @@ from boltops.fa.extend_attention import (
     extend_attention_fwd,
     extend_attention_fwd_unified,
 )
+from boltops.fa import (
+    KVQuantMode as fa_KVQuantMode,
+    reshape_and_cache_int4 as fa_reshape_and_cache_int4,
+)
+from boltops.fa.unified_attention import (
+    KVQuantMode,
+    reshape_and_cache_int4,
+    unified_attention,
+)
 from boltops.ihc import ihc_head, ihc_post, ihc_pre
 from boltops.step4_dsa import (
     triton_build_rope_cache,
@@ -128,6 +137,11 @@ def test_operator_package_exports():
     assert callable(dense_prefill_attention_fwd)
     assert callable(extend_attention_fwd)
     assert callable(extend_attention_fwd_unified)
+    assert fa_KVQuantMode is KVQuantMode
+    assert fa_reshape_and_cache_int4 is reshape_and_cache_int4
+    assert callable(unified_attention)
+    assert callable(reshape_and_cache_int4)
+    assert KVQuantMode.INT4_PER_TOKEN_HEAD == 4
     assert callable(triton_build_rope_cache)
     assert callable(triton_indexer_norm_rope)
     assert callable(triton_csa_region_layout)
