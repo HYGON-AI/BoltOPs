@@ -232,6 +232,31 @@ pytest test --bench -s       # correctness + real model-size performance
 # pytest test/fla/test_gdn_recompute_w_u.py --bench -s
 ```
 
+5. **optest**
+  `optest` is the unified operator test entry used by CI; one run covers accuracy (pytest over `test/`) and performance (`scripts/run_operator_benchmarks.py`):
+
+```bash
+pip install optest
+optest --op_name boltops --test_dir . --test_mode all      # accuracy + performance
+optest --op_name boltops --test_dir . --test_mode acc      # accuracy only
+optest --op_name boltops --test_dir . --test_mode per      # benchmarks only
+optest --op_name boltops --test_dir . --test_mode all --gpus 0,2  # pin specific DCUs
+optest --display                                            # HTML report from latest results
+```
+
+  Results land in `/op_test_output/boltops/<branch>_<commit>_<timestamp>/`
+  (`.optest-results.json` + per-kernel CSVs) with logs under `/op_test_log/boltops/`.
+  CI (`performance:optest`) runs the same entry for every MR into `main` and
+  converts the results to JUnit via `ci_script/optest_to_junit.py`.
+  To add a performance test, drop one module
+  `scripts/perf/<backend>/<kernel>.py` exposing a module-level `SPEC`
+  (shape table + how to call the op; CUDA-graph timing and CSV output are
+  handled by the shared framework in `scripts/perf/bench.py`).
+  Run a subset locally with
+  `python scripts/run_operator_benchmarks.py --kernels triton/flash_mla_sparse`.
+  Tuning scripts that search for and write configs live under
+  `scripts/tune/` and are not wired into optest.
+
 **Adding a new op:**
 
 1. Create `boltops/<op>/` with `triton/` and `tilelang/` impls; put correctness in `test/test_<op>.py` and model-size benches under `@pytest.mark.bench`, then use `--bench` to pick the winner.
