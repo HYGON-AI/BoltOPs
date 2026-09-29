@@ -28,11 +28,13 @@ from boltops.mla import (
 ```bash
 pytest -q test/mla/
 pytest -q test/mla/ --bench -s
-python scripts/benchmarks/triton/benchmark_flash_mla_sparse.py -h
+python scripts/run_operator_benchmarks.py --kernels triton/flash_mla_sparse
 ```
 
-精度测试位于 `test/mla/test_flash_mla_sparse.py`；独立性能脚本会运行典型
-`topk=2048/4096` shape，并输出包含延迟和有效 TFLOPS 的 CSV。
+精度测试位于 `test/mla/test_flash_mla_sparse.py`；性能测例在
+`scripts/perf/triton/flash_mla_sparse.py`（CUDA Graph 计时 / CSV 由
+`scripts/perf/bench.py` 统一处理），会运行典型 `topk=2048/4096` shape，
+并输出包含延迟和有效 TFLOPS 的 CSV。
 
 ### Sparse FlashMLA benchmark 与 autotune
 

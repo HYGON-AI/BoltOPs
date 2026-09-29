@@ -1,79 +1,59 @@
 #!/usr/bin/env python3
-"""Run configured BoltOps kernel benchmarks and collect their CSV files."""
+"""Run the registered BoltOps kernel performance benchmarks.
+
+This script is the optest ``per`` entry, so it stays at this fixed path.
+Benchmarks live in ``scripts/perf/<backend>/<kernel>.py``; add one by
+dropping a module that exposes a module-level ``SPEC``
+(``perf.bench.KernelSpec``) -- nothing to register.
+"""
 
 from __future__ import annotations
 
 import argparse
-import subprocess
+import os
 import sys
+import traceback
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-BENCHMARK_ROOT = ROOT / "scripts" / "benchmarks"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-# Use ``backend/kernel`` so identically named Triton and TileLang kernels remain
-# distinct. The entry resolves to ``<backend>/benchmark_<kernel>.py``.
-BENCHMARK_KERNELS = (
-    "triton/batched_gemm_bf16",
-    "triton/flash_mla_sparse",
-)
-
-
-def find_benchmark_script(kernel_spec: str) -> Path:
-    try:
-        backend, kernel = kernel_spec.split("/", 1)
-    except ValueError as exc:
-        raise ValueError(
-            f"invalid kernel {kernel_spec!r}; expected 'backend/kernel'"
-        ) from exc
-    if not backend or not kernel or "/" in kernel:
-        raise ValueError(f"invalid kernel {kernel_spec!r}; expected 'backend/kernel'")
-    expected_name = f"benchmark_{kernel}.py"
-    benchmark_script = BENCHMARK_ROOT / backend / expected_name
-    if not benchmark_script.is_file():
-        raise FileNotFoundError(
-            f"no benchmark script found for {kernel_spec!r}; "
-            f"expected {benchmark_script}"
-        )
-    return benchmark_script
+from perf import discover_specs  # noqa: E402
+from perf.bench import run_kernel  # noqa: E402
 
 
 def main(argv: list[str] | None = None) -> int:
+    specs, import_errors = discover_specs()
+    for error in import_errors:
+        print(f"[discover] {error}", file=sys.stderr, flush=True)
+
     parser = argparse.ArgumentParser(description=__doc__)
+    default_output = os.environ.get("OPTEST_OUTPUT_DIR") or Path.cwd()
     parser.add_argument(
-        "-o", "--output-dir", type=Path, default=Path.cwd(),
-        help="CSV output directory (default: current directory)",
+        "-o", "--output-dir", type=Path, default=Path(default_output),
+        help="CSV output directory (default: $OPTEST_OUTPUT_DIR, else current directory)",
+    )
+    parser.add_argument(
+        "--kernels", nargs="+", choices=sorted(specs), default=None,
+        help="kernels to run as 'backend/kernel' (default: all)",
     )
     args = parser.parse_args(argv)
     output_dir = args.output_dir.resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    if not BENCHMARK_KERNELS:
-        parser.error("BENCHMARK_KERNELS is empty")
 
-    failures = 0
-    for index, kernel in enumerate(BENCHMARK_KERNELS, 1):
+    names = args.kernels or sorted(specs)
+    failures = len(import_errors)
+    for index, name in enumerate(names, 1):
+        print(f"[{index}/{len(names)}] {name}", flush=True)
         try:
-            benchmark_script = find_benchmark_script(kernel)
-        except (FileNotFoundError, ValueError) as exc:
-            print(f"[{index}/{len(BENCHMARK_KERNELS)}] {exc}", file=sys.stderr)
+            run_kernel(specs[name], output_dir)
+        except Exception:
             failures += 1
-            continue
-        print(
-            f"[{index}/{len(BENCHMARK_KERNELS)}] {kernel} -> "
-            f"{benchmark_script.relative_to(ROOT)}",
-            flush=True,
-        )
-        result = subprocess.run(
-            [sys.executable, str(benchmark_script), "--output-dir", str(output_dir)],
-            cwd=ROOT,
-            check=False,
-        )
-        failures += int(result.returncode != 0)
+            print(f"[{index}/{len(names)}] {name} FAILED", file=sys.stderr, flush=True)
+            traceback.print_exc()
 
     if failures:
-        print(f"{failures} kernel benchmark(s) failed", file=sys.stderr)
+        print(f"{failures} benchmark target(s) failed", file=sys.stderr)
         return 1
-    print(f"Wrote {len(BENCHMARK_KERNELS)} CSV file(s) to {output_dir}")
+    print(f"Wrote {len(names)} CSV file(s) to {output_dir}")
     return 0
 
 

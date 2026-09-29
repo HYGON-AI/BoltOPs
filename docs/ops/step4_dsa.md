@@ -50,7 +50,7 @@ from boltops.step4_dsa import (
 ```bash
 pytest -q test/step4_dsa/
 pytest -q test/step4_dsa/ --bench -s
-python3 scripts/benchmarks/triton/step4_dsa/benchmark_step4_dsa.py --output-dir /tmp/dsa-bench
+python3 scripts/perf/triton/step4_dsa/benchmark_step4_dsa.py --output-dir /tmp/dsa-bench
 ```
 
 正确性对 `test/step4_dsa/ref.py`（handoff `torch_ref`）的 FP32 oracle，禁止 Triton-vs-Triton 作为门禁。`--bench` 跑 `tp8-production` 全表，包含 metadata 宽度 513、`num_splits=16` 的 decode。
@@ -65,12 +65,12 @@ python3 -m operator_parity.run_all --suite dsa --ops-module boltops.step4_dsa
 occupancy JSON 对照（`tuned` = 读 HCU JSON，`default` = `config={}` 内置 tile）：
 
 ```bash
-python3 scripts/benchmarks/triton/step4_dsa/benchmark_sparse_attn_prefill.py \
-  --output-dir scripts/benchmarks/triton/step4_dsa/result
-python3 scripts/benchmarks/triton/step4_dsa/benchmark_sparse_attn_prefill_tiled.py \
-  --output-dir scripts/benchmarks/triton/step4_dsa/result
-python3 scripts/benchmarks/triton/step4_dsa/benchmark_sparse_attn_decode.py \
-  --output-dir scripts/benchmarks/triton/step4_dsa/result
+python3 scripts/perf/triton/step4_dsa/benchmark_sparse_attn_prefill.py \
+  --output-dir scripts/perf/triton/step4_dsa/result
+python3 scripts/perf/triton/step4_dsa/benchmark_sparse_attn_prefill_tiled.py \
+  --output-dir scripts/perf/triton/step4_dsa/result
+python3 scripts/perf/triton/step4_dsa/benchmark_sparse_attn_decode.py \
+  --output-dir scripts/perf/triton/step4_dsa/result
 ```
 
 数字见下文 BW1100 性能记录。
@@ -229,7 +229,7 @@ packed_width=513, D=192, region_size=8`），`cache_regions=4096`。Triton
 数字使用 `triton.testing.do_bench`（warmup 10 ms、rep 30 ms、中位数）。
 本轮只替换 launch JSON，没有改 kernel。加速比定义为
 `default latency / tuned latency`，大于 1 表示 JSON 更快。CSV 来自
-`scripts/benchmarks/triton/step4_dsa/result/`。GPU 未锁频，数据用于同轮
+`scripts/perf/triton/step4_dsa/result/`。GPU 未锁频，数据用于同轮
 相对比较，不作为稳定性能门槛。
 
 #### per-query launch JSON（2026-09-08）
@@ -361,7 +361,7 @@ out, lse = triton_sparse_attention_decode(
 环境与 prefill 相同。metadata（`triton_decode_sparse_meta`）在计时区外。
 记录表仍只引用默认生产点 `(B=4, ctx=16384, splits=1)`。加速比定义为
 `default latency / tuned latency`，大于 1 表示 JSON 更快。CSV 来自
-`scripts/benchmarks/triton/step4_dsa/result/`。GPU 未锁频，数据用于同轮
+`scripts/perf/triton/step4_dsa/result/`。GPU 未锁频，数据用于同轮
 相对比较，不作为稳定性能门槛。
 
 #### occupancy JSON（2026-09-03）

@@ -248,8 +248,13 @@ performance:optest:
       export HIP_VISIBLE_DEVICES
       echo "Allocated performance DCU: ${HIP_VISIBLE_DEVICES}"
     - |
+      # Performance only: the accuracy suite still has pre-existing
+      # failures (see test/mqa_logits, test/qsa) that would gate every
+      # MR, so acc is not run by this job. --gpus pins the run to the
+      # DCU reserved by CIsmi above.
       optest_rc=0
-      optest --op_name boltops --test_mode per --test_dir "${CI_PROJECT_DIR}" || optest_rc=$?
+      optest --op_name boltops --test_mode per --gpus "${HIP_VISIBLE_DEVICES}" \
+        --test_dir "${CI_PROJECT_DIR}" || optest_rc=$?
 
       artifact_dir="${CI_PROJECT_DIR}/optest_artifacts/${RUNNER_TAG}/torch${TORCH_VERSION}"
       mkdir -p "${artifact_dir}"

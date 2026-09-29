@@ -231,6 +231,28 @@ pytest test --bench -s       # 正确性 + 真实模型尺寸性能
 # pytest test/fla/test_gdn_recompute_w_u.py --bench -s
 ```
 
+5. **optest**
+  `optest` 是 CI 使用的统一算子测试入口，一次运行覆盖正确性（pytest 跑 `test/`）和性能（`scripts/run_operator_benchmarks.py`）：
+
+```bash
+pip install optest
+optest --op_name boltops --test_dir . --test_mode all      # 正确性 + 性能
+optest --op_name boltops --test_dir . --test_mode acc      # 只跑正确性
+optest --op_name boltops --test_dir . --test_mode per      # 只跑性能
+optest --op_name boltops --test_dir . --test_mode all --gpus 0,2  # 指定 DCU
+optest --display                                            # 用最新结果生成 HTML 报告
+```
+
+  结果写入 `/op_test_output/boltops/<branch>_<commit>_<timestamp>/`
+  （`.optest-results.json` + 各 kernel 的 CSV），日志在 `/op_test_log/boltops/`。
+  CI（`performance:optest`）对每个进入 `main` 的 MR 运行同一入口，
+  并用 `ci_script/optest_to_junit.py` 把结果转成 JUnit。
+  新增性能测例：放一个模块 `scripts/perf/<backend>/<kernel>.py`，
+  暴露模块级 `SPEC`（shape 表 + 算子调用方式；CUDA Graph 计时与 CSV
+  由 `scripts/perf/bench.py` 统一处理）。本地跑子集：
+  `python scripts/run_operator_benchmarks.py --kernels triton/flash_mla_sparse`。
+  负责搜索/回写配置的调优脚本放 `scripts/tune/`，不接入 optest。
+
 **新算子：**
 
 1. 新建 `boltops/<op>/`，在 `triton/` 与 `tilelang/` 实现；`test/test_<op>.py` 写正确性，`@pytest.mark.bench` 写模型尺寸测速，用 `--bench` 比出最优。

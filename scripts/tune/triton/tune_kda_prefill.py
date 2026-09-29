@@ -8,13 +8,13 @@ runs a correctness smoke check against the corresponding static selector.
 
 Examples:
   # tune the default fused prefill mainline
-  python scripts/benchmarks/fla/benchmark_kda_prefill.py --write-configs --e2e
+  python scripts/tune/triton/tune_kda_prefill.py --write-configs --e2e
 
   # all exported tuneable stages (including standalone/fallback paths)
-  python scripts/benchmarks/fla/benchmark_kda_prefill.py --kernel all
+  python scripts/tune/triton/tune_kda_prefill.py --kernel all
 
   # only compare existing JSON configs against static selectors
-  python scripts/benchmarks/fla/benchmark_kda_prefill.py --e2e-only
+  python scripts/tune/triton/tune_kda_prefill.py --e2e-only
 """
 
 from __future__ import annotations

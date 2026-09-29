@@ -251,7 +251,7 @@ wide_h48_t8192   B=1,T=8192,H=48,K=V=128,bf16
 生成方式：
 
 ```bash
-python scripts/benchmarks/fla/benchmark_kda_prefill.py \
+python scripts/tune/triton/tune_kda_prefill.py \
   --shape t512 --shape t2048 --shape t4096 \
   --shape varlen_t8192 --shape batch4_t2048 \
   --kernel mainline --warmup 1 --repeat 2 --write-configs
