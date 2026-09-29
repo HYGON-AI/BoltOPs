@@ -11,10 +11,10 @@ Decode 在连续的 ragged K/V 上计算 grouped-query attention。
 
 ## 1. 算子用途与支持范围
 
-公开接口从 `boltops.fa.sparse_gqa` 导入：
+公开接口从 `boltops.sparse_gqa` 导入：
 
 ```python
-from boltops.fa.sparse_gqa import (
+from boltops.sparse_gqa import (
     qwen_sparse_kv_extraction_compact_hcu_fa_triton,
     sparse_gqa_packed_decode_triton,
 )
@@ -166,7 +166,7 @@ out = sparse_gqa_packed_decode_triton(
 ### 6.1 Pytest
 
 ```bash
-PYTHONPATH=. pytest -q test/fa/test_sparse_gqa.py
+PYTHONPATH=. pytest -q test/sparse_gqa/
 ```
 
 测试覆盖：
@@ -181,7 +181,7 @@ PYTHONPATH=. pytest -q test/fa/test_sparse_gqa.py
 可选 benchmark：
 
 ```bash
-PYTHONPATH=. pytest -q -s test/fa/test_sparse_gqa.py --bench
+PYTHONPATH=. pytest -q -s test/sparse_gqa/ --bench
 ```
 
 benchmark 在计时前先与独立 Torch reference 比较，然后分别输出 compact、
@@ -218,11 +218,11 @@ boltops-sparse-gqa-tune-cli \
 
 | 用途 | 文件 |
 | --- | --- |
-| 公开接口 | `boltops/fa/sparse_gqa/__init__.py` |
-| KV compact | `boltops/fa/sparse_gqa/triton/kv_compact.py` |
-| Packed decode | `boltops/fa/sparse_gqa/triton/packed_decode.py` |
-| 配置加载 | `boltops/fa/sparse_gqa/triton/config.py` |
+| 公开接口 | `boltops/sparse_gqa/__init__.py` |
+| KV compact | `boltops/sparse_gqa/triton/kv_compact.py` |
+| Packed decode | `boltops/sparse_gqa/triton/packed_decode.py` |
+| 配置加载 | `boltops/sparse_gqa/triton/config.py` |
 | 调优入口 | `boltops-sparse-gqa-tune-cli` → `boltops.tools.sparse_gqa_triton_tune.tune_sparse_gqa:main` |
-| 正确性与性能测试 | `test/fa/test_sparse_gqa.py` |
+| 正确性与性能测试 | `test/sparse_gqa/` |
 | Compact 文档 | [`sparse_gqa/sparse_gqa_kv_compact.md`](sparse_gqa/sparse_gqa_kv_compact.md) |
 | Decode 文档 | [`sparse_gqa/sparse_gqa_decode.md`](sparse_gqa/sparse_gqa_decode.md) |
