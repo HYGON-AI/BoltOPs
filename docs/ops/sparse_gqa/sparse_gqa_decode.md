@@ -8,7 +8,7 @@ Sparse Grouped-Query Attention。每条 query 只访问 `indices` 选中的 K/V 
 ## 2. 接口说明
 
 ```python
-from boltops.fa.sparse_gqa import sparse_gqa_packed_decode_triton
+from boltops.sparse_gqa import sparse_gqa_packed_decode_triton
 
 out = sparse_gqa_packed_decode_triton(
     q,
@@ -126,21 +126,21 @@ Wrapper 会校验 rank、shape、dtype 和 device，但不会遍历设备 tensor
 ## 9. 正确性测试与性能基准
 
 ```bash
-PYTHONPATH=. pytest -q test/fa/test_sparse_gqa.py \
+PYTHONPATH=. pytest -q test/sparse_gqa/ \
   -k 'decode or compact_then_decode'
 ```
 
 性能 case 通过总测试文件的 `--bench` 运行：
 
 ```bash
-PYTHONPATH=. pytest -q -s test/fa/test_sparse_gqa.py --bench
+PYTHONPATH=. pytest -q -s test/sparse_gqa/ --bench
 ```
 
 ## 附录 A. 仓库文件
 
 | 用途 | 文件 |
 | --- | --- |
-| 公开接口 | `boltops/fa/sparse_gqa/__init__.py` |
-| Triton 实现 | `boltops/fa/sparse_gqa/triton/packed_decode.py` |
-| 配置加载 | `boltops/fa/sparse_gqa/triton/config.py` |
-| 测试 | `test/fa/test_sparse_gqa.py` |
+| 公开接口 | `boltops/sparse_gqa/__init__.py` |
+| Triton 实现 | `boltops/sparse_gqa/triton/packed_decode.py` |
+| 配置加载 | `boltops/sparse_gqa/triton/config.py` |
+| 测试 | `test/sparse_gqa/` |

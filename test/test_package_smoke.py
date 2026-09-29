@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import importlib.util
+
 from boltops import __version__
 from boltops.fused_moe import (
     fused_experts,
@@ -39,7 +41,7 @@ from boltops.gemm import (
     w8a8_triton_block_scaled_mm,
 )
 from boltops.mla import decode_attention_fwd, compute_num_kv_splits
-from boltops.fa.sparse_gqa import (
+from boltops.sparse_gqa import (
     qwen_sparse_kv_extraction_compact_hcu_fa_triton,
     sparse_gqa_packed_decode_triton,
 )
@@ -154,6 +156,10 @@ def test_operator_package_exports():
     assert callable(triton_sparse_attention_prefill)
     assert callable(triton_sparse_attention_decode)
     assert callable(triton_merge_split_states)
+
+
+def test_sparse_gqa_is_no_longer_nested_under_fa():
+    assert importlib.util.find_spec("boltops.fa.sparse_gqa") is None
 
 
 def test_root_package_does_not_reexport_operators():

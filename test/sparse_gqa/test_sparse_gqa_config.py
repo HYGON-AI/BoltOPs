@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from boltops.fa.sparse_gqa.triton import config as sparse_gqa_config
+from boltops.sparse_gqa.triton import config as sparse_gqa_config
 from boltops.utility.triton_capability import TritonCapabilities
 
 

@@ -12,14 +12,14 @@ from typing import Callable, Union
 import torch
 import triton
 
-from boltops.fa.sparse_gqa.triton.kv_compact import _launch_compact_hcu_fa
-from boltops.fa.sparse_gqa.triton.config import (
+from boltops.sparse_gqa.triton.kv_compact import _launch_compact_hcu_fa
+from boltops.sparse_gqa.triton.config import (
     CONFIG_DIR,
     config_match,
     config_path,
     load_config,
 )
-from boltops.fa.sparse_gqa.triton.packed_decode import (
+from boltops.sparse_gqa.triton.packed_decode import (
     _sparse_gqa_packed_decode_triton_split,
 )
 from boltops.tools.sparse_gqa_triton_tune.benchmark_cases import (

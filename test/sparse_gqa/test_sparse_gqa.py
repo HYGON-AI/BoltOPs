@@ -10,7 +10,7 @@ import torch
 
 triton = pytest.importorskip("triton")
 
-from boltops.fa.sparse_gqa import (
+from boltops.sparse_gqa import (
     qwen_sparse_kv_extraction_compact_hcu_fa_triton,
     sparse_gqa_packed_decode_triton,
 )
@@ -507,7 +507,7 @@ def test_bench_simulated_production_decode(
 @pytest.mark.parametrize("packed", [False, True])
 def test_compact_grouped_v_preserves_general_gather(pattern, fp8, packed):
     """The vectorized V path must preserve arbitrary slots and masked writes."""
-    from boltops.fa.sparse_gqa.triton.kv_compact import _launch_compact_hcu_fa
+    from boltops.sparse_gqa.triton.kv_compact import _launch_compact_hcu_fa
 
     data = _make_compact_case(
         batch=3, topk=19, heads=2, dim=80, page_size=8, counts=(19, 17, 13)
@@ -582,7 +582,7 @@ def test_compact_grouped_v_preserves_general_gather(pattern, fp8, packed):
 
 @GPU_REQUIRED
 def test_compact_packed_v_preserves_fp8_output_bits():
-    from boltops.fa.sparse_gqa.triton.kv_compact import _launch_compact_hcu_fa
+    from boltops.sparse_gqa.triton.kv_compact import _launch_compact_hcu_fa
 
     data = _make_compact_case(topk=17, counts=(17, 15, 13))
     _convert_cache_to_fp8(data)

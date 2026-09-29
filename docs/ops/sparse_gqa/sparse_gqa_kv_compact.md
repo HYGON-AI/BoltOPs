@@ -10,7 +10,7 @@
 ## 2. 接口说明
 
 ```python
-from boltops.fa.sparse_gqa import (
+from boltops.sparse_gqa import (
     qwen_sparse_kv_extraction_compact_hcu_fa_triton,
 )
 
@@ -115,21 +115,21 @@ tensor 校验上述索引上界和前缀和值；调用方必须在进入算子�
 ## 7. 正确性测试与性能基准
 
 ```bash
-PYTHONPATH=. pytest -q test/fa/test_sparse_gqa.py \
+PYTHONPATH=. pytest -q test/sparse_gqa/ \
   -k 'compact or fp8_compact'
 ```
 
 性能 case 通过总测试文件的 `--bench` 运行：
 
 ```bash
-PYTHONPATH=. pytest -q -s test/fa/test_sparse_gqa.py --bench
+PYTHONPATH=. pytest -q -s test/sparse_gqa/ --bench
 ```
 
 ## 附录 A. 仓库文件
 
 | 用途 | 文件 |
 | --- | --- |
-| 公开接口 | `boltops/fa/sparse_gqa/__init__.py` |
-| Triton 实现 | `boltops/fa/sparse_gqa/triton/kv_compact.py` |
-| 配置加载 | `boltops/fa/sparse_gqa/triton/config.py` |
-| 测试 | `test/fa/test_sparse_gqa.py` |
+| 公开接口 | `boltops/sparse_gqa/__init__.py` |
+| Triton 实现 | `boltops/sparse_gqa/triton/kv_compact.py` |
+| 配置加载 | `boltops/sparse_gqa/triton/config.py` |
+| 测试 | `test/sparse_gqa/` |
