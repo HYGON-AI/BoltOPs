@@ -9,9 +9,8 @@ from __future__ import annotations
 from typing import Iterator
 
 import torch
-import triton
 
-from ..bench import Case, KernelSpec
+from ..bench import Case, KernelSpec, dtype_str
 
 DTYPE = torch.float16
 M_VALUES = (
@@ -53,7 +52,6 @@ def _case(B: int, M: int, N: int, K: int, layout: str, common: dict) -> Case:
             "M": M,
             "N": N,
             "K": K,
-            "dtype": str(DTYPE).replace("torch.", ""),
             "block_pingpong": config.get("use_block_pingpong", False),
             "batch_last_grid": config.get("BATCH_LAST_GRID", False),
         },
@@ -63,14 +61,9 @@ def _case(B: int, M: int, N: int, K: int, layout: str, common: dict) -> Case:
 
 
 def cases() -> Iterator[Case]:
-    from boltops.utility.arch_info import get_arch
-
     common = {
-        "backend": "triton",
         "operator": "batched_gemm_bf16",
-        "dtype": str(DTYPE).replace("torch.", ""),
-        "triton_version": triton.__version__,
-        "arch": get_arch(),
+        "dtype": dtype_str(DTYPE),
     }
     for layout in ("tn", "tt"):
         for B, m_values, N, K in SHAPES:
@@ -82,10 +75,10 @@ SPEC = KernelSpec(
     backend="triton",
     kernel="batched_gemm_bf16",
     fieldnames=(
-        "backend", "operator", "layout", "mode", "B", "M", "N", "K",
+        "operator", "layout", "mode", "B", "M", "N", "K",
+        "block_pingpong", "batch_last_grid",
         "dtype", "triton_version", "arch",
         "latency_ms", "tflops",
-        "block_pingpong", "batch_last_grid",
     ),
     cases=cases,
     warmup_ms=10,

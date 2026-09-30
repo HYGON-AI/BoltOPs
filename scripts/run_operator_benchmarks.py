@@ -40,18 +40,24 @@ def main(argv: list[str] | None = None) -> int:
     output_dir = args.output_dir.resolve()
 
     names = args.kernels or sorted(specs)
-    failures = len(import_errors)
+    kernel_failures: dict[str, int] = {}
+    kernel_errors = 0
     for index, name in enumerate(names, 1):
         print(f"[{index}/{len(names)}] {name}", flush=True)
         try:
-            run_kernel(specs[name], output_dir)
+            kernel_failures[name] = run_kernel(specs[name], output_dir)
         except Exception:
-            failures += 1
+            kernel_errors += 1
             print(f"[{index}/{len(names)}] {name} FAILED", file=sys.stderr, flush=True)
             traceback.print_exc()
 
+    case_failures = sum(kernel_failures.values())
+    failures = len(import_errors) + kernel_errors + case_failures
+    for name, count in kernel_failures.items():
+        if count:
+            print(f"[summary] {name}: {count} case(s) failed", file=sys.stderr, flush=True)
     if failures:
-        print(f"{failures} benchmark target(s) failed", file=sys.stderr)
+        print(f"{failures} benchmark failure(s)", file=sys.stderr)
         return 1
     print(f"Wrote {len(names)} CSV file(s) to {output_dir}")
     return 0

@@ -35,9 +35,8 @@ import math
 from typing import Iterator
 
 import torch
-import triton
 
-from ..bench import Case, KernelSpec
+from ..bench import Case, KernelSpec, dtype_str
 
 CHUNK_SIZE = 64
 # (name, B, T, h_v, h_qk, K, V, dtype, lengths or None)
@@ -193,7 +192,7 @@ def _chunk_case(
             "h_v": h_v,
             "K": K,
             "V": V,
-            "dtype": str(dtype).replace("torch.", ""),
+            "dtype": dtype_str(dtype),
         },
         run=run,
         flops=flops,
@@ -234,7 +233,7 @@ def _packed_case(name: str, B: int, common: dict) -> Case:
             "h_v": h_v,
             "K": K,
             "V": V,
-            "dtype": str(DECODE_DTYPE).replace("torch.", ""),
+            "dtype": dtype_str(DECODE_DTYPE),
         },
         run=run,
         flops=flops,
@@ -282,7 +281,7 @@ def _sigmoid_update_case(name: str, N: int, steps: int, common: dict) -> Case:
             "h_v": HV,
             "K": K,
             "V": V,
-            "dtype": str(DECODE_DTYPE).replace("torch.", ""),
+            "dtype": dtype_str(DECODE_DTYPE),
         },
         run=run,
         flops=flops,
@@ -342,7 +341,7 @@ def _wu_case(
             "h_v": h_v,
             "K": K,
             "V": V,
-            "dtype": str(WU_DTYPE).replace("torch.", ""),
+            "dtype": dtype_str(WU_DTYPE),
         },
         run=run,
         flops=flops,
@@ -350,13 +349,8 @@ def _wu_case(
 
 
 def cases() -> Iterator[Case]:
-    from boltops.utility.arch_info import get_arch
-
     common = {
-        "backend": "triton",
         "operator": "gdn",
-        "triton_version": triton.__version__,
-        "arch": get_arch(),
     }
     for spec in CHUNK_SHAPES:
         yield _chunk_case(*spec, common=common)
@@ -372,8 +366,9 @@ SPEC = KernelSpec(
     backend="triton",
     kernel="gdn",
     fieldnames=(
-        "backend", "operator", "entry", "shape", "tokens", "seqs",
-        "h_qk", "h_v", "K", "V", "dtype", "triton_version", "arch",
+        "operator", "entry", "shape", "tokens", "seqs",
+        "h_qk", "h_v", "K", "V",
+        "dtype", "triton_version", "arch",
         "latency_ms", "tflops",
     ),
     cases=cases,
