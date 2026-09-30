@@ -9,6 +9,8 @@ nothing else to register.
 from __future__ import annotations
 
 import importlib
+import sys
+import traceback
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -36,6 +38,12 @@ def discover_specs() -> Tuple[Dict[str, KernelSpec], List[str]]:
                 module = importlib.import_module(f".{module_name}", __name__)
             except Exception as exc:
                 errors.append(f"{module_name}: {str(exc).splitlines()[-1]}")
+                print(
+                    f"[discover] {module_name} import failed:",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                traceback.print_exc()
                 continue
             spec = getattr(module, "SPEC", None)
             if spec is None:

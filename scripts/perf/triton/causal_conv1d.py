@@ -20,9 +20,8 @@ from __future__ import annotations
 from typing import Iterator
 
 import torch
-import triton
 
-from ..bench import Case, KernelSpec
+from ..bench import Case, KernelSpec, dtype_str
 
 X_DTYPE = torch.bfloat16
 WEIGHT_DTYPE = torch.float32
@@ -134,14 +133,9 @@ def _update_case(name: str, dim: int, batch: int, seqlen: int, port: str, common
 
 
 def cases() -> Iterator[Case]:
-    from boltops.utility.arch_info import get_arch
-
     common = {
-        "backend": "triton",
         "operator": "causal_conv1d",
-        "dtype": str(X_DTYPE).replace("torch.", ""),
-        "triton_version": triton.__version__,
-        "arch": get_arch(),
+        "dtype": dtype_str(X_DTYPE),
     }
     for port in ("sglang", "vllm"):
         for name, dim, lengths in FWD_SHAPES:
@@ -154,8 +148,9 @@ SPEC = KernelSpec(
     backend="triton",
     kernel="causal_conv1d",
     fieldnames=(
-        "backend", "operator", "op", "port", "shape", "dim", "width",
-        "batch", "tokens", "dtype", "triton_version", "arch",
+        "operator", "op", "port", "shape", "dim", "width",
+        "batch", "tokens",
+        "dtype", "triton_version", "arch",
         "latency_ms", "tflops",
     ),
     cases=cases,

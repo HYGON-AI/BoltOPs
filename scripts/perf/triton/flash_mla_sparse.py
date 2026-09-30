@@ -12,9 +12,8 @@ import math
 from typing import Iterator
 
 import torch
-import triton
 
-from ..bench import Case, KernelSpec
+from ..bench import Case, KernelSpec, dtype_str
 
 DTYPE = torch.bfloat16
 # (query tokens, KV tokens, query heads, KV heads, top-k, d_qk, d_v)
@@ -88,14 +87,11 @@ def cases() -> Iterator[Case]:
         _get_tuned_config,
     )
 
-    arch, device_name = _device_identity(torch.device("cuda"))
+    _, device_name = _device_identity(torch.device("cuda"))
     common = {
-        "backend": "triton",
         "operator": "flash_mla_sparse",
-        "triton_version": triton.__version__,
         "device_name": device_name,
-        "arch": arch,
-        "dtype": str(DTYPE).replace("torch.", ""),
+        "dtype": dtype_str(DTYPE),
     }
     for shape in SHAPES:
         s_q, s_kv, h_q, h_kv, topk, d_qk, d_v = shape
@@ -120,9 +116,10 @@ SPEC = KernelSpec(
     backend="triton",
     kernel="flash_mla_sparse",
     fieldnames=(
-        "backend", "operator", "mode", "triton_version", "device_name",
-        "arch", "s_q", "s_kv", "h_q", "h_kv", "topk", "d_qk", "d_v",
-        "dtype", "latency_ms", "tflops", "config",
+        "operator", "mode", "s_q", "s_kv", "h_q", "h_kv", "topk",
+        "d_qk", "d_v", "config", "device_name",
+        "dtype", "triton_version", "arch",
+        "latency_ms", "tflops",
     ),
     cases=cases,
     warmup_ms=100,

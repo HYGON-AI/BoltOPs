@@ -29,9 +29,8 @@ from __future__ import annotations
 from typing import Iterator
 
 import torch
-import triton
 
-from ..bench import Case, KernelSpec
+from ..bench import Case, KernelSpec, dtype_str
 
 DTYPE = torch.bfloat16
 HEADS = 24
@@ -171,14 +170,9 @@ def _pregated_case(name: str, N: int, common: dict) -> Case:
 
 
 def cases() -> Iterator[Case]:
-    from boltops.utility.arch_info import get_arch
-
     common = {
-        "backend": "triton",
         "operator": "kda_decode",
-        "dtype": str(DTYPE).replace("torch.", ""),
-        "triton_version": triton.__version__,
-        "arch": get_arch(),
+        "dtype": dtype_str(DTYPE),
     }
     for name, N in SHAPES:
         yield _dense_case(name, N, common)
@@ -190,7 +184,7 @@ SPEC = KernelSpec(
     backend="triton",
     kernel="kda_decode",
     fieldnames=(
-        "backend", "operator", "entry", "shape", "N", "H", "K", "V",
+        "operator", "entry", "shape", "N", "H", "K", "V",
         "dtype", "triton_version", "arch", "latency_ms", "tflops",
     ),
     cases=cases,
