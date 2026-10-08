@@ -6,13 +6,15 @@ export (e.g. ``tilelang_mqa_logits``) without renaming this API.
 * docs: ``docs/ops/mqa_logits.md`` (FP8 Triton), ``docs/ops/mqa_logits_tilelang.md`` (BF16 TileLang)
 * tests: ``test/mqa_logits/``
 
-Public operator:
+Public operators:
 
 * ``triton_mqa_logits`` — prefill / dense KV (Triton)
   - ``kv_scales`` provided → float8 path
   - ``kv_scales is None`` → fp16/bf16 path
 * ``tilelang_qsa_mqa_prefill`` — TileLang QSA prefill / dense KV
 * ``tilelang_qsa_mqa_decode`` — TileLang QSA paged decode
+* ``triton_fp8_paged_mqa_logits`` — FP8 paged decode, KVBlockSize=1 or 64 (Triton)
+  - ``triton_fp8_paged_mqa_logits_stage1`` → per-head scores (``out_qk.sum(dim=0)``)
 """
 
 from __future__ import annotations
@@ -395,4 +397,31 @@ __all__ = [
     "triton_mqa_logits",
     "tilelang_qsa_mqa_decode",
     "tilelang_qsa_mqa_prefill",
+    "triton_fp8_paged_mqa_logits",
+    "triton_fp8_paged_mqa_logits_prepare",
+    "triton_fp8_paged_mqa_logits_build_bucket_schedule",
+    "triton_fp8_paged_mqa_logits_stage1",
+    "PagedBatchInfo",
+    "PagedBucketSchedule",
 ]
+
+
+def __getattr__(name: str):
+    """Lazily expose the paged decode entries.
+
+    The paged kernels live in ``boltops.mqa_logits.triton.fp8_paged_mqa_logits``
+    and pull in arch helpers, so they are imported on first use rather than
+    at package import time.
+    """
+    if name in (
+        "triton_fp8_paged_mqa_logits",
+        "triton_fp8_paged_mqa_logits_prepare",
+        "triton_fp8_paged_mqa_logits_build_bucket_schedule",
+        "triton_fp8_paged_mqa_logits_stage1",
+        "PagedBatchInfo",
+        "PagedBucketSchedule",
+    ):
+        from boltops.mqa_logits.triton import fp8_paged_mqa_logits as _mod
+
+        return getattr(_mod, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

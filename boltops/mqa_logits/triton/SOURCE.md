@@ -41,4 +41,5 @@ Launch configs:
   `tune_fp8_mqa_logits_gluon.py` — FP8 retune
 - `PERFORMANCE.md` — notes
 
-Paged decode (`fp8_paged_mqa_logits`) is intentionally not shipped in this MR.
+Paged decode 入口为 `boltops.mqa_logits.triton_fp8_paged_mqa_logits`（`KVBlockSize=1`
+per-token `kv_indices`，或 `KVBlockSize=64` 非 preshuffle 页表路径）。
