@@ -88,6 +88,7 @@ packages = [
     "boltops.fla.gdn",
     "boltops.fla.gdn.triton",
     "boltops.fla.gdn.triton.configs",
+    "boltops.fla.gdn.tilelang",
     "boltops.mhc",
     "boltops.mhc.tilelang",
     "boltops.mhc.tilelang.configs",

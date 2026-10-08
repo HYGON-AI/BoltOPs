@@ -413,6 +413,45 @@ output = chunk_fwd_o(
 `use_exp2=True` 时必须提供 log2空间的累计 gate。varlen模式要求 `B=1`，每条
 sequence在自己的 chunk边界重新累计 gate。
 
+### 4.3 TileLang backend（gfx938）
+
+公开的 `boltops.fla.gdn` 接口默认使用 Triton。需要显式使用 TileLang 时，从
+TileLang backend 导入同签名接口：
+
+```python
+from boltops.fla.gdn.tilelang.chunk_delta_h import (
+    chunk_gated_delta_rule_fwd_h,
+)
+from boltops.fla.gdn import chunk_fwd_o
+```
+
+`chunk_gated_delta_rule_fwd_h` 当前支持范围：
+
+- gfx938、fixed-length/varlen、`chunk_size=64`、BF16
+- `K=128`、`V % 32 == 0`、`Hg == H`
+- FP32 scalar累计 gate `g`，不支持 `gk` 或 `use_exp2=True`
+- VK state布局，即 `transpose_state_layout=True`
+- 要求 `output_final_state=True`、`save_new_value=True`；支持
+  `inplace_final_state=True`，此时必须提供 FP32 `initial_state`，并按
+  `initial_state_indices` 原地写回和返回同一 tensor
+- copy-pipeline支持动态 `T` 和 varlen；varlen通过 `cu_seqlens` 提供每条
+  sequence边界，`chunk_indices=None` 时由 wrapper自动生成
+- fixed模式要求 `T >= 64`；varlen支持短于64的 sequence以及非完整尾 chunk
+
+`kernel_cfg` 可选择两个 gfx938 kernel：
+
+```python
+# 默认；支持非对齐 T 和 varlen
+kernel_cfg = {"implementation": "copy-pipeline"}
+
+# 4 producer + 4 consumer WASP实现；fixed要求 T % 64 == 0
+kernel_cfg = {"implementation": "wasp_4p4c"}
+```
+
+TileLang backend当前只替换 `chunk_gated_delta_rule_fwd_h`；后续
+`chunk_fwd_o` 仍使用公开接口提供的 Triton实现。TileLang `chunk_h` 的序列长度是
+运行时参数，相同 shape配置可复用同一 kernel处理不同 `T`。
+
 ## 5. 使用约束
 
 - 所有计算 tensor必须位于同一 CUDA/HIP device
@@ -454,6 +493,21 @@ pytest -q test/fla/test_gdn_sigmoid_gating.py
 
 # Chunk h/o
 pytest -q test/fla/test_gdn_chunk.py
+
+# TileLang WASP chunk h：fixed + varlen正确性
+PYTHONPATH=. TILELANG_CACHE_DIR=./cache pytest -q -s \
+  'test/fla/test_gdn_chunk.py::test_chunk_h_and_o_match_fla_torch_reference[tilelang-fixed]' \
+  'test/fla/test_gdn_chunk.py::test_chunk_h_and_o_match_fla_torch_reference[tilelang-varlen]'
+
+# TileLang/AITER chunk h fixed性能对比
+PYTHONPATH=. TILELANG_CACHE_DIR=./cache pytest -q -s \
+  --bench --bench-warmup=5 --bench-repeat=20 --bench-t=13312 \
+  test/fla/test_gdn_chunk.py::test_bench_chunk_h_o_tflops[tilelang-vk-fixed]
+
+# TileLang/AITER chunk h varlen性能对比
+PYTHONPATH=. TILELANG_CACHE_DIR=./cache pytest -q -s \
+  --bench --bench-warmup=5 --bench-repeat=20 --bench-t=13312 \
+  test/fla/test_gdn_chunk.py::test_bench_chunk_h_o_tflops[tilelang-vk-varlen]
 ```
 
 性能输出规则：
@@ -461,12 +515,13 @@ pytest -q test/fla/test_gdn_chunk.py
 - packed decode、普通 sigmoid、speculative verify 主要受 state/cache流量限制，报告
   latency和逻辑有效带宽 `GB/s`
 - chunk h、chunk o及二者端到端为矩阵计算密集型，报告 latency和 `TFLOPS`
-- 性能测试只测 Bolt当前实现，不运行 reference、不计算 speedup，也不设置固定性能阈值
+- chunk VK的 TileLang fixed/varlen case额外运行 AITER chunk-h作为性能参考
+- 性能测试不设置固定性能阈值
 
 ## 7. 性能数据
 
-下表为当前 Triton实现的实测数据。带宽型接口使用 `GB/s`，计算密集型接口使用
-`TFLOPS`。默认计时参数：
+下表为实测数据。带宽型接口使用 `GB/s`，计算密集型接口使用 `TFLOPS`。
+除表中单独标注的条目外，历史数据的默认计时参数为：
 
 ```text
 gfx936: HIP_VISIBLE_DEVICES=5
@@ -479,8 +534,8 @@ repeat=50
 
 | Shape | gfx936 | gfx938 |
 |---|---:|---:|
-| `B=1, T=13320, H=16, Hg=8, K=128, V=128, BT=64, FP16, fixed` | 0.604 ms / 23.12 TFLOPS | 1.579 ms / 8.85 TFLOPS |
-| `B=1, lengths=[4097,4911,4312], H=16, Hg=8, K=128, V=128, BT=64, FP16, varlen` | 0.511 ms / 27.32 TFLOPS | 1.068 ms / 13.08 TFLOPS |
+| `B=1, T=13312, H=Hg=16, K=128, V=128, BT=64, BF16, fixed, VK (warmup=5, repeat=20)` | TileLang: 0.777 ms / 17.96 TFLOPS; AITER: 0.791 ms / 17.64 TFLOPS | TileLang WASP: 0.396 ms / 35.25 TFLOPS; AITER: 0.641 ms / 21.77 TFLOPS |
+| `B=1, lengths=[4437,4437,4438], H=Hg=16, K=128, V=128, BT=64, BF16, varlen, VK (warmup=5, repeat=20)` | TileLang: 0.852 ms / 16.39 TFLOPS; AITER: 0.642 ms / 21.73 TFLOPS | TileLang WASP: 0.435 ms / 32.11 TFLOPS; AITER: 0.411 ms / 33.96 TFLOPS |
 
 ### `chunk_fwd_o`
 

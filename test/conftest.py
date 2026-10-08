@@ -43,6 +43,17 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         default=50,
         help="CUDA timed iters for --bench/--benchmark (default: 50)",
     )
+    group.addoption(
+        "--bench-t",
+        "--bench-seq-len",
+        dest="bench_seq_len",
+        type=int,
+        default=None,
+        help=(
+            "override the sequence length T for benchmarks that support it "
+            "(default: benchmark-specific)"
+        ),
+    )
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -82,6 +93,12 @@ def bench_warmup(request: pytest.FixtureRequest) -> int:
 @pytest.fixture
 def bench_repeat(request: pytest.FixtureRequest) -> int:
     return int(request.config.getoption("--bench-repeat"))
+
+
+@pytest.fixture
+def bench_seq_len(request: pytest.FixtureRequest) -> int | None:
+    value = request.config.getoption("--bench-seq-len")
+    return None if value is None else int(value)
 
 
 @pytest.fixture
