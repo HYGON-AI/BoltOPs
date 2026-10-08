@@ -3,14 +3,14 @@
     "arch": "gfx938",
     "triton": "3.6.0",
     "source": "fp8_mqa_logits_gluon_all_sizes_tune_gfx938.json",
-    "note": "Prefer by_region (seq_len_leq / seq_kv_leq / num_heads_leq); legacy by_shape / by_seq_kv still readable. Coarse Q/KV/H buckets (M in {32,64,128}) aggregated from all-sizes Gluon tune (not exact grid)."
+    "note": "Prefer by_region (seq_len_leq / seq_kv_leq / num_heads_leq); legacy by_shape / by_seq_kv still readable. Coarse Q/KV/H buckets (M in {32,64,128}) aggregated from all-sizes Gluon tune (not exact grid). Default w_group raised 16->32: every by_region entry only covers seq_len_leq<=128, so real prefill shapes (M in the thousands) fall through to default; measured 16->32 gains 0.8-4.4% for M>=256 regardless of H (M=128 regresses 3% but has its own region entry)."
   },
   "default": {
     "main": {
       "block_m": 32,
       "block_n": 128,
       "head_split_k": 1,
-      "w_group": 16,
+      "w_group": 32,
       "kv_tiles_n": 2,
       "num_stages": 2,
       "waves_per_eu": 0,

@@ -2,20 +2,24 @@
 
 Backends under test: ``row``, ``bn``, ``gluon`` (plus public ``auto``).
 
-Size-grid benches reuse the prefill shape list from
-``lightop/test/mqa_logits/test_mqa_logits.py`` (Q×KV×H, D=128). Implementation
-code does not depend on lightop; optional ``--bench -k vs_lightop`` compares
-latency when ``lightop`` is importable.
+Size-grid benches reuse the prefill shape list from hipc / aiter lineage tests
+(Q×KV×H, D=128). Implementation code does not depend on hipc; optional
+``--bench`` compares latency when hipc is importable:
+
+* ``-k vs_hipc_size`` — synthetic size grid
+* ``-k vs_hipc_prod`` — 50 production prefill slices (GLM / V4 CSA / PP_Stage0)
 """
 
 from __future__ import annotations
 
+import statistics
 from typing import Callable, Tuple
 
 import pytest
 import torch
 
 pytest.importorskip("triton")
+import triton  # noqa: E402
 
 from boltops.mqa_logits import triton_mqa_logits  # noqa: E402
 from boltops.utility.arch_info import get_fp8_e4m3_dtype  # noqa: E402
@@ -28,11 +32,35 @@ GPU_REQUIRED = pytest.mark.skipif(
 e4m3_type = get_fp8_e4m3_dtype()
 fp8_max = torch.finfo(e4m3_type).max
 
-# Prefill size grid from lightop/test/mqa_logits/test_mqa_logits.py (cuda list).
+# Prefill size grid from hipc / aiter lineage tests (cuda list).
 _SIZE_GRID_Q = (16, 32, 64, 127)
 _SIZE_GRID_KV = (66, 4096, 8192, 16384, 32768, 65536, 131072)
 _SIZE_GRID_H = (8, 64)
 _SIZE_GRID_D = 128
+
+# Production prefill slices (50 shapes): GLM chunked / V4 CSA / V4 PP_Stage0.
+_PROD_SLICE_D = 128
+_PROD_SLICE_SHAPES: list[tuple[int, int, int, str]] = (
+    [(6656, 6656 * (i + 1), 32, "glm") for i in range(10)]
+    + [(6656, 1664 * (i + 1), 64, "v4_csa") for i in range(20)]
+    + [
+        (6656, kv, 64, "v4_ppstage0")
+        for kv in (
+            3167, 6334, 9502, 12669, 15836, 19003, 22170, 25337, 28505,
+            31672, 34839, 38006, 41173, 44340, 47508, 50675, 53842, 57009,
+            60176, 62369,
+        )
+    ]
+)
+
+
+def _prod_slice_params():
+    for s_q, s_k, num_heads, family in _PROD_SLICE_SHAPES:
+        yield pytest.param(
+            s_q, s_k, num_heads, family,
+            id=f"{family}-{s_q}x{s_k}-H{num_heads}",
+        )
+
 
 # Correctness covers all three backends on a compact, representative set.
 _CORRECTNESS_SHAPES = [
@@ -270,7 +298,7 @@ def test_bench_fp8_mqa_logits_size_grid(
     bench_repeat: int,
     time_ms,
 ) -> None:
-    """Perf on the lightop prefill size grid (auto backend)."""
+    """Perf on the hipc / aiter prefill size grid (auto backend)."""
     q_fp8, kv_fp8, scales, weights, ks, ke = _make_inputs(
         s_q, s_k, num_heads, head_dim, disable_cp=True
     )
@@ -328,19 +356,20 @@ def test_bench_fp8_mqa_logits_backends_size_grid(
     )
 
 
-def _require_lightop():
+def _require_hipc():
+    """Import hipc reference (package still installs as ``lightop``)."""
     try:
-        import lightop  # noqa: WPS433
+        import lightop as hipc  # noqa: WPS433
     except ImportError as exc:
-        pytest.skip(f"lightop not available: {exc}")
-    return lightop
+        pytest.skip(f"hipc not available: {exc}")
+    return hipc
 
 
 @GPU_REQUIRED
 @pytest.mark.bench
 @pytest.mark.parametrize("s_q,s_k,num_heads,head_dim", list(_size_grid_params()))
 @torch.inference_mode()
-def test_bench_fp8_mqa_logits_vs_lightop_size_grid(
+def test_bench_fp8_mqa_logits_vs_hipc_size_grid(
     s_q: int,
     s_k: int,
     num_heads: int,
@@ -349,13 +378,13 @@ def test_bench_fp8_mqa_logits_vs_lightop_size_grid(
     bench_repeat: int,
     time_ms: Callable[[Callable[[], None], int, int], float],
 ) -> None:
-    """Optional: same lightop size grid, BoltOPs auto vs lightop.mqa_logits."""
-    lightop = _require_lightop()
+    """Optional: same hipc size grid, BoltOPs auto vs hipc.mqa_logits."""
+    hipc = _require_hipc()
     q_fp8, kv_fp8, scales, weights, ks, ke = _make_inputs(
         s_q, s_k, num_heads, head_dim, disable_cp=True
     )
     d_out = torch.empty(s_q, s_k, device=DEVICE, dtype=torch.float32)
-    lo_out = torch.empty(s_q, s_k, device=DEVICE, dtype=torch.float32)
+    hi_out = torch.empty(s_q, s_k, device=DEVICE, dtype=torch.float32)
     flops = useful_flops(ks, ke, num_heads, head_dim)
 
     def run_boltops():
@@ -363,21 +392,113 @@ def test_bench_fp8_mqa_logits_vs_lightop_size_grid(
             q_fp8, kv_fp8, scales, weights, ks, ke, D_out=d_out, backend="auto"
         )
 
-    def run_lightop():
-        lightop.mqa_logits(
-            q_fp8, kv_fp8, weights, ks, ke, scales, clean_logit=True, D_out=lo_out
+    def run_hipc():
+        hipc.mqa_logits(
+            q_fp8, kv_fp8, weights, ks, ke, scales, clean_logit=True, D_out=hi_out
         )
 
     ms_boltops = time_ms(run_boltops, bench_warmup, bench_repeat)
-    ms_lightop = time_ms(run_lightop, bench_warmup, bench_repeat)
-    ratio = ms_lightop / ms_boltops if ms_boltops > 0 else float("inf")
+    ms_hipc = time_ms(run_hipc, bench_warmup, bench_repeat)
+    ratio = ms_hipc / ms_boltops if ms_boltops > 0 else float("inf")
     print(
-        f"[bench vs_lightop size-grid] {s_q}x{s_k} H={num_heads}\n"
+        f"[bench vs_hipc size-grid] {s_q}x{s_k} H={num_heads}\n"
         f"  boltops : {ms_boltops:.3f} ms, "
         f"{flops / (ms_boltops * 1e-3) / 1e12:.2f} TFLOPS\n"
-        f"  lightop : {ms_lightop:.3f} ms, "
-        f"{flops / (ms_lightop * 1e-3) / 1e12:.2f} TFLOPS\n"
-        f"  lightop/boltops: {ratio:.2f}x (>1 means boltops is faster)"
+        f"  hipc    : {ms_hipc:.3f} ms, "
+        f"{flops / (ms_hipc * 1e-3) / 1e12:.2f} TFLOPS\n"
+        f"  hipc/boltops: {ratio:.2f}x (>1 means boltops is faster)"
+    )
+
+
+def _ab_ms(
+    fn_bo: Callable[[], None],
+    fn_hi: Callable[[], None],
+    *,
+    rounds: int = 5,
+) -> tuple[float, float, float]:
+    """Interleaved BoltOPs/hipc timing; median + 3×MAD-robust ratio."""
+    bo, hi, ratios = [], [], []
+    for _ in range(rounds):
+        a = float(triton.testing.do_bench(fn_bo, warmup=25, rep=80))
+        b = float(triton.testing.do_bench(fn_hi, warmup=25, rep=80))
+        bo.append(a)
+        hi.append(b)
+        if a > 0:
+            ratios.append(b / a)
+
+    def _median(xs: list[float]) -> float:
+        return float(statistics.median(xs))
+
+    def _robust(xs: list[float]) -> float:
+        med = _median(xs)
+        mad = _median([abs(x - med) for x in xs])
+        if mad == 0:
+            return med
+        keep = [x for x in xs if abs(x - med) <= 3 * 1.4826 * mad]
+        return _median(keep or xs)
+
+    return _median(bo), _median(hi), _robust(ratios)
+
+
+@GPU_REQUIRED
+@pytest.mark.bench
+@pytest.mark.parametrize("s_q,s_k,num_heads,family", list(_prod_slice_params()))
+@torch.inference_mode()
+def test_bench_fp8_mqa_logits_vs_hipc_prod_slices(
+    s_q: int,
+    s_k: int,
+    num_heads: int,
+    family: str,
+) -> None:
+    """50 production prefill slices: BoltOPs auto vs hipc.
+
+    Run with::
+
+        pytest -q test/mqa_logits/test_fp8_mqa_logits.py --bench -s -k vs_hipc_prod
+    """
+    hipc = _require_hipc()
+    from boltops.mqa_logits.triton.mqa_config_utils import get_fp8_mqa_shape_dispatch
+
+    q_fp8, kv_fp8, scales, weights, ks, ke = _make_inputs(
+        s_q, s_k, num_heads, _PROD_SLICE_D, disable_cp=True
+    )
+    out_bo = torch.empty(s_q, s_k, device=DEVICE, dtype=torch.float32)
+    out_hi = torch.empty_like(out_bo)
+    disp = get_fp8_mqa_shape_dispatch(
+        s_q, s_k, num_heads, gluon_available=_gluon_available()
+    )
+    path = disp.get("path", "?")
+    sk = int(disp.get("head_split_k", 1))
+
+    def run_boltops():
+        triton_mqa_logits(
+            q_fp8, kv_fp8, scales, weights, ks, ke, D_out=out_bo, backend="auto"
+        )
+
+    def run_hipc():
+        hipc.mqa_logits(
+            q_fp8, kv_fp8, weights, ks, ke, scales, True, out_hi
+        )
+
+    # Accuracy on dedicated buffers (not the timed outs).
+    acc_bo = torch.empty_like(out_bo)
+    got = triton_mqa_logits(
+        q_fp8, kv_fp8, scales, weights, ks, ke, D_out=acc_bo, backend="auto"
+    )
+    _assert_close_to_ref(
+        got, q_fp8, kv_fp8, scales, weights, ks, ke, atol_diff=2e-2
+    )
+
+    ms_bo, ms_hi, ratio = _ab_ms(run_boltops, run_hipc)
+    flops = useful_flops(ks, ke, num_heads, _PROD_SLICE_D)
+    print(
+        f"[bench vs_hipc_prod] {family} {s_q}x{s_k} H={num_heads} "
+        f"path={path} sk={sk}\n"
+        f"  boltops : {ms_bo:.4f} ms, "
+        f"{flops / (ms_bo * 1e-3) / 1e12:.2f} TFLOPS\n"
+        f"  hipc    : {ms_hi:.4f} ms, "
+        f"{flops / (ms_hi * 1e-3) / 1e12:.2f} TFLOPS\n"
+        f"  hipc/boltops: {ratio:.3f}x (>1 means boltops is faster)"
     )
 
 
@@ -522,7 +643,7 @@ def test_mqa_logits_half_gluon_bn_align(
     ],
 )
 @torch.inference_mode()
-def test_bench_mqa_logits_half_vs_lightop(
+def test_bench_mqa_logits_half_vs_hipc(
     dtype: torch.dtype,
     s_q: int,
     s_k: int,
@@ -531,34 +652,34 @@ def test_bench_mqa_logits_half_vs_lightop(
     bench_warmup: int,
     bench_repeat: int,
 ) -> None:
-    lightop = pytest.importorskip("lightop")
+    hipc = _require_hipc()
     from boltops.mqa_logits import triton_mqa_logits
 
     q, kv, weights, ks, ke = _make_half_inputs(s_q, s_k, num_heads, 128, dtype)
     out_bo = torch.empty(s_q, s_k, device=DEVICE, dtype=torch.float32)
-    out_lo = torch.empty_like(out_bo)
+    out_hi = torch.empty_like(out_bo)
 
     def run_boltops():
         return triton_mqa_logits(q, kv, None, weights, ks, ke, D_out=out_bo)
 
-    def run_lightop():
-        return lightop.mqa_logits(
-            q, kv, weights, ks, ke, None, clean_logit=True, D_out=out_lo
+    def run_hipc():
+        return hipc.mqa_logits(
+            q, kv, weights, ks, ke, None, clean_logit=True, D_out=out_hi
         )
 
     got = run_boltops().clone()
-    ref = run_lightop().clone()
+    ref = run_hipc().clone()
     finite = torch.isfinite(ref) & torch.isfinite(got)
     if bool(finite.any()):
         md = (got - ref).abs()[finite].max().item()
         assert md < 5e-2, f"max abs diff {md}"
 
     ms_bo = time_ms(run_boltops, bench_warmup, bench_repeat)
-    ms_lo = time_ms(run_lightop, bench_warmup, bench_repeat)
-    ratio = ms_lo / ms_bo if ms_bo > 0 else float("inf")
+    ms_hi = time_ms(run_hipc, bench_warmup, bench_repeat)
+    ratio = ms_hi / ms_bo if ms_bo > 0 else float("inf")
     print(
-        f"[bench half vs_lightop] {s_q}x{s_k} H={num_heads} {dtype}\n"
-        f"  boltops: {ms_bo:.3f} ms  lightop: {ms_lo:.3f} ms  "
-        f"lo/bo: {ratio:.2f}x"
+        f"[bench half vs_hipc] {s_q}x{s_k} H={num_heads} {dtype}\n"
+        f"  boltops: {ms_bo:.3f} ms  hipc: {ms_hi:.3f} ms  "
+        f"hi/bo: {ratio:.2f}x"
     )
 
