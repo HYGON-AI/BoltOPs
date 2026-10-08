@@ -87,8 +87,6 @@ if _GLUON_AVAILABLE:
         BLOCK_N: tl.constexpr,
         ASSUME_KS_ZERO: tl.constexpr,
         MFMA_VERSION: tl.constexpr,
-        USE_STORE_MASK: tl.constexpr,
-        ASSUME_TILE_IN_WINDOW: tl.constexpr,
         # MFMA N tiling: tiles_n=2 → 4 warps (default); tiles_n=1 → 8 warps.
         KV_TILES_N: tl.constexpr,
         NUM_WARPS: tl.constexpr,
@@ -201,19 +199,12 @@ if _GLUON_AVAILABLE:
                     dtype=tl.float32,
                     layout=mfma_layout,
                 )
-                if USE_STORE_MASK:
-                    gl.amd.cdna3.buffer_store(
-                        gl.convert_layout(neg_inf, layout_store),
-                        ptr=logits_ptr,
-                        offsets=store_off,
-                        mask=store_mask,
-                    )
-                else:
-                    gl.amd.cdna3.buffer_store(
-                        gl.convert_layout(neg_inf, layout_store),
-                        ptr=logits_ptr,
-                        offsets=store_off,
-                    )
+                gl.amd.cdna3.buffer_store(
+                    gl.convert_layout(neg_inf, layout_store),
+                    ptr=logits_ptr,
+                    offsets=store_off,
+                    mask=store_mask,
+                )
             return
 
         kv_scales = gl.amd.cdna3.buffer_load(
@@ -392,25 +383,17 @@ if _GLUON_AVAILABLE:
                 )
             store_ok = m_mask[:, None] & n_mask[None, :]
             if NUM_SPLITS == 1:
-                if ASSUME_TILE_IN_WINDOW:
-                    out_st = gl.convert_layout(acc, layout_store)
-                else:
-                    neg_inf = gl.full(
-                        [BLOCK_M, BLOCK_N],
-                        float("-inf"),
-                        dtype=tl.float32,
-                        layout=mfma_layout,
-                    )
-                    out = tl.where(in_window & store_ok, acc, neg_inf)
-                    out_st = gl.convert_layout(out, layout_store)
-                if USE_STORE_MASK:
-                    gl.amd.cdna3.buffer_store(
-                        out_st, ptr=logits_ptr, offsets=store_off, mask=store_mask
-                    )
-                else:
-                    gl.amd.cdna3.buffer_store(
-                        out_st, ptr=logits_ptr, offsets=store_off
-                    )
+                neg_inf = gl.full(
+                    [BLOCK_M, BLOCK_N],
+                    float("-inf"),
+                    dtype=tl.float32,
+                    layout=mfma_layout,
+                )
+                out = tl.where(in_window & store_ok, acc, neg_inf)
+                out_st = gl.convert_layout(out, layout_store)
+                gl.amd.cdna3.buffer_store(
+                    out_st, ptr=logits_ptr, offsets=store_off, mask=store_mask
+                )
             else:
                 acc_st = gl.convert_layout(acc, layout_store)
                 in_window_st = gl.convert_layout(in_window, layout_store)
@@ -454,22 +437,16 @@ if _GLUON_AVAILABLE:
 
             acc_st = gl.convert_layout(acc, layout_store)
             if NUM_SPLITS == 1:
-                if ASSUME_TILE_IN_WINDOW:
-                    out = acc_st
-                else:
-                    neg_inf = gl.full(
-                        [BLOCK_M, BLOCK_N],
-                        float("-inf"),
-                        dtype=tl.float32,
-                        layout=layout_store,
-                    )
-                    out = tl.where(in_window_st & store_mask, acc_st, neg_inf)
-                if USE_STORE_MASK:
-                    gl.amd.cdna3.buffer_store(
-                        out, ptr=logits_ptr, offsets=store_off, mask=store_mask
-                    )
-                else:
-                    gl.amd.cdna3.buffer_store(out, ptr=logits_ptr, offsets=store_off)
+                neg_inf = gl.full(
+                    [BLOCK_M, BLOCK_N],
+                    float("-inf"),
+                    dtype=tl.float32,
+                    layout=layout_store,
+                )
+                out = tl.where(in_window_st & store_mask, acc_st, neg_inf)
+                gl.amd.cdna3.buffer_store(
+                    out, ptr=logits_ptr, offsets=store_off, mask=store_mask
+                )
             else:
                 add_mask = store_mask & in_window_st
                 gl.amd.cdna3.buffer_atomic_add(
@@ -516,8 +493,6 @@ def fp8_mqa_logits_gluon(
     force_row_kernel: bool = False,
     force_gluon_kernel: bool = False,
     assume_ks_zero: bool = False,
-    store_mask: bool = True,
-    assume_tile_in_window: bool = False,
     kv_tiles_n: Optional[int] = None,
     w_group: Optional[int] = None,
     head_split_k: Optional[int] = None,
@@ -762,8 +737,6 @@ def fp8_mqa_logits_gluon(
         num_stages=num_stages,
         ASSUME_KS_ZERO=assume_ks_zero,
         MFMA_VERSION=_mfma_version_for_arch(),
-        USE_STORE_MASK=store_mask,
-        ASSUME_TILE_IN_WINDOW=assume_tile_in_window,
         KV_TILES_N=int(kv_tiles_n),
         NUM_WARPS=int(num_warps),
         W_GROUP=w_grp,
