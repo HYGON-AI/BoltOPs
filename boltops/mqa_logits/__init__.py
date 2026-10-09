@@ -173,13 +173,13 @@ def _triton_mqa_logits(
             )
         if backend_norm in ("gluon_bn_align", "gluon-exp", "gluon_exp"):
             from boltops.mqa_logits.triton.fp8_mqa_logits_gluon import (
-                gluon_prefill_available,
+                gluon_language_available,
             )
             from boltops.mqa_logits.triton.mqa_logits_half_gluon_bn_align import (
                 mqa_logits_half_gluon_bn_align,
             )
 
-            if not gluon_prefill_available():
+            if not gluon_language_available():
                 raise RuntimeError(
                     "backend='gluon_bn_align' requested but Gluon is unavailable"
                 )

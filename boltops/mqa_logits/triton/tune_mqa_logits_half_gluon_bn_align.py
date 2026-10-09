@@ -22,7 +22,7 @@ from typing import Any
 
 import torch
 
-from boltops.mqa_logits.triton.fp8_mqa_logits_gluon import gluon_prefill_available
+from boltops.mqa_logits.triton.fp8_mqa_logits_gluon import gluon_language_available
 from boltops.mqa_logits.triton.mqa_logits_half_gluon_bn_align import (
     mqa_logits_half_gluon_bn_align,
 )
@@ -308,7 +308,7 @@ def main() -> None:
     args = p.parse_args()
 
     torch.cuda.set_device(args.gpu)
-    if not gluon_prefill_available():
+    if not gluon_language_available():
         raise RuntimeError("Gluon is not available in this Triton build")
 
     caps = get_triton_capabilities()

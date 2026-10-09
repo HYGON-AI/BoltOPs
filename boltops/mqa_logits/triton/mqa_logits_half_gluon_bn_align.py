@@ -21,7 +21,7 @@ import triton.language as tl
 from boltops.mqa_logits.triton.fp8_mqa_logits import _filter_hip_launch_kwargs
 from boltops.mqa_logits.triton.fp8_mqa_logits_gluon import (
     _mfma_version_for_arch,
-    gluon_prefill_available,
+    gluon_language_available,
 )
 from boltops.mqa_logits.triton.mqa_config_utils import (
     clamp_gluon_w_group,
@@ -817,7 +817,7 @@ def mqa_logits_half_gluon_bn_align(
     epilogue on the all-sizes grid vs lightop).
     Tile / warps / split from ``get_half_bn_dispatch`` (+ half JSON).
     """
-    if not gluon_prefill_available() or not _GLUON_AVAILABLE:
+    if not gluon_language_available() or not _GLUON_AVAILABLE:
         raise RuntimeError("Gluon bn_align requires triton.experimental.gluon")
 
     if Q.dtype != KV.dtype or Q.dtype not in (torch.float16, torch.bfloat16):
