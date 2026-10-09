@@ -416,6 +416,13 @@ def _flatten_half_entry(entry: dict[str, Any]) -> dict[str, Any]:
         "block_m",
         "block_n",
         "head_split_k",
+        # Optional per-shape overrides for the kernel-level knobs.  Absent from
+        # every shipped entry today, so this changes nothing by default; it just
+        # lets a tune record them without another code change.
+        "q_depth",
+        "enable_v_mmac_cluster",
+        "matrix_instr_nonkdim",
+        "kpack",
     ):
         if key in main:
             out[key] = main[key]

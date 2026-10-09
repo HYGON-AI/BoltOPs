@@ -3,7 +3,7 @@
     "arch": "gfx938",
     "source": "mqa_logits_half_row_short_kv_tune_gfx938.json",
     "kernel": "mqa_logits_half_row",
-    "note": "short-KV only; compare includes BN / Gluon / lightop"
+    "note": "short-KV only; compare includes BN / Gluon / hipc"
   },
   "by_shape": [
     {
@@ -43,7 +43,7 @@
       "main": {
         "block_kv": 16,
         "num_warps": 2,
-        "num_stages": 2,
+        "num_stages": 1,
         "waves_per_eu": 0,
         "head_split_k": 1
       }
@@ -71,7 +71,7 @@
       "main": {
         "block_kv": 16,
         "num_warps": 2,
-        "num_stages": 2,
+        "num_stages": 1,
         "waves_per_eu": 0,
         "head_split_k": 1
       }
@@ -85,7 +85,7 @@
       "main": {
         "block_kv": 128,
         "num_warps": 4,
-        "num_stages": 2,
+        "num_stages": 1,
         "waves_per_eu": 0,
         "head_split_k": 1
       }

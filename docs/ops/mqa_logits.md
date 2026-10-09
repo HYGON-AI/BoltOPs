@@ -31,6 +31,9 @@ pytest -q test/mqa_logits/test_fp8_mqa_logits.py --bench -s -k vs_hipc_prod
 pytest -q test/mqa_logits/test_mqa_logits_half_size_grid.py --bench -s -k vs_hipc
 ```
 
+half 官方网格：`test/mqa_logits/test_mqa_logits_half_size_grid.py`；
+gfx938 vs hipc 见 `boltops/mqa_logits/triton/PERFORMANCE.md`。
+
 溯源：`boltops/mqa_logits/triton/SOURCE.md`。  
 性能笔记：`boltops/mqa_logits/triton/PERFORMANCE.md`。  
 Launch 配置：`configs/triton_<capability>/fp8_mqa_logits*,arch=<gfx>.json` 与 half 对应 JSON；

@@ -21,29 +21,30 @@ row beating BN go to ``mqa_logits_half_row``; else tuned ``mqa_logits_half``
 BN (exact ``by_shape``, then optional ``by_region`` / ``by_seq_kv``). Half Gluon
 (`backend="gluon_bn_align"`, BN-style epilogue default) is **opt-in**, not auto.
 
-## vs lightop (prefill size grid)
+## vs hipc (prefill size grid)
 
-Speedup = `lightop_ms / boltops_ms` (>1 BoltOPs faster). Same shapes / windows /
+Speedup = `hipc_ms / boltops_ms` (>1 BoltOPs faster). Same shapes / windows /
 preallocated `D_out`.
 
-| Runtime | Path | ≥0.98× LO | geo mean | note |
+| Runtime | Path | ≥0.98× HIPC | geo mean | note |
 | --- | --- | --- | --- | --- |
 | Triton 3.6+ (Gluon) | float8 auto `row\|gluon` | **54/54** | **~1.27×** | BN-style epilogue; Gluon launch via Q/KV/H ``by_region`` |
 | No Gluon (e.g. 3.2) | float8 auto `row\|bn` | **41/54** | **~1.06×** | weaker on some large-`N`+`H=64` / small-`M`+`H=8` |
-| Triton 3.6 | **half auto `row\|bn`** | **50/54** | **~1.41×** | ship default; row on `32×66`/`64×66` H=64 |
-| Triton 3.6 | half Gluon `bn_align` (opt-in) | **48/54** | **~1.36×** | often close to BN; loses more on short-N H=64 |
+| Triton 3.6 | **half auto `row\|bn`** | **66/66** | **1.70×** | official 66-shape half grid; 64 faster, 2 ties, 0 slower |
+| Triton 3.6 | half Gluon `bn_align` (opt-in) | 48/54 | ~1.36× | 54-grid measurement, **not** re-run on the 66 grid |
 
-Float8 auto meets ≥0.98× LO on all 54 grid points under ``by_region``
+Float8 auto meets ≥0.98× HIPC on all 54 grid points under ``by_region``
 dispatch (short-KV stays on **row**). Exact-shape ship was ~1.28× geo;
-coarse regions trade ~0.6% for not shipping the lightop grid.
+coarse regions trade ~0.6% for not shipping the hipc grid.
 
-Half auto below 0.98× LO (4/54, all `path=bn`): `16×4096 H=64` (~0.74×),
-`32×66 H=8` (~0.85×), `16×65536 H=8` (~0.88×), `16×66 H=64` (~0.94×).
-On the last two, opt-in Gluon can match/beat LO; on the first two all three
-Triton paths (BN/row/Gluon) still lose.
+Half auto meets ≥1.00× HIPC on the 66-shape suite in
+`test/mqa_logits/test_mqa_logits_half_size_grid.py` (`HALF_SIZE_GRID`:
+54-grid + 12 production prefill shapes). 64 faster, 2 ties
+(`4608×16384` H=4 / H=16), 0 slower. Auto uses **row** on
+`32×66 H=64` / `64×66 H=64`, **bn** elsewhere.
 
 Forced `backend="gluon"` on tiny float8 shapes (e.g. `16×66 H=64`) can lose to
-lightop; auto dispatch keeps those on **row**.
+hipc; auto dispatch keeps those on **row**.
 
 ## Reproduce
 
@@ -51,26 +52,39 @@ lightop; auto dispatch keeps those on **row**.
 # Correctness (row / bn / gluon + auto grid; half backends included)
 pytest -q test/mqa_logits/test_fp8_mqa_logits.py
 
-# Size-grid latency (shapes from lightop prefill cuda list)
+# Official 66-shape half grid: correctness (default run)
+pytest -q test/mqa_logits/test_mqa_logits_half_size_grid.py
+
+# Official 66-shape half grid: perf vs hipc (all shapes)
+pytest -q test/mqa_logits/test_mqa_logits_half_size_grid.py --bench -s -k vs_hipc
+
+# ...sharded across 8 GPUs
+for i in 0 1 2 3 4 5 6 7; do
+  HIP_VISIBLE_DEVICES=$i HALF_GRID_SHARD="$i/8" \
+    pytest -q test/mqa_logits/test_mqa_logits_half_size_grid.py \
+    --bench -s -k vs_hipc > /tmp/half_shard$i.log 2>&1 &
+done; wait
+
+# ...or emit the single-process table + JSON
+HALF_GRID_REPORT=1 HALF_GRID_JSON=/tmp/mqa_logits_half_66.json \
+  pytest -q test/mqa_logits/test_mqa_logits_half_size_grid.py --bench -s -k report
+
+# Size-grid latency (shapes from hipc prefill cuda list)
 pytest -q test/mqa_logits/test_fp8_mqa_logits.py --bench -s -k size_grid
 
-# Optional comparison when lightop is installed
+# Optional comparison when hipc is installed
 pytest -q test/mqa_logits/test_fp8_mqa_logits.py --bench -s -k vs_lightop
 
-# Full vs-lightop grids (local helpers)
-HIP_VISIBLE_DEVICES=0 PYTHONPATH=. python3 -u \
-  boltops/mqa_logits/triton/_bench_fp8_auto_vs_lightop_sizes.py
-HIP_VISIBLE_DEVICES=0 python3 boltops/mqa_logits/triton/_bench_36_gluon_sizes.py
-HIP_VISIBLE_DEVICES=0 python3 boltops/mqa_logits/triton/_bench_three_backends_sizes.py
-HIP_VISIBLE_DEVICES=0 PYTHONPATH=. python3 -u \
-  boltops/mqa_logits/triton/_bench_half_auto_row_bn_vs_lightop_all_sizes.py
+# Full vs-hipc grids (legacy local helpers were removed; the pytest suites
+# above are now the source of truth)
 ```
 
 Float8 auto table artifact:
 `configs/triton_3_6/bench_row_gluon_vs_lightop_all_sizes.out`
 
-Half auto table artifact:
-`configs/triton_3_6/bench_half_auto_row_bn_vs_lightop_all_sizes.out`
+Half numbers above are from
+`test/mqa_logits/test_mqa_logits_half_size_grid.py --bench`; re-run that
+suite to refresh.
 
 Retune:
 
@@ -84,11 +98,11 @@ HIP_VISIBLE_DEVICES=0 python3 boltops/mqa_logits/triton/tune_mqa_logits_half_row
 
 * Gluon launch knobs come from coarse ``by_region`` buckets
   (``seq_len_leq`` / ``seq_kv_leq`` / ``num_heads_leq``) in
-  ``fp8_mqa_logits_gluon,arch=*.json`` — not an exact lightop-grid shape table.
+  ``fp8_mqa_logits_gluon,arch=*.json`` — not an exact hipc-grid shape table.
   Exact all-sizes tune results stay in ``*_all_sizes_tune_*.json`` only.
 * HIP warps/stages for tiled helpers still come from the tiled JSON. Row launch
   JSON was autotuned via `tune_fp8_mqa_logits.py`.
 * Row JSON tune (Triton 3.2 capability) gave ~1.3× on short-fast / XL vs code
-  defaults (not vs lightop).
-* Triton 3.2 containers without FP8 lightop can only report absolute BoltOPs ms
+  defaults (not vs hipc).
+* Triton 3.2 containers without FP8 hipc can only report absolute BoltOPs ms
   (`_bench_32_sizes.out.txt`: 51/54 ok; `{16,32,64}×66 H=8` row compile fail).
