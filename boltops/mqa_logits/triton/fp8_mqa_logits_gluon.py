@@ -6,7 +6,9 @@
 * Weights prefetched in groups (``w_group``), with Q double-buffer in LDS.
 * ``kv_scale`` and causal ``cu_ends`` mask applied at store.
 
-Requires ``triton.experimental.gluon`` (HCU Triton 3.6+ on gfx938/gfx942/gfx950).
+Requires ``triton.experimental.gluon`` and native FP8 MMAC
+(``arch_info.is_fp8_avail()``; e.g. gfx938). gfx936 can import Gluon but
+cannot lower ``V_MMAC_F32_16X16X32_FP8_FP8``.
 """
 
 from __future__ import annotations
@@ -42,8 +44,20 @@ except ImportError:
     gl = None  # type: ignore[assignment]
     _GLUON_AVAILABLE = False
 
+
+def gluon_language_available() -> bool:
+    """True when ``triton.experimental.gluon`` imports (half Gluon paths)."""
+    return bool(_GLUON_AVAILABLE)
+
+
 def gluon_prefill_available() -> bool:
-    return _GLUON_AVAILABLE
+    """True when the FP8 Gluon prefill path can run on this device.
+
+    Needs both the Gluon language package and native FP8 MMAC. Arches without
+    ``is_fp8_avail()`` (e.g. gfx936) must use the float8 ``row`` / ``bn``
+    emulation paths instead.
+    """
+    return bool(_GLUON_AVAILABLE) and bool(arch_info.is_fp8_avail())
 
 
 if _GLUON_AVAILABLE:
