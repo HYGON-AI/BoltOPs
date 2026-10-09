@@ -16,7 +16,7 @@ from boltops.mqa_logits.triton.fp8_mqa_logits import _filter_hip_launch_kwargs
 
 DEFAULT_BLOCK_KV = 64
 DEFAULT_NUM_WARPS = 4
-DEFAULT_NUM_STAGES = 2
+DEFAULT_NUM_STAGES = 1
 DEFAULT_WAVES_PER_EU = 0
 DEFAULT_CLEAR_BLOCK_KV = 512
 DEFAULT_CLEAR_NUM_WARPS = 4
@@ -217,8 +217,6 @@ def mqa_logits_half_row(
         block_kv = int(cfg["block_kv"])
     if num_warps is None and "num_warps" in cfg:
         num_warps = int(cfg["num_warps"])
-    if num_stages is None and "num_stages" in cfg:
-        num_stages = int(cfg["num_stages"])
     if waves_per_eu is None and "waves_per_eu" in cfg:
         waves_per_eu = int(cfg["waves_per_eu"])
     if head_split_k is None and "head_split_k" in cfg:
@@ -232,7 +230,8 @@ def mqa_logits_half_row(
 
     block_kv = int(DEFAULT_BLOCK_KV if block_kv is None else block_kv)
     n_warps = int(DEFAULT_NUM_WARPS if num_warps is None else num_warps)
-    n_stages = int(DEFAULT_NUM_STAGES if num_stages is None else num_stages)
+    # ns>=2 silently wrong on this kernel; ignore JSON / caller stages.
+    n_stages = 1
     waves = int(DEFAULT_WAVES_PER_EU if waves_per_eu is None else waves_per_eu)
     clear_block_kv = int(
         DEFAULT_CLEAR_BLOCK_KV if clear_block_kv is None else clear_block_kv

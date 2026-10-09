@@ -74,7 +74,7 @@
       "main": {
         "block_m": 16,
         "block_n": 32,
-        "head_split_k": 1,
+        "head_split_k": 4,
         "num_warps": 2,
         "num_stages": 2,
         "waves_per_eu": 0,
@@ -94,7 +94,7 @@
         "num_warps": 2,
         "num_stages": 2,
         "waves_per_eu": 0,
-        "w_group": 8
+        "w_group": 1
       }
     },
     {
@@ -106,11 +106,11 @@
       "main": {
         "block_m": 16,
         "block_n": 64,
-        "head_split_k": 1,
+        "head_split_k": 2,
         "num_warps": 2,
         "num_stages": 2,
         "waves_per_eu": 0,
-        "w_group": 1
+        "w_group": 4
       }
     },
     {
@@ -182,14 +182,13 @@
       "seq_kv": 65536,
       "num_heads": 8,
       "label": "m16-n65536-h8",
-      "best_ms": 0.22543980181217194,
       "main": {
         "block_m": 16,
-        "block_n": 64,
+        "block_n": 128,
         "head_split_k": 1,
         "num_warps": 4,
         "num_stages": 1,
-        "waves_per_eu": 0,
+        "waves_per_eu": 4,
         "w_group": 1
       }
     },
@@ -198,12 +197,11 @@
       "seq_kv": 65536,
       "num_heads": 64,
       "label": "m16-n65536-h64",
-      "best_ms": 0.3065170645713806,
       "main": {
         "block_m": 16,
-        "block_n": 256,
+        "block_n": 128,
         "head_split_k": 1,
-        "num_warps": 8,
+        "num_warps": 4,
         "num_stages": 1,
         "waves_per_eu": 4,
         "w_group": 1
@@ -266,7 +264,7 @@
       "main": {
         "block_m": 32,
         "block_n": 32,
-        "head_split_k": 4,
+        "head_split_k": 16,
         "num_warps": 8,
         "num_stages": 2,
         "waves_per_eu": 4,
@@ -490,7 +488,7 @@
       "main": {
         "block_m": 16,
         "block_n": 32,
-        "head_split_k": 1,
+        "head_split_k": 16,
         "num_warps": 2,
         "num_stages": 2,
         "waves_per_eu": 4,
@@ -691,6 +689,38 @@
     },
     {
       "seq_len": 127,
+      "seq_kv": 66,
+      "num_heads": 8,
+      "label": "m127-n66-h8",
+      "best_ms": 0.01008,
+      "main": {
+        "block_m": 16,
+        "block_n": 16,
+        "head_split_k": 1,
+        "num_warps": 2,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "w_group": 1
+      }
+    },
+    {
+      "seq_len": 127,
+      "seq_kv": 66,
+      "num_heads": 64,
+      "label": "m127-n66-h64",
+      "best_ms": 0.01776,
+      "main": {
+        "block_m": 16,
+        "block_n": 16,
+        "head_split_k": 16,
+        "num_warps": 2,
+        "num_stages": 1,
+        "waves_per_eu": 0,
+        "w_group": 1
+      }
+    },
+    {
+      "seq_len": 127,
       "seq_kv": 4096,
       "num_heads": 8,
       "label": "m127-n4096-h8",
@@ -880,6 +910,22 @@
         "waves_per_eu": 0,
         "w_group": 4
       }
+    },
+    {
+      "seq_len": 4608,
+      "seq_kv": 16384,
+      "num_heads": 4,
+      "label": "target-m4608-n16k-h4",
+      "best_ms": 0.7100582043329875,
+      "main": {
+        "block_m": 64,
+        "block_n": 64,
+        "head_split_k": 1,
+        "num_warps": 4,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "w_group": 4
+      }
     }
   ],
   "by_seq_kv": [
@@ -889,10 +935,21 @@
       "main": {
         "block_m": 16,
         "block_n": 32,
-        "head_split_k": 1,
         "num_warps": 2,
         "num_stages": 2,
         "waves_per_eu": 4,
+        "w_group": 1
+      }
+    },
+    {
+      "seq_kv_leq": 256,
+      "label": "n256-short-heur",
+      "main": {
+        "block_m": 16,
+        "block_n": 16,
+        "num_warps": 2,
+        "num_stages": 2,
+        "waves_per_eu": 0,
         "w_group": 1
       }
     },
@@ -911,16 +968,17 @@
     },
     {
       "seq_kv_leq": 8192,
-      "label": "n8192-m127-h64",
+      "label": "n8192-bn64-w4-s1-fixed",
       "main": {
         "block_m": 32,
-        "block_n": 128,
+        "block_n": 64,
         "head_split_k": 1,
-        "num_warps": 8,
-        "num_stages": 2,
+        "num_warps": 4,
+        "num_stages": 1,
         "waves_per_eu": 0,
         "w_group": 4
-      }
+      },
+      "_fix_note": "n8192 bucket was tuned at M=127/H=64 (bn128/w8/s2); it is also the fallback for all H=4 shapes. Large-M low-head at N=8192 measured +31% vs hipc with bn128/w8/s2 and -1% with bn64/w4/s1."
     },
     {
       "seq_kv_leq": 16384,

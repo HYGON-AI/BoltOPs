@@ -41,6 +41,30 @@ _Q_LIST = (16, 32, 64, 127)
 _KV_LIST = (66, 4096, 8192, 16384, 32768, 65536, 131072)
 _H_LIST = (8, 64)
 
+# Production prefill shapes ("4608 group") — not in the dense 54-grid.
+GROUP_4608_SHAPES: list[tuple[int, int, int, str]] = [
+    (4608, 16384, 4, "prefill-m4608-n16k-h4"),
+    (4608, 32768, 4, "prefill-m4608-n32k-h4"),
+    (4608, 65536, 4, "prefill-m4608-n64k-h4"),
+    (2048, 32768, 4, "prefill-m2048-n32k-h4"),
+    (1024, 16384, 4, "prefill-m1024-n16k-h4"),
+    (256, 16384, 4, "prefill-m256-n16k-h4"),
+    (4608, 16384, 8, "prefill-m4608-n16k-h8"),
+    (4608, 32768, 8, "prefill-m4608-n32k-h8"),
+    (1024, 32768, 8, "prefill-m1024-n32k-h8"),
+    (256, 65536, 8, "prefill-m256-n64k-h8"),
+    (4608, 16384, 16, "prefill-m4608-n16k-h16"),
+    (1024, 32768, 16, "prefill-m1024-n32k-h16"),
+]
+
+# Flagship production shape that drove the gap analysis.
+TARGET_4608_SHAPE: tuple[int, int, int, str] = (
+    4608,
+    16384,
+    4,
+    "target-m4608-n16k-h4",
+)
+
 
 def _build_all_size_shapes() -> list[tuple[int, int, int, str]]:
     out: list[tuple[int, int, int, str]] = []
@@ -114,10 +138,15 @@ def per_iter_ms(fn, warmup: int, repeat: int) -> float:
     return sum(times) / len(times)
 
 
-def _w_group_candidates(head_chunk: int, *, include_one: bool) -> list[int]:
-    # Pruned set: {1,4,8} is enough in practice (drop 2/16).
+def _w_group_candidates(
+    head_chunk: int, *, include_one: bool, expanded: bool = False
+) -> list[int]:
+    # Default pruned set: {1,4,8}. Expanded also tries {2,16}.
     out: list[int] = []
-    cands = (1, 8, 4) if include_one else (8, 4)
+    if expanded:
+        cands = (1, 2, 4, 8, 16) if include_one else (2, 4, 8, 16)
+    else:
+        cands = (1, 8, 4) if include_one else (8, 4)
     for g in cands:
         if g <= head_chunk and head_chunk % g == 0:
             out.append(g)
@@ -140,25 +169,54 @@ def sweep_shape(
     repeat: int,
     quick: bool,
     include_w1: bool = False,
+    expanded: bool = False,
+    pruned: bool = False,
 ) -> dict[str, Any]:
     q, kv, w, ks, ke = make_bf16(s_q, s_k, num_heads)
     # Default geometry family; ``block_n`` is swept unless ``--quick``.
     large_n = s_k > 8192
     base_sk = 1 if large_n else _code_half_split_k(s_q, s_k, num_heads)
-    block_ms = [16] if quick or s_q < 32 else [16, 32]
-    if quick:
+
+    # ``--pruned``: shortlist for large-M / low-H (e.g. 4608x16384 H=4).
+    # Drop knobs that historically never win here: bm=16, bn=256, warps=2,
+    # waves=2, sk>1, w_group∉{1,2,4}. Keeps ~96 configs vs ~1000 expanded.
+    if pruned:
+        block_ms = [32, 64]
+        block_ns = [64, 128]
+        warps = [4, 8]
+        stages = [1, 2]
+        waves = [0, 4]
+        split_ks = [1]
+        wg_cands = [1, 2, 4]
+    elif quick or s_q < 32:
+        block_ms = [16]
         block_ns = [128 if large_n else 64]
-    elif large_n:
-        block_ns = [64, 128, 256]
+        warps = [4, 8]
+        stages = [1, 2]
+        waves = [0, 2]
+        split_ks = _split_k_candidates(base_sk, num_heads, large_n)
+        if not large_n:
+            split_ks = [base_sk]
+        wg_cands = None
+    elif expanded and s_q >= 32:
+        # ``block_m=64`` pays off on large-M / low-head (dispatch heuristics
+        # already pin it for H<=8 & M>=256); include it in the sweep so the
+        # ship JSON records the measured winner rather than a heuristic.
+        block_ms = [16, 32, 64]
+        block_ns = [64, 128, 256] if large_n else [32, 64, 128]
+        warps = [2, 4, 8]
+        stages = [1, 2]
+        waves = [0, 2, 4]
+        split_ks = _split_k_candidates(base_sk, num_heads, large_n)
+        wg_cands = None
     else:
-        block_ns = [32, 64, 128]
-    warps = [4, 8] if quick else ([4, 8] if large_n else [2, 4, 8])
-    stages = [1, 2]
-    # Pruned waves: {0,4} (drop 2).
-    waves = [0, 4] if not quick else [0, 2]
-    split_ks = _split_k_candidates(base_sk, num_heads, large_n)
-    if quick and not large_n:
-        split_ks = [base_sk]
+        block_ms = [16, 32]
+        block_ns = [64, 128, 256] if large_n else [32, 64, 128]
+        warps = [4, 8] if large_n else [2, 4, 8]
+        stages = [1, 2]
+        waves = [0, 4]
+        split_ks = _split_k_candidates(base_sk, num_heads, large_n)
+        wg_cands = None
 
     results: list[dict[str, Any]] = []
     best_ms = float("inf")
@@ -172,7 +230,15 @@ def sweep_shape(
         if num_heads % sk != 0:
             continue
         head_chunk = num_heads // sk
-        for wg in _w_group_candidates(head_chunk, include_one=include_w1):
+        if wg_cands is not None:
+            wgs = [g for g in wg_cands if g <= head_chunk and head_chunk % g == 0]
+            if not wgs:
+                wgs = [1]
+        else:
+            wgs = _w_group_candidates(
+                head_chunk, include_one=include_w1, expanded=expanded
+            )
+        for wg in wgs:
             space.append(
                 {
                     "block_m": bm,
@@ -187,7 +253,8 @@ def sweep_shape(
     print(
         f"  search space: {len(space)} "
         f"(bm={block_ms} bn={block_ns} warps={warps} stages={stages} "
-        f"waves={waves} sk={split_ks} w1={include_w1})",
+        f"waves={waves} sk={split_ks} w1={include_w1} "
+        f"expanded={expanded} pruned={pruned})",
         flush=True,
     )
 
@@ -395,6 +462,32 @@ def _merge_mid_into_ship(
     return out
 
 
+def _merge_shapes_into_ship(
+    existing: dict[str, Any] | None,
+    new_ship: dict[str, Any],
+) -> dict[str, Any]:
+    """Upsert ``by_shape`` entries by (M,N,H); leave other sections intact."""
+    if not existing:
+        return new_ship
+    key = lambda e: (int(e["seq_len"]), int(e["seq_kv"]), int(e["num_heads"]))
+    by_shape = {key(e): e for e in existing.get("by_shape") or []}
+    for e in new_ship.get("by_shape") or []:
+        by_shape[key(e)] = e
+    out = dict(existing)
+    out["by_shape"] = sorted(
+        by_shape.values(),
+        key=lambda e: (int(e["seq_len"]), int(e["seq_kv"]), int(e["num_heads"])),
+    )
+    meta = dict(out.get("meta") or {})
+    meta["expanded_source"] = new_ship.get("meta", {}).get("source")
+    note = meta.get("note") or ""
+    if "expanded search" not in note:
+        note = (note + " by_shape refreshed with expanded search.").strip()
+    meta["note"] = note
+    out["meta"] = meta
+    return out
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--warmup", type=int, default=8)
@@ -414,6 +507,50 @@ def main() -> None:
         "--all-sizes",
         action="store_true",
         help="Sweep the full M×N×H size grid (54 points) for per-shape dispatch",
+    )
+    p.add_argument(
+        "--group-4608",
+        action="store_true",
+        help="Sweep the 12 production prefill shapes (4608 group)",
+    )
+    p.add_argument(
+        "--target-4608",
+        action="store_true",
+        help="Sweep only the flagship shape 4608×16384 H=4",
+    )
+    p.add_argument(
+        "--shape",
+        type=str,
+        default=None,
+        help="Single shape M,N,H (e.g. 4608,16384,4); overrides other shape flags",
+    )
+    p.add_argument(
+        "--expanded",
+        action="store_true",
+        help=(
+            "Widen the search: block_m+=64, waves+=2, warps+=2 on large-N, "
+            "w_group+={2,16}"
+        ),
+    )
+    p.add_argument(
+        "--pruned",
+        action="store_true",
+        help=(
+            "Shortlist for large-M/low-H: bm∈{32,64} bn∈{64,128} warps∈{4,8} "
+            "waves∈{0,4} sk=1 wg∈{1,2,4} (~96 configs)"
+        ),
+    )
+    p.add_argument(
+        "--shard",
+        type=str,
+        default=None,
+        help="Shard shapes as I/N (0-based), e.g. 0/8 for multi-GPU",
+    )
+    p.add_argument(
+        "--out",
+        type=str,
+        default=None,
+        help="Override tune JSON output path (used by sharded runs)",
     )
     p.add_argument(
         "--w1",
@@ -438,19 +575,47 @@ def main() -> None:
     if args.full_params:
         args.quick = False
     # Always include w_group=1 when doing a serious full-param pass.
-    if args.full_params:
+    if args.full_params or args.expanded or args.pruned:
         args.w1 = True
+    # Target-4608 defaults to pruned shortlist unless user asked for expanded.
+    if args.target_4608 and not args.expanded and not args.quick:
+        args.pruned = True
 
     torch.cuda.set_device(args.gpu)
     caps = get_triton_capabilities()
     arch = arch_info.get_arch()
-    if args.mid:
-        shapes = MID_TUNE_SHAPES
-    elif args.all_sizes:
-        shapes = ALL_SIZE_SHAPES
+
+    shapes: list[tuple[int, int, int, str]] = []
+    if args.shape:
+        m, n, h = (int(x) for x in args.shape.split(","))
+        shapes = [(m, n, h, f"m{m}-n{n}-h{h}")]
+    elif args.target_4608:
+        shapes = [TARGET_4608_SHAPE]
+    elif args.mid:
+        shapes = list(MID_TUNE_SHAPES)
     else:
-        shapes = TUNE_SHAPES
-    include_w1 = bool(args.w1 or args.mid or args.all_sizes)
+        if args.all_sizes:
+            shapes.extend(ALL_SIZE_SHAPES)
+        if args.group_4608:
+            shapes.extend(GROUP_4608_SHAPES)
+        if not shapes:
+            shapes = list(TUNE_SHAPES)
+
+    shard_i = shard_n = None
+    if args.shard:
+        shard_i, shard_n = (int(x) for x in args.shard.split("/"))
+        assert 0 <= shard_i < shard_n, f"bad --shard {args.shard}"
+        shapes = shapes[shard_i::shard_n]
+
+    include_w1 = bool(
+        args.w1
+        or args.mid
+        or args.all_sizes
+        or args.group_4608
+        or args.target_4608
+        or args.expanded
+        or args.pruned
+    )
 
     payload: dict[str, Any] = {
         "meta": {
@@ -462,7 +627,14 @@ def main() -> None:
             "quick": args.quick,
             "mid": args.mid,
             "all_sizes": args.all_sizes,
+            "group_4608": args.group_4608,
+            "target_4608": args.target_4608,
+            "shape": args.shape,
+            "expanded": args.expanded,
+            "pruned": args.pruned,
+            "shard": args.shard,
             "include_w1": include_w1,
+            "n_shapes": len(shapes),
             "timing": "cuda_event_per_iter",
             "dtype": "bfloat16",
         },
@@ -479,6 +651,8 @@ def main() -> None:
             repeat=args.repeat,
             quick=args.quick,
             include_w1=include_w1,
+            expanded=args.expanded,
+            pruned=args.pruned,
         )
         row["label"] = label
         payload["results"].append(row)
@@ -491,13 +665,32 @@ def main() -> None:
     cap_dir = f"triton_{caps.version.replace('.', '_')}"
     out_dir = Path(__file__).resolve().parent / "configs" / cap_dir
     out_dir.mkdir(parents=True, exist_ok=True)
-    if args.mid:
+    if args.out:
+        tune_path = Path(args.out)
+        tune_path.parent.mkdir(parents=True, exist_ok=True)
+        tune_name = tune_path.name
+    elif args.mid:
         tune_name = f"mqa_logits_half_mid_tune_{arch}.json"
+        tune_path = out_dir / tune_name
+    elif args.target_4608 or (
+        args.shape and args.shape.replace(" ", "") == "4608,16384,4"
+    ):
+        tag = "pruned" if args.pruned else ("expanded" if args.expanded else "std")
+        tune_name = f"mqa_logits_half_target4608_{tag}_tune_{arch}.json"
+        tune_path = out_dir / tune_name
+    elif args.group_4608 and not args.all_sizes:
+        tag = "expanded" if args.expanded else ("pruned" if args.pruned else "std")
+        shard_sfx = f"_shard{shard_i}of{shard_n}" if shard_n else ""
+        tune_name = f"mqa_logits_half_group4608_{tag}_tune_{arch}{shard_sfx}.json"
+        tune_path = out_dir / tune_name
     elif args.all_sizes:
-        tune_name = f"mqa_logits_half_all_sizes_tune_{arch}.json"
+        tag = "expanded" if args.expanded else "std"
+        shard_sfx = f"_shard{shard_i}of{shard_n}" if shard_n else ""
+        tune_name = f"mqa_logits_half_all_sizes_{tag}_tune_{arch}{shard_sfx}.json"
+        tune_path = out_dir / tune_name
     else:
         tune_name = f"mqa_logits_half_tune_{arch}.json"
-    tune_path = out_dir / tune_name
+        tune_path = out_dir / tune_name
     # Drop full ``all`` from disk if huge — keep top5 + best.
     slim = {
         "meta": payload["meta"],
@@ -508,13 +701,24 @@ def main() -> None:
     tune_path.write_text(json.dumps(slim, indent=2) + "\n")
     print(f"Wrote {tune_path}")
 
-    if args.ship:
+    if args.ship and not args.shard:
         ship_path = out_dir / f"mqa_logits_half,arch={arch}.json"
         mid_ship = _build_ship_json(payload["results"], arch, caps)
         mid_ship["meta"]["source"] = tune_name
-        if args.mid and ship_path.is_file():
+        merge_shapes = (
+            args.group_4608
+            or args.target_4608
+            or args.shape
+            or args.expanded
+            or args.pruned
+            or args.all_sizes
+        )
+        if ship_path.is_file() and (args.mid or merge_shapes):
             existing = json.loads(ship_path.read_text())
-            ship = _merge_mid_into_ship(existing, mid_ship)
+            if args.mid and not merge_shapes:
+                ship = _merge_mid_into_ship(existing, mid_ship)
+            else:
+                ship = _merge_shapes_into_ship(existing, mid_ship)
         else:
             ship = mid_ship
         ship_path.write_text(json.dumps(ship, indent=2) + "\n")
