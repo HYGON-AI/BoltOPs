@@ -6,8 +6,11 @@ stages:
 
 variables:
   GIT_DEPTH: "0"
+  BASE_COMPILE_IMAGE_ROCKY_PY310: "image.sourcefind.cn:5000/dcu/admin/base/dev:rockylinux8.6-mpi5.0-gcc10.3-cmake3.29-py3.10-mkl2020.4.304"
+  BASE_COMPILE_IMAGE_ROCKY_PY312: "harbor.sourcefind.cn:5443/dcu/admin/base/dev:rockylinux8.6-mpi5.0-gcc10.3-cmake3.29-py3.12-mkl2020.4.304"
   PIP_INDEX_URL: "http://10.16.1.201:9929/nightly/dtk2604/+simple/"
   PIP_TRUSTED_HOST: "10.16.1.201"
+  TRITON_INDEX_URL: "http://10.16.1.201:9929/das_nightly/dtk2604-rc4/+simple/"
   # Torch wheels are larger than 1 GB. Tolerate transient stalls and let pip
   # resume partial downloads instead of restarting the whole transfer.
   PIP_DEFAULT_TIMEOUT: "600"
@@ -49,6 +52,27 @@ variables:
       test -f /opt/dtk/hcu_llvm.info
       cat /opt/dtk/hcu_llvm.info
 
+# Both Python versions use the interpreter and packages provided by their image.
+.python-env:
+  before_script:
+    - |
+      export CI_WORK_DIR="${CI_PROJECT_DIR}/.ci-work-${CI_JOB_ID}"
+      mkdir -p "${CI_WORK_DIR}"
+      echo "Using the Python ${PYTHON_VERSION} image environment"
+    - |
+      python - <<'PY'
+      import os
+      import sys
+      import sysconfig
+      from pathlib import Path
+
+      actual = f"{sys.version_info.major}.{sys.version_info.minor}"
+      assert actual == os.environ["PYTHON_VERSION"], sys.version
+      header = Path(sysconfig.get_path("include")) / "Python.h"
+      assert header.is_file(), f"Missing Python development header: {header}"
+      print(f"Python environment: {sys.executable} ({actual})")
+      PY
+
 .git-auth:
   before_script:
     - |
@@ -68,6 +92,7 @@ select:source:
     - nmz
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"'
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_REF_NAME == "main"'
   before_script:
     - !reference [.git-auth, before_script]
   script:
@@ -90,6 +115,7 @@ select:source:
 
 build:test-wheel:
   extends: .dcu-runner
+  image: "${BUILD_IMAGE}"
   stage: build
   timeout: 3h
   needs:
@@ -97,13 +123,22 @@ build:test-wheel:
       artifacts: true
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"'
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_REF_NAME == "main"'
   parallel:
     matrix:
-      - TORCH_VERSION: ["2.10.0", "2.11.0"]
+      - PYTHON_VERSION: ["3.10"]
+        BUILD_IMAGE: ["${BASE_COMPILE_IMAGE_ROCKY_PY310}"]
+        NUMPY_VERSION: ["1.24.3"]
+        TORCH_VERSION: ["2.10.0", "2.11.0"]
+      - PYTHON_VERSION: ["3.12"]
+        BUILD_IMAGE: ["${BASE_COMPILE_IMAGE_ROCKY_PY312}"]
+        NUMPY_VERSION: ["1.26.4"]
+        TORCH_VERSION: ["2.10.0", "2.11.0"]
   before_script:
     - !reference [.dcu-runner, before_script]
     - !reference [.git-auth, before_script]
-    # Both Torch matrix jobs integrate the exact target commit selected once
+    - !reference [.python-env, before_script]
+    # All Python/Torch matrix jobs integrate the exact target commit selected once
     # by select:source, matching the source selection used by HYGON-AI/lightop.
     - |
       test "$(git rev-parse HEAD)" = "${BOLTOPS_SOURCE_SHA}"
@@ -122,27 +157,39 @@ build:test-wheel:
     # Keep pip from replacing the Torch/NumPy versions selected by this matrix job
     # while resolving TileLang and its transitive dependencies.
     - |
-      printf 'torch==%s\nnumpy==1.24.3\n' "${TORCH_VERSION}" > /tmp/boltops-constraints.txt
-      cat /tmp/boltops-constraints.txt
-    - python -m pip install --constraint /tmp/boltops-constraints.txt "torch==${TORCH_VERSION}" triton pytest PyYAML "numpy==1.24.3" pandas build wheel ciupload cismi ninja
+      printf 'torch==%s\nnumpy==%s\n' "${TORCH_VERSION}" "${NUMPY_VERSION}" > "${CI_WORK_DIR}/constraints.txt"
+      cat "${CI_WORK_DIR}/constraints.txt"
+    - python -m pip install --constraint "${CI_WORK_DIR}/constraints.txt" "torch==${TORCH_VERSION}" pytest PyYAML "numpy==${NUMPY_VERSION}" pandas build wheel ciupload cismi ninja
+    # Select the newest Torch-compatible Triton 3.6 build from the requested index.
+    - python -m pip install --constraint "${CI_WORK_DIR}/constraints.txt" --index-url "${TRITON_INDEX_URL}" --trusted-host "${PIP_TRUSTED_HOST}" "triton==3.6.0"
     - python -m pip show torch triton
     # Match TileLang CI: apache-tvm-ffi comes from Aliyun, while the constraint
     # makes pip choose the TileLang wheel compatible with this Torch matrix job.
-    - python -m pip install --constraint /tmp/boltops-constraints.txt "apache-tvm-ffi==0.1.11" -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
-    - python -m pip install --constraint /tmp/boltops-constraints.txt "tilelang==0.1.12" --extra-index-url https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
+    - python -m pip install --constraint "${CI_WORK_DIR}/constraints.txt" "apache-tvm-ffi==0.1.11" -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
+    - python -m pip install --constraint "${CI_WORK_DIR}/constraints.txt" "tilelang==0.1.12" --extra-index-url https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
     - python -m pip check
     - python -m pip show torch triton tilelang apache-tvm-ffi numpy
     - |
       python - <<'PY'
       import os
+      import sys
+      from importlib.metadata import version
       import numpy
       import torch
+      import triton
 
       expected_torch = os.environ["TORCH_VERSION"]
       actual_torch = torch.__version__.split("+", 1)[0]
       assert actual_torch == expected_torch, (actual_torch, expected_torch)
-      assert numpy.__version__ == "1.24.3", numpy.__version__
+      assert numpy.__version__ == os.environ["NUMPY_VERSION"], numpy.__version__
+      triton_version = version("triton")
+      expected_torch_tag = {"2.10.0": "torch2100", "2.11.0": "torch2110"}[expected_torch]
+      assert triton_version.startswith("3.6.0+"), triton_version
+      assert expected_torch_tag in triton_version, (triton_version, expected_torch_tag)
       print(f"Validated dependency set: torch={torch.__version__}, numpy={numpy.__version__}")
+      print(f"Python runtime: {sys.executable}; version={sys.version}; prefix={sys.prefix}; base_prefix={sys.base_prefix}")
+      print(f"Torch runtime: version={version('torch')}; path={torch.__file__}")
+      print(f"Triton runtime: version={version('triton')}; path={triton.__file__}")
       PY
   script:
     - |
@@ -152,29 +199,33 @@ build:test-wheel:
       echo "Allocated DCU: ${HIP_VISIBLE_DEVICES}"
     - DTK_VER=$(echo ${DTK_PKG} | grep -oP 'dtk\K[0-9]+\.[0-9]+' | tr -d '.')
     - GIT_COMMIT=$(git rev-parse --short=6 HEAD)
-    - python -m build --wheel
-    - CIUpload REPAIR --dtk_version ${DTK_VER} --torch_version ${TORCH_VERSION} --git_commit ${GIT_COMMIT} --outputdir output -f dist/*.whl
+    - export WHEEL_OUTPUT="${CI_PROJECT_DIR}/output/py${PYTHON_VERSION}/torch${TORCH_VERSION}"
+    - mkdir -p "${WHEEL_OUTPUT}"
+    - python -m build --wheel --outdir "${CI_WORK_DIR}/dist"
+    - CIUpload REPAIR --dtk_version ${DTK_VER} --torch_version ${TORCH_VERSION} --git_commit ${GIT_COMMIT} --outputdir "${WHEEL_OUTPUT}" -f "${CI_WORK_DIR}"/dist/*.whl
     - |
       wheel_test_dir=$(mktemp -d)
-      python -m pip install --no-deps --target "${wheel_test_dir}" output/*.whl
+      python -m pip install --no-deps --target "${wheel_test_dir}" "${WHEEL_OUTPUT}"/*.whl
       cp -r test "${wheel_test_dir}/test"
       cp pyproject.toml "${wheel_test_dir}/pyproject.toml"
       (
         cd "${wheel_test_dir}"
         python -m pytest test -s --tb=short -m "not slow" \
-          --junitxml="${CI_PROJECT_DIR}/boltops_test.xml"
+          --junitxml="${WHEEL_OUTPUT}/boltops_test.xml"
       )
   artifacts:
     when: always
     paths:
-      - output/*.whl
-      - boltops_test.xml
+      - output/py${PYTHON_VERSION}/torch${TORCH_VERSION}/
     reports:
-      junit: boltops_test.xml
+      junit: output/py${PYTHON_VERSION}/torch${TORCH_VERSION}/boltops_test.xml
     expire_in: 7 days
 
 performance:optest:
   extends: .dcu-runner
+  image: "${BUILD_IMAGE}"
+  # Serialize performance jobs on this runner tag to reduce benchmark interference.
+  resource_group: boltops-performance-${RUNNER_TAG}
   stage: performance
   timeout: 3h
   tags:
@@ -186,13 +237,23 @@ performance:optest:
       artifacts: true
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"'
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_REF_NAME == "main"'
   parallel:
     matrix:
       - RUNNER_TAG: [nmz]
+        PYTHON_VERSION: ["3.10"]
+        BUILD_IMAGE: ["${BASE_COMPILE_IMAGE_ROCKY_PY310}"]
+        NUMPY_VERSION: ["1.24.3"]
+        TORCH_VERSION: ["2.10.0", "2.11.0"]
+      - RUNNER_TAG: [nmz]
+        PYTHON_VERSION: ["3.12"]
+        BUILD_IMAGE: ["${BASE_COMPILE_IMAGE_ROCKY_PY312}"]
+        NUMPY_VERSION: ["1.26.4"]
         TORCH_VERSION: ["2.10.0", "2.11.0"]
   before_script:
     - !reference [.dcu-runner, before_script]
     - !reference [.git-auth, before_script]
+    - !reference [.python-env, before_script]
     # Use the same fixed source/target pair selected for the correctness jobs.
     - |
       test "$(git rev-parse HEAD)" = "${BOLTOPS_SOURCE_SHA}"
@@ -211,35 +272,48 @@ performance:optest:
     # Protect the selected Torch/NumPy environment while installing optest and
     # its transitive dependencies.
     - |
-      printf 'torch==%s\nnumpy==1.24.3\n' "${TORCH_VERSION}" > /tmp/boltops-constraints.txt
-      cat /tmp/boltops-constraints.txt
-    - python -m pip install --constraint /tmp/boltops-constraints.txt "torch==${TORCH_VERSION}" triton "numpy==1.24.3" pandas cismi ninja optest
-    - python -m pip install --constraint /tmp/boltops-constraints.txt "apache-tvm-ffi==0.1.11" -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
-    - python -m pip install --constraint /tmp/boltops-constraints.txt "tilelang==0.1.12" --extra-index-url https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
+      printf 'torch==%s\nnumpy==%s\n' "${TORCH_VERSION}" "${NUMPY_VERSION}" > "${CI_WORK_DIR}/constraints.txt"
+      cat "${CI_WORK_DIR}/constraints.txt"
+    - python -m pip install --constraint "${CI_WORK_DIR}/constraints.txt" "torch==${TORCH_VERSION}" "numpy==${NUMPY_VERSION}" pandas cismi ninja optest
+    # Keep performance on the same newest Torch-compatible Triton 3.6 build.
+    - python -m pip install --constraint "${CI_WORK_DIR}/constraints.txt" --index-url "${TRITON_INDEX_URL}" --trusted-host "${PIP_TRUSTED_HOST}" "triton==3.6.0"
+    - python -m pip install --constraint "${CI_WORK_DIR}/constraints.txt" "apache-tvm-ffi==0.1.11" -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
+    - python -m pip install --constraint "${CI_WORK_DIR}/constraints.txt" "tilelang==0.1.12" --extra-index-url https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
     - python -m pip check
     # Install the exact repaired wheel produced and validated by build:test-wheel.
     - |
-      TORCH_TAG=$(echo "${TORCH_VERSION}" | tr -d '.')
-      set -- output/*torch${TORCH_TAG}*.whl
+      set -- "${CI_PROJECT_DIR}/output/py${PYTHON_VERSION}/torch${TORCH_VERSION}"/*.whl
       test "$#" -eq 1
       test -f "$1"
       BOLTOPS_WHEEL="$1"
+      test -n "${BOLTOPS_WHEEL}"
       echo "Performance wheel: ${BOLTOPS_WHEEL}"
       python -m pip install --force-reinstall --no-deps "${BOLTOPS_WHEEL}"
     - |
       python - <<'PY'
       import os
+      import sys
+      from importlib.metadata import version
       import numpy
       import torch
+      import triton
 
       expected_torch = os.environ["TORCH_VERSION"]
       actual_torch = torch.__version__.split("+", 1)[0]
       assert actual_torch == expected_torch, (actual_torch, expected_torch)
-      assert numpy.__version__ == "1.24.3", numpy.__version__
+      assert numpy.__version__ == os.environ["NUMPY_VERSION"], numpy.__version__
+      triton_version = version("triton")
+      expected_torch_tag = {"2.10.0": "torch2100", "2.11.0": "torch2110"}[expected_torch]
+      assert triton_version.startswith("3.6.0+"), triton_version
+      assert expected_torch_tag in triton_version, (triton_version, expected_torch_tag)
       print(f"Performance dependency set: torch={torch.__version__}, numpy={numpy.__version__}")
+      print(f"Python runtime: {sys.executable}; version={sys.version}; prefix={sys.prefix}; base_prefix={sys.base_prefix}")
+      print(f"Torch runtime: version={version('torch')}; path={torch.__file__}")
+      print(f"Triton runtime: version={version('triton')}; path={triton.__file__}")
       PY
-    # optest strips leading underscores; use a safe name unique to this job.
-    - export OPTEST_RUN_BRANCH="ci_performance_${RUNNER_TAG}_torch${TORCH_VERSION}_${CI_JOB_ID}"
+    # optest strips leading underscores from directory names. Use a safe,
+    # job-specific branch so collection cannot pick up another run's logs.
+    - export OPTEST_RUN_BRANCH="ci_performance_${RUNNER_TAG}_py${PYTHON_VERSION}_torch${TORCH_VERSION}_${CI_JOB_ID}"
     - git checkout -B "${OPTEST_RUN_BRANCH}"
   script:
     - |
@@ -248,6 +322,7 @@ performance:optest:
       export HIP_VISIBLE_DEVICES
       echo "Allocated performance DCU: ${HIP_VISIBLE_DEVICES}"
     - |
+      touch "${CI_WORK_DIR}/optest-start"
       # Performance only: the accuracy suite still has pre-existing
       # failures (see test/mqa_logits, test/qsa) that would gate every
       # MR, so acc is not run by this job. --gpus pins the run to the
@@ -256,12 +331,13 @@ performance:optest:
       optest --op_name boltops --test_mode per --gpus "${HIP_VISIBLE_DEVICES}" \
         --test_dir "${CI_PROJECT_DIR}" || optest_rc=$?
 
-      artifact_dir="${CI_PROJECT_DIR}/optest_artifacts/${RUNNER_TAG}/torch${TORCH_VERSION}"
+      artifact_dir="${CI_PROJECT_DIR}/optest_artifacts/${RUNNER_TAG}/py${PYTHON_VERSION}/torch${TORCH_VERSION}"
       mkdir -p "${artifact_dir}"
       result_pattern="/op_test_output/boltops/${OPTEST_RUN_BRANCH}_*/.optest-results.json"
       echo "Looking for current-job results: ${result_pattern}" | tee "${artifact_dir}/collection.log"
       latest_results=$(find /op_test_output/boltops -mindepth 2 -maxdepth 2 \
-        -path "${result_pattern}" -printf '%T@ %h\n' 2>/dev/null | \
+        -path "${result_pattern}" \
+        -newer "${CI_WORK_DIR}/optest-start" -printf '%T@ %h\n' 2>/dev/null | \
         sort -n | tail -n1 | cut -d' ' -f2-) || latest_results=""
       results_file="${artifact_dir}/missing-optest-results.json"
       if [ -n "${latest_results}" ]; then
@@ -269,20 +345,40 @@ performance:optest:
         echo "Selected results: ${results_file}" | tee -a "${artifact_dir}/collection.log"
         cp -a "${latest_results}" "${artifact_dir}/results"
       else
-        echo "ERROR: No current-job report matched ${result_pattern}" | tee -a "${artifact_dir}/collection.log"
+        echo "ERROR: No current-job report matched ${result_pattern} after ${CI_WORK_DIR}/optest-start" \
+          | tee -a "${artifact_dir}/collection.log"
       fi
-      # Keep this job's logs even if a failed benchmark never wrote its report.
+
+      # Collect logs independently: a crashed benchmark may not write JSON.
       mkdir -p "${artifact_dir}/logs"
       if [ -d /op_test_log/boltops ]; then
         while IFS= read -r -d '' log_dir; do
+          echo "Collecting logs: ${log_dir}" | tee -a "${artifact_dir}/collection.log"
           cp -a "${log_dir}" "${artifact_dir}/logs/"
         done < <(find /op_test_log/boltops -mindepth 1 -maxdepth 1 -type d \
           -name "${OPTEST_RUN_BRANCH}_*" -print0)
       fi
 
       report_rc=0
-      python ci_script/optest_to_junit.py "${CI_PROJECT_DIR}" "${RUNNER_TAG}_torch${TORCH_VERSION}" \
+      python ci_script/optest_to_junit.py "${CI_PROJECT_DIR}" "${RUNNER_TAG}_py${PYTHON_VERSION}_torch${TORCH_VERSION}" \
         "${results_file}" || report_rc=$?
+      echo "optest exit=${optest_rc}; report exit=${report_rc}" | tee -a "${artifact_dir}/collection.log"
+      if [ "${optest_rc}" -ne 0 ] || [ "${report_rc}" -ne 0 ]; then
+        # Keep console output bounded; the complete logs remain in artifacts.
+        log_count=0
+        while IFS= read -r -d '' log_file; do
+          echo "===== Last 120 lines: ${log_file} ====="
+          tail -n 120 "${log_file}"
+          log_count=$((log_count + 1))
+          if [ "${log_count}" -ge 10 ]; then
+            break
+          fi
+        done < <(find "${artifact_dir}/logs" -type f -name '*.log' -print0 | sort -z)
+        if [ "${log_count}" -eq 0 ]; then
+          echo "No benchmark logs found under /op_test_log/boltops/${OPTEST_RUN_BRANCH}_*" \
+            | tee -a "${artifact_dir}/collection.log"
+        fi
+      fi
       if [ "${report_rc}" -ne 0 ]; then
         exit "${report_rc}"
       fi
@@ -292,31 +388,55 @@ performance:optest:
   artifacts:
     when: always
     paths:
-      - scripts/${RUNNER_TAG}_torch${TORCH_VERSION}_boltops_output.xml
-      - optest_artifacts/${RUNNER_TAG}/torch${TORCH_VERSION}/
+      - scripts/${RUNNER_TAG}_py${PYTHON_VERSION}_torch${TORCH_VERSION}_boltops_output.xml
+      - optest_artifacts/${RUNNER_TAG}/py${PYTHON_VERSION}/torch${TORCH_VERSION}/
     reports:
-      junit: scripts/${RUNNER_TAG}_torch${TORCH_VERSION}_boltops_output.xml
+      junit: scripts/${RUNNER_TAG}_py${PYTHON_VERSION}_torch${TORCH_VERSION}_boltops_output.xml
     expire_in: 7 days
 
 publish:
   stage: publish
   tags:
     - nmz
+  needs:
+    - job: build:test-wheel
+      artifacts: true
+    - job: performance:optest
+      artifacts: false
   rules:
     - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_REF_NAME == "main"'
-  parallel:
-    matrix:
-      - TORCH_VERSION: ["2.10.0", "2.11.0"]
   before_script:
-    - python -m pip install build wheel ciupload
+    - python -m pip install ciupload
   script:
-    - DTK_VER=$(echo ${DTK_PKG} | grep -oP 'dtk\K[0-9]+\.[0-9]+' | tr -d '.')
-    - GIT_COMMIT=$(git rev-parse --short=6 HEAD)
-    - python -m build --wheel
-    - CIUpload REPAIR --dtk_version ${DTK_VER} --torch_version ${TORCH_VERSION} --git_commit ${GIT_COMMIT} --outputdir output -f dist/*.whl
-    - ls -l output/*.whl
+    # Universal wheels may have the same name across Python jobs. Compare their
+    # unpacked contents before publishing each filename once (ZIP times differ).
     - |
-      for wheel in output/*.whl; do
+      python - <<'PY'
+      from pathlib import Path
+      import shutil
+      import zipfile
+
+      def contents(path):
+          with zipfile.ZipFile(path) as wheel:
+              return {name: wheel.read(name) for name in wheel.namelist()}
+
+      wheels = sorted(Path("output").glob("py*/torch*/*.whl"))
+      assert wheels, "No validated wheels found"
+      destination = Path("publish_wheels")
+      destination.mkdir(exist_ok=True)
+      seen = {}
+      for wheel in wheels:
+          if wheel.name in seen:
+              assert contents(wheel) == contents(seen[wheel.name]), (
+                  f"Different contents for the same wheel filename: {wheel} and {seen[wheel.name]}"
+              )
+              continue
+          seen[wheel.name] = wheel
+          shutil.copy2(wheel, destination / wheel.name)
+          print(f"Publish wheel: {wheel}")
+      PY
+    - |
+      for wheel in publish_wheels/*.whl; do
         CIUpload NIGHTLY \
           --devpi_url "${DEVPI_URL}" \
           --password "${devpi_nightly_password}" \
@@ -326,5 +446,5 @@ publish:
       done
   artifacts:
     paths:
-      - output/*.whl
+      - publish_wheels/*.whl
     expire_in: 30 days
