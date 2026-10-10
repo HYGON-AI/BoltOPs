@@ -10,12 +10,14 @@ variables:
   BASE_COMPILE_IMAGE_ROCKY_PY312: "harbor.sourcefind.cn:5443/dcu/admin/base/dev:rockylinux8.6-mpi5.0-gcc10.3-cmake3.29-py3.12-mkl2020.4.304"
   PIP_INDEX_URL: "http://10.16.1.201:9929/nightly/dtk2604/+simple/"
   PIP_TRUSTED_HOST: "10.16.1.201"
+  TORCH_INDEX_URL: "http://10.16.1.201:9929/nightly/dtk2604/+simple/"
   TRITON_INDEX_URL: "http://10.16.1.201:9929/das_nightly/dtk2604-rc4/+simple/"
   # Torch wheels are larger than 1 GB. Tolerate transient stalls and let pip
   # resume partial downloads instead of restarting the whole transfer.
   PIP_DEFAULT_TIMEOUT: "600"
   PIP_RETRIES: "10"
   PIP_RESUME_RETRIES: "10"
+  DTK_VER: "2604"
   DTK_PKG: "/ArchivedFile/dtk-pkg/dtk26.04/DTK-26.04-rc4-centos8-x86_64.tar.gz"
   AICC_INSTALLER_URL: "http://42.228.13.241:18000/ai_cc/Nightly/hcu_llvm_installer.sh"
   DEVPI_URL: "http://10.16.1.201:9929/"
@@ -31,12 +33,28 @@ variables:
   before_script:
     # Keep the DTK/AICC setup aligned with triton-staging so both projects use
     # the same compiler and runtime on the shared runner.
+    # Keep long package paths and URLs out of matrix job names.
+    - |
+      case "${DTK_VER}" in
+        2604) ;;
+        2610)
+          export DTK_PKG="/ArchivedFile/dtk-pkg/dtk26.10/DTK-26.10-Rocky8.6-x86_64.tar.gz"
+          export TORCH_INDEX_URL="http://10.16.1.201:9929/das_nightly/dtk2610/+simple/"
+          export TRITON_INDEX_URL="${TORCH_INDEX_URL}"
+          ;;
+        *)
+          echo "Unsupported DTK version: ${DTK_VER}" >&2
+          exit 1
+          ;;
+      esac
+      echo "DTK ${DTK_VER}; package=${DTK_PKG}; torch index=${TORCH_INDEX_URL}; general index=${PIP_INDEX_URL}"
     - cp -f ${DTK_PKG} /opt/
     - cd /opt && tar -xzf $(basename ${DTK_PKG}) && mv dtk-* dtk
     - source /opt/dtk/env.sh && cd ${CI_PROJECT_DIR}
     - |
       case "${DTK_PKG,,}" in
         *dtk26.04.2*|*dtk26042*) AICC_MAJOR_VERSION="2.0.0" ;;
+        *dtk26.10*|*dtk2610*) AICC_MAJOR_VERSION="2.0.0" ;;
         *dtk26.04*|*dtk2604*) AICC_MAJOR_VERSION="1.0.0" ;;
         *)
           echo "Unsupported DTK package for AICC selection: ${DTK_PKG}" >&2
@@ -113,7 +131,7 @@ select:source:
       dotenv: source.env
     expire_in: 1 day
 
-build:test-wheel:
+.build-wheel:
   extends: .dcu-runner
   image: "${BUILD_IMAGE}"
   stage: build
@@ -124,16 +142,6 @@ build:test-wheel:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"'
     - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_REF_NAME == "main"'
-  parallel:
-    matrix:
-      - PYTHON_VERSION: ["3.10"]
-        BUILD_IMAGE: ["${BASE_COMPILE_IMAGE_ROCKY_PY310}"]
-        NUMPY_VERSION: ["1.24.3"]
-        TORCH_VERSION: ["2.10.0", "2.11.0"]
-      - PYTHON_VERSION: ["3.12"]
-        BUILD_IMAGE: ["${BASE_COMPILE_IMAGE_ROCKY_PY312}"]
-        NUMPY_VERSION: ["1.26.4"]
-        TORCH_VERSION: ["2.10.0", "2.11.0"]
   before_script:
     - !reference [.dcu-runner, before_script]
     - !reference [.git-auth, before_script]
@@ -159,6 +167,9 @@ build:test-wheel:
     - |
       printf 'torch==%s\nnumpy==%s\n' "${TORCH_VERSION}" "${NUMPY_VERSION}" > "${CI_WORK_DIR}/constraints.txt"
       cat "${CI_WORK_DIR}/constraints.txt"
+    # Select Torch only from its DTK-specific index. Resolve its dependencies
+    # and CI tools from the general index in the following command.
+    - python -m pip install --force-reinstall --no-deps --constraint "${CI_WORK_DIR}/constraints.txt" --index-url "${TORCH_INDEX_URL}" --trusted-host "${PIP_TRUSTED_HOST}" "torch==${TORCH_VERSION}"
     - python -m pip install --constraint "${CI_WORK_DIR}/constraints.txt" "torch==${TORCH_VERSION}" pytest PyYAML "numpy==${NUMPY_VERSION}" pandas build wheel ciupload cismi ninja
     # Select the newest Torch-compatible Triton 3.6 build from the requested index.
     - python -m pip install --constraint "${CI_WORK_DIR}/constraints.txt" --index-url "${TRITON_INDEX_URL}" --trusted-host "${PIP_TRUSTED_HOST}" "triton==3.6.0"
@@ -166,7 +177,7 @@ build:test-wheel:
     # Match TileLang CI: apache-tvm-ffi comes from Aliyun, while the constraint
     # makes pip choose the TileLang wheel compatible with this Torch matrix job.
     - python -m pip install --constraint "${CI_WORK_DIR}/constraints.txt" "apache-tvm-ffi==0.1.11" -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
-    - python -m pip install --constraint "${CI_WORK_DIR}/constraints.txt" "tilelang==0.1.12" --extra-index-url https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
+    - python -m pip install --constraint "${CI_WORK_DIR}/constraints.txt" --index-url "${TRITON_INDEX_URL}" --trusted-host "${PIP_TRUSTED_HOST}" "tilelang==0.1.12" --extra-index-url https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
     - python -m pip check
     - python -m pip show torch triton tilelang apache-tvm-ffi numpy
     - |
@@ -181,28 +192,55 @@ build:test-wheel:
       expected_torch = os.environ["TORCH_VERSION"]
       actual_torch = torch.__version__.split("+", 1)[0]
       assert actual_torch == expected_torch, (actual_torch, expected_torch)
+      # Vendor build tags are recorded in wheel metadata, not always in torch.__version__.
+      torch_package_version = version("torch")
+      assert torch_package_version.split("+", 1)[0] == expected_torch, (torch_package_version, expected_torch)
       assert numpy.__version__ == os.environ["NUMPY_VERSION"], numpy.__version__
+      expected_dtk_tag = f"dtk{os.environ['DTK_VER']}"
+      assert expected_dtk_tag in torch_package_version, (torch_package_version, expected_dtk_tag)
       triton_version = version("triton")
       expected_torch_tag = {"2.10.0": "torch2100", "2.11.0": "torch2110"}[expected_torch]
       assert triton_version.startswith("3.6.0+"), triton_version
       assert expected_torch_tag in triton_version, (triton_version, expected_torch_tag)
+      assert expected_dtk_tag in triton_version, (triton_version, expected_dtk_tag)
       print(f"Validated dependency set: torch={torch.__version__}, numpy={numpy.__version__}")
       print(f"Python runtime: {sys.executable}; version={sys.version}; prefix={sys.prefix}; base_prefix={sys.base_prefix}")
       print(f"Torch runtime: version={version('torch')}; path={torch.__file__}")
       print(f"Triton runtime: version={version('triton')}; path={triton.__file__}")
       PY
   script:
+    - GIT_COMMIT=$(git rev-parse --short=6 HEAD)
+    - export WHEEL_OUTPUT="${CI_PROJECT_DIR}/output/dtk${DTK_VER}/py${PYTHON_VERSION}/torch${TORCH_VERSION}"
+    - mkdir -p "${WHEEL_OUTPUT}"
+    - python -m build --wheel --outdir "${CI_WORK_DIR}/dist"
+    - CIUpload REPAIR --dtk_version ${DTK_VER} --torch_version ${TORCH_VERSION} --git_commit ${GIT_COMMIT} --outputdir "${WHEEL_OUTPUT}" -f "${CI_WORK_DIR}"/dist/*.whl
+  artifacts:
+    when: always
+    paths:
+      - output/dtk${DTK_VER}/py${PYTHON_VERSION}/torch${TORCH_VERSION}/
+    expire_in: 7 days
+
+build:test-wheel:
+  extends: .build-wheel
+  parallel:
+    matrix:
+      - PYTHON_VERSION: ["3.10"]
+        BUILD_IMAGE: ["${BASE_COMPILE_IMAGE_ROCKY_PY310}"]
+        NUMPY_VERSION: ["1.24.3"]
+        TORCH_VERSION: ["2.10.0", "2.11.0"]
+        DTK_VER: ["2604"]
+      - PYTHON_VERSION: ["3.12"]
+        BUILD_IMAGE: ["${BASE_COMPILE_IMAGE_ROCKY_PY312}"]
+        NUMPY_VERSION: ["1.26.4"]
+        TORCH_VERSION: ["2.10.0", "2.11.0"]
+        DTK_VER: ["2604"]
+  script:
+    - !reference [.build-wheel, script]
     - |
       HIP_VISIBLE_DEVICES=$(CIsmi need 1 --timeout "${CISMI_TIMEOUT}")
       test -n "${HIP_VISIBLE_DEVICES}"
       export HIP_VISIBLE_DEVICES
       echo "Allocated DCU: ${HIP_VISIBLE_DEVICES}"
-    - DTK_VER=$(echo ${DTK_PKG} | grep -oP 'dtk\K[0-9]+\.[0-9]+' | tr -d '.')
-    - GIT_COMMIT=$(git rev-parse --short=6 HEAD)
-    - export WHEEL_OUTPUT="${CI_PROJECT_DIR}/output/py${PYTHON_VERSION}/torch${TORCH_VERSION}"
-    - mkdir -p "${WHEEL_OUTPUT}"
-    - python -m build --wheel --outdir "${CI_WORK_DIR}/dist"
-    - CIUpload REPAIR --dtk_version ${DTK_VER} --torch_version ${TORCH_VERSION} --git_commit ${GIT_COMMIT} --outputdir "${WHEEL_OUTPUT}" -f "${CI_WORK_DIR}"/dist/*.whl
     - |
       wheel_test_dir=$(mktemp -d)
       python -m pip install --no-deps --target "${wheel_test_dir}" "${WHEEL_OUTPUT}"/*.whl
@@ -214,12 +252,21 @@ build:test-wheel:
           --junitxml="${WHEEL_OUTPUT}/boltops_test.xml"
       )
   artifacts:
-    when: always
-    paths:
-      - output/py${PYTHON_VERSION}/torch${TORCH_VERSION}/
     reports:
-      junit: output/py${PYTHON_VERSION}/torch${TORCH_VERSION}/boltops_test.xml
-    expire_in: 7 days
+      junit: output/dtk${DTK_VER}/py${PYTHON_VERSION}/torch${TORCH_VERSION}/boltops_test.xml
+
+# Temporary build-only coverage: publish this combination without test gates.
+build:wheel:dtk2610:
+  extends: .build-wheel
+  script:
+    - !reference [.build-wheel, script]
+    - echo "DTK 26.10 build-only mode; correctness and performance tests temporarily skipped"
+  variables:
+    DTK_VER: "2610"
+    PYTHON_VERSION: "3.12"
+    BUILD_IMAGE: "${BASE_COMPILE_IMAGE_ROCKY_PY312}"
+    NUMPY_VERSION: "1.26.4"
+    TORCH_VERSION: "2.11.0"
 
 performance:optest:
   extends: .dcu-runner
@@ -245,11 +292,13 @@ performance:optest:
         BUILD_IMAGE: ["${BASE_COMPILE_IMAGE_ROCKY_PY310}"]
         NUMPY_VERSION: ["1.24.3"]
         TORCH_VERSION: ["2.10.0", "2.11.0"]
+        DTK_VER: ["2604"]
       - RUNNER_TAG: [nmz]
         PYTHON_VERSION: ["3.12"]
         BUILD_IMAGE: ["${BASE_COMPILE_IMAGE_ROCKY_PY312}"]
         NUMPY_VERSION: ["1.26.4"]
         TORCH_VERSION: ["2.10.0", "2.11.0"]
+        DTK_VER: ["2604"]
   before_script:
     - !reference [.dcu-runner, before_script]
     - !reference [.git-auth, before_script]
@@ -274,15 +323,18 @@ performance:optest:
     - |
       printf 'torch==%s\nnumpy==%s\n' "${TORCH_VERSION}" "${NUMPY_VERSION}" > "${CI_WORK_DIR}/constraints.txt"
       cat "${CI_WORK_DIR}/constraints.txt"
+    # Select Torch only from its DTK-specific index. Resolve its dependencies
+    # and CI tools from the general index in the following command.
+    - python -m pip install --force-reinstall --no-deps --constraint "${CI_WORK_DIR}/constraints.txt" --index-url "${TORCH_INDEX_URL}" --trusted-host "${PIP_TRUSTED_HOST}" "torch==${TORCH_VERSION}"
     - python -m pip install --constraint "${CI_WORK_DIR}/constraints.txt" "torch==${TORCH_VERSION}" "numpy==${NUMPY_VERSION}" pandas cismi ninja optest
     # Keep performance on the same newest Torch-compatible Triton 3.6 build.
     - python -m pip install --constraint "${CI_WORK_DIR}/constraints.txt" --index-url "${TRITON_INDEX_URL}" --trusted-host "${PIP_TRUSTED_HOST}" "triton==3.6.0"
     - python -m pip install --constraint "${CI_WORK_DIR}/constraints.txt" "apache-tvm-ffi==0.1.11" -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
-    - python -m pip install --constraint "${CI_WORK_DIR}/constraints.txt" "tilelang==0.1.12" --extra-index-url https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
+    - python -m pip install --constraint "${CI_WORK_DIR}/constraints.txt" --index-url "${TRITON_INDEX_URL}" --trusted-host "${PIP_TRUSTED_HOST}" "tilelang==0.1.12" --extra-index-url https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
     - python -m pip check
     # Install the exact repaired wheel produced and validated by build:test-wheel.
     - |
-      set -- "${CI_PROJECT_DIR}/output/py${PYTHON_VERSION}/torch${TORCH_VERSION}"/*.whl
+      set -- "${CI_PROJECT_DIR}/output/dtk${DTK_VER}/py${PYTHON_VERSION}/torch${TORCH_VERSION}"/*.whl
       test "$#" -eq 1
       test -f "$1"
       BOLTOPS_WHEEL="$1"
@@ -301,11 +353,17 @@ performance:optest:
       expected_torch = os.environ["TORCH_VERSION"]
       actual_torch = torch.__version__.split("+", 1)[0]
       assert actual_torch == expected_torch, (actual_torch, expected_torch)
+      # Vendor build tags are recorded in wheel metadata, not always in torch.__version__.
+      torch_package_version = version("torch")
+      assert torch_package_version.split("+", 1)[0] == expected_torch, (torch_package_version, expected_torch)
       assert numpy.__version__ == os.environ["NUMPY_VERSION"], numpy.__version__
+      expected_dtk_tag = f"dtk{os.environ['DTK_VER']}"
+      assert expected_dtk_tag in torch_package_version, (torch_package_version, expected_dtk_tag)
       triton_version = version("triton")
       expected_torch_tag = {"2.10.0": "torch2100", "2.11.0": "torch2110"}[expected_torch]
       assert triton_version.startswith("3.6.0+"), triton_version
       assert expected_torch_tag in triton_version, (triton_version, expected_torch_tag)
+      assert expected_dtk_tag in triton_version, (triton_version, expected_dtk_tag)
       print(f"Performance dependency set: torch={torch.__version__}, numpy={numpy.__version__}")
       print(f"Python runtime: {sys.executable}; version={sys.version}; prefix={sys.prefix}; base_prefix={sys.base_prefix}")
       print(f"Torch runtime: version={version('torch')}; path={torch.__file__}")
@@ -313,7 +371,7 @@ performance:optest:
       PY
     # optest strips leading underscores from directory names. Use a safe,
     # job-specific branch so collection cannot pick up another run's logs.
-    - export OPTEST_RUN_BRANCH="ci_performance_${RUNNER_TAG}_py${PYTHON_VERSION}_torch${TORCH_VERSION}_${CI_JOB_ID}"
+    - export OPTEST_RUN_BRANCH="ci_performance_${RUNNER_TAG}_dtk${DTK_VER}_py${PYTHON_VERSION}_torch${TORCH_VERSION}_${CI_JOB_ID}"
     - git checkout -B "${OPTEST_RUN_BRANCH}"
   script:
     - |
@@ -331,7 +389,7 @@ performance:optest:
       optest --op_name boltops --test_mode per --gpus "${HIP_VISIBLE_DEVICES}" \
         --test_dir "${CI_PROJECT_DIR}" || optest_rc=$?
 
-      artifact_dir="${CI_PROJECT_DIR}/optest_artifacts/${RUNNER_TAG}/py${PYTHON_VERSION}/torch${TORCH_VERSION}"
+      artifact_dir="${CI_PROJECT_DIR}/optest_artifacts/${RUNNER_TAG}/dtk${DTK_VER}/py${PYTHON_VERSION}/torch${TORCH_VERSION}"
       mkdir -p "${artifact_dir}"
       result_pattern="/op_test_output/boltops/${OPTEST_RUN_BRANCH}_*/.optest-results.json"
       echo "Looking for current-job results: ${result_pattern}" | tee "${artifact_dir}/collection.log"
@@ -360,7 +418,7 @@ performance:optest:
       fi
 
       report_rc=0
-      python ci_script/optest_to_junit.py "${CI_PROJECT_DIR}" "${RUNNER_TAG}_py${PYTHON_VERSION}_torch${TORCH_VERSION}" \
+      python ci_script/optest_to_junit.py "${CI_PROJECT_DIR}" "${RUNNER_TAG}_dtk${DTK_VER}_py${PYTHON_VERSION}_torch${TORCH_VERSION}" \
         "${results_file}" || report_rc=$?
       echo "optest exit=${optest_rc}; report exit=${report_rc}" | tee -a "${artifact_dir}/collection.log"
       if [ "${optest_rc}" -ne 0 ] || [ "${report_rc}" -ne 0 ]; then
@@ -388,21 +446,16 @@ performance:optest:
   artifacts:
     when: always
     paths:
-      - scripts/${RUNNER_TAG}_py${PYTHON_VERSION}_torch${TORCH_VERSION}_boltops_output.xml
-      - optest_artifacts/${RUNNER_TAG}/py${PYTHON_VERSION}/torch${TORCH_VERSION}/
+      - scripts/${RUNNER_TAG}_dtk${DTK_VER}_py${PYTHON_VERSION}_torch${TORCH_VERSION}_boltops_output.xml
+      - optest_artifacts/${RUNNER_TAG}/dtk${DTK_VER}/py${PYTHON_VERSION}/torch${TORCH_VERSION}/
     reports:
-      junit: scripts/${RUNNER_TAG}_py${PYTHON_VERSION}_torch${TORCH_VERSION}_boltops_output.xml
+      junit: scripts/${RUNNER_TAG}_dtk${DTK_VER}_py${PYTHON_VERSION}_torch${TORCH_VERSION}_boltops_output.xml
     expire_in: 7 days
 
-publish:
+.publish-wheel:
   stage: publish
   tags:
     - nmz
-  needs:
-    - job: build:test-wheel
-      artifacts: true
-    - job: performance:optest
-      artifacts: false
   rules:
     - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_REF_NAME == "main"'
   before_script:
@@ -420,10 +473,13 @@ publish:
           with zipfile.ZipFile(path) as wheel:
               return {name: wheel.read(name) for name in wheel.namelist()}
 
-      wheels = sorted(Path("output").glob("py*/torch*/*.whl"))
-      assert wheels, "No validated wheels found"
-      destination = Path("publish_wheels")
-      destination.mkdir(exist_ok=True)
+      import os
+
+      dtk_version = os.environ["DTK_VER"]
+      wheels = sorted(Path("output").glob(f"dtk{dtk_version}/py*/torch*/*.whl"))
+      assert wheels, f"No built wheels found for DTK {dtk_version}"
+      destination = Path("publish_wheels") / f"dtk{dtk_version}"
+      destination.mkdir(parents=True, exist_ok=True)
       seen = {}
       for wheel in wheels:
           if wheel.name in seen:
@@ -436,15 +492,35 @@ publish:
           print(f"Publish wheel: {wheel}")
       PY
     - |
-      for wheel in publish_wheels/*.whl; do
+      for wheel in "publish_wheels/dtk${DTK_VER}"/*.whl; do
         CIUpload NIGHTLY \
           --devpi_url "${DEVPI_URL}" \
           --password "${devpi_nightly_password}" \
-          --dtk_pkg_name "$(basename "${DTK_PKG}")" \
+          --dtk_pkg_name "${DTK_PKG_NAME}" \
           --record \
           -f "${wheel}"
       done
   artifacts:
     paths:
-      - publish_wheels/*.whl
+      - publish_wheels/dtk${DTK_VER}/*.whl
     expire_in: 30 days
+
+publish:
+  extends: .publish-wheel
+  variables:
+    DTK_VER: "2604"
+    DTK_PKG_NAME: "DTK-26.04-rc4-centos8-x86_64.tar.gz"
+  needs:
+    - job: build:test-wheel
+      artifacts: true
+    - job: performance:optest
+      artifacts: false
+
+publish:dtk2610:
+  extends: .publish-wheel
+  variables:
+    DTK_VER: "2610"
+    DTK_PKG_NAME: "DTK-26.10-Rocky8.6-x86_64.tar.gz"
+  needs:
+    - job: build:wheel:dtk2610
+      artifacts: true
