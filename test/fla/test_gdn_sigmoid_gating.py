@@ -403,6 +403,7 @@ def _sigmoid_bytes(
 def test_bench_sigmoid_update_bandwidth(
     N: int,
     steps: int,
+    time_ms,
     bench_warmup: int,
     bench_repeat: int,
 ) -> None:
@@ -435,9 +436,7 @@ def test_bench_sigmoid_update_bandwidth(
 
     run()
     assert torch.isfinite(state).all()
-    elapsed = triton.testing.do_bench(
-        run, warmup=bench_warmup, rep=bench_repeat
-    )
+    elapsed = time_ms(run, bench_warmup, bench_repeat)
     logical_bytes = _sigmoid_bytes(
         tokens=total, sequences=N, H=H, HV=HV, K=K, V=V,
         input_size=q.element_size(), state_size=state.element_size(),
@@ -452,6 +451,7 @@ def test_bench_sigmoid_update_bandwidth(
 @pytest.mark.parametrize("N", [1, 8, 32, 48], ids=lambda x: f"N{x}")
 def test_bench_recurrent_speculative_verify_bandwidth(
     N: int,
+    time_ms,
     bench_warmup: int,
     bench_repeat: int,
 ) -> None:
@@ -485,9 +485,7 @@ def test_bench_recurrent_speculative_verify_bandwidth(
 
     run()
     assert torch.isfinite(intermediate).all()
-    elapsed = triton.testing.do_bench(
-        run, warmup=bench_warmup, rep=bench_repeat
-    )
+    elapsed = time_ms(run, bench_warmup, bench_repeat)
     logical_bytes = _sigmoid_bytes(
         tokens=total, sequences=N, H=H, HV=HV, K=K, V=V,
         input_size=q.element_size(), state_size=state.element_size(),

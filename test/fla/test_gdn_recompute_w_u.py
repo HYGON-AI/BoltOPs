@@ -12,6 +12,7 @@ import pytest
 import torch
 
 pytest.importorskip("triton")
+import triton  # noqa: E402
 
 from boltops.fla.gdn.triton import recompute_w_u_fwd  # noqa: E402
 from boltops.fla.gdn.triton.recompute_w_u import (  # noqa: E402
@@ -416,7 +417,7 @@ def _bench_useful_flops(case: _BenchShape) -> int:
 @GPU_REQUIRED
 @pytest.mark.bench
 @pytest.mark.parametrize("shape_name", list(_BENCH_SHAPES))
-def test_bench_recompute_w_u(shape_name, time_ms, bench_warmup, bench_repeat):
+def test_bench_recompute_w_u(shape_name, bench_warmup, bench_repeat, time_ms):
     """Time ship API on observed / derived network sizes."""
     case = _BENCH_SHAPES[shape_name]
     k, v, beta, g, A, cu_seqlens = _bench_make_inputs(case)

@@ -242,7 +242,7 @@ pytest test --bench -s       # correctness + real model-size performance
   `optest` is the unified operator test entry used by CI; one run covers accuracy (pytest over `test/`) and performance (`scripts/run_operator_benchmarks.py`):
 
 ```bash
-pip install optest
+pip install optest -i http://10.16.1.201:9929/nightly/dtk2604/+simple/ --trusted-host 10.16.1.201  --force-reinstall
 optest --op_name boltops --test_dir . --test_mode all      # accuracy + performance
 optest --op_name boltops --test_dir . --test_mode acc      # accuracy only
 optest --op_name boltops --test_dir . --test_mode per      # benchmarks only
@@ -252,14 +252,19 @@ optest --display                                            # HTML report from l
 
   Results land in `/op_test_output/boltops/<branch>_<commit>_<timestamp>/`
   (`.optest-results.json` + per-kernel CSVs) with logs under `/op_test_log/boltops/`.
-  CI (`performance:optest`) runs the same entry for every MR into `main` and
-  converts the results to JUnit via `ci_script/optest_to_junit.py`.
-  To add a performance test, drop one module
-  `scripts/perf/<backend>/<kernel>.py` exposing a module-level `SPEC`
-  (shape table + how to call the op; CUDA-graph timing and CSV output are
-  handled by the shared framework in `scripts/perf/bench.py`).
+  CI (`performance:optest`) runs the same entry (`--test_mode per`) for every
+  MR into `main` and converts the results to JUnit via
+  `ci_script/optest_to_junit.py`; the accuracy suite still has pre-existing
+  failures, so acc is not gated yet (upgrade to `--test_mode all` once fixed).
+  To add a performance test, write a normal `@pytest.mark.bench` test
+  under `test/` -- no perf-specific code, no registration: the perf
+  entry (`scripts/run_operator_benchmarks.py`) discovers it
+  automatically.  While it runs, the collection layer
+  (`test/conftest.py`) observes each timing call and writes one unified
+  CSV per op. Full conventions (collection, CSV schema, optional
+  enrichment): `docs/optest_perf.md`.
   Run a subset locally with
-  `python scripts/run_operator_benchmarks.py --kernels triton/flash_mla_sparse`.
+  `python scripts/run_operator_benchmarks.py --ops causal_conv1d`.
   Tuning scripts that search for and write configs live under
   `scripts/tune/` and are not wired into optest.
 

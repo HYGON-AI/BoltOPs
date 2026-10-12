@@ -23,6 +23,7 @@ import torch
 import torch.nn.functional as F
 
 pytest.importorskip("triton")
+import triton  # noqa: E402
 
 from boltops.generic import (  # noqa: E402
     causal_conv1d_fn,
@@ -818,7 +819,7 @@ def _useful_flops(case: _BenchShape, fwd: bool) -> int:
 @pytest.mark.bench
 @pytest.mark.parametrize("shape_name", list(BENCH_FWD_SHAPES))
 def test_bench_causal_conv1d_fn_compare(
-    shape_name, time_ms, bench_warmup, bench_repeat
+    shape_name, bench_warmup, bench_repeat
 ):
     """Time fwd on both ports; the ratio is the kernel-merge decision data."""
     case = BENCH_FWD_SHAPES[shape_name]
@@ -846,7 +847,14 @@ def test_bench_causal_conv1d_fn_compare(
         )
         assert_close(actual, expected, case.x_dtype)
         assert_close(conv_states, ref, case.x_dtype)
-        results[backend] = time_ms(triton_fn, bench_warmup, bench_repeat)
+        # Explicit do_bench (event) for BOTH ports, not the time_ms fixture:
+        # the vLLM port's metadata=None path syncs to host on every call
+        # (seqlens .to("cpu") + .item() for the launch arrays) and is not
+        # graph-capturable, so the fixture would time sglang via cudagraph
+        # and vLLM via event; the ratio only compares under one method.
+        results[backend] = triton.testing.do_bench(
+            triton_fn, warmup=bench_warmup, rep=bench_repeat
+        )
     _report("fwd", case.name, results, _useful_flops(case, fwd=True))
 
 
@@ -854,7 +862,7 @@ def test_bench_causal_conv1d_fn_compare(
 @pytest.mark.bench
 @pytest.mark.parametrize("shape_name", list(BENCH_UPDATE_SHAPES))
 def test_bench_causal_conv1d_update_compare(
-    shape_name, time_ms, bench_warmup, bench_repeat
+    shape_name, bench_warmup, bench_repeat, time_ms
 ):
     """Time update on both ports; the ratio is the kernel-merge decision data."""
     case = BENCH_UPDATE_SHAPES[shape_name]

@@ -199,6 +199,7 @@ def test_packed_decode_rejects_invalid_null_state_index() -> None:
 @pytest.mark.parametrize("B", [1, 8, 32, 64], ids=lambda x: f"B{x}")
 def test_bench_packed_decode_bandwidth(
     B: int,
+    time_ms,
     bench_warmup: int,
     bench_repeat: int,
 ) -> None:
@@ -232,9 +233,7 @@ def test_bench_packed_decode_bandwidth(
 
     run()
     assert torch.isfinite(output).all() and torch.isfinite(state).all()
-    elapsed = triton.testing.do_bench(
-        run, warmup=bench_warmup, rep=bench_repeat
-    )
+    elapsed = time_ms(run, bench_warmup, bench_repeat)
     logical_bytes = _packed_decode_bytes(B, H, HV, K, V, mixed_qkv.element_size())
     bandwidth = logical_bytes / (elapsed * 1e-3) / 1e9
     print(f"GDN packed decode: B={B}, {elapsed * 1e3:.2f} us, {bandwidth:.2f} GB/s")

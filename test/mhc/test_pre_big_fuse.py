@@ -3,7 +3,6 @@ import pytest
 import torch
 
 pytest.importorskip("tilelang")
-from tilelang.profiler import do_bench_cudagraph
 
 from boltops.mhc import mhc_pre_big_fuse
 
@@ -181,6 +180,9 @@ def test_bench_mhc_pre_big_fuse(
     n1: int,
     hidden_size: int,
     mhc_mult: int,
+    time_ms,
+    bench_warmup: int,
+    bench_repeat: int,
 ) -> None:
     td = generate_big_fuse_test_data(n1, mhc_mult, hidden_size)
     fn = lambda: mhc_pre_big_fuse(
@@ -191,10 +193,12 @@ def test_bench_mhc_pre_big_fuse(
         sinkhorn_repeat=td["sinkhorn_repeat"], n_splits=td["n_splits"],
     )
     fn()
-    # Match the original AITER benchmark. This allocation-owning API launches
-    # multiple kernels; eager host-side timing is dominated by Python dispatch,
-    # output allocation, and launch gaps rather than GPU kernel execution.
-    ms = float(do_bench_cudagraph(fn))
+    # CUDA-graph replay, matching the original AITER benchmark method:
+    # this allocation-owning API launches multiple kernels; eager
+    # host-side timing is dominated by Python dispatch, output allocation,
+    # and launch gaps rather than GPU kernel execution.  time_ms routes
+    # to the tilelang profiler (PERF_BACKEND / $OPTEST_BACKEND).
+    ms = time_ms(fn, bench_warmup, bench_repeat)
     print(
         f"[bench] mhc_pre_big_fuse (CUDA graph replay) tokens={n1} "
         f"H={hidden_size} MHC={mhc_mult}: {ms * 1000:.2f} us"

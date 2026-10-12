@@ -3,19 +3,17 @@
 from __future__ import annotations
 
 import inspect
-import importlib
 import math
-import pkgutil
-import re
-import subprocess
 from collections.abc import Callable
 
 import pytest
 import torch
 
 triton = pytest.importorskip("triton")
+from triton.testing import do_bench as _do_bench_ref  # reference timing only, not collected
 
 import boltops.fla.gdn as gdn
+from boltops.utility.backends import discover_backends
 from boltops.fla.gdn import chunk_gated_delta_rule_fwd_h
 from ._gdn_reference import naive_chunk_h, naive_chunk_o
 
@@ -28,67 +26,8 @@ GPU_REQUIRED = pytest.mark.skipif(
 )
 
 
-def get_free_devices() -> list[int]:
-    """Return HCU IDs whose VRAM usage reported by hy-smi is zero."""
-    try:
-        result = subprocess.run(
-            ["hy-smi"], capture_output=True, text=True, check=True
-        )
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return []
-
-    lines = result.stdout.strip().splitlines()
-    header_index = next(
-        (index for index, line in enumerate(lines) if line.strip().startswith("HCU")),
-        -1,
-    )
-    if header_index < 0:
-        return []
-    columns = lines[header_index].split()
-    if "VRAM%" not in columns:
-        return []
-    vram_index = columns.index("VRAM%")
-    free_devices = []
-    for line in lines[header_index + 1 :]:
-        if not re.match(r"^\d", line.strip()):
-            continue
-        fields = line.split()
-        if float(fields[vram_index].strip("%")) == 0.0:
-            free_devices.append(int(fields[0]))
-    return free_devices
-
-
-@pytest.fixture(scope="session")
-def benchmark_device() -> int:
-    free_devices = get_free_devices()
-    if not free_devices:
-        raise RuntimeError("No free HCU devices found")
-    device_id = free_devices[0]
-    torch.cuda.set_device(device_id)
-    return device_id
-
-
-def _discover_backends(operator_name: str) -> dict[str, Callable]:
-    backends = {}
-    for module_info in pkgutil.iter_modules(gdn.__path__):
-        if not module_info.ispkg or module_info.name.startswith("_"):
-            continue
-        try:
-            module = importlib.import_module(
-                f"{gdn.__name__}.{module_info.name}"
-            )
-        except ModuleNotFoundError as exc:
-            if exc.name == module_info.name:
-                continue
-            raise
-        operator = getattr(module, operator_name, None)
-        if callable(operator):
-            backends[module_info.name] = operator
-    return dict(sorted(backends.items()))
-
-
-CHUNK_H_BACKENDS = _discover_backends("chunk_gated_delta_rule_fwd_h")
-CHUNK_O_BACKENDS = _discover_backends("chunk_fwd_o")
+CHUNK_H_BACKENDS = discover_backends(gdn, "chunk_gated_delta_rule_fwd_h")
+CHUNK_O_BACKENDS = discover_backends(gdn, "chunk_fwd_o")
 
 
 def _backend_params(backends: dict[str, Callable]):
@@ -459,7 +398,7 @@ def test_bench_chunk_h_tflops(
     chunk_h_backend: tuple[str, Callable],
     use_varlen: bool,
     transpose_state: bool,
-    benchmark_device: int,
+    time_ms,
     bench_warmup: int,
     bench_repeat: int,
     bench_seq_len: int | None,
@@ -467,7 +406,6 @@ def test_bench_chunk_h_tflops(
     backend_name, chunk_h = chunk_h_backend
     if backend_name == "tilelang" and not transpose_state:
         pytest.skip("TileLang benchmark supports VK state layout only")
-    print(f"Using HCU device: {benchmark_device}")
     torch.manual_seed(122)
     B, H, Hg, K, V, chunk_size = 1, 16, 16, 128, 128, 64
     default_T = 13312
@@ -489,7 +427,7 @@ def test_bench_chunk_h_tflops(
         "GDN chunk h benchmark case: "
         f"backend={backend_name}, mode={mode}, state_layout={state_layout}, "
         f"B={B}, T={T}, H={H}, Hg={Hg}, K={K}, V={V}, "
-        f"chunk_size={chunk_size}, dtype={dtype}, device={benchmark_device}"
+        f"chunk_size={chunk_size}, dtype={dtype}, device={DEVICE}"
     )
     g = _make_chunk_cumsum(B, T, H, chunk_size, cu, use_exp2=False)
     trailing = (H, V, K) if transpose_state else (H, K, V)
@@ -517,9 +455,7 @@ def test_bench_chunk_h_tflops(
     actual_h = h
     actual_v_new = v_new
 
-    h_ms = triton.testing.do_bench(
-        run_h, warmup=bench_warmup, rep=bench_repeat
-    )
+    h_ms = time_ms(run_h, bench_warmup, bench_repeat)
     h_flops = _chunk_h_flops(lengths, H, K, V, chunk_size)
     label = f"{backend_name}, {mode}, {state_layout}"
     h_tflops = h_flops / (h_ms * 1e-3) / 1e12
@@ -565,7 +501,7 @@ def test_bench_chunk_h_tflops(
         rtol=BF16_RTOL,
     )
 
-    aiter_h_ms = triton.testing.do_bench(
+    aiter_h_ms = _do_bench_ref(
         run_aiter_h, warmup=bench_warmup, rep=bench_repeat
     )
     print(
@@ -586,13 +522,12 @@ def test_bench_chunk_o_tflops(
     chunk_o_backend: tuple[str, Callable],
     use_varlen: bool,
     transpose_state: bool,
-    benchmark_device: int,
+    time_ms,
     bench_warmup: int,
     bench_repeat: int,
     bench_seq_len: int | None,
 ) -> None:
     backend_name, chunk_o = chunk_o_backend
-    print(f"Using HCU device: {benchmark_device}")
     torch.manual_seed(122)
     B, H, Hg, K, V, chunk_size = 1, 16, 16, 128, 128, 64
     default_T = 13312
@@ -623,7 +558,7 @@ def test_bench_chunk_o_tflops(
         "GDN chunk o benchmark case: "
         f"backend={backend_name}, mode={mode}, state_layout={state_layout}, "
         f"B={B}, T={T}, H={H}, Hg={Hg}, K={K}, V={V}, "
-        f"chunk_size={chunk_size}, dtype={dtype}, device={benchmark_device}"
+        f"chunk_size={chunk_size}, dtype={dtype}, device={DEVICE}"
     )
 
     def run_o():
@@ -642,9 +577,8 @@ def test_bench_chunk_o_tflops(
 
     output = run_o()
     assert torch.isfinite(output).all()
-    o_ms = triton.testing.do_bench(
-        run_o, warmup=bench_warmup, rep=bench_repeat
-    )
+
+    o_ms = time_ms(run_o, bench_warmup, bench_repeat)
     o_flops = _chunk_o_flops(lengths, H, K, V, chunk_size)
     o_tflops = o_flops / (o_ms * 1e-3) / 1e12
     label = f"{backend_name}, {mode}, {state_layout}"

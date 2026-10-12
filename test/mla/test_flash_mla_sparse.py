@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 import math
 import warnings
@@ -12,7 +13,7 @@ from typing import Optional
 import pytest
 import torch
 
-pytest.importorskip("triton")
+triton = pytest.importorskip("triton")
 
 import boltops.mla.triton.flash_mla_sparse as sparse_module
 
@@ -365,3 +366,99 @@ def test_flash_mla_sparse_sorted_indices_preserve_active_prefix():
     expected = _reference(q, kv, indices, scale, d_v, lengths)
     for lhs, rhs in zip(actual, expected):
         torch.testing.assert_close(lhs.float(), rhs.float(), atol=2e-2, rtol=2e-2)
+
+
+# ---------------------------------------------------------------------------
+# Performance benchmarks (representative vLLM shapes)
+# ---------------------------------------------------------------------------
+
+_BENCH_DTYPE = torch.bfloat16
+
+
+@dataclass(frozen=True)
+class _SparseMlaShape:
+    s_q: int
+    s_kv: int
+    topk: int
+    h_q: int = 16
+    h_kv: int = 1
+    d_qk: int = 576
+    d_v: int = 512
+
+
+# Last two rows track the real-model sizes recorded in
+# docs/ops/mla_sparse_performance.md (chunked prefill + long context).
+_BENCH_SHAPES = (
+    _SparseMlaShape(1, 16384, 2048),
+    _SparseMlaShape(4, 16384, 2048),
+    _SparseMlaShape(32, 16384, 2048),
+    _SparseMlaShape(4, 32768, 4096),
+    _SparseMlaShape(128, 16384, 2048),
+    _SparseMlaShape(32, 131072, 16384),
+)
+_BENCH_BASELINE_CONFIG = {
+    "BLOCK_N": 16,
+    "BLOCK_H": 16,
+    "BLOCK_DMODEL": 128,
+    "num_warps": 4,
+    "num_stages": 1,
+}
+# Large shapes: wider warmup / replay budget keeps a stable median.
+_BENCH_WARMUP_MS = 100
+_BENCH_REPEAT_MS = 300
+
+
+@GPU_REQUIRED
+@pytest.mark.bench
+@pytest.mark.parametrize("mode", ["baseline", "tuned"])
+@pytest.mark.parametrize(
+    "shape",
+    _BENCH_SHAPES,
+    ids=lambda s: f"sq{s.s_q}_skv{s.s_kv}_topk{s.topk}",
+)
+def test_bench_flash_mla_sparse(
+    mode: str,
+    shape: _SparseMlaShape,
+    time_ms,
+    bench_warmup: int,
+    bench_repeat: int,
+) -> None:
+    """Time baseline vs shipped tuned config on the same inputs per shape."""
+    from boltops.mla.triton.flash_mla_sparse import _get_tuned_config
+
+    torch.manual_seed(224)
+    s_q, s_kv, topk = shape.s_q, shape.s_kv, shape.topk
+    h_q, h_kv, d_qk, d_v = shape.h_q, shape.h_kv, shape.d_qk, shape.d_v
+    q = torch.randn((s_q, h_q, d_qk), device="cuda", dtype=_BENCH_DTYPE)
+    kv = torch.randn((s_kv, h_kv, d_qk), device="cuda", dtype=_BENCH_DTYPE)
+    indices = torch.randint(
+        0, s_kv, (s_q, h_kv, topk), device="cuda", dtype=torch.int32
+    )
+    topk_length = torch.full((s_q,), topk, device="cuda", dtype=torch.int32)
+    softmax_scale = 1.0 / math.sqrt(d_qk)
+    config = (
+        _BENCH_BASELINE_CONFIG
+        if mode == "baseline"
+        else _get_tuned_config(q, kv, indices, d_v)
+    )
+
+    def run():
+        return flash_mla_sparse_fwd(
+            q,
+            kv,
+            indices,
+            softmax_scale=softmax_scale,
+            d_v=d_v,
+            topk_length=topk_length,
+            config=config,
+        )
+
+    out, *_ = run()
+    assert torch.isfinite(out).all()
+
+    ms = time_ms(run, bench_warmup, _BENCH_REPEAT_MS)
+    flops = 2.0 * s_q * h_q * topk * (d_qk + d_v)
+    print(
+        f"[bench] flash_mla_sparse {mode} sq={s_q} skv={s_kv} topk={topk}: "
+        f"{ms:.6f} ms, {flops / (ms * 1e9):.3f} TFLOPS"
+    )

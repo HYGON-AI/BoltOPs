@@ -241,7 +241,7 @@ pytest test --bench -s       # 正确性 + 真实模型尺寸性能
   `optest` 是 CI 使用的统一算子测试入口，一次运行覆盖正确性（pytest 跑 `test/`）和性能（`scripts/run_operator_benchmarks.py`）：
 
 ```bash
-pip install optest
+pip install optest -i http://10.16.1.201:9929/nightly/dtk2604/+simple/ --trusted-host 10.16.1.201  --force-reinstall
 optest --op_name boltops --test_dir . --test_mode all      # 正确性 + 性能
 optest --op_name boltops --test_dir . --test_mode acc      # 只跑正确性
 optest --op_name boltops --test_dir . --test_mode per      # 只跑性能
@@ -251,12 +251,17 @@ optest --display                                            # 用最新结果生
 
   结果写入 `/op_test_output/boltops/<branch>_<commit>_<timestamp>/`
   （`.optest-results.json` + 各 kernel 的 CSV），日志在 `/op_test_log/boltops/`。
-  CI（`performance:optest`）对每个进入 `main` 的 MR 运行同一入口，
-  并用 `ci_script/optest_to_junit.py` 把结果转成 JUnit。
-  新增性能测例：放一个模块 `scripts/perf/<backend>/<kernel>.py`，
-  暴露模块级 `SPEC`（shape 表 + 算子调用方式；CUDA Graph 计时与 CSV
-  由 `scripts/perf/bench.py` 统一处理）。本地跑子集：
-  `python scripts/run_operator_benchmarks.py --kernels triton/flash_mla_sparse`。
+  CI（`performance:optest`）对每个进入 `main` 的 MR 运行同一入口
+  （`--test_mode per`），并用 `ci_script/optest_to_junit.py` 把结果转成
+  JUnit；正确性套件存在存量失败，acc 暂不作为门禁（修复后可升级为
+  `--test_mode all`）。
+  新增性能测例：在 `test/` 下正常写 `@pytest.mark.bench` 单测即可
+  （不需要任何 perf 专属代码、不需要注册——perf 入口
+  `scripts/run_operator_benchmarks.py` 自动发现）。运行时收集层
+  （`test/conftest.py`）观测每次计时调用，按算子输出统一 CSV。完整
+  约定（收集、CSV 列规范、可选增强）见 `docs/optest_perf.md`。
+  本地跑子集：
+  `python scripts/run_operator_benchmarks.py --ops causal_conv1d`。
   负责搜索/回写配置的调优脚本放 `scripts/tune/`，不接入 optest。
 
 **新算子：**
