@@ -75,6 +75,7 @@ from boltops.fa import (
     can_use_dense_prefill_fp8,
     unified_attention,
     reshape_and_cache_int4,
+    triangle_attention_fwd,
     KVQuantMode,
 )
 from boltops.sparse_gqa import (
@@ -149,6 +150,9 @@ decode_attention_fwd(
     page_size=64, is_mla=True,
 )
 
+# Triangle Attention forward; BF16 q/k/v are [B, H, N, D], q scaled by 1/sqrt(D)
+out = triangle_attention_fwd(q, k, v, [mask_bias, triangle_bias])
+
 # Step-4 DSA (vendor contract step4-dsa-ops-v1)
 logits = triton_indexer_logits(index_q, weights, index_k)
 out, lse = triton_sparse_attention_decode(
@@ -172,6 +176,7 @@ from boltops.generic.triton.attn_res import attn_res as triton_impl
 | FLA/GDN family                                                                       |                                                                                                                                                                                                                                                          |                       | Triton @liji<br />Tilelang @huangteng |                                         |                                                                                                                                                                                |
 | MoE family                                                                           | `fused_experts` `moe_activation`                                                                                                                                                                                                                     | Triton ✅ TileLang ❌ | Triton @zhenxin TileLang @xxx          | Triton (`fused_experts` mixed+policy) | [docs](docs/ops/fused_moe/fused_moe.md) [performance](docs/ops/fused_moe/performance_report.md) [tuning guide](boltops/tools/fused_moe_triton_tune/tune_moe_triton_user_guide.md) |
 | FA family (UnifiedAttention / PagedAttention / ExtendAttention /...) | `extend_attention_fwd` `extend_attention_fwd_unified` `dense_prefill_attention_fwd` `build_unified_kv_indices` `can_use_dense_prefill_fp8`<br>`unified_attention` `reshape_and_cache_int4` (Quant type: `KVQuantMode`) | Triton ✅ TileLang ❌ | Triton @huangshuang @sunchunhao | Triton | [UnifiedAttention](docs/ops/fa/unified_attention.md) [ExtendAttention](docs/ops/fa/extend_attention.md) |
+| Triangle Attention | `triangle_attention_fwd` | Triton ✅ TileLang ❌ | Triton @sunchunhao | Triton | [docs](docs/ops/fa/triangle_attention.md) |
 | MLA / FlashMLA / Sparse MLA                                                          | `decode_attention_fwd` `decode_attention_fwd_grouped` `decode_attention_fwd_normal` `compute_num_kv_splits`                                                                                                                                      | Triton ✅ TileLang ❌ | Triton @huangshuang @sunchunhao       | Triton                                  | [docs](docs/ops/mla.md) (dense MLA decode now; FlashMLA / Sparse TBD)                                                                                                           |
 | Qwen Sparse GQA                                                                      | `qwen_sparse_kv_extraction_compact_hcu_fa_triton` `sparse_gqa_packed_decode_triton`                                                                                                                                                                  | Triton ✅ TileLang ❌ | Triton @huangshuang @sunchunhao       | Triton                                  | [docs](docs/ops/sparse_gqa.md)                                                                                                                                                 |
 | Step-4 DSA                                                                           | `triton_build_rope_cache` `triton_indexer_norm_rope` `triton_csa_*` `triton_indexer_logits` `triton_region_topk_ids` `triton_topk_select_and_pack` `triton_*_sparse_meta` `triton_sparse_attention_*` `triton_merge_split_states`      | Triton ✅ TileLang ❌ | Triton @xukang @duyubo                 | Triton                                  | [docs](docs/ops/step4_dsa.md)                                                                                                                                                   |
