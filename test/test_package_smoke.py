@@ -55,6 +55,7 @@ from boltops.fa.extend_attention import (
 from boltops.fa import (
     KVQuantMode as fa_KVQuantMode,
     reshape_and_cache_int4 as fa_reshape_and_cache_int4,
+    triangle_attention_fwd,
 )
 from boltops.fa.unified_attention import (
     KVQuantMode,
@@ -139,6 +140,7 @@ def test_operator_package_exports():
     assert callable(dense_prefill_attention_fwd)
     assert callable(extend_attention_fwd)
     assert callable(extend_attention_fwd_unified)
+    assert callable(triangle_attention_fwd)
     assert fa_KVQuantMode is KVQuantMode
     assert fa_reshape_and_cache_int4 is reshape_and_cache_int4
     assert callable(unified_attention)

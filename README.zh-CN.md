@@ -74,6 +74,7 @@ from boltops.fa import (
     can_use_dense_prefill_fp8,
     unified_attention,
     reshape_and_cache_int4,
+    triangle_attention_fwd,
     KVQuantMode,
 )
 from boltops.sparse_gqa import (
@@ -148,6 +149,9 @@ decode_attention_fwd(
     page_size=64, is_mla=True,
 )
 
+# Triangle Attention 前向；BF16 q/k/v 形状为 [B, H, N, D]，q 已乘 1/sqrt(D)
+out = triangle_attention_fwd(q, k, v, [mask_bias, triangle_bias])
+
 # Step-4 DSA（vendor 合同 step4-dsa-ops-v1）
 logits = triton_indexer_logits(index_q, weights, index_k)
 out, lse = triton_sparse_attention_decode(
@@ -171,6 +175,7 @@ from boltops.generic.triton.attn_res import attn_res as triton_impl
 | FLA/GDN 系列                                                                      |                                                                                                                                                                                                                                        |                     | Triton @liji<br />TileLang @huangteng |                              |                                                                                                    |
 | MoE 系列                                                                          | `fused_experts` `moe_activation`                                                                                                                                                                                                       | Triton ✅ TileLang ❌ | Triton @zhenxin TileLang @xxx                 | Triton（`fused_experts` 混合策略） | [文档](docs/ops/fused_moe/fused_moe.md) [性能实测](docs/ops/fused_moe/performance_report.md) [调参指南](boltops/tools/fused_moe_triton_tune/tune_moe_triton_user_guide.md) |
 | FA 系列（UnifiedAttention / PagedAttention / ExtendAttention/...） | `extend_attention_fwd` `extend_attention_fwd_unified` `dense_prefill_attention_fwd` `build_unified_kv_indices` `can_use_dense_prefill_fp8`<br>`unified_attention` `reshape_and_cache_int4` (Quant type: `KVQuantMode`) | Triton ✅ TileLang ❌ | Triton @huangshuang @sunchunhao | Triton | [UnifiedAttention](docs/ops/fa/unified_attention.md) [ExtendAttention](docs/ops/fa/extend_attention.md) |
+| Triangle Attention | `triangle_attention_fwd` | Triton ✅ TileLang ❌ | Triton @sunchunhao | Triton | [文档](docs/ops/fa/triangle_attention.md) |
 | MLA / FlashMLA / Sparse MLA                                                     | `decode_attention_fwd` `decode_attention_fwd_grouped` `decode_attention_fwd_normal` `compute_num_kv_splits`                                                                                                                              | Triton ✅ TileLang ❌ | Triton @huangshuang @sunchunhao | Triton                       | [docs](docs/ops/mla.md)（目前 dense MLA decode；FlashMLA / Sparse 待迁）                              |
 | Qwen Sparse GQA                                                                 | `qwen_sparse_kv_extraction_compact_hcu_fa_triton` `sparse_gqa_packed_decode_triton`                                                                                                                              | Triton ✅ TileLang ❌ | Triton @huangshuang @sunchunhao | Triton                       | [docs](docs/ops/sparse_gqa.md)                                                                      |
 | Step-4 DSA                                                                      | `triton_build_rope_cache` `triton_indexer_norm_rope` `triton_csa_*` `triton_indexer_logits` `triton_region_topk_ids` `triton_topk_select_and_pack` `triton_*_sparse_meta` `triton_sparse_attention_*` `triton_merge_split_states`           | Triton ✅ TileLang ❌ | Triton @xukang @duyubo                                 | Triton                       | [docs](docs/ops/step4_dsa.md)                                                                      |

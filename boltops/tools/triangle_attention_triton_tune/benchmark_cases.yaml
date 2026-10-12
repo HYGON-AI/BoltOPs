@@ -1,0 +1,36 @@
+cases:
+  - name: production-h2
+    performance: true
+    batch: 693
+    heads: 2
+    seq_len: 693
+    head_dim: 32
+    mask_density: 0.9
+    mask_layout: contiguous
+    enabled: true
+  - name: production-h2-mask-strided
+    performance: true
+    batch: 693
+    heads: 2
+    seq_len: 693
+    head_dim: 32
+    mask_density: 0.9
+    mask_layout: strided
+    enabled: true
+  - name: production-h8
+    performance: true
+    batch: 693
+    heads: 8
+    seq_len: 693
+    head_dim: 32
+    mask_density: 0.9
+    mask_layout: contiguous
+    enabled: true
+  - name: non-power-two-head-dim
+    performance: false
+    batch: 2
+    heads: 2
+    seq_len: 65
+    head_dim: 48
+    mask_density: 1.0
+    enabled: true

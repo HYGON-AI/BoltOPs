@@ -10,6 +10,7 @@ from .extend_attention import (
     extend_attention_fwd_unified,
 )
 from .unified_attention import reshape_and_cache_int4, unified_attention
+from .triangle_attention import triangle_attention_fwd
 
 
 def __getattr__(name: str) -> Any:
@@ -30,4 +31,5 @@ __all__ = [
     "KVQuantMode",
     "reshape_and_cache_int4",
     "unified_attention",
+    "triangle_attention_fwd",
 ]
