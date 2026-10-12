@@ -415,6 +415,7 @@ def test_compact_validation_rejects_invalid_contracts() -> None:
 @pytest.mark.parametrize("case", PRODUCTION_CASES, ids=lambda case: case.case_id)
 def test_bench_simulated_production_decode(
     case,
+    time_ms,
     bench_warmup: int,
     bench_repeat: int,
 ) -> None:
@@ -476,21 +477,9 @@ def test_bench_simulated_production_decode(
     actual_out = decode()
     torch.testing.assert_close(actual_out, expected_out, rtol=1e-2, atol=4e-3)
 
-    def bench_median(fn) -> float:
-        # do_bench treats warmup/rep as milliseconds and clears L2 per sample.
-        # The median prevents occasional device stalls from skewing the result.
-        return float(
-            triton.testing.do_bench(
-                fn,
-                warmup=bench_warmup,
-                rep=bench_repeat,
-                return_mode="median",
-            )
-        )
-
-    compact_ms = bench_median(compact)
-    decode_ms = bench_median(decode)
-    end_to_end_ms = bench_median(end_to_end)
+    compact_ms = time_ms(compact, bench_warmup, bench_repeat)
+    decode_ms = time_ms(decode, bench_warmup, bench_repeat)
+    end_to_end_ms = time_ms(end_to_end, bench_warmup, bench_repeat)
     print(
         f"Sparse-GQA {case.case_id}: compact={compact_ms:.6f} ms, "
         f"decode={decode_ms:.6f} ms, "

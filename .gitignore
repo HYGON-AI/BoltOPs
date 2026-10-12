@@ -44,3 +44,6 @@ Thumbs.db
 *.log
 tmp/
 temp/
+
+# optest perf artifacts (collected into optest result dirs)
+optest_results/

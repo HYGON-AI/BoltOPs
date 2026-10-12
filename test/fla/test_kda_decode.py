@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-pytest.importorskip("triton")
+triton = pytest.importorskip("triton")
 
 from boltops.fla.kda import (
     fused_kda_gate,
@@ -313,3 +313,99 @@ def test_kda_rejects_invalid_null_state_index(entry: str) -> None:
                     torch.zeros(B, device=DEVICE, dtype=torch.int32),
                     null_state_index=bad,
                 )
+
+
+# ---------------------------------------------------------------------------
+# Performance benchmarks (real-model decode sizes)
+# ---------------------------------------------------------------------------
+
+_BENCH_DTYPE = torch.bfloat16
+_BENCH_HEADS = 24
+_BENCH_HEAD_DIM = 128
+# N = independent one-token sequences (dense) / tokens (packed)
+_BENCH_N = (1, 6, 32, 64)
+
+
+def _bench_common_inputs(N: int):
+    H, K, V = _BENCH_HEADS, _BENCH_HEAD_DIM, _BENCH_HEAD_DIM
+    q = torch.randn(1, N, H, K, device=DEVICE, dtype=_BENCH_DTYPE) * 0.1
+    k = torch.randn_like(q) * 0.1
+    v = torch.randn(1, N, H, V, device=DEVICE, dtype=_BENCH_DTYPE) * 0.1
+    raw_g = torch.randn(1, N, H, K, device=DEVICE, dtype=_BENCH_DTYPE) * 0.1
+    raw_beta = torch.randn(1, N, H, device=DEVICE, dtype=_BENCH_DTYPE) * 0.1
+    A_log = torch.randn(H, device=DEVICE, dtype=torch.float32) * 0.1
+    dt_bias = torch.randn(H, K, device=DEVICE, dtype=torch.float32) * 0.1
+    # Slot 0 of the pool is the vLLM null slot; live state sits on 1-based rows.
+    state = torch.zeros(N + 1, H, V, K, device=DEVICE, dtype=torch.float32)
+    state[1:] = torch.randn(N, H, V, K, device=DEVICE, dtype=torch.float32) * 0.01
+    cu = torch.arange(N + 1, device=DEVICE, dtype=torch.int32)
+    indices = torch.arange(1, N + 1, device=DEVICE, dtype=torch.int32)
+    return q, k, v, raw_g, raw_beta, A_log, dt_bias, state, cu, indices
+
+
+@GPU_REQUIRED
+@pytest.mark.bench
+@pytest.mark.parametrize("entry", ["dense", "packed", "dense_pregated"])
+@pytest.mark.parametrize("N", list(_BENCH_N), ids=lambda n: f"t{n}")
+def test_bench_kda_decode(
+    entry: str,
+    N: int,
+    time_ms,
+    bench_warmup: int,
+    bench_repeat: int,
+) -> None:
+    """Time the three production decode entries on real-model sizes.
+
+    H=24, K=V=128, BF16 inputs / FP32 state pool updated in place (the real
+    decode-loop semantics).  ``dense`` is the gate-fused vLLM wrapper,
+    ``packed`` the packed-QKV entry, and ``dense_pregated`` the SGLang path
+    with the gate materialized once outside the timed call.
+    """
+    torch.manual_seed(222)
+    H, K, V = _BENCH_HEADS, _BENCH_HEAD_DIM, _BENCH_HEAD_DIM
+    q, k, v, raw_g, raw_beta, A_log, dt_bias, state, cu, indices = (
+        _bench_common_inputs(N)
+    )
+
+    if entry == "dense":
+
+        def run():
+            return fused_recurrent_kda(
+                q, k, v, raw_g, raw_beta, A_log, dt_bias, None,
+                state, cu, indices,
+            )
+
+    elif entry == "packed":
+        mixed_qkv = torch.cat(
+            (q[0].reshape(N, H * K), k[0].reshape(N, H * K),
+             v[0].reshape(N, H * V)),
+            dim=-1,
+        ).contiguous()
+
+        def run():
+            return fused_recurrent_kda_packed_decode(
+                mixed_qkv, raw_g, raw_beta, A_log, dt_bias, None,
+                state, indices,
+            )
+
+    else:
+        gate = fused_kda_gate(
+            raw_g.reshape(N, H * K), A_log, K, g_bias=dt_bias
+        ).reshape(1, N, H, K)
+        beta = raw_beta.float().sigmoid()
+
+        def run():
+            return fused_recurrent_kda_fwd(
+                q, k, v, gate, beta, initial_state=state,
+                cu_seqlens=cu, ssm_state_indices=indices,
+            )
+
+    output, returned_state = run()
+    assert torch.isfinite(output).all() and torch.isfinite(state).all()
+
+    ms = time_ms(run, bench_warmup, bench_repeat)
+    flops = 4.0 * H * K * V * N
+    print(
+        f"[bench] kda_decode {entry} N={N}: "
+        f"{ms:.4f} ms, {flops / (ms * 1e9):.3f} TFLOPS"
+    )
