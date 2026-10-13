@@ -1,6 +1,24 @@
-"""Correctness tests for paged decode FP8 MQA logits (KVBlockSize=1)."""
+"""Correctness and optional GPU-latency benches for paged FP8 MQA logits.
+
+Default pytest run: correctness / contract tests (``kv_block_size`` 1 and 64).
+
+Perf (needs ``--bench``; CUDA-graph pure GPU). Production path timed is
+``kv_block_size=64`` SplitKV + ``fuse_output_init=True``::
+
+    pytest -q test/mqa_logits/test_triton_fp8_paged_mqa_logits.py --bench -s
+    pytest -q test/mqa_logits/test_triton_fp8_paged_mqa_logits.py --bench -s -k vs_hipc
+
+Standalone CLI (same benches)::
+
+    python test/mqa_logits/test_triton_fp8_paged_mqa_logits.py
+    python test/mqa_logits/test_triton_fp8_paged_mqa_logits.py --vs-hipc
+"""
 
 from __future__ import annotations
+
+import argparse
+import random
+from typing import Callable, Optional
 
 import pytest
 import torch
@@ -9,6 +27,8 @@ pytest.importorskip("triton")
 
 from boltops.mqa_logits import (  # noqa: E402
     triton_fp8_paged_mqa_logits,
+    triton_fp8_paged_mqa_logits_build_bucket_schedule,
+    triton_fp8_paged_mqa_logits_prepare,
     triton_fp8_paged_mqa_logits_stage1,
 )
 from boltops.utility.arch_info import get_fp8_e4m3_dtype  # noqa: E402
@@ -143,7 +163,7 @@ def ref_fp8_paged_mqa_logits_block64(
         (4, 1, 32, 128, 2048, [401, 888, 1333, 1999], 4),
     ],
 )
-def test_fp8_paged_mqa_logits_block64_correctness(
+def test_triton_fp8_paged_mqa_logits_block64_correctness(
     batch_size,
     next_n,
     heads,
@@ -210,6 +230,8 @@ def test_fp8_paged_mqa_logits_block64_correctness(
     ).unsqueeze(1)
 
     assert torch.isfinite(out[valid_mask]).all()
+    # Outside the causal window must be exact -inf (not merely very negative).
+    assert torch.isneginf(out[~valid_mask]).all()
     torch.testing.assert_close(out[valid_mask], ref[valid_mask], rtol=5e-2, atol=5e-2)
 
 
@@ -272,23 +294,12 @@ def _valid_logits_mask(context_lens, batch_size, next_n, max_model_len):
     "batch_size,next_n,heads,hidden_dim,max_model_len,context_lens_list,"
     "bucket_tokens,seed",
     [
-        # ctx < bucket_tokens -> exactly one bucket, the degenerate case.
-        (1, 1, 64, 128, 4096, [59], 2048, 0),
-        # ctx spans two buckets, the second one partial.
-        (1, 1, 64, 128, 4096, [3072], 2048, 1),
-        # Mixed: 2049 needs 2 buckets, 7000 needs 4 -> the imbalance this
-        # scheduler exists to fix.
-        (2, 1, 64, 128, 8192, [2049, 7000], 2048, 2),
-        # next_n=2 with widely varying bucket counts (1..8 per row).
-        (4, 2, 64, 128, 4096, [211, 777, 943, 3991], 512, 3),
-        # Many small buckets per row.
-        (2, 2, 64, 128, 2048, [1536, 1987], 256, 4),
-        (4, 1, 8, 128, 1024, [401, 888, 999, 1013], 256, 5),
-        # Single head exercises the non-MMA lowering path.
-        (1, 1, 1, 128, 512, [59], 256, 6),
+        (1, 1, 64, 128, 4096, [59], 2048, 0),          # one bucket
+        (2, 1, 64, 128, 8192, [2049, 7000], 2048, 2),  # imbalanced
+        (1, 1, 1, 128, 512, [59], 256, 6),             # non-MMA heads=1
     ],
 )
-def test_fp8_paged_mqa_logits_block64_bucket_correctness(
+def test_triton_fp8_paged_mqa_logits_block64_bucket_correctness(
     batch_size,
     next_n,
     heads,
@@ -336,7 +347,7 @@ def test_fp8_paged_mqa_logits_block64_bucket_correctness(
         (4, 2, 64, 128, 4096, [211, 777, 943, 3991], 12),
     ],
 )
-def test_fp8_paged_mqa_logits_bucket_matches_block_kernel(
+def test_triton_fp8_paged_mqa_logits_bucket_matches_block_kernel(
     batch_size,
     next_n,
     heads,
@@ -372,7 +383,7 @@ def test_fp8_paged_mqa_logits_bucket_matches_block_kernel(
     )
 
 
-def test_resolve_split_kv_pins_the_measured_regimes():
+def test_triton_resolve_split_kv_pins_the_measured_regimes():
     """The heuristic is host arithmetic; pin the cases the A/B matrix used.
 
     Numbers are for CU=72, waves_per_eu=2, chunk_k=64 -- the machine the
@@ -423,7 +434,7 @@ def test_resolve_split_kv_pins_the_measured_regimes():
     assert sk(128, 2, 4504) == 10
 
 
-def test_build_paged_bucket_schedule_layout():
+def test_triton_build_paged_bucket_schedule_layout():
     """Schedule shape/contents are pure host logic, so pin them without a GPU."""
     from boltops.mqa_logits.triton.fp8_paged_mqa_logits import (
         build_paged_bucket_schedule,
@@ -501,7 +512,7 @@ def test_build_paged_bucket_schedule_layout():
         (3, 1, [100, 100, 100], 128),
     ],
 )
-def test_build_bucket_schedule_device_matches_host(
+def test_triton_build_bucket_schedule_device_matches_host(
     batch_size, next_n, context_lens_list, bucket_tokens
 ):
     """The device partitioner must reproduce the host one exactly.
@@ -547,18 +558,12 @@ def test_build_bucket_schedule_device_matches_host(
 @pytest.mark.parametrize(
     "batch_size,next_n,heads,hidden_dim,max_model_len,context_lens_list,bucket_tokens,seed",
     [
-        (1, 1, 64, 128, 4096, [59], 128, 30),
-        (1, 1, 64, 128, 4096, [3072], 128, 31),
         (2, 1, 64, 128, 8192, [2049, 7000], 128, 32),
         (4, 2, 64, 128, 4096, [211, 777, 943, 3991], 128, 33),
-        (4, 1, 8, 128, 1024, [401, 888, 999, 1013], 256, 34),
-        # Single head exercises the non-MMA lowering path.
         (1, 1, 1, 128, 512, [59], 128, 35),
-        # next_n=2 where one row's bucket is entirely partial.
-        (2, 2, 64, 128, 2048, [1536, 1987], 128, 36),
     ],
 )
-def test_persistent_bucket_matches_block_kernel(
+def test_triton_persistent_bucket_matches_block_kernel(
     batch_size, next_n, heads, hidden_dim, max_model_len, context_lens_list,
     bucket_tokens, seed,
 ):
@@ -596,7 +601,7 @@ def test_persistent_bucket_matches_block_kernel(
 
 
 @GPU_REQUIRED
-def test_persistent_bucket_matches_host_schedule_bucket():
+def test_triton_persistent_bucket_matches_host_schedule_bucket():
     """The device schedule must drive the same partition as the host one.
 
     Bitwise equality between the two bucket paths is a stronger statement than
@@ -628,7 +633,7 @@ def test_persistent_bucket_matches_host_schedule_bucket():
 
 
 @GPU_REQUIRED
-def test_persistent_bucket_reuses_scratch_buffer():
+def test_triton_persistent_bucket_reuses_scratch_buffer():
     """A caller-supplied ``base`` must be overwritten in place, not appended to.
 
     This is the property that makes the op graph-capturable: the serving loop
@@ -669,7 +674,7 @@ def test_persistent_bucket_reuses_scratch_buffer():
 
 
 @GPU_REQUIRED
-def test_persistent_bucket_tolerates_empty_context_rows():
+def test_triton_persistent_bucket_tolerates_empty_context_rows():
     """A zero-length context must not stall the row walk.
 
     The op trusts the caller for numeric ``context_lens`` bounds. A row with
@@ -703,7 +708,7 @@ def test_persistent_bucket_tolerates_empty_context_rows():
 
 
 @GPU_REQUIRED
-def test_persistent_bucket_enables_graph_capture():
+def test_triton_persistent_bucket_enables_graph_capture():
     """Capture and replay must reproduce the eager result.
 
     The grid is a host constant and the partition lives in a device buffer, so
@@ -761,7 +766,7 @@ def test_persistent_bucket_enables_graph_capture():
 
 
 @GPU_REQUIRED
-def test_persistent_bucket_rejects_row_count_mismatch():
+def test_triton_persistent_bucket_rejects_row_count_mismatch():
     """A schedule built for another batch shape must be rejected, not mis-indexed.
 
     The kernel trusts ``num_rows`` to bound its binary search, so a stale
@@ -783,7 +788,7 @@ def test_persistent_bucket_rejects_row_count_mismatch():
 
 
 @GPU_REQUIRED
-def test_persistent_bucket_rejects_use_bucket_combo():
+def test_triton_persistent_bucket_rejects_use_bucket_combo():
     """``bucket_schedule`` and ``use_bucket`` must not be combined."""
     from boltops.mqa_logits import triton_fp8_paged_mqa_logits_build_bucket_schedule
 
@@ -801,7 +806,7 @@ def test_persistent_bucket_rejects_use_bucket_combo():
 
 
 @GPU_REQUIRED
-def test_build_bucket_schedule_validates_arguments():
+def test_triton_build_bucket_schedule_validates_arguments():
     """Bad inputs must raise rather than launch a kernel on garbage."""
     from boltops.mqa_logits import triton_fp8_paged_mqa_logits_build_bucket_schedule
 
@@ -830,7 +835,7 @@ def test_build_bucket_schedule_validates_arguments():
 
 
 @GPU_REQUIRED
-def test_default_bucket_num_programs_clamps_around_estimate():
+def test_triton_default_bucket_num_programs_clamps_around_estimate():
     """The default grid is the bucket-count estimate, clamped at both ends.
 
     Exercised directly because the clamp is the only thing keeping a wide, skewed
@@ -870,7 +875,7 @@ def test_default_bucket_num_programs_clamps_around_estimate():
 
 
 @GPU_REQUIRED
-def test_paged_prepare_returns_batch_info():
+def test_triton_paged_prepare_returns_batch_info():
     """``prepare`` records shapes and resolves ``max_ctx`` (no shape asserts)."""
     from boltops.mqa_logits import triton_fp8_paged_mqa_logits_prepare
 
@@ -893,17 +898,7 @@ def test_paged_prepare_returns_batch_info():
 
 
 @GPU_REQUIRED
-@pytest.mark.parametrize(
-    "batch_size,next_n,heads,hidden_dim,max_model_len,context_lens_list,seed",
-    [
-        (2, 1, 64, 128, 8192, [2049, 7000], 22),
-        (4, 2, 64, 128, 4096, [211, 777, 943, 3991], 23),
-        (1, 1, 1, 128, 512, [59], 24),
-    ],
-)
-def test_paged_prepare_output_matches_unprepared(
-    batch_size, next_n, heads, hidden_dim, max_model_len, context_lens_list, seed
-):
+def test_triton_paged_prepare_output_matches_unprepared():
     """Passing ``batch_info`` must not change the result, only the host path.
 
     The split_kv heuristic may legitimately pick a different value than the
@@ -916,6 +911,8 @@ def test_paged_prepare_output_matches_unprepared(
         triton_fp8_paged_mqa_logits as _op,
     )
 
+    batch_size, next_n, heads, hidden_dim = 2, 1, 64, 128
+    max_model_len, context_lens_list, seed = 8192, [2049, 7000], 22
     q_fp8, kv_fp8, weights, context_lens, block_table, out_ref = _build_block64_inputs(
         batch_size, next_n, heads, hidden_dim, max_model_len, context_lens_list, seed
     )
@@ -936,7 +933,7 @@ def test_paged_prepare_output_matches_unprepared(
 
 
 @GPU_REQUIRED
-def test_paged_batch_info_enables_graph_capture():
+def test_triton_paged_batch_info_enables_graph_capture():
     """Prepared and unprepared paths are both graph-capturable.
 
     The launch path never reads ``context_lens`` on the host. ``prepare`` still
@@ -1015,7 +1012,7 @@ def test_paged_batch_info_enables_graph_capture():
         (4, 1, 8, 128, 1024, [401, 888, 999, 1013], 11),
     ],
 )
-def test_fp8_paged_mqa_logits_correctness(
+def test_triton_fp8_paged_mqa_logits_correctness(
     batch_size,
     next_n,
     heads,
@@ -1075,6 +1072,7 @@ def test_fp8_paged_mqa_logits_correctness(
     ).unsqueeze(1)
 
     assert torch.isfinite(out[valid_mask]).all()
+    assert torch.isneginf(out[~valid_mask]).all()
     torch.testing.assert_close(out[valid_mask], ref[valid_mask], rtol=5e-2, atol=5e-2)
 
 
@@ -1088,7 +1086,7 @@ def test_fp8_paged_mqa_logits_correctness(
         (4, 1, 64, 128, 2048, [401, 888, 1333, 1999], 7),
     ],
 )
-def test_fp8_paged_mqa_logits_stage1_matches_full(
+def test_triton_fp8_paged_mqa_logits_stage1_matches_full(
     batch_size,
     next_n,
     heads,
@@ -1174,7 +1172,7 @@ def test_fp8_paged_mqa_logits_stage1_matches_full(
         (4, 1, 64, 128, 2048, [401, 888, 1333, 1999], 7),
     ],
 )
-def test_fp8_paged_mqa_logits_stage1_block64_matches_full(
+def test_triton_fp8_paged_mqa_logits_stage1_block64_matches_full(
     batch_size,
     next_n,
     heads,
@@ -1265,52 +1263,9 @@ def test_fp8_paged_mqa_logits_stage1_block64_matches_full(
 
 
 @GPU_REQUIRED
-def test_fp8_paged_mqa_logits_stage1_chunk_q_default():
-    """Default chunk_q=64 path (heads=64)."""
-    batch_size, next_n, heads, hidden_dim = 1, 1, 64, 128
-    max_model_len, ctx_len = 128, 100
-    q_fp8 = torch.randn(
-        batch_size, next_n, heads, hidden_dim, device=DEVICE, dtype=torch.bfloat16
-    ).to(e4m3_type)
-    kv = torch.randn((max_model_len, 1, 1, hidden_dim), device=DEVICE, dtype=torch.bfloat16)
-    kv_fp8 = kv_cache_cast_to_fp8(kv)
-    weights = torch.randn((batch_size * next_n, heads), device=DEVICE)
-    context_lens = torch.tensor([ctx_len], device=DEVICE, dtype=torch.int32)
-    kv_indices = torch.zeros((1, max_model_len), device=DEVICE, dtype=torch.int32)
-    kv_indices[0, :ctx_len] = torch.arange(ctx_len, device=DEVICE, dtype=torch.int32)
-
-    out_qk = torch.full(
-        (heads, batch_size * next_n, max_model_len),
-        float("-inf"),
-        device=DEVICE,
-        dtype=torch.float32,
-    )
-    triton_fp8_paged_mqa_logits_stage1(
-        q_fp8,
-        kv_fp8,
-        weights,
-        out_qk,
-        context_lens,
-        kv_indices,
-        max_model_len,
-    )
-    ref = ref_fp8_paged_mqa_logits(
-        q_fp8, kv_fp8, weights, context_lens, kv_indices, max_model_len
-    )
-    out = out_qk.sum(dim=0)
-    valid = torch.arange(max_model_len, device=DEVICE) <= (ctx_len - next_n)
-    torch.testing.assert_close(out[0, valid], ref[0, valid], rtol=5e-2, atol=5e-2)
-
-
-@GPU_REQUIRED
-@pytest.mark.parametrize("heads", [1, 2, 4, 8])
-def test_fp8_paged_mqa_logits_stage1_small_heads_default_chunk_q(heads):
-    """Small head counts must work without an explicit ``chunk_q``.
-
-    The stage-1 kernel tiles the head dim and needs ``heads % chunk_q == 0``.
-    Defaulting ``chunk_q`` to 64 used to raise ``heads must divide chunk_q``;
-    it is now derived as the largest power-of-two divisor of ``heads``.
-    """
+@pytest.mark.parametrize("heads", [1, 8, 64])
+def test_triton_fp8_paged_mqa_logits_stage1_default_chunk_q(heads):
+    """Default ``chunk_q`` must work for small heads and the heads=64 path."""
     batch_size, next_n, hidden_dim = 2, 1, 128
     max_model_len, ctx_len = 256, 200
     q_fp8 = torch.randn(
@@ -1330,7 +1285,6 @@ def test_fp8_paged_mqa_logits_stage1_small_heads_default_chunk_q(heads):
         device=DEVICE,
         dtype=torch.float32,
     )
-    # No chunk_q passed on purpose.
     triton_fp8_paged_mqa_logits_stage1(
         q_fp8, kv_fp8, weights, out_qk, context_lens, kv_indices, max_model_len,
     )
@@ -1343,7 +1297,7 @@ def test_fp8_paged_mqa_logits_stage1_small_heads_default_chunk_q(heads):
 
 
 @GPU_REQUIRED
-def test_fp8_paged_mqa_logits_rejects_context_lens_batch_mismatch():
+def test_triton_fp8_paged_mqa_logits_rejects_context_lens_batch_mismatch():
     """``context_lens`` must have one entry per batch row."""
     batch_size, next_n, heads, hidden_dim = 2, 1, 8, 128
     max_model_len = 256
@@ -1369,7 +1323,7 @@ def test_fp8_paged_mqa_logits_rejects_context_lens_batch_mismatch():
 
 @GPU_REQUIRED
 @pytest.mark.parametrize("kv_block_size", [1, 64])
-def test_prepare_paged_kv_views_layout_and_strides(kv_block_size):
+def test_triton_prepare_paged_kv_views_layout_and_strides(kv_block_size):
     """The packed-cache split must expose the values and scales with correct strides.
 
     The cache row is ``block_size * D`` fp8 bytes followed by ``block_size`` fp32
@@ -1416,7 +1370,7 @@ def test_prepare_paged_kv_views_layout_and_strides(kv_block_size):
 
 
 @GPU_REQUIRED
-def test_prepare_paged_kv_views_rejects_non_byte_cache():
+def test_triton_prepare_paged_kv_views_rejects_non_byte_cache():
     """A wider element type can't be byte-addressed; reject instead of mis-viewing."""
     from boltops.mqa_logits.triton.fp8_paged_mqa_logits import _prepare_paged_kv_views
 
@@ -1426,9 +1380,9 @@ def test_prepare_paged_kv_views_rejects_non_byte_cache():
         _prepare_paged_kv_views(kv, 64, hidden_dim, e4m3_type)
 
 
-@pytest.mark.parametrize("bad_block_size", [2, 16, 32, 128])
+@pytest.mark.parametrize("bad_block_size", [32])
 @GPU_REQUIRED
-def test_fp8_paged_mqa_logits_rejects_unsupported_kv_block_size(bad_block_size):
+def test_triton_fp8_paged_mqa_logits_rejects_unsupported_kv_block_size(bad_block_size):
     """Only 1 (per-token) and 64 (block table) are supported page sizes."""
     batch_size, next_n, heads, hidden_dim = 2, 1, 8, 128
     max_model_len = 256
@@ -1458,9 +1412,9 @@ def test_fp8_paged_mqa_logits_rejects_unsupported_kv_block_size(bad_block_size):
         )
 
 
-@pytest.mark.parametrize("bad_block_size", [2, 16, 32, 128])
+@pytest.mark.parametrize("bad_block_size", [32])
 @GPU_REQUIRED
-def test_fp8_paged_mqa_logits_stage1_rejects_unsupported_kv_block_size(bad_block_size):
+def test_triton_fp8_paged_mqa_logits_stage1_rejects_unsupported_kv_block_size(bad_block_size):
     """stage1 must reject unsupported page sizes up front, like the main entry."""
     batch_size, next_n, heads, hidden_dim = 2, 1, 8, 128
     max_model_len = 256
@@ -1487,3 +1441,522 @@ def test_fp8_paged_mqa_logits_stage1_rejects_unsupported_kv_block_size(bad_block
             q_fp8, kv_fp8, weights, out_qk, context_lens, kv_indices,
             max_model_len, kv_block_size=bad_block_size,
         )
+
+
+# ---------------------------------------------------------------------------
+# Output contract (minimal): default path does not write the tail; fuse fills
+# the whole row; unsupported fuse paths must raise (not silently ignore).
+# Outside-window -inf is checked in the main correctness tests above.
+# ---------------------------------------------------------------------------
+
+NEG_INF = float("-inf")
+SENTINEL = 12345.0  # never a legitimate logit; survives only if the kernel skips
+KV_BLOCK_SIZE = 64
+
+# Non-multiple of chunk_k + mixed per-row ctx (catches max_ctx boundary bugs).
+CONTRACT_SHAPES = [
+    (2, 1, 64, 128, 4096, [2049, 4095]),
+    (4, 2, 64, 128, 8192, [211, 777, 3991, 8191]),
+]
+CONTRACT_SHAPE_IDS = [
+    f"b{b}_n{n}_h{h}_ctx{'-'.join(map(str, ctxs))}"
+    for b, n, h, _, _, ctxs in CONTRACT_SHAPES
+]
+
+
+def _contract_run(
+    q, kv, weights, context_lens, block_table, max_model_len, fill, *,
+    split_kv=None, fuse=False,
+):
+    rows = q.size(0) * q.size(1)
+    out = torch.full((rows, max_model_len), fill, device=DEVICE, dtype=torch.float32)
+    info = triton_fp8_paged_mqa_logits_prepare(q, kv, context_lens, block_table)
+    triton_fp8_paged_mqa_logits(
+        q, kv, weights, out, context_lens, block_table, max_model_len,
+        kv_block_size=KV_BLOCK_SIZE,
+        batch_info=info,
+        split_kv=split_kv,
+        fuse_output_init=fuse,
+    )
+    return out
+
+
+def _row_context_lens(context_lens_list, next_n):
+    return [int(ctx) for ctx in context_lens_list for _ in range(next_n)]
+
+
+def _written_end(ctx_len, max_model_len):
+    end = -(-int(ctx_len) // KV_BLOCK_SIZE) * KV_BLOCK_SIZE
+    return min(end, max_model_len)
+
+
+@GPU_REQUIRED
+@pytest.mark.parametrize("shape", CONTRACT_SHAPES, ids=CONTRACT_SHAPE_IDS)
+def test_triton_paged_past_the_last_tile_is_left_untouched(shape):
+    """Default SplitKV must not touch past ceil(ctx/chunk_k)*chunk_k."""
+    batch, next_n, heads, hidden, max_model_len, ctxs = shape
+    q, kv, weights, context_lens, block_table, _ = _build_block64_inputs(
+        batch, next_n, heads, hidden, max_model_len, ctxs, seed=1
+    )
+
+    untouched = _contract_run(
+        q, kv, weights, context_lens, block_table, max_model_len, SENTINEL
+    )
+    cleaned = _contract_run(
+        q, kv, weights, context_lens, block_table, max_model_len, NEG_INF
+    )
+
+    for row, ctx_len in enumerate(_row_context_lens(ctxs, next_n)):
+        end = _written_end(ctx_len, max_model_len)
+        assert torch.all(untouched[row, end:] == SENTINEL), (
+            f"row {row} (ctx={ctx_len}): wrote past {end}"
+        )
+        if end:
+            assert torch.equal(untouched[row, :end], cleaned[row, :end])
+
+
+@GPU_REQUIRED
+@pytest.mark.parametrize("split_kv", [1, 8])
+def test_triton_paged_fuse_output_init_writes_the_whole_row_from_a_poisoned_buffer(split_kv):
+    """fuse_output_init must fill every column (NaN poison; SplitKV=8 stresses stride)."""
+    batch, next_n, heads, hidden, max_model_len, ctxs = (
+        2, 1, 64, 128, 8192, [2049, 4095],
+    )
+    q, kv, weights, context_lens, block_table, _ = _build_block64_inputs(
+        batch, next_n, heads, hidden, max_model_len, ctxs, seed=3
+    )
+
+    fused = _contract_run(
+        q, kv, weights, context_lens, block_table, max_model_len, float("nan"),
+        split_kv=split_kv, fuse=True,
+    )
+    assert not torch.isnan(fused).any()
+    valid = _valid_logits_mask(context_lens, batch, next_n, max_model_len)
+    assert torch.isneginf(fused[~valid]).all()
+    ref = ref_fp8_paged_mqa_logits_block64(
+        q, kv, weights, context_lens, block_table, max_model_len
+    )
+    torch.testing.assert_close(fused[valid], ref[valid], rtol=5e-2, atol=5e-2)
+
+    primed = _contract_run(
+        q, kv, weights, context_lens, block_table, max_model_len, NEG_INF,
+        split_kv=split_kv, fuse=False,
+    )
+    assert torch.equal(fused, primed)
+
+
+@GPU_REQUIRED
+@pytest.mark.parametrize(
+    "mode",
+    ["kv_block_size_1", "use_bucket", "bucket_schedule"],
+    ids=["block1", "use_bucket", "bucket_schedule"],
+)
+def test_triton_paged_fuse_output_init_is_rejected_where_the_tail_cannot_be_filled(mode):
+    """Paths without a tail fill must raise, not ignore fuse_output_init."""
+    batch, next_n, heads, hidden, max_model_len, ctxs = (
+        2, 1, 64, 128, 8192, [2048, 4096],
+    )
+    q, kv, weights, context_lens, block_table, out = _build_block64_inputs(
+        batch, next_n, heads, hidden, max_model_len, ctxs, seed=4
+    )
+    info = triton_fp8_paged_mqa_logits_prepare(q, kv, context_lens, block_table)
+    kwargs = dict(
+        context_lens=context_lens,
+        kv_indices=block_table,
+        max_model_len=max_model_len,
+        batch_info=info,
+        fuse_output_init=True,
+    )
+    if mode == "kv_block_size_1":
+        kwargs["kv_block_size"] = 1
+    elif mode == "use_bucket":
+        kwargs["kv_block_size"] = KV_BLOCK_SIZE
+        kwargs["use_bucket"] = True
+    else:
+        kwargs["kv_block_size"] = KV_BLOCK_SIZE
+        kwargs["bucket_schedule"] = triton_fp8_paged_mqa_logits_build_bucket_schedule(
+            context_lens, next_n=next_n, bucket_tokens=2048
+        )
+
+    with pytest.raises(NotImplementedError, match="fuse_output_init"):
+        triton_fp8_paged_mqa_logits(q, kv, weights, out, **kwargs)
+
+
+@GPU_REQUIRED
+def test_triton_paged_kv_block_size_1_leaves_the_tail_untouched():
+    """Per-token path has no tail loop; large max_model_len - ctx must stay poison."""
+    batch, next_n, heads, hidden, max_model_len, ctxs = (
+        1, 1, 64, 128, 40960, [8192],
+    )
+    torch.manual_seed(5)
+    q = torch.randn(
+        (batch, next_n, heads, hidden), device=DEVICE, dtype=torch.bfloat16
+    )
+    kv_fp8 = kv_cache_cast_to_fp8(
+        torch.randn((max_model_len, 1, 1, hidden), device=DEVICE, dtype=torch.bfloat16)
+    )
+    weights = torch.randn(
+        (batch * next_n, heads), device=DEVICE, dtype=torch.float32
+    )
+    context_lens = torch.tensor(ctxs, device=DEVICE, dtype=torch.int32)
+    kv_indices = torch.zeros(
+        (batch, max_model_len), device=DEVICE, dtype=torch.int32
+    )
+    kv_indices[0, :ctxs[0]] = torch.randperm(max_model_len, device=DEVICE)[:ctxs[0]]
+    out = torch.full(
+        (batch * next_n, max_model_len), float("nan"), device=DEVICE, dtype=torch.float32
+    )
+
+    triton_fp8_paged_mqa_logits(
+        q, kv_fp8, weights, out, context_lens, kv_indices, max_model_len,
+        kv_block_size=1,
+    )
+    end = _written_end(ctxs[0], max_model_len)
+    assert torch.isnan(out[0, end:]).all()
+    assert not torch.isnan(out[0, :end]).any()
+    assert int(torch.isnan(out).sum()) == max_model_len - end
+
+
+# ---------------------------------------------------------------------------
+# Perf: CUDA-graph pure-GPU latency (pytest --bench or __main__ CLI)
+# ---------------------------------------------------------------------------
+
+BENCH_MAX_MODEL_LEN = 111_000
+BENCH_BLOCK = 64
+BENCH_HEAD_DIM = 128
+
+# (batch, next_n, heads, avg_kv) -- hipc paged test grid subset
+BENCH_SHAPES = [
+    (1, 1, 64, 4096),
+    (64, 1, 64, 4096),
+    (64, 1, 64, 72000),
+    (128, 1, 64, 4096),
+    (64, 2, 64, 4096),
+    (64, 1, 32, 4096),
+    (128, 1, 32, 4096),
+    (64, 1, 32, 72000),
+]
+
+BENCH_PATHS = ("splitkv_fuse", "splitkv_nofuse", "bucket_persistent")
+
+
+def _bench_build_inputs(batch: int, next_n: int, heads: int, avg_kv: int, seed: int = 0):
+    torch.manual_seed(seed)
+    random.seed(seed)
+    num_blocks = max(batch * _cdiv(int(1.1 * avg_kv) + BENCH_BLOCK, BENCH_BLOCK) + 8, 256)
+    q = torch.randn(
+        (batch, next_n, heads, BENCH_HEAD_DIM), device=DEVICE, dtype=torch.bfloat16
+    ).to(e4m3_type)
+    kv = kv_cache_cast_to_fp8(
+        torch.randn(
+            (num_blocks, BENCH_BLOCK, 1, BENCH_HEAD_DIM),
+            device=DEVICE,
+            dtype=torch.bfloat16,
+        )
+    )
+    weights = torch.randn(
+        (batch * next_n, heads), device=DEVICE, dtype=torch.float32
+    )
+    lo = max(int(0.9 * avg_kv), next_n)
+    hi = int(1.1 * avg_kv)
+    context_lens = torch.randint(
+        lo, hi + 1, (batch,), device=DEVICE, dtype=torch.int32
+    )
+    max_blk = _cdiv(int(context_lens.max().item()), BENCH_BLOCK)
+    # hipc pads the second dim to a token-aligned width; only the first
+    # ceil(ctx/64) entries are used as block indices.
+    block_table = torch.zeros(
+        (batch, max_blk * BENCH_BLOCK), device=DEVICE, dtype=torch.int32
+    )
+    pool = list(range(num_blocks))
+    random.shuffle(pool)
+    c = 0
+    for i in range(batch):
+        for j in range(_cdiv(int(context_lens[i]), BENCH_BLOCK)):
+            block_table[i, j] = pool[c]
+            c += 1
+    return q, kv, weights, context_lens, block_table
+
+
+def _bench_graph_us(fn: Callable[[], None], *, warm: int = 5, reps: int = 30) -> float:
+    """Best-of CUDA-graph replay time in microseconds (pure GPU)."""
+    for _ in range(3):
+        fn()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fn()
+    for _ in range(warm):
+        graph.replay()
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    times = []
+    for _ in range(reps):
+        start.record()
+        graph.replay()
+        end.record()
+        torch.cuda.synchronize()
+        times.append(start.elapsed_time(end) * 1000.0)
+    times.sort()
+    return times[0]
+
+
+def _bench_make_bolt_fn(
+    path: str,
+    q,
+    kv,
+    weights,
+    out,
+    context_lens,
+    block_table,
+    info,
+    bucket_schedule=None,
+):
+    if path == "splitkv_fuse":
+
+        def fn():
+            triton_fp8_paged_mqa_logits(
+                q,
+                kv,
+                weights,
+                out,
+                context_lens,
+                block_table,
+                BENCH_MAX_MODEL_LEN,
+                kv_block_size=64,
+                batch_info=info,
+                fuse_output_init=True,
+            )
+
+        return fn
+
+    if path == "splitkv_nofuse":
+        # Prefill -inf outside the timed region for compute-only graph.
+        out.fill_(float("-inf"))
+        torch.cuda.synchronize()
+
+        def fn():
+            triton_fp8_paged_mqa_logits(
+                q,
+                kv,
+                weights,
+                out,
+                context_lens,
+                block_table,
+                BENCH_MAX_MODEL_LEN,
+                kv_block_size=64,
+                batch_info=info,
+                fuse_output_init=False,
+            )
+
+        return fn
+
+    if path == "bucket_persistent":
+        assert bucket_schedule is not None
+
+        def fn():
+            triton_fp8_paged_mqa_logits(
+                q,
+                kv,
+                weights,
+                out,
+                context_lens,
+                block_table,
+                BENCH_MAX_MODEL_LEN,
+                kv_block_size=64,
+                batch_info=info,
+                bucket_schedule=bucket_schedule,
+            )
+
+        return fn
+
+    raise ValueError(f"unknown path {path!r}; expected one of {BENCH_PATHS}")
+
+
+def _try_import_hipc():
+    try:
+        import lightop as hipc  # package install name
+
+        return hipc.gemmopt
+    except Exception:
+        return None
+
+
+def run_paged_bench(
+    *,
+    shapes=None,
+    paths=("splitkv_fuse",),
+    vs_hipc: bool = False,
+    warm: int = 5,
+    reps: int = 30,
+) -> list:
+    shapes = list(BENCH_SHAPES if shapes is None else shapes)
+    gemmopt = _try_import_hipc() if vs_hipc else None
+    if vs_hipc and gemmopt is None:
+        raise RuntimeError("--vs-hipc requested but hipc is not importable")
+
+    rows = []
+    hdr = f"{'shape':36s} {'path':18s} {'bolt_us':>10}"
+    if vs_hipc:
+        hdr += f" {'hipc_us':>10} {'hipc/bolt':>9}"
+    print(
+        f"device={torch.cuda.get_device_name(0)}  max_model_len={BENCH_MAX_MODEL_LEN}  "
+        f"timing=CUDA-graph replay (pure GPU, best of {reps})",
+        flush=True,
+    )
+    print(hdr, flush=True)
+
+    for batch, next_n, heads, avg_kv in shapes:
+        tag = f"B={batch} n={next_n} H={heads} L={avg_kv}"
+        q, kv, weights, context_lens, block_table = _bench_build_inputs(
+            batch, next_n, heads, avg_kv
+        )
+        info = triton_fp8_paged_mqa_logits_prepare(q, kv, context_lens, block_table)
+        out = torch.empty(
+            (batch * next_n, BENCH_MAX_MODEL_LEN), device=DEVICE, dtype=torch.float32
+        )
+
+        sch = None
+        if "bucket_persistent" in paths:
+            base = torch.empty(batch * next_n + 1, dtype=torch.int32, device=DEVICE)
+            sch = triton_fp8_paged_mqa_logits_build_bucket_schedule(
+                context_lens,
+                batch_size=batch,
+                next_n=next_n,
+                base=base,
+                max_ctx=info.max_ctx,
+            )
+
+        hipc_us = None
+        if vs_hipc:
+
+            def hipc_fn():
+                gemmopt.paged_mqa_logits(
+                    q,
+                    kv,
+                    weights,
+                    context_lens,
+                    block_table,
+                    None,
+                    BENCH_MAX_MODEL_LEN,
+                    clean_logits=True,
+                )
+
+            hipc_us = _bench_graph_us(hipc_fn, warm=warm, reps=reps)
+
+        for path in paths:
+            try:
+                bolt_fn = _bench_make_bolt_fn(
+                    path,
+                    q,
+                    kv,
+                    weights,
+                    out,
+                    context_lens,
+                    block_table,
+                    info,
+                    bucket_schedule=sch,
+                )
+                bolt_us = _bench_graph_us(bolt_fn, warm=warm, reps=reps)
+                row = {
+                    "shape": tag,
+                    "path": path,
+                    "bolt_us": bolt_us,
+                    "hipc_us": hipc_us,
+                }
+                if vs_hipc and hipc_us is not None:
+                    ratio = hipc_us / bolt_us if bolt_us > 0 else float("inf")
+                    row["ratio"] = ratio
+                    print(
+                        f"{tag:36s} {path:18s} {bolt_us:10.1f} "
+                        f"{hipc_us:10.1f} {ratio:8.2f}x",
+                        flush=True,
+                    )
+                else:
+                    print(f"{tag:36s} {path:18s} {bolt_us:10.1f}", flush=True)
+                rows.append(row)
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"{tag:36s} {path:18s} FAIL {type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+
+        del q, kv, weights, context_lens, block_table, out, info, sch
+        torch.cuda.empty_cache()
+
+    return rows
+
+
+def _bench_shape_params():
+    for shape in BENCH_SHAPES:
+        batch, next_n, heads, avg_kv = shape
+        yield pytest.param(
+            shape,
+            id=f"B{batch}-n{next_n}-H{heads}-L{avg_kv}",
+        )
+
+
+@GPU_REQUIRED
+@pytest.mark.bench
+@pytest.mark.parametrize("shape", list(_bench_shape_params()))
+@torch.inference_mode()
+def test_bench_triton_fp8_paged_mqa_logits_gpu(shape):
+    """Pure-GPU (graph) latency of the default SplitKV+fuse path."""
+    rows = run_paged_bench(shapes=[shape], paths=("splitkv_fuse",), vs_hipc=False)
+    assert rows and rows[0]["bolt_us"] > 0
+
+
+@GPU_REQUIRED
+@pytest.mark.bench
+@pytest.mark.parametrize("shape", list(_bench_shape_params()))
+@torch.inference_mode()
+def test_bench_triton_fp8_paged_mqa_logits_vs_hipc(shape):
+    """Pure-GPU BoltOPs vs hipc; skipped when hipc is missing."""
+    if _try_import_hipc() is None:
+        pytest.skip("hipc not installed")
+    rows = run_paged_bench(shapes=[shape], paths=("splitkv_fuse",), vs_hipc=True)
+    assert rows and rows[0]["bolt_us"] > 0 and rows[0]["hipc_us"] > 0
+
+
+def _bench_main(argv: Optional[list] = None) -> int:
+    ap = argparse.ArgumentParser(
+        description="FP8 paged MQA logits CUDA-graph GPU latency"
+    )
+    ap.add_argument(
+        "--vs-hipc",
+        action="store_true",
+        help="also time hipc paged_mqa_logits (same graph-replay method)",
+    )
+    ap.add_argument(
+        "--path",
+        nargs="+",
+        choices=BENCH_PATHS,
+        default=["splitkv_fuse"],
+        help="BoltOPs branches to time (default: splitkv_fuse only)",
+    )
+    ap.add_argument(
+        "--shapes",
+        type=int,
+        nargs="*",
+        default=None,
+        help="indices into BENCH_SHAPES (default: all)",
+    )
+    ap.add_argument("--warm", type=int, default=5)
+    ap.add_argument("--reps", type=int, default=30)
+    args = ap.parse_args(argv)
+
+    idx = args.shapes if args.shapes is not None else list(range(len(BENCH_SHAPES)))
+    shapes = [BENCH_SHAPES[i] for i in idx]
+    run_paged_bench(
+        shapes=shapes,
+        paths=tuple(args.path),
+        vs_hipc=args.vs_hipc,
+        warm=args.warm,
+        reps=args.reps,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_bench_main())

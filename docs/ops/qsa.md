@@ -166,7 +166,7 @@ output = qsa_sparse_paged_attention(
   管理。
 - `boltops.mqa_logits` 是 aiter 风格通用 MQA 打分包（`triton_mqa_logits`：
   dense、fp8/fp16/bf16、per-head `weights`、`kv_scales`），与 QSA 打分契约
-  不同，见 [MQA Logits](mqa_logits.md)。
+  不同，见 [MQA Logits](mqa_logits_triton.md)。
 - `boltops.sparse_gqa` 同样是稀疏 GQA 领域（packed decode / KV compact），
   但面向不同的调度数据布局，见 [Sparse GQA](sparse_gqa.md)。
 - 实现位于 `boltops/qsa/triton/qsa.py`（单文件，对齐 vLLM

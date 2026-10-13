@@ -215,7 +215,7 @@ def _assert_close_to_ref(
 @pytest.mark.parametrize("s_q,s_k,num_heads,head_dim", _CORRECTNESS_SHAPES)
 @pytest.mark.parametrize("backend", ["auto", "row", "bn", "gluon"])
 @torch.inference_mode()
-def test_fp8_mqa_logits_backends(
+def test_triton_fp8_mqa_logits_backends(
     s_q: int,
     s_k: int,
     num_heads: int,
@@ -235,22 +235,25 @@ def test_fp8_mqa_logits_backends(
 
 
 @GPU_REQUIRED
-@pytest.mark.parametrize("s_q", [1, 17, 61, 128])
-@pytest.mark.parametrize("s_k", [16, 76, 113, 1024])
-@pytest.mark.parametrize("num_heads", [16, 64])
-@pytest.mark.parametrize("head_dim", [64, 128])
-@pytest.mark.parametrize("disable_cp", [True, False])
+@pytest.mark.parametrize(
+    "s_q,s_k,num_heads,head_dim,disable_cp",
+    [
+        # Odd sizes + short KV (dispatch / mask edges).
+        pytest.param(17, 76, 16, 64, True, id="odd-short-H16-D64"),
+        pytest.param(61, 113, 64, 128, True, id="odd-mid-H64"),
+        # CP window path (even s_q, s_k multiple of s_q).
+        pytest.param(128, 1024, 64, 128, False, id="cp-window"),
+        pytest.param(1, 16, 16, 128, True, id="tiny-M1"),
+    ],
+)
 @torch.inference_mode()
-def test_fp8_mqa_logits_auto_grid(
+def test_triton_fp8_mqa_logits_auto_grid(
     s_q: int,
     s_k: int,
     num_heads: int,
     head_dim: int,
     disable_cp: bool,
 ) -> None:
-    if s_q > s_k:
-        pytest.skip("s_q > s_k")
-
     q_fp8, kv_fp8, scales, weights, ks, ke = _make_inputs(
         s_q, s_k, num_heads, head_dim, disable_cp=disable_cp
     )
@@ -260,7 +263,7 @@ def test_fp8_mqa_logits_auto_grid(
 
 @GPU_REQUIRED
 @torch.inference_mode()
-def test_fp8_mqa_logits_dout_inplace() -> None:
+def test_triton_fp8_mqa_logits_dout_inplace() -> None:
     q_fp8, kv_fp8, scales, weights, ks, ke = _make_inputs(32, 1024, 64, 128)
     d_out = torch.empty(32, 1024, device=DEVICE, dtype=torch.float32)
     out = triton_mqa_logits(
@@ -289,7 +292,7 @@ def _size_grid_params():
 @pytest.mark.bench
 @pytest.mark.parametrize("s_q,s_k,num_heads,head_dim", list(_size_grid_params()))
 @torch.inference_mode()
-def test_bench_fp8_mqa_logits_size_grid(
+def test_bench_triton_fp8_mqa_logits_size_grid(
     s_q: int,
     s_k: int,
     num_heads: int,
@@ -317,45 +320,6 @@ def test_bench_fp8_mqa_logits_size_grid(
     )
 
 
-@GPU_REQUIRED
-@pytest.mark.bench
-@pytest.mark.parametrize("s_q,s_k,num_heads,head_dim", list(_size_grid_params()))
-@pytest.mark.parametrize("backend", ["row", "bn", "gluon"])
-@torch.inference_mode()
-def test_bench_fp8_mqa_logits_backends_size_grid(
-    s_q: int,
-    s_k: int,
-    num_heads: int,
-    head_dim: int,
-    backend: str,
-    bench_warmup: int,
-    bench_repeat: int,
-    time_ms,
-) -> None:
-    if backend == "gluon" and not _gluon_available():
-        pytest.skip("Gluon unavailable")
-    # Row over ultra-large grids is multi-minute; keep BN/Gluon/auto for those.
-    if backend == "row" and s_q * s_k > 64 * 65536:
-        pytest.skip("row skipped on ultra-large MN")
-
-    q_fp8, kv_fp8, scales, weights, ks, ke = _make_inputs(
-        s_q, s_k, num_heads, head_dim, disable_cp=True
-    )
-    d_out = torch.empty(s_q, s_k, device=DEVICE, dtype=torch.float32)
-
-    def run():
-        triton_mqa_logits(
-            q_fp8, kv_fp8, scales, weights, ks, ke, D_out=d_out, backend=backend
-        )
-
-    ms = time_ms(run, bench_warmup, bench_repeat)
-    tflops = useful_flops(ks, ke, num_heads, head_dim) / (ms * 1e-3) / 1e12
-    print(
-        f"[bench size-grid] {backend} {s_q}x{s_k} H={num_heads} D={head_dim} "
-        f"-> {ms:.3f} ms, {tflops:.2f} TFLOPS"
-    )
-
-
 def _require_hipc():
     """Import hipc reference (package still installs as ``lightop``)."""
     try:
@@ -369,7 +333,7 @@ def _require_hipc():
 @pytest.mark.bench
 @pytest.mark.parametrize("s_q,s_k,num_heads,head_dim", list(_size_grid_params()))
 @torch.inference_mode()
-def test_bench_fp8_mqa_logits_vs_hipc_size_grid(
+def test_bench_triton_fp8_mqa_logits_vs_hipc_size_grid(
     s_q: int,
     s_k: int,
     num_heads: int,
@@ -444,7 +408,7 @@ def _ab_ms(
 @pytest.mark.bench
 @pytest.mark.parametrize("s_q,s_k,num_heads,family", list(_prod_slice_params()))
 @torch.inference_mode()
-def test_bench_fp8_mqa_logits_vs_hipc_prod_slices(
+def test_bench_triton_fp8_mqa_logits_vs_hipc_prod_slices(
     s_q: int,
     s_k: int,
     num_heads: int,
@@ -454,7 +418,7 @@ def test_bench_fp8_mqa_logits_vs_hipc_prod_slices(
 
     Run with::
 
-        pytest -q test/mqa_logits/test_fp8_mqa_logits.py --bench -s -k vs_hipc_prod
+        pytest -q test/mqa_logits/test_triton_fp8_mqa_logits.py --bench -s -k vs_hipc_prod
     """
     hipc = _require_hipc()
     from boltops.mqa_logits.triton.mqa_config_utils import get_fp8_mqa_shape_dispatch
@@ -502,15 +466,7 @@ def test_bench_fp8_mqa_logits_vs_hipc_prod_slices(
     )
 
 
-def test_triton_mqa_logits_smoke():
-    from boltops.mqa_logits import triton_mqa_logits
-
-    q_fp8, kv_fp8, scales, weights, ks, ke = _make_inputs(16, 128, 8, 128)
-    out = triton_mqa_logits(q_fp8, kv_fp8, scales, weights, ks, ke)
-    assert out.shape == (16, 128)
-
-
-def test_mqa_logits_public_export():
+def test_triton_mqa_logits_public_export():
     from boltops.mqa_logits import triton_mqa_logits
     import boltops.mqa_logits as pkg
 

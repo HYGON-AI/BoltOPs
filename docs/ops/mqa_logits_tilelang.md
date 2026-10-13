@@ -4,7 +4,7 @@
 `kernels/gfx938`（WASP）或 `kernels/common`（通用 GEMM）。调用方使用
 `tilelang_qsa_mqa_prefill` / `tilelang_qsa_mqa_decode`。
 
-FP8 Triton 入口见 `docs/ops/mqa_logits.md`。
+FP8 Triton 入口见 `docs/ops/mqa_logits_triton.md`。
 
 ```python
 from boltops.mqa_logits import tilelang_qsa_mqa_prefill, tilelang_qsa_mqa_decode

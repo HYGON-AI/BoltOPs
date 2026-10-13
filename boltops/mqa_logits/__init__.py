@@ -1,20 +1,19 @@
 """MQA logits operator package (sparse-attention indexer scoring).
 
-Public Triton entry lives here; TileLang can be added later as a sibling
-export (e.g. ``tilelang_mqa_logits``) without renaming this API.
-
-* docs: ``docs/ops/mqa_logits.md`` (FP8 Triton), ``docs/ops/mqa_logits_tilelang.md`` (BF16 TileLang)
-* tests: ``test/mqa_logits/``
+* docs: ``docs/ops/mqa_logits_triton.md`` (Triton prefill + FP8 paged),
+  ``docs/ops/mqa_logits_tilelang.md`` (TileLang QSA)
+* tests: ``test/mqa_logits/`` (``test_triton_*`` / ``test_tilelang_*``)
 
 Public operators:
 
 * ``triton_mqa_logits`` — prefill / dense KV (Triton)
   - ``kv_scales`` provided → float8 path
   - ``kv_scales is None`` → fp16/bf16 path
-* ``tilelang_qsa_mqa_prefill`` — TileLang QSA prefill / dense KV
-* ``tilelang_qsa_mqa_decode`` — TileLang QSA paged decode
 * ``triton_fp8_paged_mqa_logits`` — FP8 paged decode, KVBlockSize=1 or 64 (Triton)
   - ``triton_fp8_paged_mqa_logits_stage1`` → per-head scores (``out_qk.sum(dim=0)``)
+  - ``triton_fp8_paged_mqa_logits_prepare`` / ``_build_bucket_schedule``
+* ``tilelang_qsa_mqa_prefill`` — TileLang QSA prefill / dense KV
+* ``tilelang_qsa_mqa_decode`` — TileLang QSA paged decode
 """
 
 from __future__ import annotations

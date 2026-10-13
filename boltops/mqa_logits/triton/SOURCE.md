@@ -1,4 +1,6 @@
-Vendored Triton MQA logits sources (prefill / non-paged):
+Vendored Triton MQA logits sources:
+
+**Prefill / dense KV**
 
 - `fp8_mqa_logits.py` — hygon aiter lineage (row + BN-tile kernels).
   **Internal** float8 kernels used by public ``triton_mqa_logits`` when
@@ -15,17 +17,23 @@ Vendored Triton MQA logits sources (prefill / non-paged):
 - `fp8_mqa_logits_tiled.py` — thin BN forwarder (compat / tune helper).
 - `mqa_config_utils.py` — arch JSON load + float8 / half dispatch helpers.
 
+**Paged decode (FP8)**
+
+- `fp8_paged_mqa_logits.py` — hygon aiter ``pa_mqa_logits`` lineage;
+  public ``triton_fp8_paged_mqa_logits`` / ``_stage1`` / ``_prepare`` /
+  ``_build_bucket_schedule`` (``kv_block_size∈{1,64}``).
+
 Semantic lineage: DeepGEMM `fp8_mqa_logits` (sparse indexer scoring).
 Call sites: vLLM `rocm_fp8_mqa_logits`, SGLang DSA indexer (ROCm → aiter).
 
-Public entry: **`boltops.mqa_logits.triton_mqa_logits`** (Triton only;
-TileLang can land later as a sibling export).
-`backend=None|"auto"|"row"|"bn"|"gluon"` plus experimental
-`gluon_bn_align` / `gluon_opt`; optional `D_out`.
-Dispatch:
+Public Triton entries:
 
-* ``kv_scales`` provided → float8 path
-* ``kv_scales is None`` → half path
+* ``triton_mqa_logits`` — prefill; ``backend=None|"auto"|"row"|"bn"|"gluon"``
+  plus experimental ``gluon_bn_align`` / ``gluon_opt``; optional ``D_out``.
+  - ``kv_scales`` provided → float8 path
+  - ``kv_scales is None`` → half path
+* ``triton_fp8_paged_mqa_logits`` (+ ``_stage1`` / ``_prepare`` /
+  ``_build_bucket_schedule``) — FP8 paged decode
 
 Launch configs:
 - `configs/triton_3_6/fp8_mqa_logits,arch=gfx938.json` — row
@@ -40,6 +48,3 @@ Launch configs:
 - `tune_fp8_mqa_logits.py` / `tune_fp8_mqa_logits_tiled.py` /
   `tune_fp8_mqa_logits_gluon.py` — FP8 retune
 - `PERFORMANCE.md` — notes
-
-Paged decode 入口为 `boltops.mqa_logits.triton_fp8_paged_mqa_logits`（`KVBlockSize=1`
-per-token `kv_indices`，或 `KVBlockSize=64` 非 preshuffle 页表路径）。
