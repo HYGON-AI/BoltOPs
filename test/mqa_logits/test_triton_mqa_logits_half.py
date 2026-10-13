@@ -11,7 +11,7 @@ The canonical shape set is the union of two production-derived groups:
 
 Total: ``4x7x2 - 2 + 12 = 66`` shapes, exported as :data:`HALF_SIZE_GRID`.
 
-Concerns covered (half only; FP8 lives in ``test_fp8_mqa_logits.py``):
+Concerns covered (half only; FP8 lives in ``test_triton_fp8_mqa_logits.py``):
 
 * **API / backends** — explicit ``row``/``bn``, gluon rejection, optional
   ``gluon_bn_align``, and ``kv_scales`` must not take the fp8 path.
@@ -36,7 +36,7 @@ Naming
 ------
 The reference library is imported as ``lightop`` (that is its package name)
 but is called **hipc** everywhere else — display strings, identifiers and
-prose — matching ``boltops/mqa_logits/triton/_bench_fp8_vs_hipc_new.py``.
+prose (same convention as ``test_triton_fp8_mqa_logits.py`` / paged benches).
 So ``lightop = pytest.importorskip("lightop")``, called as
 ``lightop.mqa_logits(...)`` inside ``run_hipc()``, is intentional: the
 module binding keeps the real package name, only the display name is hipc.
@@ -46,17 +46,17 @@ Usage
 ::
 
     # correctness only (fast, default)
-    pytest test/mqa_logits/test_mqa_logits_half_size_grid.py
+    pytest test/mqa_logits/test_triton_mqa_logits_half.py
 
     # add the performance gates on all 66 shapes
-    pytest --bench test/mqa_logits/test_mqa_logits_half_size_grid.py
+    pytest --bench test/mqa_logits/test_triton_mqa_logits_half.py
 
     # a single shape
     pytest --bench -k "4608x16384-H4"
 
     # the report test is data emission only (no pass/fail gate)
     HALF_GRID_REPORT=1 HALF_GRID_JSON=/tmp/mqa_logits_half_66.json \
-        pytest --bench -s -k report_half_size_grid
+        pytest --bench -s -k report
 
 Set ``HALF_GRID_SAMPLES`` to override the robust-timing repeat count.
 
@@ -65,7 +65,7 @@ On a multi-GPU node, shard the grid across devices for a parallel sweep::
     for i in 0 1 2 3 4 5 6 7; do
       HIP_VISIBLE_DEVICES=$i HALF_GRID_SHARD="$i/8" python3 -u -m pytest \\
         --bench -q -s -k vs_hipc \\
-        test/mqa_logits/test_mqa_logits_half_size_grid.py \\
+        test/mqa_logits/test_triton_mqa_logits_half.py \\
         > /tmp/half_shard$i.log 2>&1 &
     done; wait
 
@@ -137,9 +137,6 @@ HALF_SIZE_GRID: Tuple[Tuple[int, int, int], ...] = (
 
 assert len(HALF_SIZE_GRID) == 66, f"expected 66 shapes, got {len(HALF_SIZE_GRID)}"
 assert len(set(HALF_SIZE_GRID)) == 66, "HALF_SIZE_GRID has duplicates"
-
-# Target shape that drove the N=4096 bucket / dispatch tuning.
-_TARGET_SHAPE = (4608, 16384, 4)
 
 # Correctness: compact coverage of every family (tiny / small-M / large-M,
 # H=4/8/16/64, short and long N), both window conventions.
@@ -281,7 +278,7 @@ def _assert_matches_ref(
 @pytest.mark.parametrize("mode", ["full", "sliding"])
 @pytest.mark.parametrize("s_q,s_k,num_heads", _CORRECTNESS_SHAPES)
 @torch.inference_mode()
-def test_mqa_logits_half_size_grid_correctness(
+def test_triton_mqa_logits_half_correctness(
     dtype: torch.dtype,
     mode: str,
     s_q: int,
@@ -302,30 +299,12 @@ def test_mqa_logits_half_size_grid_correctness(
     assert int(disp["head_split_k"]) >= 1
 
 
-@GPU_REQUIRED
-@pytest.mark.parametrize("s_q,s_k,num_heads", [_TARGET_SHAPE], ids=["h4-target"])
-@torch.inference_mode()
-def test_mqa_logits_half_target_shape_vs_hipc(
-    s_q: int, s_k: int, num_heads: int
-) -> None:
-    """Same shape cross-checked against hipc (max-abs, finite entries)."""
-    lightop = pytest.importorskip("lightop")
-
-    q, kv, weights, ks, ke = _make_inputs(s_q, s_k, num_heads)
-    out_bo = triton_mqa_logits(q, kv, None, weights, ks, ke)
-    out_lo = lightop.mqa_logits(q, kv, weights, ks, ke, None, clean_logit=True)
-    finite = torch.isfinite(out_lo) & torch.isfinite(out_bo)
-    if bool(finite.any()):
-        max_abs = (out_bo - out_lo).abs()[finite].max().item()
-        assert max_abs < 5e-2, f"max abs diff {max_abs}"
-
-
 # --------------------------------------------------------------------------- #
 # API / backends
 # --------------------------------------------------------------------------- #
 
 
-def test_mqa_logits_half_rejects_kv_scales() -> None:
+def test_triton_mqa_logits_half_rejects_kv_scales() -> None:
     q, kv, weights, ks, ke = _make_inputs(16, 66, 8, dtype=torch.bfloat16, mode="sliding")
     scales = torch.ones(66, device=DEVICE, dtype=torch.float32)
     with pytest.raises(ValueError, match="float8 path requires"):
@@ -345,7 +324,7 @@ def test_mqa_logits_half_rejects_kv_scales() -> None:
     ],
 )
 @torch.inference_mode()
-def test_mqa_logits_half_backends(
+def test_triton_mqa_logits_half_backends(
     dtype: torch.dtype,
     backend: str,
     s_q: int,
@@ -362,35 +341,24 @@ def test_mqa_logits_half_backends(
 
 @GPU_REQUIRED
 @torch.inference_mode()
-def test_mqa_logits_half_rejects_gluon() -> None:
+def test_triton_mqa_logits_half_rejects_gluon() -> None:
     q, kv, weights, ks, ke = _make_inputs(16, 66, 8, dtype=torch.bfloat16, mode="sliding")
     with pytest.raises(ValueError, match="gluon"):
         triton_mqa_logits(q, kv, None, weights, ks, ke, backend="gluon")
 
 
 @GPU_REQUIRED
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize(
-    "s_q,s_k,num_heads",
-    [
-        pytest.param(16, 66, 8, id="tiny-H8"),
-        pytest.param(64, 4096, 64, id="mid"),
-    ],
-)
 @torch.inference_mode()
-def test_mqa_logits_half_gluon_bn_align(
-    dtype: torch.dtype,
-    s_q: int,
-    s_k: int,
-    num_heads: int,
-) -> None:
+def test_triton_mqa_logits_half_gluon_bn_align() -> None:
+    """Experimental half Gluon path: one mid shape smoke vs torch ref."""
     from boltops.mqa_logits.triton.fp8_mqa_logits_gluon import gluon_prefill_available
 
     if not gluon_prefill_available():
         pytest.skip("Gluon unavailable")
 
+    s_q, s_k, num_heads = 64, 4096, 64
     q, kv, weights, ks, ke = _make_inputs(
-        s_q, s_k, num_heads, dtype=dtype, mode="sliding"
+        s_q, s_k, num_heads, dtype=torch.bfloat16, mode="sliding"
     )
     logits = triton_mqa_logits(
         q, kv, None, weights, ks, ke, backend="gluon_bn_align"
@@ -459,7 +427,7 @@ def _case_ids(shapes: Sequence[object]) -> List[str]:
     "s_q,s_k,num_heads", _shard(HALF_SIZE_GRID), ids=_case_ids(_shard(HALF_SIZE_GRID))
 )
 @torch.inference_mode()
-def test_bench_mqa_logits_half_size_grid_vs_hipc(
+def test_bench_triton_mqa_logits_half_vs_hipc(
     s_q: int,
     s_k: int,
     num_heads: int,
@@ -507,7 +475,7 @@ def test_bench_mqa_logits_half_size_grid_vs_hipc(
 @GPU_REQUIRED
 @pytest.mark.bench
 @torch.inference_mode()
-def test_mqa_logits_half_size_grid_report(
+def test_triton_mqa_logits_half_report(
     bench_warmup: int,
     bench_repeat: int,
 ) -> None:

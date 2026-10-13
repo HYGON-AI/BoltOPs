@@ -2199,7 +2199,7 @@ def triton_fp8_paged_mqa_logits(
     ``top_k_per_row_decode``, or ``torch.topk`` + ``-inf -> -1``) treat a
     non-``-inf`` value as a real index, so a stale tail silently corrupts the
     top-k -- and the op does not verify the pre-fill, it simply leaves the tail
-    as it found it. Full matrix and measurements: ``docs/ops/mqa_logits.md``.
+    as it found it. Full matrix and measurements: ``docs/ops/mqa_logits_triton.md``.
 
     Two independent knobs describe the KV cache, and they are orthogonal:
 

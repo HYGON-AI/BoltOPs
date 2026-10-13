@@ -1,4 +1,4 @@
-# MQA Logits
+# Triton MQA Logits
 
 `boltops.mqa_logits` 提供 sparse-attention indexer 用的 **MQA 打分** kernel。
 接口对齐 hygon aiter / DeepGEMM / hipc；已迁入 **prefill** 与 **paged decode**
@@ -27,12 +27,16 @@ pytest -q test/mqa_logits/
 # hipc 对照（需 --bench；默认 CI 不跑）
 pytest -q test/mqa_logits/ --bench -s -k size_grid
 pytest -q test/mqa_logits/ --bench -s -k vs_hipc_size
-pytest -q test/mqa_logits/test_fp8_mqa_logits.py --bench -s -k vs_hipc_prod
-pytest -q test/mqa_logits/test_mqa_logits_half_size_grid.py --bench -s -k vs_hipc
+pytest -q test/mqa_logits/test_triton_fp8_mqa_logits.py --bench -s -k vs_hipc_prod
+pytest -q test/mqa_logits/test_triton_mqa_logits_half.py --bench -s -k vs_hipc
+# FP8 paged：纯 GPU（CUDA-graph）；需 --bench；可选 -k vs_hipc
+pytest -q test/mqa_logits/test_triton_fp8_paged_mqa_logits.py --bench -s
+pytest -q test/mqa_logits/test_triton_fp8_paged_mqa_logits.py --bench -s -k vs_hipc
 ```
 
-half 官方网格：`test/mqa_logits/test_mqa_logits_half_size_grid.py`；
-gfx938 vs hipc 见 `boltops/mqa_logits/triton/PERFORMANCE.md`。
+half 官方网格：`test/mqa_logits/test_triton_mqa_logits_half.py`；
+prefill / **paged** Triton 性能与路径说明见 `boltops/mqa_logits/triton/PERFORMANCE.md`。
+TileLang：`docs/ops/mqa_logits_tilelang.md`。
 
 溯源：`boltops/mqa_logits/triton/SOURCE.md`。  
 性能笔记：`boltops/mqa_logits/triton/PERFORMANCE.md`。  
@@ -166,6 +170,7 @@ triton_fp8_paged_mqa_logits(
 ```
 
 `use_bucket=True`（host 侧建 schedule）仅作对照/eager 回退，**不要进热路径**。
+
 
 ### 与 hipc / aiter 的差异（替换时必改）
 
