@@ -421,6 +421,7 @@ def fp8_mqa_logits(
     block_m_tile: Optional[int] = None,
     auto_bn_tile: bool = True,
     bn_w_group: Optional[int] = None,
+    assume_no_nans: Optional[int] = None,
 ) -> torch.Tensor:
     """Compute MQA logits for sparse-attention top-k (prefill / dense KV).
 
@@ -438,6 +439,9 @@ def fp8_mqa_logits(
             main kernel launch config. ``None`` loads shipped tuned config
             under ``configs/triton_<capability>/fp8_mqa_logits,arch=*.json``,
             or BN-tile dispatch when ``auto_bn_tile`` selects that path.
+        assume_no_nans:
+            HIP ``no-nans-fp-math`` (drop FCANONICALIZE on relu fmin/fmax).
+            ``None`` defaults to ``1`` (same contract as half / hipc).
         clear_*: clear-kernel launch config used on the fast path only
             (``seq_len_kv % block_kv == 0``).
         D_out: optional preallocated ``[seq_len, seq_len_kv]`` float32 buffer
@@ -592,6 +596,9 @@ def fp8_mqa_logits(
     stride_w_s, stride_w_h = weights.stride()
     stride_logits_s, stride_logits_k = logits.stride()
 
+    # Drop relu FCANONICALIZE; measured ~1.15x on mid/large FP8 shapes.
+    # Filtered out on Tritons without the HIPOption.
+    _assume_no_nans = 1 if assume_no_nans is None else int(assume_no_nans)
     main_hip = _filter_hip_launch_kwargs(
         {
             "waves_per_eu": waves_per_eu,
@@ -599,6 +606,7 @@ def fp8_mqa_logits(
             "kpack": kpack,
             "schedule_hint": schedule_hint,
             "use_block_pingpong": use_block_pingpong,
+            "assume_no_nans": _assume_no_nans,
         }
     )
 
@@ -686,6 +694,7 @@ def fp8_mqa_logits(
                 "waves_per_eu": clear_waves_per_eu,
                 "kpack": clear_kpack,
                 "schedule_hint": clear_schedule_hint,
+                "assume_no_nans": _assume_no_nans,
             }
         )
         _fp8_mqa_clear_logits_kernel[(seq_len,)](
