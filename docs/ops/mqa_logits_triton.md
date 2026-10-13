@@ -84,6 +84,9 @@ Prefill / dense KV：对每个 query 行，在 `[cu_starts, cu_ends)` 内计算
 
 约束：`H`、`D` 为 2 的幂；半精度当前要求 **`D == 128`**；Gluon 要求 `w_group` 整除 head chunk。
 
+Float8 prefill 默认 ``assume_no_nans=1``（HIP ``no-nans-fp-math``），与 half / hipc
+有限数学契约一致；详见 `PERFORMANCE.md`。
+
 ---
 
 ## `triton_fp8_paged_mqa_logits`（paged decode）

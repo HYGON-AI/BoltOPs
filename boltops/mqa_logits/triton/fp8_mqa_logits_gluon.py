@@ -512,6 +512,7 @@ def fp8_mqa_logits_gluon(
     head_split_k: Optional[int] = None,
     bn_style_epilogue: bool = True,
     D_out: Optional[torch.Tensor] = None,
+    assume_no_nans: Optional[int] = None,
 ) -> torch.Tensor:
     """Gluon tiled FP8 MQA logits prefill.
 
@@ -536,6 +537,7 @@ def fp8_mqa_logits_gluon(
                 cu_ends,
                 assume_ks_zero=assume_ks_zero,
                 D_out=D_out,
+                assume_no_nans=assume_no_nans,
                 auto_bn_tile=False,
             )
         seq_len, num_heads, _ = Q.shape
@@ -575,6 +577,7 @@ def fp8_mqa_logits_gluon(
             bn_tile=int(block_n) if block_n is not None else int(disp["bn_tile"]),
             block_m_tile=int(block_m) if block_m is not None else int(disp["block_m_tile"]),
             auto_bn_tile=False,
+            assume_no_nans=assume_no_nans,
         )
 
     seq_len, num_heads, head_size = Q.shape
@@ -612,6 +615,7 @@ def fp8_mqa_logits_gluon(
             cu_starts,
             cu_ends,
             **row_kw,
+            assume_no_nans=assume_no_nans,
         )
 
     cfg = get_fp8_mqa_tiled_launch_config(seq_len, seq_len_kv)
@@ -715,6 +719,7 @@ def fp8_mqa_logits_gluon(
     grid_m = triton.cdiv(seq_len, block_m)
     grid_n = tiled_grid_n(seq_len_kv, block_n)
 
+    _assume_no_nans = 1 if assume_no_nans is None else int(assume_no_nans)
     hip = _filter_hip_launch_kwargs(
         {
             "waves_per_eu": waves_per_eu,
@@ -722,6 +727,7 @@ def fp8_mqa_logits_gluon(
             "kpack": kpack,
             "schedule_hint": schedule_hint,
             "use_block_pingpong": use_block_pingpong,
+            "assume_no_nans": _assume_no_nans,
         }
     )
     _fp8_mqa_logits_gluon_tiled_kernel[(grid_n, grid_m, num_splits)](

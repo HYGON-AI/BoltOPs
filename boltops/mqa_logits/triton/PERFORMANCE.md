@@ -28,14 +28,16 @@ preallocated `D_out`.
 
 | Runtime | Path | ≥0.98× HIPC | geo mean | note |
 | --- | --- | --- | --- | --- |
-| Triton 3.6+ (Gluon) | float8 auto `row\|gluon` | **54/54** | **~1.27×** | BN-style epilogue; Gluon launch via Q/KV/H ``by_region`` |
-| No Gluon (e.g. 3.2) | float8 auto `row\|bn` | **41/54** | **~1.06×** | weaker on some large-`N`+`H=64` / small-`M`+`H=8` |
+| Triton 3.6+ (Gluon) | float8 auto `row\|gluon` | **54/54** | **~1.39×** | BN-style epilogue; ``assume_no_nans=1``; Gluon launch via Q/KV/H ``by_region`` |
+| No Gluon (e.g. 3.2) | float8 auto `row\|bn` | **41/54** | **~1.06×** | weaker on some large-`N`+`H=64` / small-`M`+`H=8`; not re-run after ``assume_no_nans`` |
 | Triton 3.6 | **half auto `row\|bn`** | **66/66** | **1.70×** | official 66-shape half grid; 64 faster, 2 ties, 0 slower |
 | Triton 3.6 | half Gluon `bn_align` (opt-in) | 48/54 | ~1.36× | 54-grid measurement, **not** re-run on the 66 grid |
 
-Float8 auto meets ≥0.98× HIPC on all 54 grid points under ``by_region``
-dispatch (short-KV stays on **row**). Exact-shape ship was ~1.28× geo;
-coarse regions trade ~0.6% for not shipping the hipc grid.
+Float8 auto meets ≥1.00× HIPC on all 54 grid points under ``by_region``
+dispatch (short-KV stays on **row**; min ~1.03× on tiny ``16×66 H=64``).
+Refreshed on BW1100 after defaulting ``assume_no_nans=1`` (was ~1.27× geo
+before that flip). Coarse ``by_region`` still avoids shipping an exact hipc
+shape table.
 
 Half auto meets ≥1.00× HIPC on the 66-shape suite in
 `test/mqa_logits/test_triton_mqa_logits_half.py` (`HALF_SIZE_GRID`:
@@ -105,6 +107,9 @@ HIP_VISIBLE_DEVICES=0 python3 boltops/mqa_logits/triton/tune_mqa_logits_half_row
   defaults (not vs hipc).
 * Triton 3.2 containers without FP8 hipc can only report absolute BoltOPs ms
   (historically 51/54 ok; `{16,32,64}×66 H=8` row compile fail on some setups).
+* FP8 prefill defaults ``assume_no_nans=1`` (HIP ``no-nans-fp-math``), same
+  finite-math contract as half / hipc; mid/large shapes measured
+  ~1.15–1.19× vs off on BW1100 (bn/gluon; row ~flat).
 
 ## Paged decode (FP8)
 
