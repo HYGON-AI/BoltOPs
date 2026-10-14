@@ -18,10 +18,10 @@ Concerns covered (half only; FP8 lives in ``test_triton_fp8_mqa_logits.py``):
 * **correctness** (default pytest run) — vs a pure-torch reference, on a
   compact representative subset, for both dtypes and both ``ks``/``ke``
   window conventions.
-* **performance** (``pytest --bench``) — ours vs ``hipc`` on *all* 66
-  shapes, with a loose regression guard (``hipc/ours >= 0.85``) that is
-  skipped when node-noise spikes make the timing untrustworthy. Prefer the
-  sharded form below: one process per shard keeps timings isolated.
+* **performance** (``pytest --bench``) — BoltOPs-only ``time_ms`` on all 66
+  shapes. Hipc comparison is opt-in (``--bench -k vs_hipc``): two ``time_ms``
+  calls and a regression guard (``hipc/ours >= 0.85``). Prefer the sharded
+  form below: one process per shard keeps timings isolated.
 
 ``ks``/``ke`` conventions
 -------------------------
@@ -48,15 +48,18 @@ Usage
     # correctness only (fast, default)
     pytest test/mqa_logits/test_triton_mqa_logits_half.py
 
-    # add the performance gates on all 66 shapes
+    # BoltOPs-only latency on all 66 shapes
     pytest --bench test/mqa_logits/test_triton_mqa_logits_half.py
+
+    # optional hipc comparison (not part of a plain --bench / optest per run)
+    pytest --bench -k vs_hipc test/mqa_logits/test_triton_mqa_logits_half.py
 
     # a single shape
     pytest --bench -k "4608x16384-H4"
 
-    # the report test is data emission only (no pass/fail gate)
+    # local table + JSON (not an optest bench; no --bench)
     HALF_GRID_REPORT=1 HALF_GRID_JSON=/tmp/mqa_logits_half_66.json \
-        pytest --bench -s -k report
+        pytest -s -k report
 
 Set ``HALF_GRID_SAMPLES`` to override the robust-timing repeat count.
 
@@ -89,6 +92,9 @@ pytest.importorskip("triton")
 import triton  # noqa: E402
 
 from boltops.mqa_logits import triton_mqa_logits  # noqa: E402
+
+# optest CSV name. File stem would be ``triton_mqa_logits_half``.
+PERF_OP = "half_mqa_logits"
 
 DEVICE = "cuda"
 HEAD_DIM = 128
@@ -427,14 +433,47 @@ def _case_ids(shapes: Sequence[object]) -> List[str]:
     "s_q,s_k,num_heads", _shard(HALF_SIZE_GRID), ids=_case_ids(_shard(HALF_SIZE_GRID))
 )
 @torch.inference_mode()
+def test_bench_triton_mqa_logits_half(
+    s_q: int,
+    s_k: int,
+    num_heads: int,
+    bench_warmup: int,
+    bench_repeat: int,
+    time_ms,
+) -> None:
+    """BoltOPs-only latency on the official 66-shape grid (no hipc required)."""
+    q, kv, weights, ks, ke = _make_inputs(s_q, s_k, num_heads, mode="full")
+    out = torch.empty(s_q, s_k, device=DEVICE, dtype=torch.float32)
+
+    def run():
+        triton_mqa_logits(q, kv, None, weights, ks, ke, D_out=out)
+
+    ms = time_ms(run, bench_warmup, bench_repeat)
+    print(
+        f"[bench half] {s_q}x{s_k} H={num_heads}: {ms * 1e3:.1f} us",
+        flush=True,
+    )
+
+
+@GPU_REQUIRED
+@pytest.mark.bench
+@pytest.mark.parametrize(
+    "s_q,s_k,num_heads", _shard(HALF_SIZE_GRID), ids=_case_ids(_shard(HALF_SIZE_GRID))
+)
+@torch.inference_mode()
 def test_bench_triton_mqa_logits_half_vs_hipc(
     s_q: int,
     s_k: int,
     num_heads: int,
     bench_warmup: int,
     bench_repeat: int,
+    time_ms,
 ) -> None:
-    """All 66 official shapes: ours (auto) vs hipc, full-window ks/ke."""
+    """All 66 official shapes: ours (auto) vs hipc, full-window ks/ke.
+
+    Two ``time_ms`` calls (ours, then hipc). Skipped when hipc is not
+    installed. A ratio under the guard is measured once more before failing.
+    """
     lightop = pytest.importorskip("lightop")
 
     q, kv, weights, ks, ke = _make_inputs(s_q, s_k, num_heads, mode="full")
@@ -447,24 +486,23 @@ def test_bench_triton_mqa_logits_half_vs_hipc(
     def run_hipc():
         lightop.mqa_logits(q, kv, weights, ks, ke, None, clean_logit=True, D_out=out_lo)
 
-    samples = _samples(s_q, s_k)
-    ms_ours, ours_spikes = _measure(run_ours, samples, bench_warmup, bench_repeat)
-    ms_hipc, lo_spikes = _measure(run_hipc, samples, bench_warmup, bench_repeat)
-    ratio = ms_hipc / ms_ours if ms_ours > 0 else float("inf")
+    def measure():
+        ms_o = time_ms(run_ours, bench_warmup, bench_repeat)
+        ms_h = time_ms(run_hipc, bench_warmup, bench_repeat)
+        ratio_now = ms_h / ms_o if ms_o > 0 else float("inf")
+        return ms_o, ms_h, ratio_now
+
+    ms_ours, ms_hipc, ratio = measure()
+    if ratio < _MIN_RATIO:
+        ms_ours, ms_hipc, ratio = measure()
     gap_pct = (ms_ours - ms_hipc) / ms_hipc * 100.0
 
     print(
         f"[bench half grid] {s_q}x{s_k} H={num_heads}: "
         f"ours {ms_ours * 1e3:.1f} us, hipc {ms_hipc * 1e3:.1f} us, "
-        f"{gap_pct:+.2f}% (hipc/ours {ratio:.3f}x)"
-        f" [spikes ours={ours_spikes} hipc={lo_spikes}]",
+        f"{gap_pct:+.2f}% (hipc/ours {ratio:.3f}x)",
         flush=True,
     )
-    if _unreliable(ours_spikes, samples) or _unreliable(lo_spikes, samples):
-        pytest.skip(
-            f"timing unreliable on this shared node (node-noise spikes): "
-            f"ours {ms_ours * 1e3:.1f} us / hipc {ms_hipc * 1e3:.1f} us"
-        )
     assert ratio >= _MIN_RATIO, (
         f"perf regression on {s_q}x{s_k} H={num_heads}: "
         f"ours {ms_ours * 1e3:.1f} us vs hipc {ms_hipc * 1e3:.1f} us "
@@ -473,7 +511,6 @@ def test_bench_triton_mqa_logits_half_vs_hipc(
 
 
 @GPU_REQUIRED
-@pytest.mark.bench
 @torch.inference_mode()
 def test_triton_mqa_logits_half_report(
     bench_warmup: int,
@@ -481,8 +518,8 @@ def test_triton_mqa_logits_half_report(
 ) -> None:
     """Emit the full 66-shape table + JSON consumed by the perf docs.
 
-    Skipped unless ``HALF_GRID_REPORT=1`` so a plain ``pytest --bench`` run
-    does not duplicate the parametrized cases above.
+    Local table/JSON only (not an optest bench). Skipped unless
+    ``HALF_GRID_REPORT=1``.
     """
     if os.environ.get("HALF_GRID_REPORT") != "1":
         pytest.skip("set HALF_GRID_REPORT=1 to emit the 66-shape report")

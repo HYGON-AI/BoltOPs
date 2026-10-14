@@ -24,13 +24,13 @@ logits = triton_mqa_logits(..., backend="bn", D_out=prealloc)
 
 ```bash
 pytest -q test/mqa_logits/
-# hipc 对照（需 --bench；默认 CI 不跑）
-pytest -q test/mqa_logits/ --bench -s -k size_grid
-pytest -q test/mqa_logits/ --bench -s -k vs_hipc_size
+# --bench 只跑 BoltOPs。hipc 对比要加 -k vs_hipc（默认 CI 不跑）
+pytest -q test/mqa_logits/test_triton_fp8_mqa_logits.py --bench -s -k size_grid
+pytest -q test/mqa_logits/test_triton_mqa_logits_half.py --bench -s -k test_bench_triton_mqa_logits_half
+pytest -q test/mqa_logits/test_triton_fp8_paged_mqa_logits.py --bench -s -k test_bench_triton_fp8_paged_mqa_logits_gpu
+pytest -q test/mqa_logits/test_triton_fp8_mqa_logits.py --bench -s -k vs_hipc_size
 pytest -q test/mqa_logits/test_triton_fp8_mqa_logits.py --bench -s -k vs_hipc_prod
 pytest -q test/mqa_logits/test_triton_mqa_logits_half.py --bench -s -k vs_hipc
-# FP8 paged：纯 GPU（CUDA-graph）；需 --bench；可选 -k vs_hipc
-pytest -q test/mqa_logits/test_triton_fp8_paged_mqa_logits.py --bench -s
 pytest -q test/mqa_logits/test_triton_fp8_paged_mqa_logits.py --bench -s -k vs_hipc
 ```
 
