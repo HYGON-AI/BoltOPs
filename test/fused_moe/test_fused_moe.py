@@ -1,14 +1,16 @@
-"""Correctness tests for the public fused MoE operator."""
+"""Correctness and CUDA-graph benchmarks for the public fused MoE operator."""
 
 from __future__ import annotations
 
+from statistics import median
 from typing import Optional
 
 import pytest
 import torch
 import torch.nn.functional as F
 
-pytest.importorskip("triton")
+triton = pytest.importorskip("triton")
+import triton.testing  # noqa: E402
 
 from boltops.fused_moe import fused_experts  # noqa: E402
 import boltops.fused_moe.triton.fused_moe as fused_moe_module  # noqa: E402
@@ -17,6 +19,12 @@ from boltops.fused_moe.triton.moe_activation import (  # noqa: E402
     FUSED_ACTIVATION_QUANT_ACTIVATIONS,
 )
 from boltops.fused_moe.triton.moe_compat import pertoken_quant  # noqa: E402
+from boltops.tools.fused_moe_triton_tune.routing import fused_topk  # noqa: E402
+from boltops.tools.fused_moe_triton_tune.performance_csv import (  # noqa: E402
+    DeviceGuard,
+    spread_fraction,
+)
+from boltops.utility import arch_info  # noqa: E402
 from boltops.fused_moe.triton.quant import (  # noqa: E402
     dynamic_per_token_quant_fp8_i8,
     static_per_tensor_quant_fp8_i8,
@@ -48,6 +56,22 @@ HIDDEN_SIZE = 384
 INTERMEDIATE_SIZE = 7168
 NUM_EXPERTS = 8
 TOPK = 4
+
+# Shapes and M samples from docs/ops/fused_moe/performance_report.md.
+# N is the intermediate width: gated Gemm1 produces 2N columns.
+BENCH_TOKENS = [
+    1, 2, 4, 8, 16, 24, 32, 64, 128, 256, 512, 1024,
+    2048, 4096, 8192, 16384, 32768,
+]
+BENCH_SHAPES = [
+    pytest.param(("bf16", 128, 384, 4096, torch.bfloat16), id="bf16-E128-N384-K4096"),
+    pytest.param(("int8_channel", 256, 256, 7168, torch.float16),
+                 id="int8-channel-E256-N256-K7168"),
+    pytest.param(("int8_block", 256, 256, 7168, torch.float16),
+                 id="int8-block128-E256-N256-K7168"),
+    pytest.param(("fp8_channel", 256, 320, 7168, torch.float16),
+                 id="fp8-channel-E256-N320-K7168"),
+]
 
 
 def _default_activation_kwargs(activation: str) -> dict:
@@ -1206,3 +1230,101 @@ def test_router_weight_fold_persistent_mls(monkeypatch):
     )
     monkeypatch.setattr(moe_op_module, "_USE_MOE_PERSISTENT_KERNEL", True)
     _run_router_fold_pair(monkeypatch, *case)
+
+
+@pytest.fixture(scope="module", params=BENCH_SHAPES)
+def fused_moe_bench_weights(request):
+    """Reuse one shape's weights across M; all weight preparation is untimed."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA/HIP device is required")
+    mode, experts, n, k, dtype = request.param
+    if mode == "fp8_channel" and not arch_info.is_fp8_avail():
+        pytest.skip(f"{arch_info.get_arch()} does not support native FP8")
+
+    torch.manual_seed(0)
+    shapes = [(experts, 2 * n, k), (experts, k, n)]
+    weights, scales = [], []
+    for shape in shapes:
+        if mode == "bf16":
+            weight = torch.randn(shape, device=DEVICE, dtype=dtype).div_(10)
+            scale = None
+        elif mode == "fp8_channel":
+            weight = torch.empty(shape, device=DEVICE, dtype=arch_info.get_fp8_e4m3_dtype())
+            scale = torch.empty(shape[:2], device=DEVICE, dtype=torch.float32)
+            # Quantize one expert at a time to avoid full-sized FP32 temporaries.
+            for expert in range(experts):
+                values = torch.randn(shape[1:], device=DEVICE, dtype=dtype).div_(10)
+                quantized, expert_scale = pertoken_quant(values, quant_dtype=weight.dtype)
+                weight[expert].copy_(quantized)
+                scale[expert].copy_(expert_scale.squeeze(-1))
+        else:
+            weight = torch.randint(-128, 128, shape, device=DEVICE, dtype=torch.int8)
+            scale_shape = (
+                (experts, (shape[1] + 127) // 128, (shape[2] + 127) // 128)
+                if mode == "int8_block" else shape[:2]
+            )
+            scale = torch.rand(scale_shape, device=DEVICE, dtype=torch.float32).mul_(1e-2)
+        weights.append(weight)
+        scales.append(scale)
+
+    kwargs = dict(
+        activation="silu", is_gated=True, global_num_experts=experts,
+        output_dtype=dtype, use_int8_w8a8=mode.startswith("int8"),
+        use_fp8_w8a8=mode == "fp8_channel", per_channel_quant=mode.endswith("channel"),
+        w1_scale=scales[0], w2_scale=scales[1],
+        block_shape=[128, 128] if mode == "int8_block" else None,
+    )
+    return mode, experts, n, k, dtype, weights, kwargs
+
+
+@pytest.mark.bench
+@GPU_REQUIRED
+@torch.inference_mode()
+@pytest.mark.parametrize("num_tokens", BENCH_TOKENS, ids=lambda m: f"M{m}")
+def test_fused_moe_benchmark(
+    fused_moe_bench_weights, num_tokens, bench_warmup, bench_repeat,
+):
+    """Full MoE graph replay; --bench-repeat is each sample's duration in ms."""
+    if bench_warmup < 0 or bench_repeat <= 0:
+        raise ValueError("bench warmup must be >= 0 and repeat must be > 0")
+    mode, experts, n, k, dtype, weights, kwargs = fused_moe_bench_weights
+    torch.manual_seed(0)
+    hidden_states = torch.randn((num_tokens, k), device=DEVICE, dtype=dtype).div_(10)
+    scores = torch.randn((num_tokens, experts), device=DEVICE, dtype=dtype)
+    topk_weights, topk_ids = fused_topk(hidden_states, scores, 8, renormalize=False)
+    del scores
+
+    def run():
+        return fused_experts(hidden_states, *weights, topk_weights, topk_ids, **kwargs)
+
+    output = run()  # Compile and initialize sorting before graph capture.
+    assert output.shape == hidden_states.shape and output.dtype == dtype
+    assert torch.isfinite(output).all().item()
+    del output
+    for _ in range(bench_warmup):
+        run()
+    torch.cuda.synchronize()
+    # Same graph timer and five-sample median as the tune CLI's CSV benchmark.
+    # do_bench_cudagraph interprets rep as a target measurement duration in ms.
+    guard = DeviceGuard(torch.cuda.current_device())
+    for attempt in range(3):
+        guard.wait_until_exclusive()
+        with guard:
+            samples_us = [
+                float(triton.testing.do_bench_cudagraph(run, rep=bench_repeat)) * 1000
+                for _ in range(5)
+            ]
+        assert all(0 < value < float("inf") for value in samples_us)
+        spread = spread_fraction(samples_us)
+        if not guard.contaminated and spread <= 0.03:
+            break
+        print(f"[bench] retry={attempt + 1}/3 spread={spread:.2%} "
+              f"foreign_queue={guard.contaminated}")
+    else:
+        pytest.fail("MoE graph timings remained unstable or the GPU was shared")
+    print(
+        f"[bench] fused_moe arch={arch_info.get_arch()} mode={mode} "
+        f"M={num_tokens} E={experts} N={n} K={k} topk=8 dtype={dtype} "
+        f"block_shape={kwargs['block_shape']} CUDA-graph median={median(samples_us):.3f} us "
+        f"samples_us={[round(value, 3) for value in samples_us]}"
+    )
