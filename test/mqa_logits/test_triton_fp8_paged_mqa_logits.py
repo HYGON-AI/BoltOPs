@@ -2,13 +2,15 @@
 
 Default pytest run: correctness / contract tests (``kv_block_size`` 1 and 64).
 
-Perf (needs ``--bench``; CUDA-graph pure GPU). Production path timed is
-``kv_block_size=64`` SplitKV + ``fuse_output_init=True``::
+Perf (needs ``--bench``; ``time_ms``, CUDA-graph first / median). Production
+path timed is ``kv_block_size=64`` SplitKV + ``fuse_output_init=True``.
+A plain ``--bench`` run is BoltOPs-only; hipc comparison needs ``-k vs_hipc``
+(optest ``per`` does not pass that)::
 
     pytest -q test/mqa_logits/test_triton_fp8_paged_mqa_logits.py --bench -s
     pytest -q test/mqa_logits/test_triton_fp8_paged_mqa_logits.py --bench -s -k vs_hipc
 
-Standalone CLI (same benches)::
+Standalone CLI (best-of graph replay; path sweep; not collected by optest)::
 
     python test/mqa_logits/test_triton_fp8_paged_mqa_logits.py
     python test/mqa_logits/test_triton_fp8_paged_mqa_logits.py --vs-hipc
@@ -32,6 +34,9 @@ from boltops.mqa_logits import (  # noqa: E402
     triton_fp8_paged_mqa_logits_stage1,
 )
 from boltops.utility.arch_info import get_fp8_e4m3_dtype  # noqa: E402
+
+# optest CSV name. File stem would be ``triton_fp8_paged_mqa_logits``.
+PERF_OP = "fp8_paged_mqa_logits"
 
 DEVICE = "cuda"
 GPU_REQUIRED = pytest.mark.skipif(
@@ -1888,35 +1893,95 @@ def run_paged_bench(
     return rows
 
 
-def _bench_shape_params():
-    for shape in BENCH_SHAPES:
-        batch, next_n, heads, avg_kv = shape
-        yield pytest.param(
-            shape,
-            id=f"B{batch}-n{next_n}-H{heads}-L{avg_kv}",
+_BENCH_IDS = [
+    f"B{b}-n{n}-H{h}-L{avg}" for b, n, h, avg in BENCH_SHAPES
+]
+
+
+def _paged_splitkv_fuse_fn(batch: int, next_n: int, heads: int, avg_kv: int):
+    """Default production path (SplitKV + fuse) for one paged shape."""
+    q, kv, weights, context_lens, block_table = _bench_build_inputs(
+        batch, next_n, heads, avg_kv
+    )
+    info = triton_fp8_paged_mqa_logits_prepare(q, kv, context_lens, block_table)
+    out = torch.empty(
+        (batch * next_n, BENCH_MAX_MODEL_LEN), device=DEVICE, dtype=torch.float32
+    )
+    fn = _bench_make_bolt_fn(
+        "splitkv_fuse", q, kv, weights, out, context_lens, block_table, info
+    )
+    return fn, q, kv, weights, context_lens, block_table
+
+
+@GPU_REQUIRED
+@pytest.mark.bench
+@pytest.mark.parametrize(
+    "batch,next_n,heads,avg_kv", BENCH_SHAPES, ids=_BENCH_IDS
+)
+@torch.inference_mode()
+def test_bench_triton_fp8_paged_mqa_logits_gpu(
+    batch: int,
+    next_n: int,
+    heads: int,
+    avg_kv: int,
+    bench_warmup: int,
+    bench_repeat: int,
+    time_ms,
+) -> None:
+    """BoltOPs-only latency of SplitKV+fuse (``time_ms``, cudagraph-first)."""
+    fn, *_rest = _paged_splitkv_fuse_fn(batch, next_n, heads, avg_kv)
+    ms = time_ms(fn, bench_warmup, bench_repeat)
+    assert ms > 0
+    print(
+        f"[bench paged] B={batch} n={next_n} H={heads} L={avg_kv}: {ms:.4f} ms",
+        flush=True,
+    )
+
+
+@GPU_REQUIRED
+@pytest.mark.bench
+@pytest.mark.parametrize(
+    "batch,next_n,heads,avg_kv", BENCH_SHAPES, ids=_BENCH_IDS
+)
+@torch.inference_mode()
+def test_bench_triton_fp8_paged_mqa_logits_vs_hipc(
+    batch: int,
+    next_n: int,
+    heads: int,
+    avg_kv: int,
+    bench_warmup: int,
+    bench_repeat: int,
+    time_ms,
+) -> None:
+    """Same ``time_ms`` method vs hipc; skipped when hipc is missing."""
+    gemmopt = _try_import_hipc()
+    if gemmopt is None:
+        pytest.skip("hipc not installed")
+    fn, q, kv, weights, context_lens, block_table = _paged_splitkv_fuse_fn(
+        batch, next_n, heads, avg_kv
+    )
+
+    def hipc_fn():
+        gemmopt.paged_mqa_logits(
+            q,
+            kv,
+            weights,
+            context_lens,
+            block_table,
+            None,
+            BENCH_MAX_MODEL_LEN,
+            clean_logits=True,
         )
 
-
-@GPU_REQUIRED
-@pytest.mark.bench
-@pytest.mark.parametrize("shape", list(_bench_shape_params()))
-@torch.inference_mode()
-def test_bench_triton_fp8_paged_mqa_logits_gpu(shape):
-    """Pure-GPU (graph) latency of the default SplitKV+fuse path."""
-    rows = run_paged_bench(shapes=[shape], paths=("splitkv_fuse",), vs_hipc=False)
-    assert rows and rows[0]["bolt_us"] > 0
-
-
-@GPU_REQUIRED
-@pytest.mark.bench
-@pytest.mark.parametrize("shape", list(_bench_shape_params()))
-@torch.inference_mode()
-def test_bench_triton_fp8_paged_mqa_logits_vs_hipc(shape):
-    """Pure-GPU BoltOPs vs hipc; skipped when hipc is missing."""
-    if _try_import_hipc() is None:
-        pytest.skip("hipc not installed")
-    rows = run_paged_bench(shapes=[shape], paths=("splitkv_fuse",), vs_hipc=True)
-    assert rows and rows[0]["bolt_us"] > 0 and rows[0]["hipc_us"] > 0
+    ms_bo = time_ms(fn, bench_warmup, bench_repeat)
+    ms_hi = time_ms(hipc_fn, bench_warmup, bench_repeat)
+    assert ms_bo > 0 and ms_hi > 0
+    print(
+        f"[bench paged vs hipc] B={batch} n={next_n} H={heads} L={avg_kv}: "
+        f"boltops {ms_bo:.4f} ms hipc {ms_hi:.4f} ms "
+        f"({ms_hi / ms_bo:.3f}x)",
+        flush=True,
+    )
 
 
 def _bench_main(argv: Optional[list] = None) -> int:

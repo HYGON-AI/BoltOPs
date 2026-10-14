@@ -57,7 +57,13 @@ pytest -q test/mqa_logits/test_triton_fp8_mqa_logits.py
 # Prefill half correctness (official 66-shape grid subset)
 pytest -q test/mqa_logits/test_triton_mqa_logits_half.py
 
-# Official 66-shape half grid: perf vs hipc (all shapes)
+# --bench alone is BoltOPs-only. Hipc comparison needs -k vs_hipc
+# (optest per does not pass it, so CI does not time hipc).
+
+# Official 66-shape half grid: BoltOPs-only latency
+pytest -q test/mqa_logits/test_triton_mqa_logits_half.py --bench -s -k test_bench_triton_mqa_logits_half
+
+# ...vs hipc
 pytest -q test/mqa_logits/test_triton_mqa_logits_half.py --bench -s -k vs_hipc
 
 # ...sharded across 8 GPUs
@@ -67,9 +73,9 @@ for i in 0 1 2 3 4 5 6 7; do
     --bench -s -k vs_hipc > /tmp/half_shard$i.log 2>&1 &
 done; wait
 
-# ...or emit the single-process table + JSON
+# ...or emit the single-process table + JSON (not an optest bench; no --bench)
 HALF_GRID_REPORT=1 HALF_GRID_JSON=/tmp/mqa_logits_half_66.json \
-  pytest -q test/mqa_logits/test_triton_mqa_logits_half.py --bench -s -k report
+  pytest -q test/mqa_logits/test_triton_mqa_logits_half.py -s -k report
 
 # Size-grid latency (shapes from hipc prefill cuda list)
 pytest -q test/mqa_logits/test_triton_fp8_mqa_logits.py --bench -s -k size_grid
@@ -78,10 +84,11 @@ pytest -q test/mqa_logits/test_triton_fp8_mqa_logits.py --bench -s -k size_grid
 pytest -q test/mqa_logits/test_triton_fp8_mqa_logits.py --bench -s -k vs_hipc_size
 pytest -q test/mqa_logits/test_triton_fp8_mqa_logits.py --bench -s -k vs_hipc_prod
 
-# Paged decode pure-GPU (+ optional vs-hipc)
-pytest -q test/mqa_logits/test_triton_fp8_paged_mqa_logits.py --bench -s
+# Paged decode: pytest benches use time_ms (cudagraph-first median)
+pytest -q test/mqa_logits/test_triton_fp8_paged_mqa_logits.py --bench -s -k test_bench_triton_fp8_paged_mqa_logits_gpu
 pytest -q test/mqa_logits/test_triton_fp8_paged_mqa_logits.py --bench -s -k vs_hipc
-# or: python test/mqa_logits/test_triton_fp8_paged_mqa_logits.py [--vs-hipc]
+# CLI path sweep (splitkv_nofuse / bucket_persistent) is not collected by optest:
+# python test/mqa_logits/test_triton_fp8_paged_mqa_logits.py [--vs-hipc] [--path ...]
 ```
 
 Float8 / half vs-hipc numbers above come from the pytest suites; re-run those
@@ -126,14 +133,15 @@ Public Triton entries (TileLang is documented in ``docs/ops/mqa_logits_tilelang.
 
 ### Bench
 
-Default is **BoltOPs-only pure GPU** (CUDA-graph replay; host / Triton launch excluded).
-Optional ``--vs-hipc`` compares against hipc with the same method.
+Pytest benches use ``time_ms`` (cudagraph-first, median). BoltOPs-only covers
+the default path; ``-k vs_hipc`` is skipped when hipc is missing. The CLI still
+does best-of CUDA-graph replay and is the only place that sweeps extra paths.
 
 ```bash
-pytest -q test/mqa_logits/test_triton_fp8_paged_mqa_logits.py --bench -s
+pytest -q test/mqa_logits/test_triton_fp8_paged_mqa_logits.py --bench -s -k test_bench_triton_fp8_paged_mqa_logits_gpu
 pytest -q test/mqa_logits/test_triton_fp8_paged_mqa_logits.py --bench -s -k vs_hipc
-# or: python test/mqa_logits/test_triton_fp8_paged_mqa_logits.py [--vs-hipc]
+# CLI (not optest): python test/mqa_logits/test_triton_fp8_paged_mqa_logits.py [--vs-hipc]
 ```
 
-Default path timed: ``kv_block_size=64`` SplitKV + ``fuse_output_init=True``.
-Other branches: ``--path splitkv_nofuse bucket_persistent``.
+Default path timed by pytest: ``kv_block_size=64`` SplitKV + ``fuse_output_init=True``.
+``splitkv_nofuse`` / ``bucket_persistent`` stay on the CLI (``--path``).

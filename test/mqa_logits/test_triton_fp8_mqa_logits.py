@@ -3,26 +3,27 @@
 Backends under test: ``row``, ``bn``, ``gluon`` (plus public ``auto``).
 
 Size-grid benches reuse the prefill shape list from hipc / aiter lineage tests
-(Q×KV×H, D=128). Implementation code does not depend on hipc; optional
-``--bench`` compares latency when hipc is importable:
+(Q×KV×H, D=128). ``pytest --bench`` times BoltOPs only. Hipc comparison is
+opt-in and is skipped by optest ``per``:
 
-* ``-k vs_hipc_size`` — synthetic size grid
-* ``-k vs_hipc_prod`` — 50 production prefill slices (GLM / V4 CSA / PP_Stage0)
+* ``--bench -k vs_hipc_size`` — synthetic size grid
+* ``--bench -k vs_hipc_prod`` — 50 production prefill slices (GLM / V4 CSA / PP_Stage0)
 """
 
 from __future__ import annotations
 
-import statistics
-from typing import Callable, Tuple
+from typing import Tuple
 
 import pytest
 import torch
 
 pytest.importorskip("triton")
-import triton  # noqa: E402
 
 from boltops.mqa_logits import triton_mqa_logits  # noqa: E402
 from boltops.utility.arch_info import get_fp8_e4m3_dtype  # noqa: E402
+
+# optest CSV name. File stem would be ``triton_fp8_mqa_logits``.
+PERF_OP = "fp8_mqa_logits"
 
 DEVICE = "cuda"
 GPU_REQUIRED = pytest.mark.skipif(
@@ -312,11 +313,11 @@ def test_bench_triton_fp8_mqa_logits_size_grid(
             q_fp8, kv_fp8, scales, weights, ks, ke, D_out=d_out, backend="auto"
         )
 
-    ms = time_ms(run, bench_warmup, bench_repeat)
-    tflops = useful_flops(ks, ke, num_heads, head_dim) / (ms * 1e-3) / 1e12
+    flops = useful_flops(ks, ke, num_heads, head_dim)
+    ms = time_ms(run, bench_warmup, bench_repeat, flops=flops)
     print(
         f"[bench size-grid] auto {s_q}x{s_k} H={num_heads} D={head_dim} "
-        f"-> {ms:.3f} ms, {tflops:.2f} TFLOPS"
+        f"-> {ms:.3f} ms, {flops / (ms * 1e-3) / 1e12:.2f} TFLOPS"
     )
 
 
@@ -340,7 +341,7 @@ def test_bench_triton_fp8_mqa_logits_vs_hipc_size_grid(
     head_dim: int,
     bench_warmup: int,
     bench_repeat: int,
-    time_ms: Callable[[Callable[[], None], int, int], float],
+    time_ms,
 ) -> None:
     """Optional: same hipc size grid, BoltOPs auto vs hipc.mqa_logits."""
     hipc = _require_hipc()
@@ -361,8 +362,8 @@ def test_bench_triton_fp8_mqa_logits_vs_hipc_size_grid(
             q_fp8, kv_fp8, weights, ks, ke, scales, clean_logit=True, D_out=hi_out
         )
 
-    ms_boltops = time_ms(run_boltops, bench_warmup, bench_repeat)
-    ms_hipc = time_ms(run_hipc, bench_warmup, bench_repeat)
+    ms_boltops = time_ms(run_boltops, bench_warmup, bench_repeat, flops=flops)
+    ms_hipc = time_ms(run_hipc, bench_warmup, bench_repeat, flops=flops)
     ratio = ms_hipc / ms_boltops if ms_boltops > 0 else float("inf")
     print(
         f"[bench vs_hipc size-grid] {s_q}x{s_k} H={num_heads}\n"
@@ -374,36 +375,6 @@ def test_bench_triton_fp8_mqa_logits_vs_hipc_size_grid(
     )
 
 
-def _ab_ms(
-    fn_bo: Callable[[], None],
-    fn_hi: Callable[[], None],
-    *,
-    rounds: int = 5,
-) -> tuple[float, float, float]:
-    """Interleaved BoltOPs/hipc timing; median + 3×MAD-robust ratio."""
-    bo, hi, ratios = [], [], []
-    for _ in range(rounds):
-        a = float(triton.testing.do_bench(fn_bo, warmup=25, rep=80))
-        b = float(triton.testing.do_bench(fn_hi, warmup=25, rep=80))
-        bo.append(a)
-        hi.append(b)
-        if a > 0:
-            ratios.append(b / a)
-
-    def _median(xs: list[float]) -> float:
-        return float(statistics.median(xs))
-
-    def _robust(xs: list[float]) -> float:
-        med = _median(xs)
-        mad = _median([abs(x - med) for x in xs])
-        if mad == 0:
-            return med
-        keep = [x for x in xs if abs(x - med) <= 3 * 1.4826 * mad]
-        return _median(keep or xs)
-
-    return _median(bo), _median(hi), _robust(ratios)
-
-
 @GPU_REQUIRED
 @pytest.mark.bench
 @pytest.mark.parametrize("s_q,s_k,num_heads,family", list(_prod_slice_params()))
@@ -413,6 +384,9 @@ def test_bench_triton_fp8_mqa_logits_vs_hipc_prod_slices(
     s_k: int,
     num_heads: int,
     family: str,
+    bench_warmup: int,
+    bench_repeat: int,
+    time_ms,
 ) -> None:
     """50 production prefill slices: BoltOPs auto vs hipc.
 
@@ -453,8 +427,10 @@ def test_bench_triton_fp8_mqa_logits_vs_hipc_prod_slices(
         got, q_fp8, kv_fp8, scales, weights, ks, ke, atol_diff=2e-2
     )
 
-    ms_bo, ms_hi, ratio = _ab_ms(run_boltops, run_hipc)
     flops = useful_flops(ks, ke, num_heads, _PROD_SLICE_D)
+    ms_bo = time_ms(run_boltops, bench_warmup, bench_repeat, flops=flops)
+    ms_hi = time_ms(run_hipc, bench_warmup, bench_repeat, flops=flops)
+    ratio = ms_hi / ms_bo if ms_bo > 0 else float("inf")
     print(
         f"[bench vs_hipc_prod] {family} {s_q}x{s_k} H={num_heads} "
         f"path={path} sk={sk}\n"

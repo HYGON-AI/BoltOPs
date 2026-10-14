@@ -599,10 +599,13 @@ my_kernel,triton,64,2048,16,128,128,3.6.0+git46766868.staging,gfx938,cudagraph,0
 | `mhc_post` | `test/mhc/test_post.py` | `test_bench_mhc_post_fwd` | `time_ms` | tilelang | op 名自动派生（`test_post` 重名，加目录前缀） |
 | `split_sinkhorn` | `test/mhc/test_split_sinkhorn.py` | `test_bench_hc_split_sinkhorn` | `time_ms` | tilelang | |
 | `decode_attention` | `test/mla/test_decode_attention.py` | `test_bench_mla_decode_attention` | `time_ms` | triton | |
-| `fp8_mqa_logits` | `test/mqa_logits/test_fp8_mqa_logits.py` | `test_bench_fp8_mqa_logits_size_grid` | `time_ms` | triton | |
-| `fp8_mqa_logits` | `test/mqa_logits/test_fp8_mqa_logits.py` | `test_bench_fp8_mqa_logits_backends_size_grid` | `time_ms` | triton | |
-| `fp8_mqa_logits` | `test/mqa_logits/test_fp8_mqa_logits.py` | `test_bench_fp8_mqa_logits_vs_lightop_size_grid` | `time_ms` ×2 | triton | `call`=1/2（boltops vs lightop） |
-| `fp8_mqa_logits` | `test/mqa_logits/test_fp8_mqa_logits.py` | `test_bench_mqa_logits_half_vs_lightop` | `time_ms` ×2 | triton | `call`=1/2（boltops vs lightop 比率） |
+| `fp8_mqa_logits` | `test/mqa_logits/test_triton_fp8_mqa_logits.py` | `test_bench_triton_fp8_mqa_logits_size_grid` | `time_ms` + `flops=` | triton | `PERF_OP`；CI 默认收集；`s_q,s_k,num_heads,head_dim` |
+| `fp8_mqa_logits` | `test/mqa_logits/test_triton_fp8_mqa_logits.py` | `test_bench_triton_fp8_mqa_logits_vs_hipc_size_grid` | `time_ms` ×2 | triton | `-k vs_hipc` 才跑；默认 CI skip；`call`=1/2 |
+| `fp8_mqa_logits` | `test/mqa_logits/test_triton_fp8_mqa_logits.py` | `test_bench_triton_fp8_mqa_logits_vs_hipc_prod_slices` | `time_ms` ×2 | triton | `-k vs_hipc` 才跑；默认 CI skip；`call`=1/2 |
+| `half_mqa_logits` | `test/mqa_logits/test_triton_mqa_logits_half.py` | `test_bench_triton_mqa_logits_half` | `time_ms` | triton | `PERF_OP`；CI 默认收集；`s_q,s_k,num_heads` |
+| `half_mqa_logits` | `test/mqa_logits/test_triton_mqa_logits_half.py` | `test_bench_triton_mqa_logits_half_vs_hipc` | `time_ms` ×2 | triton | `-k vs_hipc` 才跑；默认 CI skip；比值不足再测一次 |
+| `fp8_paged_mqa_logits` | `test/mqa_logits/test_triton_fp8_paged_mqa_logits.py` | `test_bench_triton_fp8_paged_mqa_logits_gpu` | `time_ms` | triton | `PERF_OP`；CI 默认收集；标量 `batch,next_n,heads,avg_kv`；只测 splitkv_fuse |
+| `fp8_paged_mqa_logits` | `test/mqa_logits/test_triton_fp8_paged_mqa_logits.py` | `test_bench_triton_fp8_paged_mqa_logits_vs_hipc` | `time_ms` ×2 | triton | `-k vs_hipc` 才跑；默认 CI skip；`call`=1/2 |
 | `tilelang_mqa` | `test/mqa_logits/test_tilelang_mqa.py` | `test_bench_qsa_mqa_prefill_kernel` | `time_ms` | tilelang | |
 | `tilelang_mqa` | `test/mqa_logits/test_tilelang_mqa.py` | `test_bench_qsa_mqa_decode_cooperative_load` | `time_ms`（循环内多计时点） | tilelang | 循环变量（query_heads 等）不进 CSV，仅 `call` 自动编号；要成 case 列需改 parametrize；本测例在本机可复现 GPU VM fault（存量 kernel 问题，§9），修复前会带崩 tilelang pass |
 | `step4_dsa_bench` | `test/step4_dsa/test_bench.py` | `test_bench_tp8_production` | `time_ms` | triton | op 名自动派生（文件名 `test_bench.py` 泛化名，加目录前缀） |
