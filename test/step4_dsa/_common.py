@@ -1,4 +1,4 @@
-"""Shared pytest helpers for Step-4 DSA correctness tests."""
+"""Shared pytest helpers for Step-4 DSA correctness tests and benchmarks."""
 
 from __future__ import annotations
 
@@ -13,6 +13,16 @@ DEVICE = "cuda"
 GPU_REQUIRED = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA/HIP device is required"
 )
+
+
+def tp8_geometry() -> Step4Geometry:
+    """Real TP8 per-rank geometry, including one four-head indexer provider group."""
+    return Step4Geometry(
+        num_attention_heads=8,
+        num_attention_groups=1,
+        indexer_num_heads=4,
+        num_provider_groups=1,
+    )
 
 
 def last_dim_padded_view(src: torch.Tensor, pad: int, poison: float) -> torch.Tensor:

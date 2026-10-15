@@ -13,7 +13,6 @@ On the ``num_splits==1`` path, occupancy JSON may pin the launch grid with
 from __future__ import annotations
 
 import functools
-import json
 import os
 from typing import Any
 
@@ -22,24 +21,28 @@ import triton
 import triton.language as tl
 
 from boltops.step4_dsa.triton.common import (
-    _config_path_for_device,
+    _cache_is_fp8,
+    _choose_kv_splits,
+    _clamp_auto_kv_splits,
+    _config_match_score,
     _device_name_for_config,
     _fit_block_regions,
+    _load_device_configs,
     _occupancy_dtype,
+    _portable_launch_options,
     _require_contiguous_last_dim,
+    _select_config,
 )
 from boltops.utility.triton_capability import get_triton_capabilities
+
+# Retained for source-tree config verification callers.
+_decode_config_match_score = _config_match_score
 
 DECODE_PHYS_SHIFT = tl.constexpr(32)
 DECODE_LOW_MASK = tl.constexpr((1 << 32) - 1)
 NEGATIVE_INFINITY = tl.constexpr(float("-inf"))
 LOG2E = tl.constexpr(1.4426950408889634)
 LN2 = tl.constexpr(0.6931471805599453)
-
-
-def _cache_is_fp8(dtype: torch.dtype) -> bool:
-    """True for an fp8 KV cache. Query dtype stays the compute dtype."""
-    return bool(dtype.is_floating_point and dtype.itemsize == 1)
 
 
 @triton.jit
@@ -735,9 +738,8 @@ def _sparse_attn_decode_dsplit_pipelined_bf16_kernel(
     )
 
 
-# Separate launch entry points keep dtype-specific compilation and dispatch explicit.
-# The shared JIT bodies contain the identical metadata, softmax, and scheduling
-# logic; only the K/V widening path is specialized by each entry point.
+# Dtype-specific and pipelined JIT bodies stay separate to preserve compilation
+# and scheduling behavior. Python configuration/occupancy helpers are shared.
 
 
 # FP8 192-dim kernels. Gathered K/V are widened through fp32.
@@ -1256,9 +1258,8 @@ def _sparse_attn_decode_dsplit_pipelined_fp8_kernel(
     )
 
 
-# Separate launch entry points keep dtype-specific compilation and dispatch explicit.
-# The shared JIT bodies contain the identical metadata, softmax, and scheduling
-# logic; only the K/V widening path is specialized by each entry point.
+# Dtype-specific and pipelined JIT bodies stay separate to preserve compilation
+# and scheduling behavior. Python configuration/occupancy helpers are shared.
 
 
 def _decode_head_dim_split(head_dim: int) -> tuple[int, int, int] | None:
@@ -1303,7 +1304,6 @@ _COMMON_KERNEL_CONFIG_KEYS = frozenset(
 _PADDED_KERNEL_CONFIG_KEYS = _COMMON_KERNEL_CONFIG_KEYS | {"BLOCK_D"}
 _ALL_KERNEL_CONFIG_KEYS = _PADDED_KERNEL_CONFIG_KEYS | {"BLOCK_D1", "BLOCK_D2", "BLOCK_D3"}
 _HOST_OR_KERNEL_CONFIG_KEYS = _ALL_KERNEL_CONFIG_KEYS | _HOST_CONFIG_KEYS
-_STANDARD_LAUNCH_KEYS = frozenset({"num_warps", "num_stages"})
 
 
 def _build_launch_options(config: dict[str, Any]) -> dict[str, Any]:
@@ -1313,20 +1313,10 @@ def _build_launch_options(config: dict[str, Any]) -> dict[str, Any]:
     are forwarded only when the installed backend declares support for them.
     Kernel constexpr, host-only, unknown, and unsupported fields are omitted.
     """
-    options = {
-        name: int(config[name])
-        for name in _STANDARD_LAUNCH_KEYS
-        if name in config
-    }
-    if torch.version.hip is None:
-        return options
-
-    capabilities = get_triton_capabilities()
-    consumed = _HOST_OR_KERNEL_CONFIG_KEYS | _STANDARD_LAUNCH_KEYS
-    for name, value in config.items():
-        if name not in consumed and capabilities.supports(name):
-            options[name] = value
-    return options
+    supports = get_triton_capabilities().supports if torch.version.hip is not None else None
+    return _portable_launch_options(
+        config, consumed_keys=_HOST_OR_KERNEL_CONFIG_KEYS, supports=supports
+    )
 
 
 def _decode_config_filename(device: str) -> str:
@@ -1334,53 +1324,9 @@ def _decode_config_filename(device: str) -> str:
     return f"sparse_attn_decode_{device}.json"
 
 
-def _decode_config_match_score(
-    match: dict[str, Any], shape: dict[str, Any]
-) -> tuple[int, int, float] | None:
-    """Return match specificity, or ``None`` when a shape does not match.
-
-    A key missing from ``shape`` (including legacy ``s_kv`` constraints) is a
-    mismatch, not a wildcard.
-    """
-    exact = 0
-    bounds = 0
-    widths: dict[str, dict[str, float]] = {}
-    for key, expected in match.items():
-        if key.endswith("_min") or key.endswith("_max"):
-            field, kind = key.rsplit("_", 1)
-            actual = shape.get(field)
-            if actual is None:
-                return None
-            if kind == "min" and actual < expected:
-                return None
-            if kind == "max" and actual > expected:
-                return None
-            widths.setdefault(field, {})[kind] = expected
-            bounds += 1
-        elif shape.get(key) != expected:
-            return None
-        else:
-            exact += 1
-    total_width = 0.0
-    for limits in widths.values():
-        if "min" in limits and "max" in limits:
-            total_width += limits["max"] - limits["min"]
-        else:
-            total_width += float("inf")
-    return exact, bounds, -total_width
-
-
 @functools.lru_cache(maxsize=None)
 def _load_decode_device_configs(device: str) -> dict[str, Any]:
-    path = _config_path_for_device(_CONFIG_DIR, _decode_config_filename, device)
-    if path is None:
-        return {}
-    try:
-        with open(path) as handle:
-            data = json.load(handle)
-    except (OSError, json.JSONDecodeError):
-        return {}
-    return data if isinstance(data, dict) else {}
+    return _load_device_configs(_CONFIG_DIR, _decode_config_filename, device)
 
 
 def _filter_launch_config(config: dict[str, Any], *, head_dim: int) -> dict[str, Any]:
@@ -1400,10 +1346,6 @@ def _filter_launch_config(config: dict[str, Any], *, head_dim: int) -> dict[str,
     filtered = {key: value for key, value in config.items() if key in consumed}
     filtered.update(_build_launch_options(config))
     return filtered
-
-
-def _clamp_auto_kv_splits(value: int, packed_width: int) -> int:
-    return min(max(int(value), 1), max(int(packed_width), 1))
 
 
 def _load_sparse_attn_decode_config(
@@ -1434,19 +1376,8 @@ def _load_sparse_attn_decode_config(
         "region_size": int(region_size),
         "dtype": _occupancy_dtype(key_cache.dtype),
     }
-    selected = None
-    selected_score: tuple[int, int, float] | None = None
-    for entry in data.get("configs", ()):
-        match = entry.get("match", {})
-        if not isinstance(match, dict):
-            continue
-        score = _decode_config_match_score(match, shape)
-        if score is not None and (selected_score is None or score > selected_score):
-            selected, selected_score = entry, score
-    if selected is None:
-        return None
-    config = selected.get("config", {})
-    if not isinstance(config, dict):
+    config = _select_config(data, shape)
+    if config is None:
         return None
     filtered = _filter_launch_config(config, head_dim=int(query.shape[2]))
     if "BLOCK_R" not in filtered:
@@ -1489,27 +1420,14 @@ def choose_decode_kv_splits(
     ``ceil(packed_width / splits) >= min_slots_per_split`` when the row is full
     (``max_splits = (K - 1) // (M - 1)`` for ``M > 1``).
     """
-    packed_width = max(int(packed_width), 1)
-    programs_base = max(int(num_reqs) * int(num_kv_groups), 1)
-    if target_programs is None:
-        try:
-            index = (
-                device.index
-                if device is not None and device.index is not None
-                else torch.cuda.current_device()
-            )
-            target_programs = int(torch.cuda.get_device_properties(index).multi_processor_count)
-        except Exception:
-            target_programs = 1
-    target_programs = max(int(target_programs or 1), 1)
-    splits = -(-target_programs // programs_base)
-    min_slots = max(int(min_slots_per_split), 1)
-    if min_slots <= 1:
-        max_splits = packed_width
-    else:
-        # ceil(K/S) >= M  <=>  S <= (K - 1) // (M - 1)
-        max_splits = max(1, (packed_width - 1) // (min_slots - 1))
-    return min(max(splits, 1), max_splits, packed_width)
+    return _choose_kv_splits(
+        num_reqs,
+        num_kv_groups,
+        packed_width,
+        target_programs=target_programs,
+        min_slots_per_split=min_slots_per_split,
+        device=device,
+    )
 
 
 def sparse_attention_decode(

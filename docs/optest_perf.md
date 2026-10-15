@@ -565,9 +565,9 @@ my_kernel,triton,64,2048,16,128,128,3.6.0+git46766868.staging,gfx938,cudagraph,0
 
 ### 8.1 当前 op 与 bench 测例（盘点快照）
 
-2026-10-09 盘点：29 个文件、37 个 `@pytest.mark.bench` 测试函数、
-29 个 op（8 个文件为 tilelang backend，1 个文件为文件内双 backend，
-见 §6）。36 个可被观测层自动收集，唯一例外是 `moe_sorting_hipc`
+2026-10-14 盘点：30 个文件、38 个 `@pytest.mark.bench` 测试函数、
+30 个 op（8 个文件为 tilelang backend，1 个文件为文件内双 backend，
+见 §6）。37 个可被观测层自动收集，唯一例外是 `moe_sorting_hipc`
 的手动 `torch.cuda.Event` 采样（备注列说明）。
 
 | op | 测试文件 | bench 测试函数 | 计时入口 | backend | 备注 |
@@ -608,7 +608,8 @@ my_kernel,triton,64,2048,16,128,128,3.6.0+git46766868.staging,gfx938,cudagraph,0
 | `fp8_paged_mqa_logits` | `test/mqa_logits/test_triton_fp8_paged_mqa_logits.py` | `test_bench_triton_fp8_paged_mqa_logits_vs_hipc` | `time_ms` ×2 | triton | `-k vs_hipc` 才跑；默认 CI skip；`call`=1/2 |
 | `tilelang_mqa` | `test/mqa_logits/test_tilelang_mqa.py` | `test_bench_qsa_mqa_prefill_kernel` | `time_ms` | tilelang | |
 | `tilelang_mqa` | `test/mqa_logits/test_tilelang_mqa.py` | `test_bench_qsa_mqa_decode_cooperative_load` | `time_ms`（循环内多计时点） | tilelang | 循环变量（query_heads 等）不进 CSV，仅 `call` 自动编号；要成 case 列需改 parametrize；本测例在本机可复现 GPU VM fault（存量 kernel 问题，§9），修复前会带崩 tilelang pass |
-| `step4_dsa_bench` | `test/step4_dsa/test_bench.py` | `test_bench_tp8_production` | `time_ms` | triton | op 名自动派生（文件名 `test_bench.py` 泛化名，加目录前缀） |
+| `step4_dsa_prefill` | `test/step4_dsa/test_step4_dsa_prefill.py` | `test_bench_sparse_prefill` | `time_ms`（tiled 用 `use_graph=False`） | triton | `PERF_OP` 钉名；shape 与 `boltops/step4_dsa/triton/config/sparse_attn_prefill*` 逐条对应（scalar q=1..4096 bf16 + q=128 fp8；tiled q=128 bf16/fp8）；tiled 建 tile 有 host 同步不可 graph 捕获，timing=event |
+| `step4_dsa_decode` | `test/step4_dsa/test_step4_dsa_decode.py` | `test_bench_sparse_decode` | `time_ms` | triton | `PERF_OP` 钉名；shape 与 `config/sparse_attn_decode` 逐条对应（bf16 b=1..128、fp8 b=1/4/8，splits=1）；context=16384 取自 TP8 production case；metadata 在计时外生成 |
 | `attn_res` | `test/test_generic_attn_res.py` | `test_bench_attn_res` | `time_ms` | triton | |
 | `mamba_state_scatter` | `test/test_generic_mamba_state_scatter.py` | `test_bench_mamba_state_scatter` | `time_ms` | triton | |
 

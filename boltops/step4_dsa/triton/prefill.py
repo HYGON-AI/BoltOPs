@@ -9,7 +9,6 @@ BF16 casts gathered K/V to the query dtype, and FP8 widens them through fp32.
 from __future__ import annotations
 
 import functools
-import json
 import os
 from typing import Any
 
@@ -18,13 +17,22 @@ import triton
 import triton.language as tl
 
 from boltops.step4_dsa.triton.common import (
-    _config_path_for_device,
+    _cache_is_fp8,
+    _choose_kv_splits,
+    _clamp_auto_kv_splits,
+    _config_match_score,
     _device_name_for_config,
     _fit_block_regions,
+    _load_device_configs,
     _occupancy_dtype,
+    _portable_launch_options,
     _require_contiguous_last_dim,
+    _select_config,
 )
 from boltops.utility.triton_capability import get_triton_capabilities
+
+# Retained for source-tree config verification callers.
+_prefill_config_match_score = _config_match_score
 
 REGION_VALID_SHIFT = tl.constexpr(24)
 REGION_ID_MASK = tl.constexpr((1 << 24) - 1)
@@ -1521,16 +1529,6 @@ def _prefill_tile_mask_kernel(
     )
 
 
-def _cache_is_fp8(dtype: torch.dtype) -> bool:
-    """True for an fp8 KV cache. Query dtype stays the compute dtype.
-
-    Pass the actual cache tensor dtype. Occupancy JSON also matches on dtype,
-    but a caller-supplied ``config`` can override that match, so kernel
-    selection does not read the cache family from the config.
-    """
-    return bool(dtype.is_floating_point and dtype.itemsize == 1)
-
-
 def _require_matching_kv_dtypes(
     key_cache: torch.Tensor, value_cache: torch.Tensor
 ) -> None:
@@ -1929,7 +1927,6 @@ _KERNEL_CONFIG_KEYS = frozenset(
         "BLOCK_Q",
     }
 )
-_STANDARD_LAUNCH_KEYS = frozenset({"num_warps", "num_stages"})
 
 
 def _build_launch_options(
@@ -1944,24 +1941,13 @@ def _build_launch_options(
     installed backend declares support for them. Unknown and unsupported fields
     are ignored so configs remain portable across Triton versions.
     """
-    options = dict(defaults or {})
-    for name in _STANDARD_LAUNCH_KEYS:
-        if name in config:
-            options[name] = int(config[name])
-    if torch.version.hip is None:
-        return options
-
-    capabilities = get_triton_capabilities()
-    for name, value in config.items():
-        if (
-            name in _KERNEL_CONFIG_KEYS
-            or name in _STANDARD_LAUNCH_KEYS
-            or name in _HOST_CONFIG_KEYS
-        ):
-            continue
-        if capabilities.supports(name):
-            options[name] = value
-    return options
+    supports = get_triton_capabilities().supports if torch.version.hip is not None else None
+    return _portable_launch_options(
+        config,
+        consumed_keys=_KERNEL_CONFIG_KEYS | _HOST_CONFIG_KEYS,
+        supports=supports,
+        defaults=defaults,
+    )
 
 
 def _prefill_config_filename(device: str) -> str:
@@ -1969,54 +1955,10 @@ def _prefill_config_filename(device: str) -> str:
     return f"sparse_attn_prefill_{device}.json"
 
 
-def _prefill_config_match_score(
-    match: dict[str, Any], shape: dict[str, Any]
-) -> tuple[int, int, float] | None:
-    """Return (exact_count, bound_count, -total_width) or ``None`` on mismatch.
-
-    Supports exact-value keys and range keys with ``_min`` / ``_max`` suffixes,
-    mirroring the MLA ``_config_match_score`` convention.
-    """
-    exact = 0
-    bounds = 0
-    widths: dict[str, dict[str, float]] = {}
-    for key, expected in match.items():
-        if key.endswith("_min") or key.endswith("_max"):
-            field, kind = key.rsplit("_", 1)
-            actual = shape.get(field)
-            if actual is None:
-                return None
-            if kind == "min" and actual < expected:
-                return None
-            if kind == "max" and actual > expected:
-                return None
-            widths.setdefault(field, {})[kind] = expected
-            bounds += 1
-        elif shape.get(key) != expected:
-            return None
-        else:
-            exact += 1
-    total_width = 0.0
-    for limits in widths.values():
-        if "min" in limits and "max" in limits:
-            total_width += limits["max"] - limits["min"]
-        else:
-            total_width += float("inf")
-    return exact, bounds, -total_width
-
-
 @functools.lru_cache(maxsize=None)
 def _load_prefill_device_configs(device: str) -> dict[str, Any]:
     """Load ``sparse_attn_prefill_{device}.json`` and return its parsed dict."""
-    path = _config_path_for_device(_CONFIG_DIR, _prefill_config_filename, device)
-    if path is None:
-        return {}
-    try:
-        with open(path) as handle:
-            data = json.load(handle)
-    except (OSError, json.JSONDecodeError):
-        return {}
-    return data if isinstance(data, dict) else {}
+    return _load_device_configs(_CONFIG_DIR, _prefill_config_filename, device)
 
 
 def _load_sparse_attn_prefill_config(
@@ -2055,19 +1997,7 @@ def _load_sparse_attn_prefill_config(
         "region_size": int(region_size),
         "dtype": _occupancy_dtype(key_cache.dtype),
     }
-    selected = None
-    selected_score: tuple[int, int, float] | None = None
-    for entry in data.get("configs", ()):
-        match = entry.get("match", {})
-        if not isinstance(match, dict):
-            continue
-        score = _prefill_config_match_score(match, shape)
-        if score is not None and (selected_score is None or score > selected_score):
-            selected, selected_score = entry, score
-    if selected is None:
-        return None
-    raw = selected.get("config", {})
-    return dict(raw) if isinstance(raw, dict) else None
+    return _select_config(data, shape)
 
 
 def _per_query_tile_defaults(
@@ -2090,10 +2020,6 @@ def _per_query_tile_defaults(
     return block_h, block_d, block_r
 
 
-def _clamp_auto_kv_splits(value: int, packed_width: int) -> int:
-    return min(max(int(value), 1), max(int(packed_width), 1))
-
-
 def choose_prefill_kv_splits(
     total_q: int,
     num_kv_groups: int,
@@ -2110,26 +2036,14 @@ def choose_prefill_kv_splits(
     Extra-wave occupancy beyond CU-fill is pinned per match by ``AUTO_KV_SPLITS``
     in the occupancy JSON. The chooser itself only covers ``Q * G < CUs``.
     """
-    packed_width = max(int(packed_width), 1)
-    programs_base = max(int(total_q) * int(num_kv_groups), 1)
-    if target_programs is None:
-        try:
-            index = (
-                device.index
-                if device is not None and device.index is not None
-                else torch.cuda.current_device()
-            )
-            target_programs = int(torch.cuda.get_device_properties(index).multi_processor_count)
-        except Exception:
-            target_programs = 1
-    target_programs = max(int(target_programs or 1), 1)
-    splits = -(-target_programs // programs_base)
-    min_slots = max(int(min_slots_per_split), 1)
-    if min_slots <= 1:
-        max_splits = packed_width
-    else:
-        max_splits = max(1, (packed_width - 1) // (min_slots - 1))
-    return min(max(splits, 1), max_splits, packed_width)
+    return _choose_kv_splits(
+        total_q,
+        num_kv_groups,
+        packed_width,
+        target_programs=target_programs,
+        min_slots_per_split=min_slots_per_split,
+        device=device,
+    )
 
 
 def _resolve_prefill_kv_splits(
@@ -2165,17 +2079,7 @@ def _prefill_tiled_config_filename(device: str) -> str:
 @functools.lru_cache(maxsize=None)
 def _load_prefill_tiled_device_configs(device: str) -> dict[str, Any]:
     """Load ``sparse_attn_prefill_tiled_{device}.json`` and return its parsed dict."""
-    path = _config_path_for_device(
-        _CONFIG_DIR, _prefill_tiled_config_filename, device
-    )
-    if path is None:
-        return {}
-    try:
-        with open(path) as handle:
-            data = json.load(handle)
-    except (OSError, json.JSONDecodeError):
-        return {}
-    return data if isinstance(data, dict) else {}
+    return _load_device_configs(_CONFIG_DIR, _prefill_tiled_config_filename, device)
 
 
 def _load_sparse_attn_prefill_tiled_config(
@@ -2225,19 +2129,7 @@ def _load_sparse_attn_prefill_tiled_config(
         "block_q": int(block_q),
         "dtype": _occupancy_dtype(key_cache.dtype),
     }
-    selected = None
-    selected_score: tuple[int, int, float] | None = None
-    for entry in data.get("configs", ()):
-        match = entry.get("match", {})
-        if not isinstance(match, dict):
-            continue
-        score = _prefill_config_match_score(match, shape)
-        if score is not None and (selected_score is None or score > selected_score):
-            selected, selected_score = entry, score
-    if selected is None:
-        return None
-    raw = selected.get("config", {})
-    return dict(raw) if isinstance(raw, dict) else None
+    return _select_config(data, shape)
 
 
 def _run_tiled_prefill(

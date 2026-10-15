@@ -8,8 +8,10 @@ that call them; this module is Python-only.
 from __future__ import annotations
 
 import importlib
+import json
 import os
 from collections.abc import Callable
+from typing import Any
 
 import torch
 
@@ -70,12 +72,139 @@ def _device_name_for_config() -> str:
     return _canonical_config_sku(torch.cuda.get_device_name())
 
 
-def _dtype_tag(dtype: torch.dtype) -> str:
-    if dtype == torch.bfloat16:
-        return "bf16"
-    if dtype == torch.float16:
-        return "fp16"
-    return str(dtype).replace("torch.", "")
+def _load_device_configs(
+    config_dir: str, filename_for: Callable[[str], str], device: str
+) -> dict[str, Any]:
+    """Read a device config, falling back to defaults for missing/invalid JSON."""
+    path = _config_path_for_device(config_dir, filename_for, device)
+    if path is None:
+        return {}
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _config_match_score(
+    match: dict[str, Any], shape: dict[str, Any]
+) -> tuple[int, int, float] | None:
+    """Rank exact constraints, then range bounds, then narrower ranges.
+
+    Missing shape fields are mismatches, including legacy sequence-length keys.
+    Equal scores preserve JSON entry order in :func:`_select_config`.
+    """
+    exact = 0
+    bounds = 0
+    widths: dict[str, dict[str, float]] = {}
+    for key, expected in match.items():
+        if key.endswith(("_min", "_max")):
+            field, kind = key.rsplit("_", 1)
+            actual = shape.get(field)
+            if actual is None:
+                return None
+            if kind == "min" and actual < expected:
+                return None
+            if kind == "max" and actual > expected:
+                return None
+            widths.setdefault(field, {})[kind] = expected
+            bounds += 1
+        elif key not in shape or shape[key] != expected:
+            return None
+        else:
+            exact += 1
+    total_width = 0.0
+    for limits in widths.values():
+        if "min" in limits and "max" in limits:
+            total_width += limits["max"] - limits["min"]
+        else:
+            total_width += float("inf")
+    return exact, bounds, -total_width
+
+
+def _select_config(data: dict[str, Any], shape: dict[str, Any]) -> dict[str, Any] | None:
+    """Copy the most specific matched config; ignore malformed entries."""
+    entries = data.get("configs", ())
+    if not isinstance(entries, (list, tuple)):
+        return None
+    selected = None
+    selected_score = None
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        match = entry.get("match", {})
+        if not isinstance(match, dict):
+            continue
+        score = _config_match_score(match, shape)
+        if score is not None and (selected_score is None or score > selected_score):
+            selected, selected_score = entry, score
+    if selected is None:
+        return None
+    config = selected.get("config", {})
+    return dict(config) if isinstance(config, dict) else None
+
+
+def _portable_launch_options(
+    config: dict[str, Any],
+    *,
+    consumed_keys: frozenset[str],
+    supports: Callable[[str], bool] | None = None,
+    defaults: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Separate launch options from host/kernel fields and filter compiler options."""
+    options = dict(defaults or {})
+    standard_keys = frozenset({"num_warps", "num_stages"})
+    for name in standard_keys:
+        if name in config:
+            options[name] = int(config[name])
+    if supports is not None:
+        consumed = consumed_keys | standard_keys
+        for name, value in config.items():
+            if name not in consumed and supports(name):
+                options[name] = value
+    return options
+
+
+def _cache_is_fp8(dtype: torch.dtype) -> bool:
+    """The KV cache dtype, rather than the query dtype, selects the FP8 path."""
+    return bool(dtype.is_floating_point and dtype.itemsize == 1)
+
+
+def _clamp_auto_kv_splits(value: int, packed_width: int) -> int:
+    return min(max(int(value), 1), max(int(packed_width), 1))
+
+
+def _choose_kv_splits(
+    num_queries: int,
+    num_kv_groups: int,
+    packed_width: int,
+    *,
+    target_programs: int | None = None,
+    min_slots_per_split: int = 8,
+    device: torch.device | None = None,
+) -> int:
+    """Fill compute units while retaining a minimum packed-slot window per split."""
+    packed_width = max(int(packed_width), 1)
+    programs_base = max(int(num_queries) * int(num_kv_groups), 1)
+    if target_programs is None:
+        try:
+            index = (
+                device.index
+                if device is not None and device.index is not None
+                else torch.cuda.current_device()
+            )
+            target_programs = int(torch.cuda.get_device_properties(index).multi_processor_count)
+        except Exception:  # noqa: BLE001 — best-effort device query; CPU fallback.
+            target_programs = 1
+    target_programs = max(int(target_programs or 1), 1)
+    splits = -(-target_programs // programs_base)
+    min_slots = max(int(min_slots_per_split), 1)
+    # ceil(K/S) >= M  <=>  S <= (K - 1) // (M - 1), for M > 1.
+    max_splits = (
+        packed_width if min_slots <= 1 else max(1, (packed_width - 1) // (min_slots - 1))
+    )
+    return min(max(splits, 1), max_splits, packed_width)
 
 
 def _occupancy_dtype(dtype: torch.dtype) -> str:
@@ -91,7 +220,6 @@ def _occupancy_dtype(dtype: torch.dtype) -> str:
 # kernels hard-specialize on this; we keep it a parameter but never exercise
 # anything else.
 REGION_BLOCK_SIZE = 8
-PROXY_DIM = 256
 
 
 def _shared_memory_limit() -> int:
@@ -112,7 +240,7 @@ def _shared_memory_limit() -> int:
                 torch.cuda.current_device()
             )["max_shared_mem"]
         )
-    except Exception:  # pragma: no cover - no driver, no device, or no such property.
+    except Exception:  # noqa: BLE001 — best-effort driver capability probe.
         return 0
 
 
@@ -175,17 +303,11 @@ def _detect_rounded_intrinsics() -> bool:
     at launch instead (see ``_NO_FP_FUSION``).
     """
     try:
-        import triton.language as tl
-
-        try:
-            import triton.language.extra.libdevice as _libdevice  # noqa: F401
-        except ImportError:  # pragma: no cover
-            _libdevice = tl.libdevice  # noqa: F841
         from triton.runtime.driver import driver
 
         backend = driver.active.get_current_target().backend
         module = importlib.import_module(f"triton.language.extra.{backend}.libdevice")
-    except Exception:  # pragma: no cover - no driver, no device, or Triton missing.
+    except Exception:  # noqa: BLE001 — optional backend support probe.
         return False
     return all(
         hasattr(module, name)

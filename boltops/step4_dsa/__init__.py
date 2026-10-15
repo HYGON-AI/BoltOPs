@@ -1,8 +1,7 @@
 """Step-4 Dynamic Sparse Attention (DSA) operator package.
 
-Public signature and ship-time backend selection live here (not a runtime
-``backend=`` switch). Change the lazy-import target below after Triton /
-TileLang bake-off.
+12 core numerical APIs plus the ``triton_csa_prefill`` convenience wrapper
+are exported. Implementations use lazy imports so the facade is CPU-importable.
 
 Public APIs follow the handoff vendor contract ``step4-dsa-ops-v1``
 (aligned with the Step-4 / vLLM overlay numerical surface):
@@ -14,8 +13,6 @@ This module is a valid ``--ops-module`` for the original handoff parity suite.
 """
 
 from __future__ import annotations
-
-from typing import Optional
 
 import torch
 
@@ -37,7 +34,7 @@ def triton_build_rope_cache(
     max_position: int,
     device: torch.device,
     dtype: torch.dtype = torch.float32,
-    scaling: Optional[dict] = None,
+    scaling: dict | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """NeoX-style partial RoPE cos/sin tables ``[max_position, rotary_span // 2]``."""
     from boltops.step4_dsa.triton.norm_rope import build_rope_cache as impl
@@ -174,7 +171,7 @@ def triton_topk_select_and_pack(
     lengths: torch.Tensor,
     q_positions: torch.Tensor,
     block_table: torch.Tensor,
-    request_indices: Optional[torch.Tensor] = None,
+    request_indices: torch.Tensor | None = None,
     *,
     topk: int,
     region_size: int = 8,
@@ -199,7 +196,7 @@ def triton_prefill_sparse_meta(
     logits: torch.Tensor,
     q_positions: torch.Tensor,
     block_table: torch.Tensor,
-    request_indices: Optional[torch.Tensor] = None,
+    request_indices: torch.Tensor | None = None,
     *,
     topk: int,
     region_size: int = 8,
@@ -225,7 +222,7 @@ def triton_decode_sparse_meta(
     logits: torch.Tensor,
     kv_seqlens: torch.Tensor,
     block_table: torch.Tensor,
-    request_indices: Optional[torch.Tensor] = None,
+    request_indices: torch.Tensor | None = None,
     *,
     topk: int,
     region_size: int = 8,
@@ -254,13 +251,13 @@ def triton_sparse_attention_prefill(
     *,
     num_kv_groups: int,
     region_size: int = 8,
-    softmax_scale: Optional[float] = None,
+    softmax_scale: float | None = None,
     block_regions: int = 16,
-    logical_regions: Optional[torch.Tensor] = None,
-    q_positions: Optional[torch.Tensor] = None,
-    request_indices: Optional[torch.Tensor] = None,
+    logical_regions: torch.Tensor | None = None,
+    q_positions: torch.Tensor | None = None,
+    request_indices: torch.Tensor | None = None,
     block_q: int = 128,
-    config: Optional[dict] = None,
+    config: dict | None = None,
     k_scale: float = 1.0,
     v_scale: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -302,10 +299,10 @@ def triton_sparse_attention_decode(
     *,
     num_kv_groups: int,
     region_size: int = 8,
-    softmax_scale: Optional[float] = None,
+    softmax_scale: float | None = None,
     num_splits: int = 1,
     block_regions: int = 16,
-    config: Optional[dict] = None,
+    config: dict | None = None,
     k_scale: float = 1.0,
     v_scale: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:

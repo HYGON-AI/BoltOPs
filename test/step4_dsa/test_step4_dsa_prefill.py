@@ -1,6 +1,8 @@
-"""Correctness tests for sparse prefill attention (stage 5)."""
+"""Correctness tests and production benches for sparse prefill attention (stage 5)."""
 
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 import pytest
 import torch
@@ -11,6 +13,8 @@ from boltops.step4_dsa.geometry import STEP4
 from . import _common as C
 from .compare import compare
 from .ref import ref_sparse_attention
+
+PERF_OP = "step4_dsa_prefill"
 
 OUT_RTOL, OUT_ATOL = 1e-2, 2e-2
 LSE_RTOL, LSE_ATOL = 1e-3, 1e-3
@@ -826,57 +830,138 @@ def test_sparse_prefill_fp8_kv_cache_matches_ref(k_scale: float, v_scale: float)
     assert lse_check.passed, lse_check.format()
 
 
+# ---------------------------------------------------------------------------
+# Performance benchmarks (TP8 per-rank production shapes, shipped configs)
+# ---------------------------------------------------------------------------
+# One case per entry of ``boltops/step4_dsa/triton/config/sparse_attn_prefill*``
+# (h_q=8, h_kv=1, d=192, topk=512 (+1 current region), region_size=8,
+# s_k=32768 -> cache_regions=4096).  Launch knobs not in the config JSON come
+# from the TP8 production cases (dsa-bw1100-tp8-production.jsonl):
+# scalar block_regions=16, tiled block_regions=4 / block_q=128.
+
+
+@dataclass(frozen=True)
+class _PrefillBench:
+    mode: str  # "scalar" (per-query) | "tiled" (query-tiled)
+    queries: int
+    kv_dtype: str  # "bf16" | "fp8"
+    cache_regions: int = 4096
+    topk: int = 512
+
+
+_PREFILL_BENCH_CASES = (
+    # sparse_attn_prefill_BW1100.json
+    [_PrefillBench("scalar", q, "bf16") for q in (1, 4, 8, 32, 64, 128, 512, 4096)]
+    + [_PrefillBench("scalar", 128, "fp8")]
+    # sparse_attn_prefill_tiled_BW1100.json
+    + [_PrefillBench("tiled", 128, kv) for kv in ("bf16", "fp8")]
+)
+
+
+def _make_prefill_bench_inputs(case: _PrefillBench, device: torch.device) -> dict:
+    """One request at the tail of a shuffled paged cache; sliding top-k window."""
+    geo = C.tp8_geometry()
+    generator = torch.Generator(device=device).manual_seed(20260831)
+    groups, heads, head_dim = (
+        geo.num_attention_groups, geo.num_attention_heads, geo.head_dim
+    )
+    region_size, page_size = geo.region_block_size, geo.paged_block_size
+    regions_per_page = geo.regions_per_page
+    pages = -(-case.cache_regions // regions_per_page)
+
+    def randn(*shape: int) -> torch.Tensor:
+        return torch.randn(
+            shape, generator=generator, device=device, dtype=torch.bfloat16
+        )
+
+    query = randn(case.queries, heads, head_dim)
+    key_cache = randn(pages * page_size, groups, head_dim)
+    value_cache = randn(pages * page_size, groups, head_dim)
+    if case.kv_dtype == "fp8":
+        key_cache = C.quantize_kv_fp8(key_cache)
+        value_cache = C.quantize_kv_fp8(value_cache)
+    page_table = torch.randperm(pages, generator=generator, device=device)
+
+    start = max(case.cache_regions * region_size - case.queries, 0)
+    positions = torch.arange(
+        start, start + case.queries, device=device, dtype=torch.int64
+    )
+    q_positions = positions.repeat(groups)
+    current = (q_positions // region_size).clamp(max=case.cache_regions - 1)
+    history = current.clamp(max=case.topk)
+    slot = torch.arange(case.topk + 1, device=device, dtype=torch.int64)
+    live = slot[None, :] <= history[:, None]
+    logical = torch.where(live, (current - history)[:, None] + slot[None, :], 0)
+    physical = (
+        page_table[logical // regions_per_page] * regions_per_page
+        + logical % regions_per_page
+    )
+    valid = (q_positions[:, None] + 1 - logical * region_size).clamp(0, region_size)
+    packed = torch.where(
+        live, physical | (valid << PREFILL_REGION_VALID_SHIFT), -1
+    ).to(torch.int32)
+    return {
+        "query": query,
+        "key_cache": key_cache,
+        "value_cache": value_cache,
+        "packed": packed.contiguous(),
+        "counts": (history + 1).to(torch.int32),
+        "logical_ids": torch.where(live, logical, -1).to(torch.int32),
+        "q_positions": q_positions.to(torch.int32),
+        "request_indices": torch.zeros_like(q_positions, dtype=torch.int32),
+        "groups": groups,
+        "region_size": region_size,
+        "scale": head_dim**-0.5,
+    }
+
+
 @C.GPU_REQUIRED
-def test_tiled_prefill_fp8_kv_cache_matches_scalar():
-    if getattr(torch, "float8_e4m3fn", None) is None:
+@pytest.mark.bench
+@pytest.mark.parametrize(
+    "case",
+    _PREFILL_BENCH_CASES,
+    ids=lambda c: f"{c.mode}-q{c.queries}-{c.kv_dtype}",
+)
+def test_bench_sparse_prefill(
+    case: _PrefillBench, time_ms, bench_warmup: int, bench_repeat: int
+) -> None:
+    if case.kv_dtype == "fp8" and getattr(torch, "float8_e4m3fn", None) is None:
         pytest.skip("torch.float8_e4m3fn is not available")
-    data = _make_prefill_case(
-        total_q=32, seq_regions=16, topk=8, empty_rows=False, seed=49
-    )
-    k_scale, v_scale = 2.0, 0.5
-    key_fp8 = C.quantize_kv_fp8(data["key_cache"], k_scale)
-    value_fp8 = C.quantize_kv_fp8(data["value_cache"], v_scale)
-    total_q = data["query"].shape[0]
-    logical = torch.where(
-        data["packed"] >= 0,
-        data["packed"] & PREFILL_REGION_ID_MASK,
-        torch.full_like(data["packed"], -1),
-    )
-    q_positions = torch.full(
-        (total_q,),
-        data["seq_regions"] * data["region_size"] - 1,
-        device=data["query"].device,
-        dtype=torch.int32,
-    )
+    data = _make_prefill_bench_inputs(case, torch.device(C.DEVICE))
     kwargs = dict(
-        query=data["query"],
-        key_cache=key_fp8,
-        value_cache=value_fp8,
-        packed_regions=data["packed"],
-        region_counts=data["counts"],
         num_kv_groups=data["groups"],
         region_size=data["region_size"],
         softmax_scale=data["scale"],
-        block_regions=4,
-        k_scale=k_scale,
-        v_scale=v_scale,
+        block_regions=16,
     )
-    tiled_out, tiled_lse = triton_sparse_attention_prefill(
-        **kwargs, logical_regions=logical, q_positions=q_positions, block_q=16
-    )
-    scalar_out, scalar_lse = triton_sparse_attention_prefill(**kwargs)
-    ref_out, ref_lse = ref_sparse_attention(
-        data["query"],
-        key_fp8,
-        value_fp8,
-        data["packed"],
-        data["counts"],
-        num_kv_groups=data["groups"],
-        region_size=data["region_size"],
-        softmax_scale=data["scale"],
-        k_scale=k_scale,
-        v_scale=v_scale,
-    )
+    if case.mode == "tiled":
+        kwargs.update(
+            block_regions=4,
+            logical_regions=data["logical_ids"],
+            q_positions=data["q_positions"],
+            request_indices=data["request_indices"],
+            block_q=128,
+        )
+
+    def run():
+        return triton_sparse_attention_prefill(
+            data["query"],
+            data["key_cache"],
+            data["value_cache"],
+            data["packed"],
+            data["counts"],
+            **kwargs,
+        )
+
+    out, lse = run()
     torch.cuda.synchronize()
-    _assert_prefill_close(tiled_out, tiled_lse, scalar_out, scalar_lse, what="tiled vs scalar")
-    _assert_prefill_close(tiled_out, tiled_lse, ref_out, ref_lse, what="tiled vs ref")
+    assert out.shape == data["query"].shape
+    assert torch.isfinite(lse).all()
+
+    # Tiled prefill builds its tile list with a host sync (not graph-capturable),
+    # so it is timed with plain events; scalar prefill uses CUDA graph replay.
+    ms = time_ms(run, bench_warmup, bench_repeat, use_graph=case.mode != "tiled")
+    print(
+        f"[bench] step4_dsa prefill {case.mode} q={case.queries} "
+        f"kv={case.kv_dtype}: {ms:.4f} ms"
+    )

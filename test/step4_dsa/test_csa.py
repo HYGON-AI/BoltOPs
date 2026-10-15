@@ -125,22 +125,6 @@ def test_csa_prefill_matches_ref(seq_lens: tuple[int, ...]):
         )
 
 
-def _last_dim_padded_view(src: torch.Tensor, pad: int, poison: float) -> torch.Tensor:
-    """Same logical values as ``src``, larger token/head stride, poison in the pad."""
-    padded = torch.empty(
-        (*src.shape[:-1], src.shape[-1] + pad),
-        device=src.device,
-        dtype=src.dtype,
-    )
-    padded[..., : src.shape[-1]] = src
-    padded[..., src.shape[-1] :] = poison
-    view = padded[..., : src.shape[-1]]
-    assert view.shape == src.shape
-    assert view.stride(2) == 1
-    assert view.stride(0) != src.stride(0)
-    return view
-
-
 @C.GPU_REQUIRED
 def test_csa_prefill_independent_k_z_strides():
     """index_k / index_z may share a shape without sharing a stride."""
@@ -155,8 +139,8 @@ def test_csa_prefill_independent_k_z_strides():
         device=device,
         seed=20260908,
     )
-    index_k = _last_dim_padded_view(metadata.index_k, pad=16, poison=3.0)
-    index_z = _last_dim_padded_view(metadata.index_z, pad=48, poison=-9.0)
+    index_k = C.last_dim_padded_view(metadata.index_k, pad=16, poison=3.0)
+    index_z = C.last_dim_padded_view(metadata.index_z, pad=48, poison=-9.0)
     assert index_k.stride() != index_z.stride()
 
     summary, mean = triton_csa_prefill(

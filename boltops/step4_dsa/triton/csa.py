@@ -9,7 +9,8 @@ import torch
 import triton
 import triton.language as tl
 
-from boltops.step4_dsa.triton.common import REGION_BLOCK_SIZE, _NO_FP_FUSION
+from boltops.step4_dsa.triton.common import _NO_FP_FUSION, REGION_BLOCK_SIZE
+
 
 @triton.jit
 def _csa_compress_regions_kernel(

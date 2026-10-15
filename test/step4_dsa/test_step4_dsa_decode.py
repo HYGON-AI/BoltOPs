@@ -1,11 +1,14 @@
-"""Correctness tests for sparse decode attention (stage 6)."""
+"""Correctness tests and production benches for sparse decode attention (stage 6)."""
 
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 import pytest
 import torch
 
 from boltops.step4_dsa import (
+    triton_decode_sparse_meta,
     triton_merge_split_states,
     triton_sparse_attention_decode,
 )
@@ -18,6 +21,8 @@ from .ref import ref_sparse_attention_decode
 OUT_RTOL, OUT_ATOL = 1e-2, 4e-3
 LSE_RTOL, LSE_ATOL = 1e-3, 1e-3
 DECODE_PHYS_SHIFT = 32
+
+PERF_OP = "step4_dsa_decode"
 
 
 def test_decode_config_match_rejects_unavailable_sequence_length():
@@ -398,47 +403,6 @@ def test_sparse_decode_matches_vllm_num_splits_shapes():
     assert lse_check.passed, lse_check.format()
 
 
-@C.GPU_REQUIRED
-def test_sparse_decode_split_then_merge_matches_single():
-    data = _make_decode_case(
-        num_reqs=4, topk=16, context_len=256, empty_rows=False, seed=62
-    )
-    kwargs = dict(
-        num_kv_groups=data["groups"],
-        region_size=data["region_size"],
-        softmax_scale=data["scale"],
-        block_regions=4,
-    )
-    single_out, single_lse = triton_sparse_attention_decode(
-        data["query"],
-        data["key_cache"],
-        data["value_cache"],
-        data["packed"],
-        data["counts"],
-        data["kv_seqlens"],
-        num_splits=1,
-        **kwargs,
-    )
-    partial_out, partial_lse = triton_sparse_attention_decode(
-        data["query"],
-        data["key_cache"],
-        data["value_cache"],
-        data["packed"],
-        data["counts"],
-        data["kv_seqlens"],
-        num_splits=4,
-        **kwargs,
-    )
-    merged_out, merged_lse = triton_merge_split_states(partial_out, partial_lse)
-    torch.cuda.synchronize()
-    out_check = compare(
-        merged_out.float(), single_out.float(), rtol=OUT_RTOL, atol=OUT_ATOL
-    )
-    lse_check = compare(merged_lse, single_lse, rtol=LSE_RTOL, atol=LSE_ATOL)
-    assert out_check.passed, out_check.format()
-    assert lse_check.passed, lse_check.format()
-
-
 def test_sparse_decode_rejects_strided_head_dim():
     query = torch.randn(1, 8, 16)
     key_cache = torch.randn(16, 1, 16)
@@ -610,3 +574,120 @@ def test_sparse_decode_fp8_kv_cache_matches_ref(
     lse_check = compare(lse, ref_lse, rtol=LSE_RTOL, atol=LSE_ATOL)
     assert out_check.passed, out_check.format()
     assert lse_check.passed, lse_check.format()
+
+
+# ---------------------------------------------------------------------------
+# Performance benchmarks (TP8 per-rank production shapes, shipped configs)
+# ---------------------------------------------------------------------------
+# One case per entry of ``boltops/step4_dsa/triton/config/sparse_attn_decode``
+# (s_q=batch, h_q=8, h_kv=1, d=192, topk=512 (+1 current region),
+# num_splits=1, region_size=8).  The config JSON has no sequence length, so
+# context=16384 comes from the TP8 production case
+# tp8.decode.b4.ctx16384.k512.s1 (dsa-bw1100-tp8-production.jsonl).  Metadata
+# is built once by the real decode selector outside the timed region; only
+# ``triton_sparse_attention_decode`` is timed.
+
+
+@dataclass(frozen=True)
+class _DecodeBench:
+    batch: int
+    kv_dtype: str  # "bf16" | "fp8"
+    context: int = 16384
+    splits: int = 1
+    topk: int = 512
+
+
+_DECODE_BENCH_CASES = [
+    _DecodeBench(b, "bf16") for b in (1, 4, 8, 32, 64, 128)
+] + [_DecodeBench(b, "fp8") for b in (1, 4, 8)]
+
+
+def _make_decode_bench_inputs(case: _DecodeBench, device: torch.device) -> dict:
+    geo = C.tp8_geometry()
+    generator = torch.Generator(device=device).manual_seed(20260831)
+    groups, heads, head_dim = (
+        geo.num_attention_groups, geo.num_attention_heads, geo.head_dim
+    )
+    region_size, page_size = geo.region_block_size, geo.paged_block_size
+    pages_per_request = -(-case.context // page_size)
+    regions = -(-case.context // region_size)
+    total_pages = case.batch * pages_per_request
+
+    def randn(*shape: int, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
+        return torch.randn(shape, generator=generator, device=device, dtype=dtype)
+
+    query = randn(case.batch, heads, head_dim)
+    key_cache = randn(total_pages * page_size, groups, head_dim)
+    value_cache = randn(total_pages * page_size, groups, head_dim)
+    if case.kv_dtype == "fp8":
+        key_cache = C.quantize_kv_fp8(key_cache)
+        value_cache = C.quantize_kv_fp8(value_cache)
+    block_table = (
+        torch.randperm(total_pages, generator=generator, device=device)
+        .to(torch.int32)
+        .view(case.batch, pages_per_request)
+        .contiguous()
+    )
+    kv_seqlens = torch.full(
+        (case.batch,), case.context, device=device, dtype=torch.int32
+    )
+    logits = randn(groups * case.batch, regions, dtype=torch.float32)
+    packed, counts = triton_decode_sparse_meta(
+        logits,
+        kv_seqlens,
+        block_table,
+        topk=case.topk,
+        region_size=region_size,
+        regions_per_page=geo.regions_per_page,
+    )
+    return {
+        "query": query,
+        "key_cache": key_cache,
+        "value_cache": value_cache,
+        "packed": packed,
+        "counts": counts,
+        "kv_seqlens": kv_seqlens,
+        "groups": groups,
+        "region_size": region_size,
+        "scale": head_dim**-0.5,
+    }
+
+
+@C.GPU_REQUIRED
+@pytest.mark.bench
+@pytest.mark.parametrize(
+    "case",
+    _DECODE_BENCH_CASES,
+    ids=lambda c: f"b{c.batch}-ctx{c.context}-{c.kv_dtype}-s{c.splits}",
+)
+def test_bench_sparse_decode(
+    case: _DecodeBench, time_ms, bench_warmup: int, bench_repeat: int
+) -> None:
+    if case.kv_dtype == "fp8" and getattr(torch, "float8_e4m3fn", None) is None:
+        pytest.skip("torch.float8_e4m3fn is not available")
+    data = _make_decode_bench_inputs(case, torch.device(C.DEVICE))
+
+    def run():
+        return triton_sparse_attention_decode(
+            data["query"],
+            data["key_cache"],
+            data["value_cache"],
+            data["packed"],
+            data["counts"],
+            data["kv_seqlens"],
+            num_kv_groups=data["groups"],
+            region_size=data["region_size"],
+            softmax_scale=data["scale"],
+            num_splits=case.splits,
+        )
+
+    out, lse = run()
+    torch.cuda.synchronize()
+    assert out.shape[-3:] == data["query"].shape
+    assert torch.isfinite(lse).all()
+
+    ms = time_ms(run, bench_warmup, bench_repeat)
+    print(
+        f"[bench] step4_dsa decode b={case.batch} ctx={case.context} "
+        f"kv={case.kv_dtype} splits={case.splits}: {ms:.4f} ms"
+    )

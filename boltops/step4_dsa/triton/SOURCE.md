@@ -12,7 +12,7 @@ live in `../geometry.py`; production shapes / synthetic inputs live in
 Split layout (DSA numerical ops only; MoE FP8 / `fused_qknorm_rope` / vLLM planner
 are not vendored):
 
-- `common.py` — shared-memory tile fit, shared block-table stride, fp-fusion flag
+- `common.py` — Python-only device aliases, JSON loading/matching, portable launch options, KV-split selection, shared-memory tile fit, shared table stride, fp-fusion flag
 - `norm_rope.py` — `build_rope_cache`, `indexer_norm_rope` (`kernel.py` ~112-347, 2438-2501)
 - `csa.py` — region layout + compress (`kernel.py` ~349-497)
 - `logits.py` — weighted-ReLU indexer scores (`kernel.py` ~500-645)
@@ -28,6 +28,10 @@ Sibling (not Triton impl):
 
 Test / bench fixtures (not in this package):
 
-- `test/step4_dsa/benchmark_cases.py` — `operator_parity/dsa_benchmark_cases.py` production shapes
+- `test/step4_dsa/_common.py` — shared test helpers, including TP8 per-rank benchmark geometry
 - `test/step4_dsa/gen.py` — synthetic input builders from `operator_parity/gen.py`
-- `test/step4_dsa/bench_inputs.py` — timed-callable construction for production benches
+- `test/step4_dsa/test_step4_dsa_decode.py`, `test_step4_dsa_prefill.py` — active configuration-coverage performance cases
+- `test/step4_dsa/test_helpers.py` — runtime configuration matching/loading, launch option filtering, and KV-split regression tests
+
+Offline tuning scripts are not retained. Existing device JSON configurations and
+their runtime loading/selection logic remain in this package.
