@@ -323,7 +323,7 @@ performance:optest:
     # Select Torch only from its DTK-specific index. Resolve its dependencies
     # and CI tools from the general index in the following command.
     - python -m pip install --force-reinstall --no-deps --constraint "${CI_WORK_DIR}/constraints.txt" --index-url "${TORCH_INDEX_URL}" --trusted-host "${PIP_TRUSTED_HOST}" "torch==${TORCH_VERSION}"
-    - python -m pip install --constraint "${CI_WORK_DIR}/constraints.txt" "torch==${TORCH_VERSION}" "numpy==${NUMPY_VERSION}" pandas cismi ninja optest
+    - python -m pip install --constraint "${CI_WORK_DIR}/constraints.txt" "torch==${TORCH_VERSION}" "numpy==${NUMPY_VERSION}" pandas cismi ninja optest PyYAML
     # Keep performance on the same newest Torch-compatible Triton 3.6 build.
     - python -m pip install --constraint "${CI_WORK_DIR}/constraints.txt" --index-url "${TRITON_INDEX_URL}" --trusted-host "${PIP_TRUSTED_HOST}" "triton==3.6.0"
     - python -m pip install --constraint "${CI_WORK_DIR}/constraints.txt" "apache-tvm-ffi==0.1.11" -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com

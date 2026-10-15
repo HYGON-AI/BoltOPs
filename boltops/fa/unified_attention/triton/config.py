@@ -50,6 +50,28 @@ def _kv_type(dtype) -> str:
     return "fp8" if "float8" in str(dtype) else "auto"
 
 
+def head_size_layout(head_size: int) -> tuple[int, int, int]:
+    """Kernel head layout: ``(width, part1, part2)`` for a given head size.
+
+    ``tl.arange`` only accepts power-of-two widths, while production heads
+    such as 192 are not powers of two.  Heads that decompose into two
+    power-of-two halves (e.g. ``192 = 128 + 64``) are processed unpadded:
+    every head-wide load, dot, and store is split into a ``part1`` +
+    ``part2`` pair, so no padded lanes are ever touched.  Power-of-two
+    heads (and non-decomposable heads) keep the legacy single-dot layout
+    padded to the next power of two, reported as ``(width, width, 0)``.
+    """
+    if head_size <= 0:
+        raise ValueError(f"head_size must be positive: {head_size}")
+    if head_size & (head_size - 1) == 0:
+        return head_size, head_size, 0
+    part1 = 1 << (head_size // 2 - 1).bit_length()
+    part2 = head_size - part1
+    if 16 <= part2 and part2 & (part2 - 1) == 0:
+        return head_size, part1, part2
+    return triton.next_power_of_2(head_size), triton.next_power_of_2(head_size), 0
+
+
 def make_config_filename(
     kind: str,
     *,
@@ -69,7 +91,7 @@ def make_config_filename(
     """Build the exact JSON filename used by tuning and runtime."""
     if kind not in (KIND_2D, KIND_3D):
         raise ValueError(f"Unknown UnifiedAttention config kind: {kind!r}")
-    head_size_padded = triton.next_power_of_2(head_size)
+    head_size_padded, _, _ = head_size_layout(head_size)
     fields = [
         kind,
         f"device={device_label}",
@@ -179,6 +201,7 @@ def _load_shape_config(
     *,
     kind: str,
     config_key: tuple[int, int, int, int, int],
+    exact_only: bool = False,
 ) -> dict | None:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -200,6 +223,8 @@ def _load_shape_config(
     table = {key: value for key, value in parsed}
     candidate = table.get(config_key)
     if candidate is None:
+        if exact_only:
+            return None
         same_layout = [item for item in parsed if item[0][-1] == config_key[-1]]
         if not same_layout:
             return None
@@ -228,6 +253,7 @@ def get_kernel_config(
     use_fp8_output: bool = False,
     num_segments_per_seq: int | None = None,
     device=None,
+    exact_only: bool = False,
 ) -> dict | None:
     """Load an exact shape or the closest shape with the same head layout."""
     info = get_device_info(device)
@@ -258,7 +284,9 @@ def get_kernel_config(
     ):
         path = directory / filename
         if path.is_file():
-            loaded = _load_shape_config(path, kind=kind, config_key=config_key)
+            loaded = _load_shape_config(
+                path, kind=kind, config_key=config_key, exact_only=exact_only
+            )
             if loaded is not None:
                 return loaded
     return None

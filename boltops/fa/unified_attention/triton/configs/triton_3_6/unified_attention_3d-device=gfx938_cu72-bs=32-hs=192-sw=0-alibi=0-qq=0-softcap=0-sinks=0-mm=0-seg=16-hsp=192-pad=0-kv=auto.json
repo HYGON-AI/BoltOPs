@@ -14,6 +14,14 @@
       "num_stages": 2,
       "reduce_num_warps": 1,
       "reduce_num_stages": 1
+    },
+    "(1, 49, 49, 4096, 16)": {
+      "BLOCK_M": 32,
+      "TILE_SIZE": 32,
+      "num_warps": 2,
+      "num_stages": 1,
+      "reduce_num_warps": 1,
+      "reduce_num_stages": 1
     }
   }
 }

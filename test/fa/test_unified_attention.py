@@ -461,6 +461,149 @@ def test_3d_split_kv_matches_2d_reference() -> None:
     torch.testing.assert_close(out, reference, atol=2e-2, rtol=2e-2)
 
 
+def _recorded_kernel(kernel, hits):
+    class _Recorder:
+        def __getitem__(self, grid):
+            launcher = kernel[grid]
+
+            def wrapped(*args, **kwargs):
+                hits.append(grid)
+                return launcher(*args, **kwargs)
+
+            return wrapped
+
+    return _Recorder()
+
+
+def _prefill_paged_inputs(device: str):
+    torch.manual_seed(1)
+    q_len, kv_len = 3, 13
+    heads_q, heads_kv, dim, page = 4, 2, 32, 16
+    q = torch.randn(q_len, heads_q, dim, device=device, dtype=torch.bfloat16)
+    k = torch.randn(1, page, heads_kv, dim, device=device, dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    out = torch.empty_like(q)
+    indptr = torch.tensor([0, q_len], device=device, dtype=torch.int32)
+    lens = torch.tensor([kv_len], device=device, dtype=torch.int64)
+    table = torch.tensor([[0]], device=device, dtype=torch.int32)
+    return q, k, v, out, indptr, lens, table
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires an HCU/CUDA Triton device")
+def test_3d_split_kv_prefill_matches_reference(monkeypatch) -> None:
+    backend = importlib.import_module(
+        "boltops.fa.unified_attention.triton.unified_attention"
+    )
+    q, k, v, out, indptr, lens, table = _prefill_paged_inputs("cuda")
+    hits_2d: list = []
+    hits_3d: list = []
+    monkeypatch.setattr(
+        backend, "kernel_unified_attention_2d",
+        _recorded_kernel(backend.kernel_unified_attention_2d, hits_2d),
+    )
+    monkeypatch.setattr(
+        backend, "kernel_unified_attention_3d",
+        _recorded_kernel(backend.kernel_unified_attention_3d, hits_3d),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_get_unified_attention_3d_config",
+        lambda **kwargs: {
+            "BLOCK_M": 16,
+            "TILE_SIZE": 4,
+            "num_warps": 1,
+            "num_stages": 1,
+            "reduce_num_warps": 1,
+            "reduce_num_stages": 1,
+        },
+    )
+    partial = torch.empty((q.shape[0], q.shape[1], 2, 32), device="cuda", dtype=torch.float32)
+    partial_max = torch.empty((q.shape[0], q.shape[1], 2), device="cuda", dtype=torch.float32)
+    partial_sum = torch.empty_like(partial_max)
+    unified_attention(
+        q, k, v, out, indptr, q.shape[0], lens, lens.item(), q.shape[-1] ** -0.5, True,
+        (-1, -1), table, 0.0, None, None, None, 128, 2, partial,
+        partial_max, partial_sum,
+    )
+    assert len(hits_3d) == 1 and hits_2d == []
+    reference = _reference_paged_attention(
+        q, k, v, [q.shape[0]], [lens.item()], table, q.shape[-1] ** -0.5, True
+    )
+    torch.testing.assert_close(out, reference, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires an HCU/CUDA Triton device")
+def test_prefill_3d_dispatch_gates(monkeypatch) -> None:
+    backend = importlib.import_module(
+        "boltops.fa.unified_attention.triton.unified_attention"
+    )
+    q, k, v, out, indptr, lens, table = _prefill_paged_inputs("cuda")
+    reference = _reference_paged_attention(
+        q, k, v, [q.shape[0]], [lens.item()], table, q.shape[-1] ** -0.5, True
+    )
+    hits_2d: list = []
+    hits_3d: list = []
+    monkeypatch.setattr(
+        backend, "kernel_unified_attention_2d",
+        _recorded_kernel(backend.kernel_unified_attention_2d, hits_2d),
+    )
+    monkeypatch.setattr(
+        backend, "kernel_unified_attention_3d",
+        _recorded_kernel(backend.kernel_unified_attention_3d, hits_3d),
+    )
+
+    # Decode-sized scratch (one row) never opens the 3D path for prefill.
+    partial = torch.empty((1, q.shape[1], 2, 32), device="cuda", dtype=torch.float32)
+    partial_max = torch.empty((1, q.shape[1], 2), device="cuda", dtype=torch.float32)
+    partial_sum = torch.empty_like(partial_max)
+    out.zero_()
+    unified_attention(
+        q, k, v, out, indptr, q.shape[0], lens, lens.item(),
+        q.shape[-1] ** -0.5, True, (-1, -1), table, 0.0,
+        None, None, None, 128, 2, partial, partial_max, partial_sum,
+    )
+    assert hits_3d == [] and len(hits_2d) == 1
+    torch.testing.assert_close(out, reference, atol=2e-2, rtol=2e-2)
+
+    # Sized scratch but no tuned 3D config for the shape keeps 2D.
+    partial = torch.empty((q.shape[0], q.shape[1], 2, 32), device="cuda", dtype=torch.float32)
+    partial_max = torch.empty((q.shape[0], q.shape[1], 2), device="cuda", dtype=torch.float32)
+    partial_sum = torch.empty_like(partial_max)
+    hits_2d.clear()
+    out.zero_()
+    unified_attention(
+        q, k, v, out, indptr, q.shape[0], lens, lens.item(),
+        q.shape[-1] ** -0.5, True, (-1, -1), table, 0.0,
+        None, None, None, 128, 2, partial, partial_max, partial_sum,
+    )
+    assert hits_3d == [] and len(hits_2d) == 1
+    torch.testing.assert_close(out, reference, atol=2e-2, rtol=2e-2)
+
+    # Sized scratch plus a tuned 3D config switches prefill to split-KV.
+    original = backend._get_unified_attention_3d_config
+    monkeypatch.setattr(
+        backend,
+        "_get_unified_attention_3d_config",
+        lambda **kwargs: {
+            "BLOCK_M": 16,
+            "TILE_SIZE": 4,
+            "num_warps": 1,
+            "num_stages": 1,
+            "reduce_num_warps": 1,
+            "reduce_num_stages": 1,
+        },
+    )
+    hits_2d.clear()
+    out.zero_()
+    unified_attention(
+        q, k, v, out, indptr, q.shape[0], lens, lens.item(),
+        q.shape[-1] ** -0.5, True, (-1, -1), table, 0.0,
+        None, None, None, 128, 2, partial, partial_max, partial_sum,
+    )
+    assert len(hits_3d) == 1 and hits_2d == []
+    torch.testing.assert_close(out, reference, atol=2e-2, rtol=2e-2)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires an HCU/CUDA Triton device")
 @pytest.mark.parametrize("feature", ["chunk", "rswa", "td", "int8_per_token_head"])
 def test_general_path_matches_reference(feature: str) -> None:
@@ -639,9 +782,13 @@ def _make_unified_attention_benchmark_inputs(
         if case.use_sinks
         else None
     )
-    padded_head = 1 << (case.head_size - 1).bit_length()
+    padded_head = config.head_size_layout(case.head_size)[0]
+    # The 3D scratch is indexed by global query-token offset, so it must
+    # cover every query token (prefill) in addition to the decode row
+    # count (seq_threshold_3d).
+    segm_rows = max(case.seq_threshold_3d, sum(q_len for q_len, _ in case.seq_lens))
     partial = torch.empty(
-        case.seq_threshold_3d,
+        segm_rows,
         case.query_heads,
         case.num_segments,
         padded_head,
@@ -649,7 +796,7 @@ def _make_unified_attention_benchmark_inputs(
         dtype=torch.float32,
     )
     partial_max = torch.empty(
-        case.seq_threshold_3d,
+        segm_rows,
         case.query_heads,
         case.num_segments,
         device=device,
@@ -702,10 +849,7 @@ def _unified_attention_benchmark_work(case: UnifiedAttentionBenchmarkCase) -> tu
     return flops, query_output_bytes + kv_bytes
 
 
-# bench mark temporarily removed: the CI test-dependency set (optest wheel)
-# has no pyyaml yet, so the perf entry must not collect this file (it
-# discovers bench files by static "@pytest.mark.bench" scan).  Once pyyaml
-# lands in the wheel, restore the mark (docs/optest_perf.md, section 3.3).
+@pytest.mark.bench
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires an HCU/CUDA device")
 @pytest.mark.parametrize(
     "case",
@@ -734,6 +878,13 @@ def test_unified_attention_benchmark(
 
     run()
     assert torch.isfinite(data["out"]).all()
+    # CUDA-graph-first timing (time_ms default): production runs the
+    # operator in graph-replay mode, so the bench measures the same
+    # steady state (graph keeps KV L2-warm; do_bench would flush L2
+    # per iteration and time decode ~1.3-1.4x slower, verified
+    # 2026-10-15).  Capture failure falls back to event timing with a
+    # warning; the perf collector records the method actually used in
+    # the CSV timing column.
     elapsed_ms = time_ms(run, bench_warmup, bench_repeat)
     flops, io_bytes = _unified_attention_benchmark_work(case)
     tflops = flops / (elapsed_ms * 1e9)

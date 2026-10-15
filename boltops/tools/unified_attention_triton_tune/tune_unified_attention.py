@@ -7,7 +7,7 @@ import argparse
 import importlib
 import json
 import math
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
@@ -286,19 +286,37 @@ def _config_override(case: TuneCase, candidate: dict) -> Iterator[None]:
         setattr(backend, attribute, original)
 
 
+@contextmanager
+def _force_2d_dispatch() -> Iterator[None]:
+    # 2D-case tuning must stay on the 2D kernel.  A tuned 3D config for the
+    # same shape may already exist, and _make_inputs always provides the 3D
+    # scratch buffers, so without this guard dispatch would silently run the
+    # 3D kernel while the 2D candidate configs are being timed.
+    backend = _backend_module()
+    original = backend._get_unified_attention_3d_config
+    backend._get_unified_attention_3d_config = lambda **_: None
+    try:
+        yield
+    finally:
+        backend._get_unified_attention_3d_config = original
+
+
 def _launch(case: TuneCase, data: dict, candidate: dict | None = None) -> None:
     backend = _backend_module()
 
     def run() -> None:
-        backend.unified_attention(
-            data["q"], data["k"], data["v"], data["out"],
-            data["cu_seqlens_q"], max(data["query_lens"]), data["seqused_k"],
-            max(data["kv_lens"]), case.head_size ** -0.5, True,
-            ((case.sliding_window - 1, 0) if case.sliding_window else (-1, -1)),
-            data["block_table"], case.soft_cap or 0.0, None, None, None,
-            case.seq_threshold_3d, case.num_segments, data["partial"],
-            data["partial_max"], data["partial_sum"], sinks=data["sinks"],
-        )
+        # inference_mode matches the bench-suite timing regime
+        # (test/fa runs under @torch.inference_mode).
+        with torch.inference_mode():
+            backend.unified_attention(
+                data["q"], data["k"], data["v"], data["out"],
+                data["cu_seqlens_q"], max(data["query_lens"]), data["seqused_k"],
+                max(data["kv_lens"]), case.head_size ** -0.5, True,
+                ((case.sliding_window - 1, 0) if case.sliding_window else (-1, -1)),
+                data["block_table"], case.soft_cap or 0.0, None, None, None,
+                case.seq_threshold_3d, case.num_segments, data["partial"],
+                data["partial_max"], data["partial_sum"], sinks=data["sinks"],
+            )
 
     if candidate is None:
         run()
@@ -314,10 +332,12 @@ def _bench(
     warmup_ms: int,
     rep_ms: int,
 ) -> float:
+    # Time in CUDA-graph replay mode, matching production deployment
+    # and the bench suite (test/fa time_ms default).  do_bench_cudagraph
+    # warms up internally, so warmup_ms is unused.
     return float(
-        triton.testing.do_bench(
+        triton.testing.do_bench_cudagraph(
             lambda: _launch(case, data, candidate),
-            warmup=warmup_ms,
             rep=rep_ms,
             return_mode="median",
         )
@@ -541,32 +561,38 @@ def main(argv: list[str] | None = None) -> int:
     if len(identities) != len(set(identities)):
         raise ValueError("selected UnifiedAttention cases contain duplicate config keys")
     for case in selected:
-        data = _make_inputs(case)
-        reference = _reference(case, data)
-        defaults = dict(config_module.DEFAULT_CONFIGS[case.kind])
-        _launch(case, data, defaults)
-        _check_output(case, data, reference)
-        baseline_ms = _bench(case, data, defaults, args.warmup_ms, args.rep_ms)
-        candidates = candidate_configs(case, quick=args.quick)
-        if case.kind == config_module.KIND_3D:
-            best, best_ms = _tune_reduce(
-                case, data, reference, candidates,
-                quick=args.quick,
-                warmup_ms=args.warmup_ms,
-                rep_ms=args.rep_ms,
-            )
-        else:
-            best, best_ms = _select_best(
-                case, data, reference, candidates,
-                warmup_ms=args.warmup_ms,
-                rep_ms=args.rep_ms,
-            )
-        path = write_config(case, best, args.output_root)
-        verify_runtime_hit(case, data, best, args.output_root)
-        print(
-            f"[{case.name}] baseline={baseline_ms:.6f} ms, best={best_ms:.6f} ms, "
-            f"speedup={baseline_ms / best_ms:.3f}x, json={path}"
+        dispatch_guard = (
+            _force_2d_dispatch()
+            if case.kind == config_module.KIND_2D
+            else nullcontext()
         )
+        with dispatch_guard:
+            data = _make_inputs(case)
+            reference = _reference(case, data)
+            defaults = dict(config_module.DEFAULT_CONFIGS[case.kind])
+            _launch(case, data, defaults)
+            _check_output(case, data, reference)
+            baseline_ms = _bench(case, data, defaults, args.warmup_ms, args.rep_ms)
+            candidates = candidate_configs(case, quick=args.quick)
+            if case.kind == config_module.KIND_3D:
+                best, best_ms = _tune_reduce(
+                    case, data, reference, candidates,
+                    quick=args.quick,
+                    warmup_ms=args.warmup_ms,
+                    rep_ms=args.rep_ms,
+                )
+            else:
+                best, best_ms = _select_best(
+                    case, data, reference, candidates,
+                    warmup_ms=args.warmup_ms,
+                    rep_ms=args.rep_ms,
+                )
+            path = write_config(case, best, args.output_root)
+            verify_runtime_hit(case, data, best, args.output_root)
+            print(
+                f"[{case.name}] baseline={baseline_ms:.6f} ms, best={best_ms:.6f} ms, "
+                f"speedup={baseline_ms / best_ms:.3f}x, json={path}"
+            )
     return 0
 
 
