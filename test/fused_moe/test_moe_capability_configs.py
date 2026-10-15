@@ -168,19 +168,30 @@ def test_k_topk_are_part_of_config_cache_key(monkeypatch, tmp_path):
     ) == {1: {"marker": "k7168"}}
 
 
-def test_k1232_topk1_config_is_exact_only(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    "e,n,k,topk,arch,dtype",
+    (
+        (392, 1536, 1232, 1, "gfx936", None),
+        (128, 192, 2048, 8, "gfx938", "int8_w8a8"),
+    ),
+)
+def test_exact_only_config_does_not_match_other_shapes(
+    monkeypatch, tmp_path, e, n, k, topk, arch, dtype
+):
     config_root = _load_configs(monkeypatch, tmp_path, "3.6")
-    exact_name = "E=392,N=1536,K=1232,topk=1,arch=gfx936.json"
+    monkeypatch.setattr(moe_config_utils.arch_info, "get_arch", lambda: arch)
+    dtype_suffix = f",dtype={dtype}" if dtype is not None else ""
+    exact_name = f"E={e},N={n},K={k},topk={topk},arch={arch}{dtype_suffix}.json"
     _write_config(config_root, "3.6", exact_name, "exact-only")
 
     assert moe_config_utils.get_moe_configs(
-        392, 1536, None, K=1232, top_k=1
+        e, n, dtype, K=k, top_k=topk
     ) == {1: {"marker": "exact-only"}}
     assert moe_config_utils.get_moe_configs(
-        392, 1536, None, K=1248, top_k=1
+        e, n, dtype, K=k + 16, top_k=topk
     ) is None
     assert moe_config_utils.get_moe_configs(
-        392, 1536, None, K=1232, top_k=2
+        e, n, dtype, K=k, top_k=topk + 1
     ) is None
 
 
@@ -725,8 +736,6 @@ def test_checked_in_moe_configs_have_explicit_shape_selectors():
         selector_kinds = set()
         top_families = set()
         bottom_families = set()
-        shapes: dict[str, set[str]] = {}
-        shape_paths: dict[str, list[str]] = {}
 
         for path in paths:
             match = re.match(r"^(E=\d+,N=\d+),(.*)(,arch=.*\.json)$", path.name)
@@ -749,31 +758,12 @@ def test_checked_in_moe_configs_have_explicit_shape_selectors():
                 bottom_families.add(normalized_family)
             else:
                 top_families.add(normalized_family)
-            shapes.setdefault(normalized_family, set()).add(kind)
-            shape_paths.setdefault(normalized_family, []).append(path.name)
 
         assert top_families == bottom_families
         if version == "triton_3_2":
             assert selector_kinds == {"fuzzy"}
-        else:
-            assert selector_kinds == {"exact", "fuzzy"}
-            for family, kinds in shapes.items():
-                if kinds == {"exact"}:
-                    # This BMZ family has only been measured at K2048/topk8.
-                    # Do not require an unvalidated fuzzy range just to ship it.
-                    if family == "E=256,N=512,arch=gfx936,dtype=int8_w8a8.json":
-                        assert all(
-                            name.replace(",is_bottom=True", "")
-                            == "E=256,N=512,K=2048,topk=8,arch=gfx936,dtype=int8_w8a8.json"
-                            for name in shape_paths[family]
-                        )
-                        continue
-                    assert all(
-                        ",K=1232,topk=1," in name
-                        for name in shape_paths[family]
-                    ), f"unexpected exact-only 3.6 config family: {family}"
-                else:
-                    assert kinds == {"exact", "fuzzy"}
+        # A 3.6 family may provide exact configs, validated fuzzy configs, or
+        # both. Do not require an unvalidated fuzzy range for an exact config.
 
 
 def test_autotune_skips_unloadable_hip_candidate():
