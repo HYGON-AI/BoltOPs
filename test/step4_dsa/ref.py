@@ -283,7 +283,7 @@ def ref_sparse_attention(
 
     ``k_scale`` / ``v_scale`` dequantize an fp8 cache as ``cache.float() * scale``.
     """
-    total_q, num_heads, head_dim = query.shape
+    total_q, num_heads, _ = query.shape
     heads_per_group = num_heads // num_kv_groups
     out = torch.zeros_like(query)
     lse = torch.full(

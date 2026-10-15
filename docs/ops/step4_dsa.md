@@ -1,6 +1,6 @@
 # Step-4 DSA 系列算子说明
 
-`boltops.step4_dsa` 公开 Step-4 Dynamic Sparse Attention 的 **12 个数值 Triton API**（合同 `step4-dsa-ops-v1`）。Triton kernel 在 `boltops/step4_dsa/triton/`；模型几何在 `geometry.py`；生产 shape / 造数在 `test/step4_dsa/`（不进 wheel）；TileLang 目录为占位。
+`boltops.step4_dsa` 公开 Step-4 Dynamic Sparse Attention 的 **12 个核心数值 Triton API**（合同 `step4-dsa-ops-v1`），另提供 `triton_csa_prefill` 便利封装，共 13 个可调用入口。Triton kernel 在 `boltops/step4_dsa/triton/`；模型几何在 `geometry.py`；测试和性能测试输入构造在 `test/step4_dsa/`（不进 wheel）。当前仅实现 Triton 后端。
 
 不包含 vLLM planner / KV 缓存写入，也不包含 `kernel.py` 里的 MoE FP8 / 主注意力 `fused_qknorm_rope`。sparse prefill/decode 可以**读取**框架侧写入的 FP8 KV cache（`float8_e4m3fn` + per-tensor `k_scale`/`v_scale`）；量化写入仍由框架完成。
 
@@ -49,31 +49,107 @@ from boltops.step4_dsa import (
 
 ```bash
 pytest -q test/step4_dsa/
-pytest -q test/step4_dsa/ --bench -s
-python3 scripts/perf/triton/step4_dsa/benchmark_step4_dsa.py --output-dir /tmp/dsa-bench
+pytest -q test/step4_dsa/test_step4_dsa_decode.py test/step4_dsa/test_step4_dsa_prefill.py --bench -s
+python3 scripts/run_operator_benchmarks.py --help
 ```
 
-正确性对 `test/step4_dsa/ref.py`（handoff `torch_ref`）的 FP32 oracle，禁止 Triton-vs-Triton 作为门禁。`--bench` 跑 `tp8-production` 全表，包含 metadata 宽度 513、`num_splits=16` 的 decode。
+正确性对 `test/step4_dsa/ref.py` 的 FP32 Torch oracle，禁止 Triton-vs-Triton 作为正确性门禁。显式 split decode 在合并 partial 后验证。
 
-独立脚本输出 `triton_step4_dsa.csv`。也可：
+当前性能测试由 `test_step4_dsa_decode.py` / `test_step4_dsa_prefill.py` 内的 case 列表定义，共 20 个配置覆盖点（decode 9 个、prefill 11 个），包含 BF16 和 FP8。decode bench 使用 `num_splits=1` 的自动切分入口；宽度 513 的显式 split 边界由正确性测试覆盖。性能测试输入由 `test_step4_dsa_decode.py` / `test_step4_dsa_prefill.py` 各自构造，TP8 单分片几何参数由测试公共辅助文件 `_common.py` 提供；不再保留独立的历史 benchmark case 清单。
+
+统一性能入口会生成 `step4_dsa_decode.csv` / `step4_dsa_prefill.csv`，对应 raw 文件为 `step4_dsa_decode.raw.jsonl` / `step4_dsa_prefill.raw.jsonl`（由测试文件名派生），调用参数见 [`docs/optest_perf.md`](../optest_perf.md)。历史 JSONL/CSV 和 `optest_results_step4/` 为测量证据，不参与算子运行；此次整理保留数据，仅将本地结果目录加入忽略规则。
+
+在 handoff 仓库内仍可把本包作为 vendor 模块：
 
 ```bash
 # 在 handoff 仓库内，把本包装成 vendor 模块
 python3 -m operator_parity.run_all --suite dsa --ops-module boltops.step4_dsa
 ```
 
-occupancy JSON 对照（`tuned` = 读 HCU JSON，`default` = `config={}` 内置 tile）：
+## 当前配置与代码组织（2026-10-14）
 
-```bash
-python3 scripts/perf/triton/step4_dsa/benchmark_sparse_attn_prefill.py \
-  --output-dir scripts/perf/triton/step4_dsa/result
-python3 scripts/perf/triton/step4_dsa/benchmark_sparse_attn_prefill_tiled.py \
-  --output-dir scripts/perf/triton/step4_dsa/result
-python3 scripts/perf/triton/step4_dsa/benchmark_sparse_attn_decode.py \
-  --output-dir scripts/perf/triton/step4_dsa/result
-```
+- `common.py` 统一 Python 侧设备别名、JSON 读取与匹配、launch 参数过滤、自动 KV-split 策略；prefill/decode 保留各自 shape 和内核参数合同。
+- 配置按设备集中存储：`config/sparse_attn_decode/sparse_attn_decode_BW1100.json`、`config/sparse_attn_prefill/sparse_attn_prefill_BW1100.json`、`config/sparse_attn_prefill/sparse_attn_prefill_tiled_BW1100.json`。每个文件通过 `configs[].match` 匹配 shape；更具体的 exact/range 约束优先。
+- `config=None` 查设备 JSON；`config={}` 使用内置默认值。decode 不读取 `kv_seqlens[0]` 做配置匹配，也不按 context 或自动 split 数查找旧文件。
+- `head_dim=192` 当前拆成 `64+64+64`；BF16/FP8 和 decode pipeline 变体有不同访存/编译行为，保留专用内核，不以文本相似为由合并。
+- BW1100 的性能验证使用 `AMDGCN_USE_BUFFER_OPS=1`（与下方历史测量设置一致）。可以在上述 pytest 命令前显式加该环境变量；其他平台不应直接套用此 HIP 编译设置。
+- 已移除未实际使用的离线调优脚本及专属造数、测试；已有三个设备 JSON 配置、运行时读取与匹配逻辑、算子正确性和性能测试继续保留。`test_helpers.py` 仅测试运行时配置辅助逻辑。
 
-数字见下文 BW1100 性能记录。
+## BW1100 三类稀疏注意力 baseline 与优化版对比（2026-10-14）
+
+本轮覆盖 `boltops/step4_dsa/triton/config/` 中三个 BW1100 JSON 的全部 **20 个 shape**：decode 9 个、普通 prefill 9 个、tiled prefill 2 个。Baseline 为优化前算子及其默认配置，优化版为当前算子及其匹配的调优 JSON；收益同时包含 kernel 实现、自动 KV-split 与 launch 配置的变化，**不是仅替换 JSON 的收益**。两版时间均在本轮测量，未使用 JSON 中的历史 `latency_ms`。
+
+### 测试环境、输入与计时口径
+
+- 最终测量全部使用物理 **GPU 1：BW1100 / gfx938，72 个计算单元**；PyTorch 2.10.0、Triton 3.6.0、HIP 6.3.26093。
+- 共同几何：`H=8, G=1, D=192, region_size=8, topk=512, packed_width=513`；query 均为 BF16，表中的 KV 类型表示 KV cache 数据类型，FP8 为 `float8_e4m3fn`，`k_scale=v_scale=1.0`。
+- 输入复用 `test/step4_dsa/test_step4_dsa_decode.py` / `test/step4_dsa/test_step4_dsa_prefill.py` 的生成函数，`seed=20260831`；每个 shape 的两版共享同一组输入。decode 的 context 为 16,384 tokens；两类 prefill 的 KV cache 为 32,768 tokens。
+- 使用与 pytest benchmark 相同的 `boltops.utility.bench.time_ms`。每版 **5 轮**，交替测量顺序，每轮取中位数，再取 5 轮中位数；`repeat=50ms`。decode / 普通 prefill 使用 graph replay 及其内部预热；tiled 使用 event、`warmup=10ms`，包含 tile 元数据构建与主机同步。
+- 优化版计入所有内部 split / merge kernel；decode 的 selector 和输入 metadata 生成在计时外。这里是算子测量，不代表完整模型端到端加速；tiled 的 event 时间也不能与历史纯 kernel 调优时间直接比较。
+- 运行前连续检查 GPU 空闲状态，每个 shape 和每轮测量前再次检查利用率与其他显存占用，稳定性复测还检查其他进程的计算单元占用；检测到活动任务时等待或拒绝结果。波动较大的项已复测。GPU 未预约独占，采样间极短的外部干扰不能完全排除。
+
+时间单位为 **μs**，保留三位小数；加速比 = `baseline / optimized`，耗时降低 = `(1 - optimized / baseline) × 100%`，均按未舍入数据计算。
+
+### Baseline 配置口径
+
+- BF16 / FP8 baseline 均使用优化前的通用 kernel；FP8 不走 `head_dim=192` 专用分支。
+- Baseline 不读取调优 JSON，使用默认 `block_regions=16` 和共享内存自适应收缩，`BLOCK_H=16, BLOCK_D=256`；decode 使用 `num_splits=1`，不增加自动 KV-split。普通 prefill / decode 沿用 Triton 默认编译参数；tiled 使用 `block_q=128, num_warps=4, num_stages=2`。
+- **19 个 shape 严格使用 baseline 默认配置**；BF16 tiled 默认配置无法启动，以下明确区分失败与 `block_regions=4` 补测。其他成功的默认配置实际 `BLOCK_R=8`，由资源适配决定，不属于最优配置选择。
+
+### Decode：9 个 shape
+
+`B` 为请求 batch，context 固定为 16,384 tokens；所有行的 baseline 均为严格默认配置，计时包含优化版的 split / merge。
+
+| KV 类型 | B | Baseline（μs） | 优化后（μs） | 加速比 | 耗时降低 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| BF16 | 1 | 841.389 | 11.514 | 73.08× | 98.6% |
+| BF16 | 4 | 853.941 | 19.857 | 43.00× | 97.7% |
+| BF16 | 8 | 855.333 | 28.713 | 29.79× | 96.6% |
+| BF16 | 32 | 857.404 | 73.010 | 11.74× | 91.5% |
+| BF16 | 64 | 859.472 | 140.353 | 6.12× | 83.7% |
+| BF16 | 128 | 1716.057 | 260.210 | 6.59× | 84.8% |
+| FP8 | 1 | 1241.214 | 14.757 | 84.11× | 98.8% |
+| FP8 | 4 | 1195.323 | 15.847 | 75.43× | 98.7% |
+| FP8 | 8 | 1237.552 | 27.236 | 45.44× | 97.8% |
+
+本轮 decode 加速比范围为 **6.12–84.11×**。
+
+### 普通 Prefill：9 个 shape
+
+`Q` 为 query token 数，KV cache 固定为 32,768 tokens；使用 per-query 路径，所有行的 baseline 均为严格默认配置。
+
+| KV 类型 | Q | Baseline（μs） | 优化后（μs） | 加速比 | 耗时降低 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| BF16 | 1 | 823.546 | 12.218 | 67.40× | 98.5% |
+| BF16 | 4 | 822.922 | 18.933 | 43.47× | 97.7% |
+| BF16 | 8 | 823.185 | 19.590 | 42.02× | 97.6% |
+| BF16 | 32 | 822.862 | 45.336 | 18.15× | 94.5% |
+| BF16 | 64 | 822.922 | 75.626 | 10.88× | 90.8% |
+| BF16 | 128 | 1643.514 | 128.579 | 12.78× | 92.2% |
+| BF16 | 512 | 6583.084 | 473.834 | 13.89× | 92.8% |
+| BF16 | 4096 | 47092.068 | 3277.893 | 14.37× | 93.0% |
+| FP8 | 128 | 1939.311 | 165.523 | 11.72× | 91.5% |
+
+本轮普通 prefill 加速比范围为 **10.88–67.40×**。
+
+### Tiled Prefill：2 个 shape
+
+`Q=128, block_q=128`，KV cache 为 32,768 tokens；event 计时包含 tile 元数据构建及主机同步。
+
+| KV 类型 | Q | Baseline（μs） | 优化后（μs） | 加速比 | 耗时降低 | Baseline 配置 |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| BF16 | 128 | 3068.639（补测） | 575.520 | 5.33×（补测） | 81.2% | 默认超限；仅改 `block_regions=4` |
+| FP8 | 128 | 4188.799 | 595.200 | 7.04× | 85.8% | 严格默认配置 |
+
+**BF16 tiled 的严格默认配置无有效时间**：默认 `block_regions=16` 经资源适配收缩至 `BLOCK_R=8` 后，仍需要 **66,560 B** 共享内存，超过硬件上限 **65,536 B**，报 `OutOfResources`。表中的 BF16 baseline 沿用现有 `test_step4_dsa_prefill.py` 的 `block_regions=4` 补测，仍使用优化前的通用 kernel，其余默认参数不变；对应加速比和耗时降低仅适用于这次补测，不能作为严格默认配置的收益。FP8 tiled 没有采用该补测参数。
+
+### 一致性检查
+
+20 个可运行对比的输出和 LSE（log-sum-exp）一致性检查全部通过。该检查用于本次两版结果对照，**不替代前述 FP32 Torch oracle 正确性门禁**。
+
+## 历史优化与性能记录
+
+以下日期化记录保留用于溯源；其中 `prefill-k...` / `decode-k...` 文件名、旧 benchmark 脚本、`128+64` 分块及当时的配置选择策略均为历史状态，不代表当前接口。当前配置和运行入口以“当前配置与代码组织”一节为准。历史性能数字没有在此次代码整理中重新测定。
 
 ## 接口对齐、健壮性与配置规范化（2026-09-12）
 
@@ -93,8 +169,8 @@ Decode launch 配置支持 `BALANCE_LIVE`（默认 false）。开启时，自动
 `AUTO_KV_SPLITS` 选择整次 launch 共用的 split 数；`BALANCE_LIVE` 则按每行
 运行时 `region_counts` 重新划分窗口，两者作用维度不同，前者不能替代后者。
 历史上曾在三个短上下文 BW1100 点开启并得到下表收益；后续重新调优的当前
-BW1100 配置均选择 false，因此 JSON 省略该默认值，但保留内核和 tuner 支持，
-供高度 ragged 的自定义输入继续评估。动态窗口在长上下文没有稳定收益，不应
+BW1100 配置均选择 false，因此 JSON 省略该默认值，但保留内核支持，
+供高度 ragged 的自定义输入通过显式 config 继续评估。动态窗口在长上下文没有稳定收益，不应
 全局启用。`config={}` 仍使用原默认策略。
 
 | B | context | HEAD 基线 us | 优化 us | 加速比 |

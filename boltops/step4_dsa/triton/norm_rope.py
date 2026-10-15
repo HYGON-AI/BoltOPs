@@ -12,6 +12,7 @@ import torch
 import triton
 import triton.language as tl
 
+
 @triton.jit
 def _affine_normalize(
     raw,

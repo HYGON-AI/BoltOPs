@@ -9,6 +9,7 @@ import torch
 import triton
 import triton.language as tl
 
+
 @triton.jit
 def _indexer_logits_kernel(
     index_q_ptr,
