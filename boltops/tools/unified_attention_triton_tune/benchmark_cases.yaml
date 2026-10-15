@@ -55,8 +55,8 @@ cases:
     sliding_window: null
     soft_cap: null
     use_sinks: false
-    num_segments: 16
-    seq_threshold_3d: 2
+    num_segments: 2
+    seq_threshold_3d: 128
     enabled: true
 
   - name: decode-gqa-sink-swa-3d
