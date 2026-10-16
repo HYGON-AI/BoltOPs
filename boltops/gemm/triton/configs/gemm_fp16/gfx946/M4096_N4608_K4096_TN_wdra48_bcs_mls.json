@@ -1,0 +1,41 @@
+{
+  "arch": "gfx946",
+  "mode": "wdra48",
+  "M": 4096,
+  "N": 4608,
+  "K": 4096,
+  "ab_layout": "TN",
+  "use_mls": true,
+  "BLOCK_SIZE_M": 256,
+  "BLOCK_SIZE_N": 256,
+  "BLOCK_SIZE_K": 64,
+  "num_stages": 2,
+  "GROUP_SIZE_M": 1,
+  "WARP_SPECIALIZE": true,
+  "empty_arrive_after_mmac": false,
+  "enable_v_mmac_cluster": 0,
+  "TRITON_BUFFER_CACHE_SWIZZLE": true,
+  "cycles": 1205665,
+  "gc_frequency_ghz": 2.197802,
+  "winner_tops": 281.854,
+  "wall_s": 2965.39,
+  "baseline_mode": null,
+  "baseline_tops": null,
+  "speedup_vs_nowasp": null,
+  "source_csv": "gemm_wasp_tune.csv",
+  "triton_commit": "c768cc23ecff840963acfd068969354eda2b48c3",
+  "triton_commit_short": "c768cc23e",
+  "bolt_ops_commit": "2c21f6f",
+  "notes": "New TN best: wdra48 + BCS + MLS @ 256x256x64, num_stages=2, VGPR 88/208/208 (amdgcn s_set_vgpr_size 88/208/208), ea=0 cl=0. golden=PASS. Non-MLS BK=64 on TN previously did not fit VGPR; MLS enables BK=64. vs prior best non-MLS ns4 BK=32 255.252 TOPS / 1331316 cycles: ~+10.4% TOPS. vs prior MLS ns4 BK=32 244.320 TOPS: ~+15.4% TOPS.",
+  "wasp_wdra": true,
+  "wasp_partition_warps": [
+    4,
+    4,
+    4
+  ],
+  "wasp_partition_regs": [
+    88,
+    208,
+    208
+  ]
+}

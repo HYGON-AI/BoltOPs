@@ -5,13 +5,34 @@ Public call shape follows vLLM's Triton matmul wrappers
 
     gemm_fp16(a, b, bias=None, *, out=None, ...)
 
-Kernel launch options follow ``triton-staging`` HCU regression
+Kernel launch options follow ``triton-release-3.6.x`` HCU regression /
+barrier autotune
 (``test_wasp_mls_regression.py`` / ``bench_gemm_wasp_barrier_autotune.py``).
 
-Autotune dimensions (MR !208 HIPOptions):
+Autotune HIPOptions (consolidated; sched barriers are not independent):
   * ``empty_arrive_after_mmac`` — bool
   * ``enable_v_mmac_cluster`` — 0 | 1 | 2
+      0: off
+      1: cluster (+ SchedBarrier before mmac and between A/B loads)
+      2: cluster + cross-region A/B load analysis (implies 1)
+  * ``wasp_partition_warps`` / ``wasp_wdra`` / ``wasp_partition_regs`` —
+    Load-first topology, WDRA selection and optional per-partition VGPR quotas.
+    Consumer ping-pong is managed by Triton for two-consumer topologies.
+  * ``hcu_use_gfx946_sched_model_v2`` — bool. This GEMM sets it to False to
+    retain the legacy gfx946 scheduling model with newer HCU Clang builds.
+  * ``num_stages`` — WASP/WDRA LDS buffer depth ``2`` (default) or ``4``
+    (``wdra88`` / TwoPTwoC does not support ``4``)
+  * ``mmac_layout_force`` — ``-1`` (default / auto) or ``0..4``
+      0: mfma; 1: mmac legacy; 2: interleave; 3: transpose;
+      4: interleave+transpose
 plus a small BLOCK_SIZE_{M,N,K} sweep for the selected WASP/WDRA mode.
+
+Named modes (same as the release bench): nowasp | wasp44 | wdra48 | wdra88.
+
+MLS path (``use_mls`` / ``--mls``): A/B use ``tl.matrix_load``. C uses
+``tl.matrix_store`` when ``use_matrix_store`` / ``--matrix-store`` is set
+(needs ``triton-mls-store``; prefer ``mmac_layout_force=3``); otherwise
+``tl.store``.
 """
 
 from __future__ import annotations
@@ -28,21 +49,31 @@ from boltops.utility import arch_info
 # WASP / WDRA are opt-in only on gfx946 (HCU).
 _WASP_WDRA_ARCHS = frozenset({"gfx946"})
 
-# Default WDRA VGPR budgets from triton-staging GEMM regression.
-_DEFAULT_WDRA_LOAD_REGS = 88
-_DEFAULT_WDRA_MMA_MAIN = 144
-_DEFAULT_WDRA_MMA_TAIL = 140
-_DEFAULT_WDRA_MMA_TAIL_8 = 160  # TwoPTwoC: load+load+main+tail % 32 == 0
+# Default WDRA VGPR budgets (load / mma_main / mma_tail).
+# OnePTwoC must keep sum % 12 == 0. TN MLS BK=64 + consumer pingpong uses
+# 16/244/244 (sum 504); prior non-pingpong TN was 88/208/208. TT large tiles
+# often use 112/196/196.
+_DEFAULT_WDRA_LOAD_REGS = 16
+_DEFAULT_WDRA_MMA_MAIN = 244
+_DEFAULT_WDRA_MMA_TAIL = 244
+#_DEFAULT_WDRA_LOAD_REGS = 88
+#_DEFAULT_WDRA_MMA_MAIN = 208
+#_DEFAULT_WDRA_MMA_TAIL = 208
+_DEFAULT_WDRA_MMA_TAIL_8 = 160  # TwoPTwoC quotas are normalized by Triton to sum % 16 == 0
+
+# Named modes mirrored from scripts/hcu/bench_gemm_wasp_barrier_autotune.py.
+MODES = ("nowasp", "wasp44", "wdra48", "wdra88")
 
 # Block candidates: wasp-friendly 128 tiles; WDRA often prefers smaller LDS.
+# Defaults match regression ``gemm_config`` (square tile: 128 or 64).
 _BLOCK_CANDIDATES_NOWASP = (
-    (128, 128, 64),
     (128, 128, 128),
+    (128, 128, 64),
     (64, 64, 64),
 )
 _BLOCK_CANDIDATES_WASP = (
-    (128, 128, 64),
     (128, 128, 128),
+    (128, 128, 64),
     (64, 64, 64),
 )
 _BLOCK_CANDIDATES_WDRA = (
@@ -54,6 +85,41 @@ _BLOCK_CANDIDATES_WDRA = (
 _KERNEL_CACHE: dict[tuple, Any] = {}
 
 
+def _validate_mmac_cluster(enable_v_mmac_cluster: int) -> int:
+    cluster = int(enable_v_mmac_cluster)
+    if cluster not in (0, 1, 2):
+        raise ValueError(
+            f"enable_v_mmac_cluster must be 0, 1, or 2; got {cluster}"
+        )
+    return cluster
+
+
+def _validate_mmac_layout_force(mmac_layout_force: int) -> int:
+    """HIPOptions ``mmac_layout_force``: ``-1`` auto, else ``0..4`` (see module doc)."""
+    layout = int(mmac_layout_force)
+    if layout < -1 or layout > 4:
+        raise ValueError(
+            f"mmac_layout_force must be -1 or 0..4; got {layout}"
+        )
+    return layout
+
+
+def _validate_num_stages(num_stages: int, *, wasp: bool, wdra: bool, load_warps: int) -> int:
+    """WASP/WDRA LDS buffer depth is 2 or 4; TwoPTwoC (wdra88) forbids 4."""
+    stages = int(num_stages)
+    if wasp:
+        if stages not in (2, 4):
+            raise ValueError(f"wasp requires num_stages in (2, 4); got {stages}")
+        if load_warps >= 8 and stages == 4:
+            raise ValueError(
+                "wdra TwoPTwoC (load_warps=8) does not support num_stages=4 "
+                "(abarrier ID limit)"
+            )
+    elif stages < 1:
+        raise ValueError(f"num_stages must be >= 1; got {stages}")
+    return stages
+
+
 def default_launch_config(
     *,
     wasp: bool = False,
@@ -62,29 +128,72 @@ def default_launch_config(
     mma_warps: int = 4,
     empty_arrive_after_mmac: bool = False,
     enable_v_mmac_cluster: int = 0,
+    num_stages: int = 2,
+    mmac_layout_force: int = -1,
 ) -> dict[str, Any]:
-    """Single fixed launch config (no autotune)."""
-    if wdra:
-        bm = bn = bk = 64
-    else:
-        bm = bn = 128
-        bk = 64
+    """Single fixed launch config (no autotune).
+
+    Tile defaults match ``test_wasp_mls_regression.gemm_config``: square
+    ``128`` without WDRA, square ``64`` with WDRA (smaller LDS).
+
+    Under WASP/WDRA, ``num_stages`` is the LDS buffer depth (2 or 4).
+    """
+    block = 64 if wdra else 128
+    stages = _validate_num_stages(
+        num_stages, wasp=wasp, wdra=wdra, load_warps=load_warps
+    )
     cfg = _mode_launch_kwargs(
         wasp=wasp, wdra=wdra, load_warps=load_warps, mma_warps=mma_warps
     )
     cfg.update(
         {
-            "BLOCK_SIZE_M": bm,
-            "BLOCK_SIZE_N": bn,
-            "BLOCK_SIZE_K": bk,
+            "BLOCK_SIZE_M": block,
+            "BLOCK_SIZE_N": block,
+            "BLOCK_SIZE_K": block,
             "empty_arrive_after_mmac": bool(empty_arrive_after_mmac),
-            "enable_v_mmac_cluster": int(enable_v_mmac_cluster),
+            "enable_v_mmac_cluster": _validate_mmac_cluster(enable_v_mmac_cluster),
+            "num_stages": stages,
+            "mmac_layout_force": _validate_mmac_layout_force(mmac_layout_force),
         }
     )
     if not wasp:
         cfg["num_warps"] = 4
-        cfg["num_stages"] = 2
     return cfg
+
+
+def mode_launch_kwargs(
+    mode: str,
+    *,
+    empty_arrive_after_mmac: bool = False,
+    enable_v_mmac_cluster: int = 0,
+    num_stages: int = 2,
+    mmac_layout_force: int = -1,
+) -> dict[str, Any]:
+    """Fixed launch kwargs for a named release-bench mode.
+
+    Modes: ``nowasp`` | ``wasp44`` | ``wdra48`` | ``wdra88``.
+    """
+    kw = dict(
+        empty_arrive_after_mmac=empty_arrive_after_mmac,
+        enable_v_mmac_cluster=enable_v_mmac_cluster,
+        num_stages=num_stages,
+        mmac_layout_force=mmac_layout_force,
+    )
+    if mode == "nowasp":
+        return default_launch_config(wasp=False, wdra=False, **kw)
+    if mode == "wasp44":
+        return default_launch_config(
+            wasp=True, wdra=False, load_warps=4, mma_warps=4, **kw
+        )
+    if mode == "wdra48":
+        return default_launch_config(
+            wasp=True, wdra=True, load_warps=4, mma_warps=8, **kw
+        )
+    if mode == "wdra88":
+        return default_launch_config(
+            wasp=True, wdra=True, load_warps=8, mma_warps=8, **kw
+        )
+    raise ValueError(f"unknown mode {mode!r}; choose from {MODES}")
 
 
 def supports_wasp_wdra(arch: Optional[str] = None) -> bool:
@@ -112,22 +221,22 @@ def _mode_launch_kwargs(
     cfg: dict[str, Any] = {
         "GROUP_SIZE_M": 1,
         "WARP_SPECIALIZE": wasp,
-        "wasp_enabled": wasp,
-        "wdra_enabled": wdra,
+        "wasp_wdra": wdra,
+        "amdgpu_enable_max_ilp_scheduling_strategy": True,
+        "hcu_use_gfx946_sched_model_v2": False,
     }
     if wasp:
-        cfg["wasp_num_load_warps"] = load_warps
-        cfg["wasp_num_mma_warps"] = mma_warps
+        producers = 2 if load_warps == 8 else 1
+        consumers = 2 if mma_warps == 8 else 1
+        cfg["wasp_partition_warps"] = (4,) * (producers + consumers)
         if wdra:
-            mma_tail = (
-                _DEFAULT_WDRA_MMA_TAIL_8 if load_warps >= 8 else _DEFAULT_WDRA_MMA_TAIL
-            )
-            cfg.update(
-                {
-                    "wdra_num_load_regs": _DEFAULT_WDRA_LOAD_REGS,
-                    "wdra_num_mma_regs_main": _DEFAULT_WDRA_MMA_MAIN,
-                    "wdra_num_mma_regs_tail": mma_tail,
-                }
+            consumers_regs = (_DEFAULT_WDRA_MMA_MAIN,)
+            if consumers == 2:
+                consumers_regs += (
+                    _DEFAULT_WDRA_MMA_TAIL_8 if producers == 2 else _DEFAULT_WDRA_MMA_TAIL,
+                )
+            cfg["wasp_partition_regs"] = (
+                (_DEFAULT_WDRA_LOAD_REGS,) * producers + consumers_regs
             )
     return cfg
 
@@ -146,32 +255,46 @@ def build_autotune_configs(
     wdra: bool = False,
     load_warps: int = 4,
     mma_warps: int = 4,
+    mmac_layout_force: tuple[int, ...] = (-1,),
 ) -> list[triton.Config]:
     """Build ``@triton.autotune`` configs for the selected mode.
 
-    Sweep ``empty_arrive_after_mmac`` × ``enable_v_mmac_cluster`` (MR !208)
-    and a small block-size grid. Mode / WASP topology is fixed per call.
+    Mirrors ``bench_gemm_wasp_barrier_autotune.py`` HIPOptions sweep inside one
+    topology: ``empty_arrive_after_mmac`` × ``enable_v_mmac_cluster`` (0/1/2)
+    × ``mmac_layout_force``, plus a small block-size grid. Sched barriers are
+    not swept separately — ``enable_v_mmac_cluster >= 1`` implies before-mmac
+    and A/B-load fences. Default ``mmac_layout_force=(-1,)`` keeps auto layout
+    only; pass ``(-1, 0, 1, 2, 3, 4)`` (or a subset) to sweep. Mode / WASP
+    topology stays fixed per call (use ``mode_launch_kwargs`` /
+    ``wasp``+``wdra``+warp counts to select nowasp/wasp44/wdra48/wdra88).
     """
     mode = _mode_launch_kwargs(
         wasp=wasp, wdra=wdra, load_warps=load_warps, mma_warps=mma_warps
     )
+    layouts = tuple(
+        _validate_mmac_layout_force(v) for v in mmac_layout_force
+    ) or (-1,)
     configs: list[triton.Config] = []
     for bm, bn, bk in _block_candidates(wasp=wasp, wdra=wdra):
         for empty_after in (False, True):
             for cluster in (0, 1, 2):
-                kwargs = {
-                    **mode,
-                    "BLOCK_SIZE_M": bm,
-                    "BLOCK_SIZE_N": bn,
-                    "BLOCK_SIZE_K": bk,
-                    "empty_arrive_after_mmac": empty_after,
-                    "enable_v_mmac_cluster": cluster,
-                }
-                # Plain num_warps only for non-WASP; compiler ignores it after WS.
-                if wasp:
-                    configs.append(triton.Config(kwargs))
-                else:
-                    configs.append(triton.Config(kwargs, num_warps=4, num_stages=2))
+                for layout in layouts:
+                    kwargs = {
+                        **mode,
+                        "BLOCK_SIZE_M": bm,
+                        "BLOCK_SIZE_N": bn,
+                        "BLOCK_SIZE_K": bk,
+                        "empty_arrive_after_mmac": empty_after,
+                        "enable_v_mmac_cluster": cluster,
+                        "mmac_layout_force": layout,
+                    }
+                    # Plain num_warps only for non-WASP; compiler ignores it after WS.
+                    if wasp:
+                        configs.append(triton.Config(kwargs))
+                    else:
+                        configs.append(
+                            triton.Config(kwargs, num_warps=4, num_stages=2)
+                        )
     return configs
 
 
@@ -221,8 +344,9 @@ def _gemm_fp16_load_kernel(
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPECIALIZE):
-        a = tl.load(a_ptrs)
-        b = tl.load(b_ptrs)
+        remaining_k = K - k * BLOCK_SIZE_K
+        a = tl.load(a_ptrs, mask=offs_k[None, :] < remaining_k, other=0.0)
+        b = tl.load(b_ptrs, mask=offs_k[:, None] < remaining_k, other=0.0)
         accumulator = tl.dot(a, b, accumulator)
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
@@ -260,6 +384,7 @@ def _gemm_fp16_mls_kernel(
     GROUP_SIZE_M: tl.constexpr,
     WARP_SPECIALIZE: tl.constexpr,
     HAS_BIAS: tl.constexpr,
+    USE_MATRIX_STORE: tl.constexpr,
 ):
     tl.assume(stride_am > 0)
     tl.assume(stride_ak > 0)
@@ -301,16 +426,28 @@ def _gemm_fp16_mls_kernel(
         )
         accumulator = tl.dot(a, b, accumulator)
 
-    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     if HAS_BIAS:
+        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         bias = tl.load(bias_ptr + offs_cn, mask=offs_cn < N, other=0.0).to(tl.float32)
         accumulator += bias
     c = accumulator.to(tl.float16)
 
-    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    tl.store(c_ptrs, c, mask=c_mask)
+    if USE_MATRIX_STORE:
+        # VGPR→GMEM matrix_store (prefer mmac_layout_force=3).
+        tl.matrix_store(
+            c_ptr,
+            c,
+            shape=[M, N],
+            strides=[stride_cm, stride_cn],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+            offsets=[mls_offs_am, mls_offs_bn],
+        )
+    else:
+        offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+        c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+        tl.store(c_ptrs, c, mask=c_mask)
 
 
 def _get_autotuned_kernel(
@@ -320,8 +457,9 @@ def _get_autotuned_kernel(
     load_warps: int,
     mma_warps: int,
     use_mls: bool,
+    use_matrix_store: bool = False,
 ):
-    key = (wasp, wdra, load_warps, mma_warps, use_mls)
+    key = (wasp, wdra, load_warps, mma_warps, use_mls, use_matrix_store)
     cached = _KERNEL_CACHE.get(key)
     if cached is not None:
         return cached
@@ -386,6 +524,7 @@ def gemm_fp16(
     wasp: bool = False,
     wdra: bool = False,
     use_mls: bool = False,
+    use_matrix_store: bool = False,
     wasp_num_load_warps: Optional[int] = None,
     wasp_num_mma_warps: Optional[int] = None,
     autotune: bool = True,
@@ -396,6 +535,9 @@ def gemm_fp16(
     Computes ``out = a @ b [+ bias]`` with FP32 accumulate. Layout matches
     vLLM ``matmul_persistent(a, b, bias)`` / ``VLLM_USE_NN`` linear path:
     ``a[..., K]``, ``b[K, N]``, optional 1D ``bias[N]``.
+
+    ``use_matrix_store`` selects ``tl.matrix_store`` for C (requires
+    ``use_mls=True`` and a Triton build that exposes ``tl.matrix_store``).
     """
     if a.dtype != torch.float16 or b.dtype != torch.float16:
         raise TypeError(
@@ -434,6 +576,8 @@ def gemm_fp16(
         raise ValueError(
             f"use_mls=True requires an MLS-capable arch; got {arch_info.get_arch()!r}"
         )
+    if use_matrix_store and not use_mls:
+        raise ValueError("use_matrix_store=True requires use_mls=True")
     if config is not None and not isinstance(config, dict):
         raise TypeError(f"config must be a dict or None; got {type(config)!r}")
 
@@ -501,6 +645,8 @@ def gemm_fp16(
             )
         )
         launch["HAS_BIAS"] = has_bias
+        if use_mls:
+            launch["USE_MATRIX_STORE"] = bool(use_matrix_store)
         base = _gemm_fp16_mls_kernel if use_mls else _gemm_fp16_load_kernel
         base[grid](*args, **launch)
     else:
@@ -510,14 +656,20 @@ def gemm_fp16(
             load_warps=load_warps,
             mma_warps=mma_warps,
             use_mls=use_mls,
+            use_matrix_store=use_matrix_store,
         )
-        kernel[grid](*args, HAS_BIAS=has_bias)
+        launch_extra: dict[str, Any] = {"HAS_BIAS": has_bias}
+        if use_mls:
+            launch_extra["USE_MATRIX_STORE"] = bool(use_matrix_store)
+        kernel[grid](*args, **launch_extra)
     return out
 
 
 __all__ = [
+    "MODES",
     "build_autotune_configs",
     "default_launch_config",
     "gemm_fp16",
+    "mode_launch_kwargs",
     "supports_wasp_wdra",
 ]

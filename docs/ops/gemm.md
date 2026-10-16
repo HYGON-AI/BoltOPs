@@ -3,6 +3,8 @@
 `boltops.gemm` 公开 Triton GEMM 族（布局对齐 vLLM / aiter / SGLang 调用侧）。
 实现位于 `boltops/gemm/triton/`；维护人 Triton @xukang。
 
+调优与支持跟踪见 [GEMM 优化记录](../gemm/OPTIMIZATION.md)，历史 WASP/WDRA 性能见 [RESULTS](../gemm/RESULTS.md)，寄存器策略见 [VGPR](../gemm/VGPR.md)。
+
 ## 当前支持一览
 
 | 公开 API | 精度 / 量化 | 布局要点 | 来源 | 备注 |
