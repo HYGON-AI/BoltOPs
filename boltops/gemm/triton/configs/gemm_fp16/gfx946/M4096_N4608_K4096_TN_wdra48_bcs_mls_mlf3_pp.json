@@ -1,0 +1,43 @@
+{
+  "arch": "gfx946",
+  "mode": "wdra48",
+  "M": 4096,
+  "N": 4608,
+  "K": 4096,
+  "ab_layout": "TN",
+  "use_mls": true,
+  "BLOCK_SIZE_M": 256,
+  "BLOCK_SIZE_N": 256,
+  "BLOCK_SIZE_K": 64,
+  "num_stages": 2,
+  "GROUP_SIZE_M": 1,
+  "WARP_SPECIALIZE": true,
+  "empty_arrive_after_mmac": false,
+  "enable_v_mmac_cluster": 0,
+  "mmac_layout_force": 3,
+  "TRITON_BUFFER_CACHE_SWIZZLE": true,
+  "cycles": 1037013,
+  "gc_frequency_ghz": 2.197802,
+  "winner_tops": 327.693,
+  "wall_s": 2915.037,
+  "baseline_mode": null,
+  "baseline_tops": null,
+  "speedup_vs_nowasp": null,
+  "source_csv": "gemm_wasp_tune.csv",
+  "triton_commit": "7225e1068dd006d2648f248d71a1ae4d704d7a5b",
+  "triton_commit_short": "7225e1068",
+  "bolt_ops_commit": "af8475a",
+  "notes": "New TN best: wdra48 + BCS + MLS @ 256x256x64, num_stages=2, mmac_layout_force=3, enable_consumer_pingpong=true, VGPR 16/244/244 (Clang s_set_vgpr_size matches), ea=0 cl=0. golden=PASS. Triton consumer-pingpong tree 7225e1068. vs prior mlf=3 (pp off, VGPR 88/208/208) 293.201 TOPS / 1159006 cycles: ~+11.8% TOPS. vs non-MLS ns4 BK32 255.252: ~+28.4% TOPS. Gain is pingpong + VGPR rebalance together, not pingpong alone.",
+  "historical_enable_consumer_pingpong": true,
+  "wasp_wdra": true,
+  "wasp_partition_warps": [
+    4,
+    4,
+    4
+  ],
+  "wasp_partition_regs": [
+    16,
+    244,
+    244
+  ]
+}

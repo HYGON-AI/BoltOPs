@@ -1,0 +1,41 @@
+{
+  "arch": "gfx946",
+  "mode": "wdra48",
+  "M": 4096,
+  "N": 4608,
+  "K": 4096,
+  "ab_layout": "TN",
+  "use_mls": true,
+  "BLOCK_SIZE_M": 256,
+  "BLOCK_SIZE_N": 256,
+  "BLOCK_SIZE_K": 32,
+  "num_stages": 4,
+  "GROUP_SIZE_M": 1,
+  "WARP_SPECIALIZE": true,
+  "empty_arrive_after_mmac": false,
+  "enable_v_mmac_cluster": 0,
+  "TRITON_BUFFER_CACHE_SWIZZLE": true,
+  "cycles": 1390887,
+  "gc_frequency_ghz": 2.197802,
+  "winner_tops": 244.32,
+  "wall_s": 3134.372,
+  "baseline_mode": null,
+  "baseline_tops": null,
+  "speedup_vs_nowasp": null,
+  "source_csv": "gemm_wasp_tune.csv",
+  "triton_commit": "c768cc23ecff840963acfd068969354eda2b48c3",
+  "triton_commit_short": "c768cc23e",
+  "bolt_ops_commit": "cfdc811",
+  "notes": "First MLS datapoint on this shape: wdra48 + BCS + use_mls @ 256x256x32, num_stages=4, VGPR 88/208/208 (amdgcn s_set_vgpr_size 88/208/208), ea=0 cl=0. golden=PASS. vs non-MLS ns4 JSON 255.252 TOPS / 1331316 cycles: ~−4.3% TOPS (MLS slower here).",
+  "wasp_wdra": true,
+  "wasp_partition_warps": [
+    4,
+    4,
+    4
+  ],
+  "wasp_partition_regs": [
+    88,
+    208,
+    208
+  ]
+}

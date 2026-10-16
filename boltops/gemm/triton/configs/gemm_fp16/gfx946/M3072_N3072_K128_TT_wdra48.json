@@ -1,0 +1,42 @@
+{
+  "arch": "gfx946",
+  "mode": "wdra48",
+  "M": 3072,
+  "N": 3072,
+  "K": 128,
+  "ab_layout": "TT",
+  "use_mls": false,
+  "BLOCK_SIZE_M": 256,
+  "BLOCK_SIZE_N": 256,
+  "BLOCK_SIZE_K": 64,
+  "num_stages": 2,
+  "GROUP_SIZE_M": 1,
+  "WARP_SPECIALIZE": true,
+  "empty_arrive_after_mmac": false,
+  "enable_v_mmac_cluster": 0,
+  "cycles": 196300,
+  "cycles_note": "back-computed from TOPS=27.049 and gcFrequency; CSV row lost",
+  "gc_frequency_ghz": 2.197802,
+  "winner_tops": 27.049,
+  "wall_s": null,
+  "baseline_mode": null,
+  "baseline_tops": null,
+  "speedup_vs_nowasp": 7.909,
+  "speedup_note": "SUMMARY reported wdra48/nowasp=7.909x; nowasp itself not recorded",
+  "source_csv": null,
+  "triton_commit": "e4fee6ec52a70b965397549d920d2090d2801d5d",
+  "triton_commit_short": "e4fee6ec5",
+  "bolt_ops_commit": "901eb99",
+  "notes": "First datapoint (not claimed best). wdra48 non-MLS @ 256x256x64, VGPR 112/196/196 assumed (BranchAvailable match other 256-tile runs). nowasp not recorded. tiles=144. Short-K (K=128=2×BK).",
+  "wasp_wdra": true,
+  "wasp_partition_warps": [
+    4,
+    4,
+    4
+  ],
+  "wasp_partition_regs": [
+    112,
+    196,
+    196
+  ]
+}

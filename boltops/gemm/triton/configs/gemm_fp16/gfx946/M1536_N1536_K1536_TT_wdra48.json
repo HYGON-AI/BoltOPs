@@ -1,0 +1,40 @@
+{
+  "arch": "gfx946",
+  "mode": "wdra48",
+  "M": 1536,
+  "N": 1536,
+  "K": 1536,
+  "ab_layout": "TT",
+  "use_mls": false,
+  "BLOCK_SIZE_M": 256,
+  "BLOCK_SIZE_N": 256,
+  "BLOCK_SIZE_K": 64,
+  "num_stages": 2,
+  "GROUP_SIZE_M": 1,
+  "WARP_SPECIALIZE": true,
+  "empty_arrive_after_mmac": false,
+  "enable_v_mmac_cluster": 0,
+  "cycles": 119723,
+  "gc_frequency_ghz": 2.197802,
+  "winner_tops": 133.04991952948242,
+  "wall_s": 131.826,
+  "baseline_mode": "nowasp",
+  "baseline_tops": 115.46784423556011,
+  "speedup_vs_nowasp": 1.152,
+  "source_csv": "gemm_wasp_tune.csv",
+  "triton_commit": "e4fee6ec52a70b965397549d920d2090d2801d5d",
+  "triton_commit_short": "e4fee6ec5",
+  "bolt_ops_commit": "901eb99",
+  "notes": "1536^3 wdra48 non-MLS @ 256x256x64, VGPR 112/196/196. vs best nowasp 128^3 @ 115.468 TOPS (~1.15x).",
+  "wasp_wdra": true,
+  "wasp_partition_warps": [
+    4,
+    4,
+    4
+  ],
+  "wasp_partition_regs": [
+    112,
+    196,
+    196
+  ]
+}

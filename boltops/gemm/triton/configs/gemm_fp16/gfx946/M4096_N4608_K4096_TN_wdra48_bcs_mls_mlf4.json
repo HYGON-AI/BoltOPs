@@ -1,0 +1,42 @@
+{
+  "arch": "gfx946",
+  "mode": "wdra48",
+  "M": 4096,
+  "N": 4608,
+  "K": 4096,
+  "ab_layout": "TN",
+  "use_mls": true,
+  "BLOCK_SIZE_M": 256,
+  "BLOCK_SIZE_N": 256,
+  "BLOCK_SIZE_K": 64,
+  "num_stages": 2,
+  "GROUP_SIZE_M": 1,
+  "WARP_SPECIALIZE": true,
+  "empty_arrive_after_mmac": false,
+  "enable_v_mmac_cluster": 0,
+  "mmac_layout_force": 4,
+  "TRITON_BUFFER_CACHE_SWIZZLE": true,
+  "cycles": 1159119,
+  "gc_frequency_ghz": 2.197802,
+  "winner_tops": 293.172,
+  "wall_s": 2945.821,
+  "baseline_mode": null,
+  "baseline_tops": null,
+  "speedup_vs_nowasp": null,
+  "source_csv": "gemm_wasp_tune.csv",
+  "triton_commit": "c768cc23ecff840963acfd068969354eda2b48c3",
+  "triton_commit_short": "c768cc23e",
+  "bolt_ops_commit": "8b45db6",
+  "notes": "MLS BK64 ns=2 mmac_layout_force=4 (interleave+transpose), VGPR 88/208/208, ea=0 cl=0. golden=PASS. vs mlf=3 293.201 TOPS / 1159006 cycles: essentially tied (~−0.01%). vs MLS auto 281.854: ~+4.0% TOPS.",
+  "wasp_wdra": true,
+  "wasp_partition_warps": [
+    4,
+    4,
+    4
+  ],
+  "wasp_partition_regs": [
+    88,
+    208,
+    208
+  ]
+}

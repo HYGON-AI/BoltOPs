@@ -1,0 +1,43 @@
+{
+  "arch": "gfx946",
+  "mode": "wdra48",
+  "M": 4096,
+  "N": 4608,
+  "K": 4096,
+  "ab_layout": "TN",
+  "use_mls": false,
+  "BLOCK_SIZE_M": 256,
+  "BLOCK_SIZE_N": 256,
+  "BLOCK_SIZE_K": 32,
+  "num_stages": 4,
+  "GROUP_SIZE_M": 1,
+  "WARP_SPECIALIZE": true,
+  "empty_arrive_after_mmac": false,
+  "enable_v_mmac_cluster": 0,
+  "TRITON_BUFFER_CACHE_SWIZZLE": true,
+  "cycles": 1331316,
+  "gc_frequency_ghz": 2.197802,
+  "winner_tops": 255.252,
+  "wall_s": 3138.631,
+  "baseline_mode": null,
+  "baseline_tops": null,
+  "speedup_vs_nowasp": null,
+  "source_csv": "gemm_wasp_tune.csv",
+  "triton_commit": "5f67c818ee36ecbcf3dbcc60f4748d51bfdd742d",
+  "triton_commit_short": "5f67c818e",
+  "triton_mr": "http://10.16.1.204/dcutoolkit/deeplearing/triton/-/merge_requests/301",
+  "triton_merged": false,
+  "bolt_ops_commit": "4eaefa0",
+  "notes": "wdra48 + BCS @ 256x256x32, num_stages=4, VGPR 88/208/208 (Clang Available 208/208/88), ea=0 cl=0. Includes epilogue reorder (store→ebarrier→abarrier.inv) and OnePTwoC VGPR pad %12 (needed for 88/208/208). vs ns2 JSON 245.557 TOPS / 1383878 cycles: ~+4.0% TOPS. vs prior ns4 250.732 TOPS / 1355319 cycles: ~+1.8% TOPS. golden=PASS. Triton tip is MR #301 branch commit (not yet on release/3.6.x); update triton_commit after merge if squash/rebase rewrites SHA.",
+  "wasp_wdra": true,
+  "wasp_partition_warps": [
+    4,
+    4,
+    4
+  ],
+  "wasp_partition_regs": [
+    88,
+    208,
+    208
+  ]
+}
