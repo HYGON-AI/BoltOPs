@@ -132,5 +132,542 @@
       "num_warps": 4,
       "num_stages": 3
     }
+  },
+  "dot_config": {
+    "dtype=bf16,K=128,V=128,T=1,N=small": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=128,V=128,T=16,N=large": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=128,V=128,T=16,N=medium": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=128,V=128,T=16,N=small": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=128,V=128,T=2,N=large": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=128,V=128,T=2,N=medium": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=128,V=128,T=2,N=small": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=128,V=128,T=4,N=large": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=128,V=128,T=4,N=medium": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=128,V=128,T=4,N=small": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=128,V=128,T=8,N=large": {
+      "BV": 64,
+      "num_warps": 2,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=128,V=128,T=8,N=medium": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=128,V=128,T=8,N=small": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=128,V=256,T=1,N=small": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=128,V=256,T=16,N=small": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=128,V=256,T=2,N=small": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=128,V=256,T=4,N=small": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=128,V=256,T=8,N=small": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=128,V=64,T=1,N=large": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=128,V=64,T=1,N=medium": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=128,V=64,T=1,N=small": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=128,V=64,T=16,N=large": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=128,V=64,T=16,N=medium": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=128,V=64,T=16,N=small": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=128,V=64,T=2,N=large": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=128,V=64,T=2,N=medium": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=128,V=64,T=2,N=small": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=128,V=64,T=4,N=large": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=128,V=64,T=4,N=medium": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=128,V=64,T=4,N=small": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=128,V=64,T=8,N=large": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=128,V=64,T=8,N=medium": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=128,V=64,T=8,N=small": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=128,V=96,T=1,N=medium": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=128,V=96,T=1,N=small": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=128,V=96,T=16,N=large": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=128,V=96,T=16,N=medium": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=128,V=96,T=16,N=small": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=128,V=96,T=2,N=large": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=128,V=96,T=2,N=medium": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=128,V=96,T=2,N=small": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=128,V=96,T=4,N=large": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=128,V=96,T=4,N=medium": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=128,V=96,T=4,N=small": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=128,V=96,T=8,N=large": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=128,V=96,T=8,N=medium": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=128,V=96,T=8,N=small": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=128,T=1,N=large": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=128,T=1,N=medium": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=128,T=16,N=large": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=128,T=16,N=medium": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=128,T=16,N=small": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=128,T=2,N=large": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=128,T=2,N=medium": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=128,T=2,N=small": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=128,T=4,N=large": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=128,T=4,N=medium": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=128,T=4,N=small": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=128,T=8,N=large": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=128,T=8,N=medium": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=128,T=8,N=small": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=256,T=1,N=large": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=256,T=1,N=medium": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=256,T=1,N=small": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=256,T=16,N=large": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=256,T=16,N=medium": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=256,T=16,N=small": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=256,T=2,N=large": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=256,T=2,N=medium": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=256,T=2,N=small": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=256,T=4,N=large": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=256,T=4,N=medium": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=256,T=4,N=small": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=256,T=8,N=large": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=256,T=8,N=medium": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=256,T=8,N=small": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=64,T=16,N=large": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=64,T=16,N=medium": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=64,T=16,N=small": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=64,T=2,N=large": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=64,T=2,N=medium": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=64,T=2,N=small": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=64,T=4,N=large": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=64,T=4,N=medium": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=64,T=4,N=small": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=64,T=8,N=large": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=64,T=8,N=medium": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=64,T=8,N=small": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=96,T=1,N=large": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=96,T=1,N=medium": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=96,T=16,N=large": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=96,T=16,N=medium": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=96,T=16,N=small": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=96,T=2,N=large": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=96,T=2,N=medium": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=96,T=2,N=small": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=96,T=4,N=large": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=96,T=4,N=medium": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=96,T=4,N=small": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=96,T=8,N=large": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=96,T=8,N=medium": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=96,T=8,N=small": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    }
+  },
+  "verify_config": {
+    "fallback_chain_T4_from_N": 28,
+    "default_chain_T4": {
+      "BV": 16,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "default_tree_T4": {
+      "BV": 4,
+      "num_warps": 1,
+      "num_stages": 1,
+      "reuse_parent": true
+    },
+    "default_chain_T8": {
+      "BV": 16,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "default_tree_T8": {
+      "BV": 4,
+      "num_warps": 1,
+      "num_stages": 1,
+      "reuse_parent": true
+    }
   }
 }
