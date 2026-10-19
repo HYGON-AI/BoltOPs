@@ -52,5 +52,57 @@
       "BV": 16,
       "num_warps": 1
     }
+  },
+  "dot_config": {
+    "dtype=bf16,K=64,V=64,T=1,N=small": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=96,T=4,N=small": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=64,V=128,T=8,N=large": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=128,V=64,T=4,N=small": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=128,V=96,T=4,N=small": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=128,V=128,T=8,N=large": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=128,V=128,T=8,N=small": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=128,V=256,T=8,N=small": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=256,V=128,T=4,N=small": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    },
+    "dtype=bf16,K=256,V=256,T=16,N=small": {
+      "BV": 32,
+      "num_warps": 1,
+      "num_stages": 1
+    }
   }
 }

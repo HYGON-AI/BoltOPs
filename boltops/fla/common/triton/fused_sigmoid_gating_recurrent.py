@@ -38,6 +38,7 @@ import torch
 import triton
 import triton.language as tl
 from boltops.utility import arch_info, logger
+from . import gdn_verify
 
 _CONFIGS_PATH = os.path.join(os.path.dirname(__file__), "configs")
 
@@ -66,6 +67,71 @@ def _load_fused_sigmoid_gating_recurrent_configs() -> dict:
     with open(path) as f:
         payload = json.load(f)
     return payload.get("config", {}) if isinstance(payload, dict) else {}
+
+
+@functools.lru_cache(maxsize=1)
+def _load_gdn_dot_recurrent_configs() -> dict:
+    device_name = arch_info.get_arch()
+    path = os.path.join(
+        _CONFIGS_PATH,
+        "fused_sigmoid_gating_recurrent",
+        f"fused_sigmoid_gating_recurrent-{device_name}.json",
+    )
+    if not os.path.exists(path):
+        return {}
+    with open(path) as config_file:
+        payload = json.load(config_file)
+    return payload.get("dot_config", {}) if isinstance(payload, dict) else {}
+
+
+def _gdn_dot_t_bucket(tokens: int, sequences: int) -> Optional[int]:
+    if sequences <= 0 or tokens % sequences:
+        return None
+    average = tokens // sequences
+    return average if average in (1, 2, 4, 8, 16) else None
+
+
+def _gdn_dot_n_bucket(sequences: int) -> str:
+    if sequences <= 4:
+        return "small"
+    if sequences <= 16:
+        return "medium"
+    return "large"
+
+
+@functools.lru_cache
+def _get_gdn_dot_recurrent_config(
+    dtype: torch.dtype,
+    K: int,
+    V: int,
+    tokens: int,
+    sequences: int,
+) -> Optional[dict]:
+    t_bucket = _gdn_dot_t_bucket(tokens, sequences)
+    if t_bucket is None:
+        return None
+    if dtype == torch.bfloat16:
+        dtype_name = "bf16"
+    elif dtype == torch.float16:
+        dtype_name = "fp16"
+    else:
+        return None
+    key = (
+        f"dtype={dtype_name},K={K},V={V},T={t_bucket},"
+        f"N={_gdn_dot_n_bucket(sequences)}"
+    )
+    config = _load_gdn_dot_recurrent_configs().get(key)
+    if not isinstance(config, dict):
+        return None
+    try:
+        BV = int(config["BV"])
+        num_warps = int(config["num_warps"])
+        num_stages = int(config["num_stages"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if BV not in (32, 64) or num_warps not in (1, 2, 4) or num_stages < 1:
+        return None
+    return {"BV": BV, "num_warps": num_warps, "num_stages": num_stages}
 
 
 @functools.lru_cache
@@ -431,6 +497,366 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
                 tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=mask_h)
 
 
+@triton.jit
+def _bf16_rz(x):
+    # f32 -> bf16 with round-toward-zero.  On gfx936 (no v_cvt_bf16_f32)
+    # RNE costs ~3 VOPs per element (bfe/add3/carry) while RZ is a single
+    # v_lshrrev; the extra <=1 ulp error is far below the verify tolerance.
+    return (x.to(tl.uint32, bitcast=True) >> 16).to(tl.uint16).to(
+        tl.bfloat16, bitcast=True)
+
+
+@triton.jit
+def fused_sigmoid_gating_delta_rule_update_dot_kernel(
+    A_log,
+    a,
+    b,
+    dt_bias,
+    softplus_beta,
+    softplus_threshold,
+    lower_bound,
+    q,
+    k,
+    v,
+    o,
+    h0_source,
+    h0_indices,
+    stride_h0_source,
+    cu_seqlens,
+    intermediate_states_buffer,
+    intermediate_state_indices,
+    cache_steps,
+    scale,
+    T,
+    stride_a,
+    stride_q,
+    stride_k,
+    stride_v,
+    stride_b,
+    B: tl.constexpr,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BV: tl.constexpr,
+    USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+    IS_KDA: tl.constexpr,
+    USE_LOWER_BOUND: tl.constexpr,
+    DISABLE_STATE_UPDATE: tl.constexpr = False,
+    CACHE_INTERMEDIATE_STATES: tl.constexpr = False,
+    NULL_STATE_INDEX: tl.constexpr = -1,
+):
+    """Matrix-core (MFMA) variant of the sigmoid-gating recurrent update.
+
+    Keeps the [BV, K] state tile in the MMA accumulator layout so the rank-1
+    update and both K-reductions run as ``tl.dot`` (zero shuffles), instead of
+    the blocked-layout cross-lane moves of the elementwise variant.  A single
+    zero-padded [16, K] operand tile carries both k (row 0) and q (row 1), so
+    one dot yields both K-reductions (``c_kq[:, 0] = h^T k``,
+    ``c_kq[:, 1] = h^T q``) and the same tile serves as the rank-1 update
+    operand.  The output row is recovered from the pre-update state by
+    ``o = D * (q^T h) + v' * (q^T k)`` (scalar/vector gate), which removes the
+    third dot on the updated state.
+    """
+    i_v, i_nh = tl.program_id(0), tl.program_id(1)
+    i_n, i_hv = i_nh // HV, i_nh % HV
+    i_h = i_hv // (HV // H)
+
+    if IS_VARLEN:
+        bos = tl.load(cu_seqlens + i_n).to(tl.int64)
+        T = tl.load(cu_seqlens + i_n + 1).to(tl.int64) - bos
+    else:
+        bos = i_n * T
+
+    o_k = tl.arange(0, K)
+    o_v = i_v * BV + tl.arange(0, BV)
+    o_16 = tl.arange(0, 16)
+    row0 = o_16[:, None] == 0
+    row1 = o_16[:, None] == 1
+    col0 = o_16[None, :] == 0
+    col1 = o_16[None, :] == 1
+
+    p_q = q + bos * stride_q + i_h * K + o_k
+    p_k = k + bos * stride_k + i_h * K + o_k
+    p_v = v + bos * stride_v + i_hv * V
+    p_b = b + bos * stride_b + i_hv
+    if IS_KDA:
+        p_a = a + bos * stride_a + i_hv * K + o_k
+        p_dt_bias = dt_bias + i_hv * K + o_k
+    else:
+        p_a = a + bos * stride_a + i_hv
+        p_dt_bias = dt_bias + i_hv
+
+    dtype: tl.constexpr = q.dtype.element_ty
+    BF16_RZ_CVT: tl.constexpr = dtype == tl.bfloat16
+    o_v0 = i_v * BV + tl.arange(0, BV // 2)
+    o_v1 = i_v * BV + BV // 2 + tl.arange(0, BV // 2)
+    mask_v0 = o_v0 < V
+    mask_v1 = o_v1 < V
+    b_h0 = tl.zeros([BV // 2, K], dtype=tl.float32)
+    b_h1 = tl.zeros([BV // 2, K], dtype=tl.float32)
+    slot_idx = tl.load(h0_indices + i_n).to(tl.int64)
+    has_state = slot_idx > NULL_STATE_INDEX
+    if has_state:
+        p_h0 = (
+            h0_source
+            + slot_idx * stride_h0_source
+            + i_hv * K * V
+            + o_v0[:, None] * K
+            + o_k[None, :]
+        )
+        b_h0 = tl.load(p_h0, mask=mask_v0[:, None], other=0).to(tl.float32)
+        b_h1 = tl.load(
+            p_h0 + (BV // 2) * K,
+            mask=mask_v1[:, None],
+            other=0,
+        ).to(tl.float32)
+
+    cache_idx = -1
+    if CACHE_INTERMEDIATE_STATES:
+        cache_idx = tl.load(intermediate_state_indices + i_n).to(tl.int64)
+
+    b_A = tl.exp(tl.load(A_log + i_hv).to(tl.float32))
+    if IS_KDA:
+        b_dt_bias = tl.load(p_dt_bias).to(tl.float32)
+    else:
+        b_dt_bias = tl.load(p_dt_bias).to(tl.float32)
+
+    o_flat0 = tl.arange(0, BV // 2 * K)
+    o_flat1 = o_flat0 + BV // 2 * K
+
+    b_k = tl.load(p_k).to(tl.float32)
+    b_q = tl.load(p_q).to(tl.float32)
+    b_v0 = tl.load(p_v + o_v0, mask=mask_v0, other=0).to(tl.float32)
+    b_v1 = tl.load(p_v + o_v1, mask=mask_v1, other=0).to(tl.float32)
+    b_k_n = tl.zeros([K], dtype=dtype)
+    b_q_n = tl.zeros([K], dtype=dtype)
+    b_v0_n = tl.zeros([BV // 2], dtype=dtype)
+    b_v1_n = tl.zeros([BV // 2], dtype=dtype)
+    p_v += stride_v
+    p_q += stride_q
+    p_k += stride_k
+
+    for t in range(T):
+        if t + 1 < T:
+            b_k_n = tl.load(p_k)
+            b_q_n = tl.load(p_q)
+            b_v0_n = tl.load(p_v + o_v0, mask=mask_v0, other=0)
+            b_v1_n = tl.load(p_v + o_v1, mask=mask_v1, other=0)
+            p_v += stride_v
+            p_q += stride_q
+            p_k += stride_k
+        # Sigmoid gating (GDN scalar / KDA per-K), same softplus schedule as
+        # the elementwise kernel.
+        b_x = tl.load(p_a).to(tl.float32) + b_dt_bias
+        if USE_LOWER_BOUND:
+            b_g = lower_bound * tl.sigmoid(b_A * b_x)
+        else:
+            x_scaled = softplus_beta * b_x
+            b_x = tl.where(
+                x_scaled <= softplus_threshold,
+                (1.0 / softplus_beta) * tl.log(1.0 + tl.exp(x_scaled)),
+                b_x,
+            )
+            b_g = -b_A * b_x
+        b_beta = 1.0 / (1.0 + tl.exp(-tl.load(p_b).to(tl.float32)))
+
+        if USE_QK_L2NORM_IN_KERNEL:
+            b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
+            b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
+        # One [16, K] tile carries both vectors (row 0 = k, row 1 = q) so a
+        # single dot yields both K-reductions; rows >= 2 are exact zeros.
+        kq2p = tl.where(row0, b_k[None, :],
+                        tl.where(row1, b_q[None, :], 0.0))
+        kq2p = _bf16_rz(kq2p) if BF16_RZ_CVT else kq2p.to(dtype)
+
+        # KDA gates the state before the delta reduction; GDN applies its
+        # scalar decay after (it commutes out of the dot products below).
+        if IS_KDA:
+            b_h0 = b_h0 * tl.exp(b_g)[None, :]
+            b_h1 = b_h1 * tl.exp(b_g)[None, :]
+            D = 1.0
+        else:
+            D = tl.exp(b_g)
+
+        h_b0 = _bf16_rz(b_h0) if BF16_RZ_CVT else b_h0.to(dtype)
+        h_b1 = _bf16_rz(b_h1) if BF16_RZ_CVT else b_h1.to(dtype)
+        c_kq0 = tl.dot(h_b0, tl.trans(kq2p), out_dtype=tl.float32)
+        c_kq1 = tl.dot(h_b1, tl.trans(kq2p), out_dtype=tl.float32)
+        r0 = tl.sum(tl.where(col0, c_kq0, 0.0), axis=1)
+        qh0 = tl.sum(tl.where(col1, c_kq0, 0.0), axis=1)
+        r1 = tl.sum(tl.where(col0, c_kq1, 0.0), axis=1)
+        qh1 = tl.sum(tl.where(col1, c_kq1, 0.0), axis=1)
+        qk = tl.sum(b_q * b_k)
+
+        b_vprime0 = (b_v0 - D * r0) * b_beta
+        b_vprime1 = (b_v1 - D * r1) * b_beta
+        if not IS_KDA:
+            b_h0 = b_h0 * D
+            b_h1 = b_h1 * D
+        b_h0 = b_h0 + b_k[None, :] * b_vprime0[:, None]
+        if CACHE_INTERMEDIATE_STATES:
+            if cache_idx >= 0:
+                cp0 = (
+                    intermediate_states_buffer
+                    + cache_idx * cache_steps * HV * K * V
+                    + t * HV * K * V
+                    + i_hv * K * V
+                    + i_v * BV * K
+                )
+                tl.store(cp0 + o_flat0, tl.reshape(b_h0, [BV // 2 * K]))
+        b_h1 = b_h1 + b_k[None, :] * b_vprime1[:, None]
+        if CACHE_INTERMEDIATE_STATES:
+            if cache_idx >= 0:
+                cp1 = (
+                    intermediate_states_buffer
+                    + cache_idx * cache_steps * HV * K * V
+                    + t * HV * K * V
+                    + i_hv * K * V
+                    + i_v * BV * K
+                )
+                tl.store(cp1 + o_flat1, tl.reshape(b_h1, [BV // 2 * K]))
+
+        b_o0 = (D * qh0 + b_vprime0 * qk) * scale
+        b_o1 = (D * qh1 + b_vprime1 * qk) * scale
+        p_o = o + (bos + t) * HV * V + i_hv * V + o_v0
+        tl.store(p_o, b_o0.to(o.dtype.element_ty), mask=mask_v0)
+        tl.store(
+            p_o + BV // 2,
+            b_o1.to(o.dtype.element_ty),
+            mask=mask_v1,
+        )
+
+        if t + 1 < T:
+            b_k = b_k_n.to(tl.float32)
+            b_q = b_q_n.to(tl.float32)
+            b_v0 = b_v0_n.to(tl.float32)
+            b_v1 = b_v1_n.to(tl.float32)
+            p_b += stride_b
+            p_a += stride_a
+
+    if not DISABLE_STATE_UPDATE:
+        if has_state:
+            p_h0_out = (
+                h0_source
+                + slot_idx * stride_h0_source
+                + i_hv * K * V
+                + o_v0[:, None] * K
+                + o_k[None, :]
+            )
+            tl.store(
+                p_h0_out,
+                b_h0.to(h0_source.dtype.element_ty),
+                mask=mask_v0[:, None],
+            )
+            tl.store(
+                p_h0_out + (BV // 2) * K,
+                b_h1.to(h0_source.dtype.element_ty),
+                mask=mask_v1[:, None],
+            )
+
+
+
+def _use_gdn_verify_dot_kernel(
+    *,
+    H: int,
+    HV: int,
+    K: int,
+    V: int,
+    is_varlen: bool,
+    is_kda: bool,
+    has_tree: bool,
+    cache_ring: bool,
+    has_intermediate: bool,
+    has_initial_state: bool,
+    state_is_fp32: bool,
+    input_is_half: bool,
+    config_available: bool,
+) -> bool:
+    return (
+        config_available
+        and is_varlen
+        and H > 0
+        and HV % H == 0
+        and K in (64, 128, 256)
+        and V in (64, 96, 128, 256)
+        and not is_kda
+        and not has_tree
+        and not cache_ring
+        and not has_intermediate
+        and has_initial_state
+        and state_is_fp32
+        and input_is_half
+    )
+
+
+def _launch_dot_update(
+    *,
+    A_log, a, b, dt_bias,
+    softplus_beta, softplus_threshold,
+    q, k, v, o,
+    initial_state_source, initial_state_indices,
+    stride_h0_source,
+    cu_seqlens,
+    is_kda, lower_bound,
+    disable_state_update,
+    intermediate_states_buffer, intermediate_state_indices,
+    cache_stride_steps,
+    scale,
+    B, T, N, H, HV, K, V,
+    stride_a, stride_q, stride_k, stride_v, stride_b,
+    use_qk_l2norm_in_kernel,
+    null_state_index,
+    dot_config,
+) -> None:
+    """Launch the MFMA variant in-place into ``o`` (wrapper's layout)."""
+    BV = min(int(dot_config["BV"]), triton.next_power_of_2(V))
+    grid = (triton.cdiv(V, BV), N * HV)
+    fused_sigmoid_gating_delta_rule_update_dot_kernel[grid](
+        A_log,
+        a,
+        b,
+        dt_bias,
+        softplus_beta,
+        softplus_threshold,
+        lower_bound if lower_bound is not None else 0.0,
+        q,
+        k,
+        v,
+        o,
+        initial_state_source,
+        initial_state_indices,
+        stride_h0_source,
+        cu_seqlens,
+        intermediate_states_buffer,
+        intermediate_state_indices,
+        cache_stride_steps,
+        scale,
+        T,
+        stride_a,
+        stride_q,
+        stride_k,
+        stride_v,
+        stride_b,
+        B=B,
+        H=H,
+        HV=HV,
+        K=K,
+        V=V,
+        BV=BV,
+        USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+        IS_VARLEN=cu_seqlens is not None,
+        IS_KDA=is_kda,
+        USE_LOWER_BOUND=lower_bound is not None,
+        DISABLE_STATE_UPDATE=disable_state_update,
+        CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
+        NULL_STATE_INDEX=null_state_index,
+        num_warps=int(dot_config["num_warps"]),
+        num_stages=int(dot_config["num_stages"]),
+    )
+
+
 def fused_sigmoid_gating_delta_rule_update(
     A_log: torch.Tensor,
     a: torch.Tensor,
@@ -605,7 +1031,111 @@ def fused_sigmoid_gating_delta_rule_update(
     else:
         stride_retrieve_parent_token_seq = 0
         stride_retrieve_parent_token_token = 0
+    verify_config = gdn_verify.get_config(
+        q=q, k=k, v=v, a=a, b=b, dt_bias=dt_bias,
+        initial_state_source=initial_state_source,
+        initial_state_indices=initial_state_indices, cu_seqlens=cu_seqlens,
+        intermediate_states_buffer=intermediate_states_buffer,
+        intermediate_state_indices=intermediate_state_indices,
+        is_kda=is_kda, lower_bound=lower_bound,
+        disable_state_update=disable_state_update,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        cache_ring=cache_ring, retrieve_parent_token=retrieve_parent_token,
+        kernel_cfg=kernel_cfg,
+    )
+    if verify_config is not None:
+        gdn_verify.gdn_verify_kernel[(triton.cdiv(V, verify_config["BV"]), N * HV)](
+            q, k, v, a, b, A_log, dt_bias,
+            initial_state_source, initial_state_indices, cu_seqlens,
+            intermediate_states_buffer, intermediate_state_indices,
+            retrieve_parent_token, o,
+            stride_q=stride_q, stride_k=stride_k, stride_v=stride_v,
+            stride_a=stride_a, stride_b=stride_b,
+            stride_state=initial_state_source.stride(0),
+            stride_cache=intermediate_states_buffer.stride(0),
+            stride_parent_n=stride_retrieve_parent_token_seq,
+            stride_parent_t=stride_retrieve_parent_token_token,
+            stride_out=o.stride(2),
+            state_head_stride=initial_state_source.stride(1),
+            cache_head_stride=intermediate_states_buffer.stride(2),
+            cache_token_stride=intermediate_states_buffer.stride(1),
+            H=H, HV=HV, K_DIM=K, V_DIM=V,
+            SCALE=scale, SOFTPLUS_BETA=softplus_beta,
+            SOFTPLUS_THRESHOLD=softplus_threshold, NULL_INDEX=null_state_index,
+            HAS_TREE=retrieve_parent_token is not None,
+            BV=verify_config["BV"],
+            REUSE_PARENT=verify_config.get("reuse_parent", False),
+            num_warps=verify_config["num_warps"],
+            num_stages=verify_config["num_stages"],
+        )
+        return o.squeeze(0)
 
+    dot_config = _get_gdn_dot_recurrent_config(q.dtype, K, V, T, N)
+    if _use_gdn_verify_dot_kernel(
+        H=H,
+        HV=HV,
+        K=K,
+        V=V,
+        is_varlen=cu_seqlens is not None,
+        is_kda=is_kda,
+        has_tree=retrieve_parent_token is not None,
+        cache_ring=cache_ring,
+        has_intermediate=intermediate_states_buffer is not None,
+        has_initial_state=initial_state_source is not None,
+        state_is_fp32=(
+            initial_state_source is not None
+            and initial_state_source.dtype == torch.float32
+        ),
+        input_is_half=(
+            q.dtype in (torch.bfloat16, torch.float16)
+            and k.dtype == q.dtype
+            and v.dtype == q.dtype
+        ),
+        config_available=dot_config is not None,
+    ):
+        _launch_dot_update(
+                A_log=A_log,
+                a=a,
+                b=b,
+                dt_bias=dt_bias,
+                softplus_beta=softplus_beta,
+                softplus_threshold=softplus_threshold,
+                q=q,
+                k=k,
+                v=v,
+                o=o,
+                initial_state_source=initial_state_source,
+                initial_state_indices=initial_state_indices,
+                stride_h0_source=(
+                    initial_state_source.stride(0)
+                    if initial_state_source is not None
+                    else 0
+                ),
+                cu_seqlens=cu_seqlens,
+                is_kda=is_kda,
+                lower_bound=lower_bound,
+                disable_state_update=disable_state_update,
+                intermediate_states_buffer=intermediate_states_buffer,
+                intermediate_state_indices=intermediate_state_indices,
+                cache_stride_steps=cache_stride_steps,
+                scale=scale,
+                B=B,
+                T=T,
+                N=N,
+                H=H,
+                HV=HV,
+                K=K,
+                V=V,
+                stride_a=stride_a,
+                stride_q=stride_q,
+                stride_k=stride_k,
+                stride_v=stride_v,
+                stride_b=stride_b,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                null_state_index=null_state_index,
+                dot_config=dot_config,
+        )
+        return o.squeeze(0)
     NP2_T = triton.next_power_of_2(T)
 
     grid = (NK, NV, N * HV)

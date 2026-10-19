@@ -9,6 +9,7 @@ import torch
 
 triton = pytest.importorskip("triton")
 
+from boltops.fla.common.triton import fused_sigmoid_gating_recurrent
 from boltops.fla.common.triton.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update as fused_sigmoid_gating_delta_rule_update_verify,
 )
@@ -23,6 +24,242 @@ DEVICE = "cuda"
 GPU_REQUIRED = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA/HIP device is required"
 )
+
+
+def test_gdn_dot_config_lookup_uses_shape_buckets(monkeypatch) -> None:
+    configs = {
+        "dtype=bf16,K=64,V=96,T=4,N=small": {
+            "BV": 64,
+            "num_warps": 1,
+            "num_stages": 1,
+        },
+        "dtype=bf16,K=256,V=96,T=4,N=small": {
+            "BV": 16,
+            "num_warps": 1,
+            "num_stages": 1,
+        },
+    }
+    monkeypatch.setattr(
+        fused_sigmoid_gating_recurrent,
+        "_load_gdn_dot_recurrent_configs",
+        lambda: configs,
+        raising=False,
+    )
+    get_config = getattr(
+        fused_sigmoid_gating_recurrent, "_get_gdn_dot_recurrent_config", None
+    )
+    assert get_config is not None
+    get_config.cache_clear()
+    assert get_config(torch.bfloat16, 64, 96, 16, 4) == configs[
+        "dtype=bf16,K=64,V=96,T=4,N=small"
+    ]
+    assert get_config(torch.bfloat16, 256, 96, 16, 4) is None
+    assert get_config(torch.bfloat16, 64, 96, 12, 4) is None
+    get_config.cache_clear()
+
+
+def test_gdn_verify_dot_fast_path_is_narrowly_dispatched() -> None:
+    select_fast_path = getattr(
+        fused_sigmoid_gating_recurrent, "_use_gdn_verify_dot_kernel", None
+    )
+    assert select_fast_path is not None
+
+    target = dict(
+        H=4,
+        HV=8,
+        K=64,
+        V=96,
+        is_varlen=True,
+        is_kda=False,
+        has_tree=False,
+        cache_ring=False,
+        has_intermediate=False,
+        has_initial_state=True,
+        state_is_fp32=True,
+        input_is_half=True,
+        config_available=True,
+    )
+    assert select_fast_path(**target)
+    assert select_fast_path(**(target | {"H": 8, "HV": 16, "K": 256, "V": 256}))
+    assert not select_fast_path(**(target | {"HV": 10}))
+    assert not select_fast_path(**(target | {"K": 32}))
+    assert not select_fast_path(**(target | {"V": 80}))
+    assert not select_fast_path(**(target | {"is_kda": True}))
+    assert not select_fast_path(**(target | {"has_tree": True}))
+    assert not select_fast_path(**(target | {"cache_ring": True}))
+    assert not select_fast_path(**(target | {"has_intermediate": True}))
+    assert not select_fast_path(**(target | {"config_available": False}))
+
+
+@GPU_REQUIRED
+@pytest.mark.parametrize(
+    ("dtype", "steps", "H", "HV", "K", "V"),
+    [
+        pytest.param(torch.bfloat16, 1, 4, 8, 64, 64, id="bf16-k64-v64-t1"),
+        pytest.param(torch.bfloat16, 4, 4, 8, 64, 96, id="bf16-k64-v96-t4"),
+        pytest.param(torch.bfloat16, 8, 8, 16, 128, 128, id="bf16-k128-v128-t8"),
+        pytest.param(torch.bfloat16, 16, 8, 16, 256, 256, id="bf16-k256-v256-t16"),
+        pytest.param(torch.float16, 4, 4, 8, 128, 96, id="fp16-k128-v96-t4"),
+    ],
+)
+def test_gdn_dot_fast_path_matches_generic_kernel(
+    monkeypatch,
+    dtype: torch.dtype,
+    steps: int,
+    H: int,
+    HV: int,
+    K: int,
+    V: int,
+) -> None:
+    assert "dot_config" in inspect.signature(
+        fused_sigmoid_gating_recurrent._launch_dot_update
+    ).parameters
+    monkeypatch.setattr(
+        fused_sigmoid_gating_recurrent,
+        "_get_gdn_dot_recurrent_config",
+        lambda *_args: {"BV": 64, "num_warps": 1, "num_stages": 1},
+    )
+    torch.manual_seed(114)
+    N, pool = 2, 5
+    total = N * steps
+    q = torch.randn(1, total, H, K, device=DEVICE, dtype=dtype) * 0.15
+    k = torch.randn_like(q) * 0.15
+    v = torch.randn(1, total, HV, V, device=DEVICE, dtype=dtype) * 0.15
+    a = torch.randn(total, HV, device=DEVICE, dtype=dtype) * 0.15
+    b = torch.randn(total, HV, device=DEVICE, dtype=dtype) * 0.15
+    A_log = torch.randn(HV, device=DEVICE, dtype=torch.float32) * 0.1
+    dt_bias = torch.randn(HV, device=DEVICE, dtype=dtype) * 0.1
+    initial = torch.randn(
+        pool, HV, V, K, device=DEVICE, dtype=torch.float32
+    ) * 0.01
+    state_indices = torch.tensor([1, 4], device=DEVICE, dtype=torch.int32)
+    cu_seqlens = torch.arange(
+        0, total + 1, steps, device=DEVICE, dtype=torch.int32
+    )
+
+    fast_state = initial.clone()
+    fast_output = fused_sigmoid_gating_delta_rule_update_verify(
+        A_log,
+        a,
+        dt_bias,
+        1.0,
+        20.0,
+        q,
+        k,
+        v,
+        b,
+        fast_state,
+        state_indices,
+        scale=K**-0.5,
+        use_qk_l2norm_in_kernel=True,
+        cu_seqlens=cu_seqlens,
+    )
+
+    generic_state = initial.clone()
+    intermediate = torch.empty(
+        N, steps, HV, V, K, device=DEVICE, dtype=torch.float32
+    )
+    generic_output = fused_sigmoid_gating_delta_rule_update_verify(
+        A_log,
+        a,
+        dt_bias,
+        1.0,
+        20.0,
+        q,
+        k,
+        v,
+        b,
+        generic_state,
+        state_indices,
+        scale=K**-0.5,
+        use_qk_l2norm_in_kernel=True,
+        cu_seqlens=cu_seqlens,
+        intermediate_states_buffer=intermediate,
+        intermediate_state_indices=torch.arange(
+            N, device=DEVICE, dtype=torch.int32
+        ),
+        cache_steps=steps,
+    )
+
+    torch.testing.assert_close(fast_output, generic_output, atol=3e-2, rtol=2e-2)
+    torch.testing.assert_close(fast_state, generic_state, atol=3e-2, rtol=2e-2)
+
+
+@GPU_REQUIRED
+@pytest.mark.parametrize("null_state_index", [-1, 0])
+@pytest.mark.parametrize("disable_state_update", [False, True])
+def test_gdn_dot_fast_path_matches_generic_state_behavior(
+    null_state_index: int,
+    disable_state_update: bool,
+) -> None:
+    torch.manual_seed(116)
+    N, steps, H, HV, K, V, pool = 2, 1, 4, 8, 64, 64, 4
+    dtype = torch.bfloat16
+    q = torch.randn(1, N, H, K, device=DEVICE, dtype=dtype) * 0.15
+    k = torch.randn_like(q) * 0.15
+    v = torch.randn(1, N, HV, V, device=DEVICE, dtype=dtype) * 0.15
+    a = torch.randn(N, HV, device=DEVICE, dtype=dtype) * 0.15
+    b = torch.randn_like(a) * 0.15
+    A_log = torch.randn(HV, device=DEVICE, dtype=torch.float32) * 0.1
+    dt_bias = torch.randn(HV, device=DEVICE, dtype=dtype) * 0.1
+    initial = torch.randn(
+        pool, HV, V, K, device=DEVICE, dtype=torch.float32
+    ) * 0.01
+    state_indices = torch.tensor(
+        [null_state_index, 1], device=DEVICE, dtype=torch.int32
+    )
+    cu_seqlens = torch.arange(0, N + 1, device=DEVICE, dtype=torch.int32)
+
+    fast_state = initial.clone()
+    fast_output = fused_sigmoid_gating_delta_rule_update_verify(
+        A_log,
+        a,
+        dt_bias,
+        1.0,
+        20.0,
+        q,
+        k,
+        v,
+        b,
+        fast_state,
+        state_indices,
+        scale=K**-0.5,
+        use_qk_l2norm_in_kernel=True,
+        cu_seqlens=cu_seqlens,
+        disable_state_update=disable_state_update,
+        null_state_index=null_state_index,
+    )
+
+    generic_state = initial.clone()
+    intermediate = torch.empty(
+        N, steps, HV, V, K, device=DEVICE, dtype=torch.float32
+    )
+    generic_output = fused_sigmoid_gating_delta_rule_update_verify(
+        A_log,
+        a,
+        dt_bias,
+        1.0,
+        20.0,
+        q,
+        k,
+        v,
+        b,
+        generic_state,
+        state_indices,
+        scale=K**-0.5,
+        use_qk_l2norm_in_kernel=True,
+        cu_seqlens=cu_seqlens,
+        disable_state_update=disable_state_update,
+        intermediate_states_buffer=intermediate,
+        intermediate_state_indices=torch.arange(
+            N, device=DEVICE, dtype=torch.int32
+        ),
+        cache_steps=steps,
+        null_state_index=null_state_index,
+    )
+
+    torch.testing.assert_close(fast_output, generic_output, atol=3e-2, rtol=2e-2)
+    torch.testing.assert_close(fast_state, generic_state, atol=3e-2, rtol=2e-2)
 
 
 def test_public_sigmoid_signatures_match_backends() -> None:
@@ -391,6 +628,71 @@ def _sigmoid_bytes(
         + state_writes * state_elements * state_size
         + intermediate_writes * state_elements * state_size
         + tokens * HV * V * input_size
+    )
+
+
+@GPU_REQUIRED
+@pytest.mark.bench
+@pytest.mark.parametrize(
+    ("N", "steps", "H", "HV", "K", "V"),
+    [
+        pytest.param(4, 1, 4, 8, 64, 64, id="k64-v64-t1-n4"),
+        pytest.param(4, 4, 4, 8, 64, 96, id="k64-v96-t4-n4"),
+        pytest.param(4, 8, 8, 16, 128, 128, id="k128-v128-t8-n4"),
+        pytest.param(20, 8, 8, 16, 128, 128, id="k128-v128-t8-n20"),
+        pytest.param(4, 16, 8, 16, 256, 256, id="k256-v256-t16-n4"),
+    ],
+)
+def test_bench_gdn_t8_verify_no_intermediate(
+    N: int,
+    steps: int,
+    H: int,
+    HV: int,
+    K: int,
+    V: int,
+    time_ms,
+    bench_warmup: int,
+    bench_repeat: int,
+) -> None:
+    torch.manual_seed(115)
+    pool = 105
+    total, dtype = N * steps, torch.bfloat16
+    q = torch.randn(1, total, H, K, device=DEVICE, dtype=dtype) * 0.05
+    k = torch.randn_like(q) * 0.05
+    v = torch.randn(1, total, HV, V, device=DEVICE, dtype=dtype) * 0.05
+    a = torch.zeros(total, HV, device=DEVICE, dtype=dtype)
+    b = torch.zeros_like(a)
+    A_log = torch.zeros(HV, device=DEVICE, dtype=torch.float32)
+    dt_bias = torch.zeros(HV, device=DEVICE, dtype=dtype)
+    state = torch.zeros(pool, HV, V, K, device=DEVICE, dtype=torch.float32)
+    state_indices = torch.arange(N, device=DEVICE, dtype=torch.int32)
+    cu_seqlens = torch.arange(
+        0, total + 1, steps, device=DEVICE, dtype=torch.int32
+    )
+
+    def run() -> None:
+        fused_sigmoid_gating_delta_rule_update_verify(
+            A_log,
+            a,
+            dt_bias,
+            1.0,
+            20.0,
+            q,
+            k,
+            v,
+            b,
+            state,
+            state_indices,
+            scale=K**-0.5,
+            use_qk_l2norm_in_kernel=True,
+            cu_seqlens=cu_seqlens,
+        )
+
+    run()
+    elapsed = time_ms(run, bench_warmup, bench_repeat)
+    print(
+        f"GDN dot verify: N={N}, T={steps}, K={K}, V={V}, "
+        f"{elapsed * 1e3:.2f} us"
     )
 
 
