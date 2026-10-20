@@ -10,6 +10,7 @@ from tilelang import language as T
         tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
         tilelang.PassConfigKey.TL_DISABLE_DATA_RACE_CHECK: True,
         tilelang.PassConfigKey.TL_DEVICE_COMPILE_FLAGS: ["-ffast-math"],
+        tilelang.PassConfigKey.TL_Z3_RLIMIT: 50000,
     }
 )
 def _tilelang_qsa_mqa_decode_kernel(
@@ -208,6 +209,7 @@ def _tilelang_qsa_mqa_decode_kernel(
         tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
         tilelang.PassConfigKey.TL_DISABLE_DATA_RACE_CHECK: True,
         tilelang.PassConfigKey.TL_DEVICE_COMPILE_FLAGS: ["-ffast-math"],
+        tilelang.PassConfigKey.TL_Z3_RLIMIT: 50000,
     }
 )
 def _tilelang_qsa_mqa_decode_persistent_kernel(
