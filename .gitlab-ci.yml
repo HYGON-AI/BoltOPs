@@ -285,19 +285,16 @@ performance:optest:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"'
     - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_REF_NAME == "main"'
+  # Reduced from 4 combos (py3.10/3.12 x torch 2.10.0/2.11.0) to one so the
+  # serialized performance stage (resource_group) stays short. Restore the
+  # dropped entries to widen coverage again.
   parallel:
     matrix:
-      - RUNNER_TAG: [nmz]
-        PYTHON_VERSION: ["3.10"]
-        BUILD_IMAGE: ["${BASE_COMPILE_IMAGE_ROCKY_PY310}"]
-        NUMPY_VERSION: ["1.24.3"]
-        TORCH_VERSION: ["2.10.0", "2.11.0"]
-        DTK_VER: ["2604"]
       - RUNNER_TAG: [nmz]
         PYTHON_VERSION: ["3.12"]
         BUILD_IMAGE: ["${BASE_COMPILE_IMAGE_ROCKY_PY312}"]
         NUMPY_VERSION: ["1.26.4"]
-        TORCH_VERSION: ["2.10.0", "2.11.0"]
+        TORCH_VERSION: ["2.11.0"]
         DTK_VER: ["2604"]
   before_script:
     - !reference [.dcu-runner, before_script]
