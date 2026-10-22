@@ -49,11 +49,17 @@ from boltops.fa.extend_attention import (
     build_unified_kv_indices,
     can_use_dense_prefill_fp8,
     dense_prefill_attention_fwd,
+    dense_prefill_attention_fwd_4d,
+    dense_prefill_attention_fwd_segmented,
     extend_attention_fwd,
     extend_attention_fwd_unified,
 )
+from boltops.fa.decode_attention import decode_attention_fwd_4d
 from boltops.fa import (
     KVQuantMode as fa_KVQuantMode,
+    decode_attention_fwd_4d as fa_decode_attention_fwd_4d,
+    dense_prefill_attention_fwd_4d as fa_dense_prefill_attention_fwd_4d,
+    dense_prefill_attention_fwd_segmented as fa_dense_prefill_attention_fwd_segmented,
     reshape_and_cache_int4 as fa_reshape_and_cache_int4,
     triangle_attention_fwd,
 )
@@ -138,6 +144,12 @@ def test_operator_package_exports():
     assert callable(build_unified_kv_indices)
     assert callable(can_use_dense_prefill_fp8)
     assert callable(dense_prefill_attention_fwd)
+    assert callable(dense_prefill_attention_fwd_4d)
+    assert callable(dense_prefill_attention_fwd_segmented)
+    assert callable(decode_attention_fwd_4d)
+    assert fa_dense_prefill_attention_fwd_4d is dense_prefill_attention_fwd_4d
+    assert fa_dense_prefill_attention_fwd_segmented is dense_prefill_attention_fwd_segmented
+    assert fa_decode_attention_fwd_4d is decode_attention_fwd_4d
     assert callable(extend_attention_fwd)
     assert callable(extend_attention_fwd_unified)
     assert callable(triangle_attention_fwd)
@@ -176,6 +188,9 @@ def test_root_package_does_not_reexport_operators():
         "matmul_persistent",
         "gemm_a16w16",
         "triton_indexer_logits",
+        "dense_prefill_attention_fwd_4d",
+        "dense_prefill_attention_fwd_segmented",
+        "decode_attention_fwd_4d",
     ):
         assert not hasattr(boltops, name)
 

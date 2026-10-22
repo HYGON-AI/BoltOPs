@@ -17,7 +17,9 @@ Memory-efficient attention for prefill.
 It supports page size = 1 and prefill with KV cache (i.e. extend).
 """
 
+from collections.abc import Sequence
 import math
+import numbers
 from typing import Optional
 
 import torch
@@ -2388,3 +2390,284 @@ def dense_prefill_attention_fwd(
         num_stages=num_stages,
         **extra_kargs,
     )
+
+
+# Element offsets inside _fwd_kernel_dense_prefill are int32 products of
+# token/head indices and strides; anything at or past 2**31 wraps.
+_DENSE_PREFILL_MAX_SPAN = 2**31
+# (Dqk, Dv) pairs the four-dimensional entry has been validated on.
+_DENSE_PREFILL_4D_HEAD_DIMS = frozenset({(192, 128)})
+# Key rows streamed per request (H * cdiv(Sq, 64) * Sk) at or below which one
+# packed launch beats per-request launches (HCU: launch ~0.1ms; 47x at B=32,
+# Sq=Sk=16). Larger shapes stay per-request: packing spreads K/V and can be ~6x slower.
+_DENSE_PREFILL_4D_PACK_MAX_KEY_ROWS = 2**15
+
+
+def _span(shape, stride) -> int:
+    """Elements addressed from the first to the last element of a strided view."""
+    return 1 + sum((size - 1) * step for size, step in zip(shape, stride))
+
+
+def _request_span(t: torch.Tensor) -> int:
+    """Elements one request ``t[b]`` addresses, first to last, once the kernel sees it."""
+    if t.stride(-1) != 1:  # copied to contiguous before launch
+        return math.prod(t.shape[1:])
+    return _span(t.shape[1:], t.stride()[1:])
+
+
+def _check_sm_scale(sm_scale) -> float:
+    """Return ``sm_scale`` as a float after checking it is finite and positive."""
+    if isinstance(sm_scale, bool) or not isinstance(sm_scale, numbers.Real):
+        raise TypeError(f"sm_scale must be a number, got {sm_scale!r}")
+    sm_scale = float(sm_scale)
+    if not (math.isfinite(sm_scale) and sm_scale > 0):
+        raise ValueError(f"sm_scale must be finite and positive, got {sm_scale}")
+    return sm_scale
+
+
+def _validate_prefill_4d_inputs(q, k, v, op_name="dense_prefill_attention_fwd_4d"):
+    """Check the common BF16 MHA contract for the new 4D adapters."""
+    for name, t in (("q", q), ("k", k), ("v", v)):
+        if not isinstance(t, torch.Tensor):
+            raise TypeError(f"{name} must be a torch.Tensor, got {type(t).__name__}")
+        if t.ndim != 4:
+            raise ValueError(f"{name} must be 4-D [B, H, S, D], got shape {tuple(t.shape)}")
+        if t.dtype != torch.bfloat16:
+            raise TypeError(f"{name} must be torch.bfloat16, got {t.dtype}")
+        if t.device.type != "cuda":
+            raise ValueError(f"{name} must be a CUDA/HIP tensor, got device {t.device}")
+        if t.device != q.device:
+            raise ValueError(f"{name} must be on {q.device} like q, got {t.device}")
+        if 0 in t.shape:
+            raise ValueError(f"{name} must not have empty dims, got shape {tuple(t.shape)}")
+    if torch.is_grad_enabled() and any(t.requires_grad for t in (q, k, v)):
+        raise RuntimeError(f"{op_name} does not support autograd")
+
+    batch, q_heads, q_len, qk_dim = q.shape
+    if k.shape[0] != batch or v.shape[0] != batch:
+        raise ValueError(
+            f"q/k/v batch sizes must match, got {q.shape[0]}/{k.shape[0]}/{v.shape[0]}"
+        )
+    if k.shape[1:3] != v.shape[1:3]:
+        raise ValueError(
+            f"k/v heads and lengths must match, got {tuple(k.shape)} vs {tuple(v.shape)}"
+        )
+    kv_heads, kv_len, v_dim = k.shape[1], k.shape[2], v.shape[3]
+    if k.shape[3] != qk_dim:
+        raise ValueError(f"q/k head dims must match, got {qk_dim} vs {k.shape[3]}")
+    if q_heads != kv_heads:
+        raise ValueError(f"only MHA is supported (Hq == Hkv), got {q_heads} vs {kv_heads}")
+    if (qk_dim, v_dim) not in _DENSE_PREFILL_4D_HEAD_DIMS:
+        raise ValueError(
+            f"unsupported (Dqk, Dv)=({qk_dim}, {v_dim}); "
+            f"supported: {sorted(_DENSE_PREFILL_4D_HEAD_DIMS)}"
+        )
+    return batch, q_heads, q_len, qk_dim, kv_len, v_dim
+
+
+def dense_prefill_attention_fwd_4d(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    sm_scale: Optional[float] = None,
+    is_causal: bool = True,
+) -> torch.Tensor:
+    """Dense prefill over ``[B, H, S, D]`` Q/K/V, returning a new BF16 output.
+
+    Every request has ``Sk`` keys and ``q`` holds the last ``Sq`` of them, so
+    causal masking is bottom-right aligned: query ``i`` sees keys
+    ``0 .. Sk - Sq + i``.
+
+    Large requests run as one ``dense_prefill_attention_fwd`` launch each, over
+    transposed ``[S, H, D]`` views. The kernel takes token and head strides, so
+    inputs whose last dim is contiguous are never copied and the output is
+    written in place. Packing the batch instead would push K offsets past
+    int32 at long contexts; per request they stay within one request's span.
+    Batches of small requests, where per-launch host time would dominate, are
+    packed and run as one launch (see ``_use_packed_dense_prefill_4d``).
+
+    Shapes::
+
+        q : [B, H, Sq, Dqk]    k : [B, H, Sk, Dqk]    v : [B, H, Sk, Dv]
+        returns [B, H, Sq, Dv]
+    """
+    batch, q_heads, q_len, qk_dim, kv_len, v_dim = _validate_prefill_4d_inputs(q, k, v)
+    if kv_len < q_len:
+        raise ValueError(f"Sk must be >= Sq, got Sk={kv_len}, Sq={q_len}")
+
+    sm_scale = qk_dim**-0.5 if sm_scale is None else _check_sm_scale(sm_scale)
+    if not isinstance(is_causal, bool):
+        raise TypeError(f"is_causal must be bool, got {is_causal!r}")
+
+    spans = {name: _request_span(t) for name, t in (("q", q), ("k", k), ("v", v))}
+    spans["out"] = q_heads * q_len * v_dim
+    for name, span in spans.items():
+        if span >= _DENSE_PREFILL_MAX_SPAN:
+            raise ValueError(
+                f"{name}[b] spans {span} elements, but the kernel addresses at most "
+                f"{_DENSE_PREFILL_MAX_SPAN - 1}"
+            )
+    # The kernel needs unit stride on the head dim only.
+    q, k, v = (t if t.stride(-1) == 1 else t.contiguous() for t in (q, k, v))
+
+    with torch.cuda.device(q.device):
+        if _use_packed_dense_prefill_4d(batch, q_heads, q_len, kv_len, qk_dim, v_dim):
+            return _dense_prefill_4d_packed(q, k, v, sm_scale, is_causal)
+        return _dense_prefill_4d_per_request(q, k, v, sm_scale, is_causal)
+
+
+def _use_packed_dense_prefill_4d(batch, heads, q_len, kv_len, qk_dim, v_dim) -> bool:
+    """Whether one packed launch should replace one launch per request.
+
+    The shape estimate rejects batches that cannot fit even when contiguous.
+    Packing may preserve padding strides, so the actual packed tensors must
+    also pass the span check in ``_dense_prefill_4d_packed``.
+    """
+    if batch == 1:
+        return False
+    packed_span = batch * kv_len * heads * max(qk_dim, v_dim)  # Sk >= Sq: K/V widest
+    key_rows = heads * triton.cdiv(q_len, 64) * kv_len
+    return (
+        packed_span < _DENSE_PREFILL_MAX_SPAN
+        and key_rows <= _DENSE_PREFILL_4D_PACK_MAX_KEY_ROWS
+    )
+
+
+def _dense_prefill_4d_packed(q, k, v, sm_scale, is_causal) -> torch.Tensor:
+    batch, heads, q_len, _ = q.shape
+    kv_len, v_dim = k.shape[2], v.shape[3]
+
+    def pack(t):
+        return t.transpose(1, 2).reshape(-1, heads, t.shape[-1])
+
+    packed = tuple(pack(t) for t in (q, k, v))
+    # reshape can retain token-major views sliced from a wider Q/K/V buffer.
+    # Check the actual address spans, not just the tightly packed shapes.
+    if any(_span(t.shape, t.stride()) >= _DENSE_PREFILL_MAX_SPAN for t in packed):
+        del packed  # Release any packing copies before allocating fallback output.
+        return _dense_prefill_4d_per_request(q, k, v, sm_scale, is_causal)
+
+    out = torch.empty(batch * q_len, heads, v_dim, dtype=q.dtype, device=q.device)
+    dense_prefill_attention_fwd(
+        *packed,
+        out,
+        torch.arange(0, (batch + 1) * q_len, q_len, dtype=torch.int32, device=q.device),
+        torch.arange(0, (batch + 1) * kv_len, kv_len, dtype=torch.int32, device=q.device),
+        q_len,
+        sm_scale=sm_scale,
+        is_causal=is_causal,
+    )
+    return out.view(batch, q_len, heads, v_dim).transpose(1, 2).contiguous()
+
+
+def _dense_prefill_4d_per_request(q, k, v, sm_scale, is_causal) -> torch.Tensor:
+    batch, heads, q_len, _ = q.shape
+    kv_len, v_dim = k.shape[2], v.shape[3]
+
+    out = torch.empty(batch, heads, q_len, v_dim, dtype=q.dtype, device=q.device)
+    qo_indptr = torch.arange(0, 2 * q_len, q_len, dtype=torch.int32, device=q.device)
+    kv_indptr = torch.arange(0, 2 * kv_len, kv_len, dtype=torch.int32, device=q.device)
+    for b in range(batch):
+        dense_prefill_attention_fwd(
+            q[b].transpose(0, 1),
+            k[b].transpose(0, 1),
+            v[b].transpose(0, 1),
+            out[b].transpose(0, 1),
+            qo_indptr,
+            kv_indptr,
+            q_len,
+            sm_scale=sm_scale,
+            is_causal=is_causal,
+        )
+    return out
+
+
+# Two ordered Q segments over the existing dense prefill implementation.
+# Metadata contract: SGLang ZigzagCPStrategy, commit
+# d0a75654368a470d8484e3ea45b06e500fee57af (build_metadata/run_attention).
+def _host_lengths(value, batch, name):
+    """Validate and snapshot host metadata before allocating or launching."""
+    if isinstance(value, torch.Tensor):
+        if value.device.type != "cpu":
+            raise ValueError(f"{name} must be host metadata (CPU tensor or integer sequences)")
+        if value.dtype not in (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64):
+            raise TypeError(f"{name} must contain integers, not bool or floating values")
+        if tuple(value.shape) != (batch, 2):
+            raise ValueError(f"{name} must have shape [B,2]")
+        value = value.tolist()
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)) or len(value) != batch:
+        raise ValueError(f"{name} must have shape [B,2]")
+    rows = []
+    for row in value:
+        if not isinstance(row, Sequence) or isinstance(row, (str, bytes)) or len(row) != 2:
+            raise ValueError(f"{name} must have shape [B,2]")
+        if any(isinstance(n, bool) or not isinstance(n, numbers.Integral) for n in row):
+            raise TypeError(f"{name} must contain integers, not bool or floating values")
+        if any(n < 0 for n in row):
+            raise ValueError(f"{name} must be nonnegative")
+        rows.append(tuple(int(n) for n in row))
+    return tuple(rows)
+
+
+def dense_prefill_attention_fwd_segmented(
+    q, k, v, *, q_segment_lens, kv_prefix_lens, sm_scale,
+):
+    """Return BF16 dense causal attention for two query segments per request.
+
+    Q is ``[B,H,Slocal_max,192]``, K/V are ``[B,H,Sk_max,192/128]``.
+    For request b, Q packs the first segment, then the second, then padding.
+    Host integer metadata ``[B,2]`` gives each segment's length L and its
+    exclusive KV prefix end E. Its Q rows must represent global positions
+    ``E-L .. E-1`` in K/V, whose token order starts at global position zero.
+    Every row attends all keys at or before its global position.
+
+    Nonempty segments must be ordered and nonoverlapping. Empty segments
+    are skipped; output padding is zero. The new output is contiguous and
+    has shape ``[B,H,Slocal_max,128]``. Inputs are read-only, including
+    batch-stride-zero shared KV. The existing single-segment adapter handles
+    supported strided views and int32 request-span limits.
+
+    No CP rank mapping, all-gather, RoPE, paging, FP8, backward or CUDA Graph
+    capture support is implied. Metadata must be on the host; sm_scale is
+    explicit. Two different query segments need output concatenation, not
+    an LSE merge. The caller must ensure Q actually matches its metadata.
+    """
+    batch, heads, q_capacity, _, _, v_dim = _validate_prefill_4d_inputs(
+        q, k, v, op_name="dense_prefill_attention_fwd_segmented",
+    )
+    scale = _check_sm_scale(sm_scale)
+
+    lengths = _host_lengths(q_segment_lens, batch, "q_segment_lens")
+    prefixes = _host_lengths(kv_prefix_lens, batch, "kv_prefix_lens")
+    for lens, ends in zip(lengths, prefixes):
+        if sum(lens) > q_capacity:
+            raise ValueError("sum of q_segment_lens exceeds Q capacity")
+        for length, end in zip(lens, ends):
+            if not length <= end <= k.shape[2]:
+                raise ValueError("each segment requires 0 <= L <= E <= KV capacity")
+        if all(lens) and ends[0] > ends[1] - lens[1]:
+            raise ValueError("nonempty query segments must be ordered and nonoverlapping")
+
+    # Validate full request views even if all query rows are padding. Copies
+    # made for non-unit feature strides are compact in the existing adapter.
+    for name, t in (("q", q), ("k", k), ("v", v)):
+        span = _request_span(t)
+        if span >= _DENSE_PREFILL_MAX_SPAN:
+            raise ValueError(f"{name} request stride span exceeds int32 indexing capacity")
+    if heads * q_capacity * v_dim >= _DENSE_PREFILL_MAX_SPAN:
+        raise ValueError("output request span exceeds int32 indexing capacity")
+
+    with torch.cuda.device(q.device):
+        out = torch.zeros((batch, heads, q_capacity, v_dim), device=q.device, dtype=q.dtype)
+        for b, (lens, ends) in enumerate(zip(lengths, prefixes)):
+            begin = 0
+            for length, end in zip(lens, ends):
+                if length:
+                    out[b:b+1, :, begin:begin+length] = dense_prefill_attention_fwd_4d(
+                        q[b:b+1, :, begin:begin+length],
+                        k[b:b+1, :, :end], v[b:b+1, :, :end],
+                        sm_scale=scale, is_causal=True,
+                    )
+                begin += length
+    return out

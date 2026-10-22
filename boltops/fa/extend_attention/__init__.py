@@ -168,10 +168,31 @@ def dense_prefill_attention_fwd(
     )
 
 
+def dense_prefill_attention_fwd_4d(q, k, v, *, sm_scale=None, is_causal: bool = True):
+    """Run dense prefill on ``[B, H, S, D]`` Q/K/V and return a new output."""
+    from .triton.extend_attention import dense_prefill_attention_fwd_4d as impl
+
+    return impl(q, k, v, sm_scale=sm_scale, is_causal=is_causal)
+
+
+def dense_prefill_attention_fwd_segmented(
+    q, k, v, *, q_segment_lens, kv_prefix_lens, sm_scale,
+):
+    """Run two ordered Q segments per request over full four-dimensional KV."""
+    from .triton.extend_attention import dense_prefill_attention_fwd_segmented as impl
+
+    return impl(
+        q, k, v, q_segment_lens=q_segment_lens,
+        kv_prefix_lens=kv_prefix_lens, sm_scale=sm_scale,
+    )
+
+
 __all__ = [
     "build_unified_kv_indices",
     "can_use_dense_prefill_fp8",
     "dense_prefill_attention_fwd",
+    "dense_prefill_attention_fwd_4d",
+    "dense_prefill_attention_fwd_segmented",
     "extend_attention_fwd",
     "extend_attention_fwd_unified",
 ]

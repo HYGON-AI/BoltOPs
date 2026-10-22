@@ -64,6 +64,8 @@ packages = [
     "boltops.mla.triton",
     "boltops.mla.tilelang",
     "boltops.fa",
+    "boltops.fa.decode_attention",
+    "boltops.fa.decode_attention.triton",
     "boltops.sparse_gqa",
     "boltops.sparse_gqa.triton",
     "boltops.fa.extend_attention",

@@ -14,6 +14,8 @@ import torch
 from boltops.fa.extend_attention import (
     build_unified_kv_indices,
     dense_prefill_attention_fwd,
+    dense_prefill_attention_fwd_4d,
+    dense_prefill_attention_fwd_segmented,
     extend_attention_fwd,
     extend_attention_fwd_unified,
 )
@@ -30,6 +32,13 @@ from boltops.tools.extend_attention_triton_tune.benchmark_cases import (
 
 triton = pytest.importorskip("triton")
 import triton.language as tl
+
+from ._fa_bench_utils import (
+    case_parameters,
+    prepared_case,
+    strict_fp32_matmul,
+    useful_flops,
+)
 
 DEVICE = "cuda"
 GPU_REQUIRED = pytest.mark.skipif(
@@ -1061,6 +1070,604 @@ def test_dense_prefill_matches_independent_reference() -> None:
     torch.testing.assert_close(lse, expected_lse, atol=HIP_ATOL_RTOL, rtol=HIP_ATOL_RTOL)
 
 
+# Four-dimensional dense prefill.
+
+
+def _dense_4d_inputs(batch=2, heads=3, q_len=7, kv_len=23):
+    shape = (batch, heads)
+    q = torch.randn(*shape, q_len, 192, device=DEVICE, dtype=torch.bfloat16)
+    k = torch.randn(*shape, kv_len, 192, device=DEVICE, dtype=torch.bfloat16)
+    v = torch.randn(*shape, kv_len, 128, device=DEVICE, dtype=torch.bfloat16)
+    return q, k, v
+
+
+def _causal_positions(q, k):
+    """Global positions of the last ``Sq`` of ``Sk`` tokens: bottom-right causal."""
+    q_len, kv_len = q.shape[-2], k.shape[-2]
+    return torch.arange(kv_len - q_len, kv_len, device=q.device)
+
+
+def _attention_reference(q, k, v, sm_scale, positions=None):
+    """FP32 attention over ``[..., S, D]``; query i sees keys ``0 .. positions[i]``.
+
+    ``positions=None`` attends every key (non-causal).
+    """
+    scores = q.float() @ k.float().transpose(-1, -2) * sm_scale
+    if positions is not None:
+        mask = torch.arange(k.shape[-2], device=q.device)[None, :] > positions[:, None]
+        scores.masked_fill_(mask, -torch.inf)
+    return torch.softmax(scores, -1) @ v.float()
+
+
+@pytest.fixture(params=["packed", "per_request"])
+def dense_4d_path(request, monkeypatch):
+    """Force the 4-D entry onto one of its two launch strategies."""
+    from boltops.fa.extend_attention.triton import extend_attention as backend
+
+    monkeypatch.setattr(
+        backend, "_use_packed_dense_prefill_4d", lambda *args: request.param == "packed"
+    )
+
+
+@pytest.mark.parametrize(
+    ("batch", "heads", "q_len", "kv_len", "packed"),
+    [
+        (1, 8, 16, 16, False),  # a single request is already one launch
+        (32, 8, 16, 16, True),  # host-bound: one launch instead of 32
+        (4, 8, 64, 4096, True),  # 8 * cdiv(64, 64) * 4096 == 2**15 key rows
+        (4, 8, 64, 4097, False),  # one key row past the threshold
+        (4, 64, 1, 4096, False),  # decode-like, long KV: per request is faster
+        (4, 64, 6656, 13312, False),  # Kimi mha_slice1
+        (100_000, 1, 1, 128, False),  # small, but packed K offsets pass int32
+    ],
+)
+def test_dense_prefill_4d_packs_only_small_batched_requests(
+    batch, heads, q_len, kv_len, packed
+) -> None:
+    from boltops.fa.extend_attention.triton import extend_attention as backend
+
+    assert backend._use_packed_dense_prefill_4d(batch, heads, q_len, kv_len, 192, 128) is packed
+
+
+@GPU_REQUIRED
+def test_dense_prefill_4d_public_signature_and_exports() -> None:
+    import boltops.fa
+    from boltops.fa.extend_attention.triton.extend_attention import (
+        dense_prefill_attention_fwd_4d as backend,
+    )
+
+    assert boltops.fa.dense_prefill_attention_fwd_4d is dense_prefill_attention_fwd_4d
+    assert _parameters(dense_prefill_attention_fwd_4d) == _parameters(backend)
+    assert _parameters(dense_prefill_attention_fwd_4d) == [
+        ("q", inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.empty),
+        ("k", inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.empty),
+        ("v", inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.empty),
+        ("sm_scale", inspect.Parameter.KEYWORD_ONLY, None),
+        ("is_causal", inspect.Parameter.KEYWORD_ONLY, True),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("batch", "heads", "q_len", "kv_len", "is_causal", "sm_scale"),
+    [
+        (1, 1, 1, 1, True, None),
+        (2, 3, 17, 17, True, None),  # no prefix
+        (2, 3, 5, 77, True, 0.3),  # prefix, ragged KV tile
+        (3, 2, 1, 130, True, 0.3),  # single query over several KV tiles
+        (2, 2, 130, 200, True, 0.3),  # several query and KV tiles
+        (2, 2, 70, 150, False, 0.3),
+    ],
+)
+@pytest.mark.usefixtures("dense_4d_path")
+@GPU_REQUIRED
+def test_dense_prefill_4d_matches_independent_reference(
+    batch, heads, q_len, kv_len, is_causal, sm_scale
+) -> None:
+    torch.manual_seed(2468)
+    q, k, v = _dense_4d_inputs(batch, heads, q_len, kv_len)
+
+    out = dense_prefill_attention_fwd_4d(
+        q, k, v, sm_scale=sm_scale, is_causal=is_causal
+    )
+
+    assert out.shape == (batch, heads, q_len, 128)
+    assert out.dtype == torch.bfloat16 and out.is_contiguous()
+    expected = _attention_reference(
+        q, k, v, 192**-0.5 if sm_scale is None else sm_scale,
+        _causal_positions(q, k) if is_causal else None,
+    )
+    torch.testing.assert_close(out.float(), expected, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.usefixtures("dense_4d_path")
+@GPU_REQUIRED
+def test_dense_prefill_4d_matches_packed_api_and_is_deterministic() -> None:
+    torch.manual_seed(1357)
+    batch, heads, q_len, kv_len = 2, 2, 33, 100
+    q, k, v = _dense_4d_inputs(batch, heads, q_len, kv_len)
+
+    def pack(t):
+        return t.transpose(1, 2).reshape(-1, heads, t.shape[-1])
+
+    packed_out = torch.empty(batch * q_len, heads, 128, device=DEVICE, dtype=torch.bfloat16)
+    dense_prefill_attention_fwd(
+        pack(q), pack(k), pack(v), packed_out,
+        torch.arange(0, (batch + 1) * q_len, q_len, device=DEVICE, dtype=torch.int32),
+        torch.arange(0, (batch + 1) * kv_len, kv_len, device=DEVICE, dtype=torch.int32),
+        q_len,
+    )
+    out = dense_prefill_attention_fwd_4d(q, k, v)
+
+    expected = packed_out.view(batch, q_len, heads, 128).transpose(1, 2)
+    torch.testing.assert_close(out, expected, atol=0, rtol=0)
+    assert torch.equal(dense_prefill_attention_fwd_4d(q, k, v), out)
+
+
+@pytest.mark.usefixtures("dense_4d_path")
+@GPU_REQUIRED
+def test_dense_prefill_4d_accepts_strided_inputs() -> None:
+    torch.manual_seed(97531)
+    batch, heads, q_len, kv_len = 2, 3, 40, 90
+    # Token-major projections, with K and V sliced out of one buffer.
+    q = torch.randn(batch, q_len, heads, 192, device=DEVICE, dtype=torch.bfloat16)
+    kv = torch.randn(batch, kv_len, heads, 320, device=DEVICE, dtype=torch.bfloat16)
+    q, k, v = q.transpose(1, 2), kv[..., :192].transpose(1, 2), kv[..., 192:].transpose(1, 2)
+    # Head dim not unit-stride: the only layout that has to be copied.
+    q_strided_dim = q.transpose(-1, -2).contiguous().transpose(-1, -2)
+
+    expected = dense_prefill_attention_fwd_4d(q.contiguous(), k.contiguous(), v.contiguous())
+
+    torch.testing.assert_close(dense_prefill_attention_fwd_4d(q, k, v), expected, atol=0, rtol=0)
+    torch.testing.assert_close(
+        dense_prefill_attention_fwd_4d(q_strided_dim, k, v), expected, atol=0, rtol=0
+    )
+
+
+@pytest.mark.parametrize("padded_operand", ["q", "k", "v"])
+def test_dense_prefill_4d_packed_checks_actual_strides(monkeypatch, padded_operand) -> None:
+    """A small CPU view reproduces the padded packed-span overflow without a GPU."""
+    from boltops.fa.extend_attention.triton import extend_attention as backend
+
+    batch, heads, q_len, kv_len = 4, 8, 1, 7
+    limit = 60000
+    monkeypatch.setattr(backend, "_DENSE_PREFILL_MAX_SPAN", limit)
+
+    def projection(length, width, storage_width):
+        storage = torch.empty(batch, length, heads, storage_width, dtype=torch.bfloat16)
+        return storage[..., :width].transpose(1, 2)
+
+    q = projection(q_len, 192, 2048 if padded_operand == "q" else 192)
+    k = projection(kv_len, 192, 320 if padded_operand == "k" else 192)
+    v = projection(kv_len, 128, 320 if padded_operand == "v" else 128)
+    assert all(backend._request_span(t) < limit for t in (q, k, v))
+    assert backend._use_packed_dense_prefill_4d(batch, heads, q_len, kv_len, 192, 128)
+
+    sentinel = object()
+    calls = []
+
+    def fallback(*args):
+        calls.append(args)
+        return sentinel
+
+    def unsafe_launch(*args, **kwargs):
+        pytest.fail("packed launcher must not receive an overflowing padded view")
+
+    monkeypatch.setattr(backend, "_dense_prefill_4d_per_request", fallback)
+    monkeypatch.setattr(backend, "dense_prefill_attention_fwd", unsafe_launch)
+    assert backend._dense_prefill_4d_packed(q, k, v, 0.3, True) is sentinel
+    assert len(calls) == 1
+    assert all(actual is expected for actual, expected in zip(calls[0][:3], (q, k, v)))
+    assert calls[0][3:] == (0.3, True)
+
+
+@GPU_REQUIRED
+def test_dense_prefill_4d_padded_packed_overflow_falls_back_correctly(monkeypatch) -> None:
+    from boltops.fa.extend_attention.triton import extend_attention as backend
+
+    torch.manual_seed(31337)
+    batch, heads, q_len, kv_len = 4, 8, 1, 7
+    q = torch.randn(batch, heads, q_len, 192, device=DEVICE, dtype=torch.bfloat16)
+    kv = torch.randn(batch, kv_len, heads, 320, device=DEVICE, dtype=torch.bfloat16)
+    k, v = kv[..., :192].transpose(1, 2), kv[..., 192:].transpose(1, 2)
+    monkeypatch.setattr(backend, "_DENSE_PREFILL_MAX_SPAN", 60000)
+    assert backend._use_packed_dense_prefill_4d(batch, heads, q_len, kv_len, 192, 128)
+
+    original = backend._dense_prefill_4d_per_request
+    fallback_calls = []
+
+    def fallback(*args):
+        fallback_calls.append(True)
+        return original(*args)
+
+    monkeypatch.setattr(backend, "_dense_prefill_4d_per_request", fallback)
+    out = dense_prefill_attention_fwd_4d(q, k, v, sm_scale=0.3)
+    assert fallback_calls == [True]
+    expected = _attention_reference(q, k, v, 0.3, _causal_positions(q, k))
+    torch.testing.assert_close(out.float(), expected, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize(
+    ("make_args", "error", "match"),
+    [
+        pytest.param(lambda q, k, v: ((q[0], k, v), {}), ValueError, "q must be 4-D", id="ndim"),
+        pytest.param(
+            lambda q, k, v: ((q.float(), k, v), {}), TypeError, "q must be torch.bfloat16",
+            id="dtype",
+        ),
+        pytest.param(
+            lambda q, k, v: ((q, k.cpu(), v), {}), ValueError, "k must be a CUDA/HIP tensor",
+            id="cpu",
+        ),
+        pytest.param(
+            lambda q, k, v: ((q[:, :, :0], k, v), {}), ValueError, "q must not have empty dims",
+            id="empty",
+        ),
+        pytest.param(
+            lambda q, k, v: ((q, k[:1], v[:1]), {}), ValueError, "batch sizes must match",
+            id="batch",
+        ),
+        pytest.param(
+            lambda q, k, v: ((q, k, v[:, :, :4]), {}), ValueError, "k/v heads and lengths",
+            id="kv_len",
+        ),
+        pytest.param(
+            lambda q, k, v: ((q, k[..., :128], v), {}), ValueError, "q/k head dims must match",
+            id="qk_dim",
+        ),
+        pytest.param(lambda q, k, v: ((q[:, :1], k, v), {}), ValueError, "only MHA", id="gqa"),
+        pytest.param(
+            lambda q, k, v: ((q[..., :128], k[..., :128], v), {}),
+            ValueError, r"unsupported \(Dqk, Dv\)=\(128, 128\)", id="head_dims",
+        ),
+        pytest.param(
+            lambda q, k, v: ((q, k[:, :, :2], v[:, :, :2]), {}), ValueError, "Sk must be >= Sq",
+            id="short_kv",
+        ),
+        pytest.param(
+            lambda q, k, v: ((q, k, v), {"is_causal": 1}), TypeError, "is_causal must be bool",
+            id="is_causal",
+        ),
+        pytest.param(
+            lambda q, k, v: ((q.clone().requires_grad_(), k, v), {}),
+            RuntimeError, "does not support autograd", id="requires_grad",
+        ),
+    ],
+)
+@GPU_REQUIRED
+def test_dense_prefill_4d_rejects_invalid_inputs(make_args, error, match) -> None:
+    args, kwargs = make_args(*_dense_4d_inputs(2, 2, 3, 5))
+    with pytest.raises(error, match=match):
+        dense_prefill_attention_fwd_4d(*args, **kwargs)
+
+
+@pytest.mark.parametrize(
+    ("sm_scale", "error"),
+    [
+        (True, TypeError),
+        ("0.1", TypeError),
+        (0.0, ValueError),
+        (-1.0, ValueError),
+        (math.inf, ValueError),
+        (math.nan, ValueError),
+    ],
+)
+@GPU_REQUIRED
+def test_dense_prefill_4d_rejects_invalid_sm_scale(sm_scale, error) -> None:
+    with pytest.raises(error, match="sm_scale must be"):
+        dense_prefill_attention_fwd_4d(*_dense_4d_inputs(1, 1, 3, 5), sm_scale=sm_scale)
+
+
+@GPU_REQUIRED
+def test_dense_prefill_4d_rejects_per_request_span_beyond_int32(monkeypatch) -> None:
+    from boltops.fa.extend_attention.triton import extend_attention as backend
+
+    q, k, v = _dense_4d_inputs(2, 2, 3, 5)
+    # k[b] is the widest operand here: 2 heads * 5 tokens * 192 elements.
+    monkeypatch.setattr(backend, "_DENSE_PREFILL_MAX_SPAN", 2 * 5 * 192)
+    with pytest.raises(ValueError, match="k\\[b\\] spans 1920 elements"):
+        dense_prefill_attention_fwd_4d(q, k, v)
+
+
+@pytest.mark.usefixtures("dense_4d_path")
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two CUDA/HIP devices")
+def test_dense_prefill_4d_runs_on_non_current_device() -> None:
+    torch.manual_seed(8642)
+    with torch.cuda.device(1):
+        q, k, v = _dense_4d_inputs(2, 2, 9, 30)
+    with torch.cuda.device(0):
+        out = dense_prefill_attention_fwd_4d(q, k, v)
+
+    assert out.device == q.device
+    expected = _attention_reference(q, k, v, 192**-0.5, _causal_positions(q, k))
+    torch.testing.assert_close(out.float(), expected, atol=2e-2, rtol=2e-2)
+
+
+@GPU_REQUIRED
+def test_dense_prefill_4d_long_context_past_packed_int32_offsets() -> None:
+    """Packed, these two requests would put K offsets past 2**31; per request they fit."""
+    torch.manual_seed(1928)
+    q, k, v = _dense_4d_inputs(2, 64, 64, 131072)
+
+    # A peaked softmax keeps outputs O(1); at the default scale, averaging
+    # 131072 random values leaves outputs within the tolerance of zero.
+    out = dense_prefill_attention_fwd_4d(q, k, v, sm_scale=1.0)
+
+    # The last heads of the last request are where a wrapped offset would land.
+    expected = _attention_reference(
+        q[1:, -4:], k[1:, -4:], v[1:, -4:], 1.0, _causal_positions(q, k)
+    )
+    torch.testing.assert_close(out[1:, -4:].float(), expected, atol=2e-2, rtol=2e-2)
+
+
+# Four-dimensional prefill isolation and independent-B32 coverage.
+
+@pytest.fixture
+def strict_fp32():
+    """Run one test without TF32, restoring global matmul settings afterwards."""
+    with strict_fp32_matmul():
+        yield
+
+
+@GPU_REQUIRED
+@pytest.mark.usefixtures("strict_fp32")
+@pytest.mark.parametrize("q_len,kv_len,strided,shared", [
+    (5, 19, False, False),
+    (17, 513, False, False),  # B32, per-request route and ragged KV tile
+    (17, 513, True, False),
+    (17, 513, False, True),
+])
+def test_dense_prefill_4d_b32_matches_full_independent_fp32(q_len, kv_len, strided, shared):
+    torch.manual_seed(732)
+    batch, heads = 32, 64
+    storage_d = 320 if strided else 192
+    q = torch.randn(batch, heads, q_len, storage_d, device=DEVICE, dtype=torch.bfloat16)[..., :192]
+    k = torch.randn(1 if shared else batch, heads, kv_len, storage_d,
+                    device=DEVICE, dtype=torch.bfloat16)[..., :192]
+    v = torch.randn(1 if shared else batch, heads, kv_len, 256 if strided else 128,
+                    device=DEVICE, dtype=torch.bfloat16)[..., :128]
+    if shared:
+        k, v = k.expand(batch, -1, -1, -1), v.expand(batch, -1, -1, -1)
+    out = dense_prefill_attention_fwd_4d(q, k, v, sm_scale=0.11, is_causal=True)
+    assert out.shape == (batch, heads, q_len, 128)
+    assert out.dtype == torch.bfloat16 and out.is_contiguous()
+    assert bool(torch.isfinite(out).all())
+    positions = _causal_positions(q, k)
+    # Keep the independent reference bounded; every output element is checked.
+    for b in range(batch):
+        expected = _attention_reference(q[b], k[b], v[b], 0.11, positions)
+        torch.testing.assert_close(out[b].float(), expected, atol=0.02, rtol=0.02)
+
+
+@GPU_REQUIRED
+def test_dense_prefill_4d_shared_kv_is_readonly_and_batch_isolated():
+    torch.manual_seed(733)
+    q = torch.randn(32, 64, 5, 192, device=DEVICE, dtype=torch.bfloat16)
+    k = torch.randn(1, 64, 19, 192, device=DEVICE, dtype=torch.bfloat16)
+    v = torch.randn(1, 64, 19, 128, device=DEVICE, dtype=torch.bfloat16)
+    saved_k, saved_v = k.clone(), v.clone()
+    first = dense_prefill_attention_fwd_4d(q, k.expand(32, -1, -1, -1),
+                                          v.expand(32, -1, -1, -1), sm_scale=0.11)
+    q[17].neg_()
+    second = dense_prefill_attention_fwd_4d(q, k.expand(32, -1, -1, -1),
+                                           v.expand(32, -1, -1, -1), sm_scale=0.11)
+    torch.testing.assert_close(k, saved_k, atol=0, rtol=0)
+    torch.testing.assert_close(v, saved_v, atol=0, rtol=0)
+    torch.testing.assert_close(first[:17], second[:17], atol=0, rtol=0)
+    torch.testing.assert_close(first[18:], second[18:], atol=0, rtol=0)
+    assert not torch.equal(first[17], second[17])
+
+
+@pytest.mark.parametrize("packed", [False, True])
+@GPU_REQUIRED
+def test_dense_prefill_4d_causal_future_and_batch_isolation_preserves_inputs(monkeypatch, packed):
+    from boltops.fa.extend_attention.triton import extend_attention as backend
+    monkeypatch.setattr(backend, "_use_packed_dense_prefill_4d", lambda *args: packed)
+    torch.manual_seed(834)
+    q, k, v = _dense_4d_inputs(2, 3, 5, 9)
+    snapshots = [t.clone() for t in (q, k, v)]
+    original = dense_prefill_attention_fwd_4d(q, k, v, sm_scale=0.17)
+    for t, saved in zip((q, k, v), snapshots):
+        assert torch.equal(t, saved)
+    # Query 0 sees keys 0..4; changes to future keys 5..8 cannot affect it.
+    k2, v2 = k.clone(), v.clone()
+    k2[0, :, 5:] = 20
+    v2[0, :, 5:] = -20
+    changed = dense_prefill_attention_fwd_4d(q, k2, v2, sm_scale=0.17)
+    torch.testing.assert_close(changed[0, :, :1], original[0, :, :1], atol=0, rtol=0)
+    torch.testing.assert_close(changed[1], original[1], atol=0, rtol=0)
+    # Noncausal attention must see the same changed tokens.
+    a = dense_prefill_attention_fwd_4d(q, k, v, sm_scale=0.17, is_causal=False)
+    b = dense_prefill_attention_fwd_4d(q, k2, v2, sm_scale=0.17, is_causal=False)
+    assert not torch.equal(a[0, :, :1], b[0, :, :1])
+
+
+# Segmented prefill: explicit global positions and metadata contracts.
+
+@pytest.fixture
+def segmented_adapter():
+    """Load the Triton host adapter only when a test needs an active target."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA/HIP target required to load the Triton host adapter")
+    from boltops.fa.extend_attention.triton import extend_attention as backend
+
+    return backend
+
+
+def test_segmented_exports_and_signature():
+    from boltops.fa.extend_attention import dense_prefill_attention_fwd_segmented as entry
+    assert entry is dense_prefill_attention_fwd_segmented
+    assert list(inspect.signature(entry).parameters) == [
+        "q", "k", "v", "q_segment_lens", "kv_prefix_lens", "sm_scale"]
+    for p in list(inspect.signature(entry).parameters.values())[3:]:
+        assert p.kind == p.KEYWORD_ONLY and p.default is p.empty
+
+
+@pytest.mark.parametrize("value,error", [
+    ([[1]], ValueError), ([[1, 2], [3, 4]], ValueError),
+    ([[True, 2]], TypeError), ([[1.0, 2]], TypeError), ([[-1, 2]], ValueError),
+    ("12", ValueError), (torch.ones(1, 2), TypeError),
+    (torch.ones(1, 2, dtype=torch.bool), TypeError),
+])
+def test_segmented_host_metadata_rejects_ambiguous_values(segmented_adapter, value, error):
+    with pytest.raises(error):
+        segmented_adapter._host_lengths(value, 1, "lengths")
+
+
+def test_segmented_host_metadata_snapshots_integer_lists_and_cpu_tensor(segmented_adapter):
+    values = [[0, 7], [3, 4]]
+    assert segmented_adapter._host_lengths(values, 2, "lengths") == ((0, 7), (3, 4))
+    assert segmented_adapter._host_lengths(torch.tensor(values), 2, "lengths") == ((0, 7), (3, 4))
+
+
+@GPU_REQUIRED
+@pytest.mark.usefixtures("strict_fp32")
+@pytest.mark.parametrize("batch,heads,total,prefix", [(32, 64, 33, 0), (2, 4, 257, 19), (2, 3, 7, 3)])
+def test_segmented_all_eight_ranks_restore_full_global_attention(batch, heads, total, prefix):
+    torch.manual_seed(743)
+    q, k, v = _dense_4d_inputs(batch, heads, total, prefix + total)
+    positions = torch.arange(prefix, prefix + total, device=DEVICE)
+    expected = _attention_reference(q, k, v, 0.11, positions)
+    restored = torch.empty_like(expected, dtype=q.dtype)
+    blocks = torch.tensor_split(torch.arange(total, device=DEVICE), 16)
+    visited = torch.zeros(total, dtype=torch.int64, device=DEVICE)
+    for rank in range(8):
+        first, second = blocks[rank], blocks[15-rank]
+        ids = torch.cat([first, second])
+        # Physical padding also lets ranks with no tokens exercise zero output.
+        local = torch.full((batch, heads, len(ids)+3, 192), torch.nan, device=DEVICE, dtype=q.dtype)
+        local[:, :, :len(ids)] = q[:, :, ids]
+        lens = [[len(first), len(second)]] * batch
+        ends = [[int(chunk[-1])+prefix+1 if len(chunk) else 0 for chunk in (first, second)]] * batch
+        out = dense_prefill_attention_fwd_segmented(
+            local, k, v, q_segment_lens=lens, kv_prefix_lens=ends, sm_scale=0.11)
+        assert out.is_contiguous() and out.dtype == q.dtype
+        assert not bool(out[:, :, len(ids):].any())
+        if len(ids):
+            torch.testing.assert_close(out[:, :, :len(ids)].float(), expected[:, :, ids], atol=0.02, rtol=0.02)
+            restored[:, :, ids] = out[:, :, :len(ids)]
+            visited[ids] += 1
+    assert bool((visited == 1).all())
+    torch.testing.assert_close(restored.float(), expected, atol=0.02, rtol=0.02)
+
+
+@GPU_REQUIRED
+@pytest.mark.parametrize("layout", ["ordinary", "padded_features", "nonunit_features", "shared_kv"])
+def test_segmented_ragged_batch_padding_empty_segments_strides_and_readonly_kv(layout):
+    torch.manual_seed(744)
+    q, k, v = _dense_4d_inputs(4, 3, 7, 23)
+    lens = [[2, 3], [0, 4], [3, 0], [0, 0]]
+    ends = [[5, 19], [0, 11], [9, 0], [0, 0]]
+    if layout in ("padded_features", "nonunit_features"):
+        step = 2 if layout == "nonunit_features" else 1
+        def strided(t):
+            storage = torch.empty(*t.shape[:-1], t.shape[-1]*2+8, device=t.device, dtype=t.dtype)
+            view = storage[..., :t.shape[-1]*step:step]
+            view.copy_(t)
+            return view
+        q, k, v = map(strided, (q, k, v))
+    if layout == "shared_kv":
+        k, v = k[:1].expand(4, -1, -1, -1), v[:1].expand(4, -1, -1, -1)
+    saved = [t.clone() for t in (q, k, v)]
+    out = dense_prefill_attention_fwd_segmented(
+        q, k, v, q_segment_lens=torch.tensor(lens), kv_prefix_lens=ends, sm_scale=0.11)
+    for b, (lengths, boundaries) in enumerate(zip(lens, ends)):
+        pos = torch.tensor([p for length, end in zip(lengths, boundaries)
+                            for p in range(end-length, end)], device=DEVICE)
+        if len(pos):
+            expected = _attention_reference(q[b:b+1, :, :len(pos)], k[b:b+1], v[b:b+1], 0.11, pos)
+            torch.testing.assert_close(out[b:b+1, :, :len(pos)].float(), expected, atol=0.02, rtol=0.02)
+        assert not bool(out[b, :, len(pos):].any())
+    for original, snapshot in zip((q, k, v), saved):
+        torch.testing.assert_close(original, snapshot, atol=0, rtol=0)
+    # Altering one request's query must not change another request's output.
+    q2 = q.clone()
+    q2[1].neg_()
+    out2 = dense_prefill_attention_fwd_segmented(
+        q2, k, v, q_segment_lens=lens, kv_prefix_lens=ends, sm_scale=0.11)
+    torch.testing.assert_close(out2[[0, 2, 3]], out[[0, 2, 3]], atol=0, rtol=0)
+    assert not torch.equal(out2[1], out[1])
+
+
+@GPU_REQUIRED
+def test_segmented_wrong_whole_query_tail_assumption_is_detected():
+    q = torch.zeros(1, 2, 4, 192, device=DEVICE, dtype=torch.bfloat16)
+    k = torch.zeros(1, 2, 32, 192, device=DEVICE, dtype=torch.bfloat16)
+    v = torch.arange(32, device=DEVICE, dtype=torch.bfloat16)[None, None, :, None].expand(1, 2, 32, 128)
+    correct = dense_prefill_attention_fwd_segmented(
+        q, k, v, q_segment_lens=[[2, 2]], kv_prefix_lens=[[2, 32]], sm_scale=0.11)
+    expected = _attention_reference(q, k, v, 0.11, torch.tensor([0, 1, 30, 31], device=DEVICE))
+    wrong = dense_prefill_attention_fwd_4d(q, k, v, sm_scale=0.11)
+    torch.testing.assert_close(correct.float(), expected, atol=0.02, rtol=0.02)
+    assert (wrong[:, :, :2].float() - expected[:, :, :2]).abs().min().item() > 10
+
+
+@GPU_REQUIRED
+@pytest.mark.parametrize("lens,ends,error", [
+    ([[4, 4], [2, 3]], [[5, 19], [5, 19]], ValueError),
+    ([[2, 3], [2, 3]], [[1, 19], [5, 19]], ValueError),
+    ([[2, 3], [2, 3]], [[5, 24], [5, 19]], ValueError),
+    ([[2, 3], [2, 3]], [[5, 19], [9, 10]], ValueError),
+    ([[2, 3]], [[5, 19]], ValueError),
+    ([[2, 3], [True, 3]], [[5, 19], [5, 19]], TypeError),
+])
+def test_segmented_invalid_metadata_is_rejected_before_any_segment_launch(segmented_adapter, monkeypatch, lens, ends, error):
+    q, k, v = _dense_4d_inputs()
+    def unexpected(*args, **kwargs):
+        pytest.fail("invalid batch must be rejected before the first launch")
+    monkeypatch.setattr(segmented_adapter, "dense_prefill_attention_fwd_4d", unexpected)
+    with pytest.raises(error):
+        dense_prefill_attention_fwd_segmented(q, k, v, q_segment_lens=lens, kv_prefix_lens=ends, sm_scale=0.11)
+
+
+@GPU_REQUIRED
+@pytest.mark.parametrize("scale,error", [(True, TypeError), (None, TypeError), (0, ValueError),
+                                         (-1, ValueError), (float("nan"), ValueError), (float("inf"), ValueError)])
+def test_segmented_invalid_scale(scale, error):
+    with pytest.raises(error):
+        dense_prefill_attention_fwd_segmented(*_dense_4d_inputs(), q_segment_lens=[[2, 3]]*2,
+                                               kv_prefix_lens=[[5, 19]]*2, sm_scale=scale)
+
+
+@GPU_REQUIRED
+def test_segmented_device_metadata_and_invalid_tensors_are_rejected():
+    q, k, v = _dense_4d_inputs()
+    kwargs = dict(q_segment_lens=[[2, 3]]*2, kv_prefix_lens=[[5, 19]]*2, sm_scale=0.11)
+    with pytest.raises(ValueError, match="host metadata"):
+        dense_prefill_attention_fwd_segmented(q, k, v, **dict(kwargs, q_segment_lens=torch.tensor([[2, 3]]*2, device=DEVICE)))
+    for bad, error in [((q.float(), k, v), TypeError), ((q, k.cpu(), v), ValueError),
+                       ((q, k[:1], v), ValueError), ((q[..., :128], k, v), ValueError),
+                       ((q[:, :, :0], k, v), ValueError), ((None, k, v), TypeError)]:
+        with pytest.raises(error):
+            dense_prefill_attention_fwd_segmented(*bad, **kwargs)
+    q.requires_grad_()
+    with pytest.raises(RuntimeError, match="autograd"):
+        dense_prefill_attention_fwd_segmented(q, k, v, **kwargs)
+    with torch.no_grad():
+        assert torch.isfinite(dense_prefill_attention_fwd_segmented(q, k, v, **kwargs)).all()
+
+
+@GPU_REQUIRED
+def test_segmented_actual_batch_pointer_offset_beyond_int32():
+    # Two tiny requests separated by >2^31 elements in the underlying K/V
+    # storages. This checks a real 64-bit batch pointer, not a mocked limit.
+    q, _, _ = _dense_4d_inputs(2, 1, 3, 5)
+    offset = 2**31 + 256
+    caches = []
+    for dim in (192, 128):
+        storage = torch.empty(offset + 5*dim, dtype=torch.bfloat16, device=DEVICE)
+        cache = storage.as_strided((2, 1, 5, dim), (offset, 5*dim, dim, 1))
+        cache.normal_()
+        caches.append(cache)
+    k, v = caches
+    out = dense_prefill_attention_fwd_segmented(q, k, v, q_segment_lens=[[1, 2]]*2,
+                                               kv_prefix_lens=[[1, 5]]*2, sm_scale=0.11)
+    for b in range(2):
+        expected = _attention_reference(
+            q[b:b+1], k[b:b+1], v[b:b+1], 0.11, torch.tensor([0, 3, 4], device=DEVICE)
+        )
+        torch.testing.assert_close(out[b:b+1].float(), expected, atol=0.02, rtol=0.02)
+
+
 @GPU_REQUIRED
 def test_long_ragged_batch_crosses_query_and_kv_tiles(monkeypatch) -> None:
     """Validate multi-tile Q/KV reduction and masked tail tiles on the legacy grid."""
@@ -1542,3 +2149,25 @@ def test_extend_attention_benchmark(case) -> None:
         f"sinks={case.with_sinks}: "
         f"{elapsed_ms:.4f} ms"
     )
+
+
+# Original-shape correctness uses the same independent reference, without timing.
+@GPU_REQUIRED
+@pytest.mark.parametrize("prepared_case", case_parameters({"dense", "segmented"}, full=True),
+                         indirect=True, scope="module", ids=lambda c: c["case_id"])
+def test_original_shape_prefill(prepared_case):
+    case, _ = prepared_case  # Input preparation executes and checks the reference.
+    print(f"[correctness] {case['case_id']}: passed")
+
+
+# Original-shape benchmarks, using the shared time_ms fixture.
+
+@pytest.mark.bench
+@pytest.mark.parametrize("prepared_case", case_parameters({"dense", "segmented"}),
+                         indirect=True, scope="module", ids=lambda c: c["case_id"])
+def test_bench_fa_prefill(prepared_case, time_ms, bench_warmup, bench_repeat):
+    case, run = prepared_case
+    ms = time_ms(run, bench_warmup, bench_repeat,
+                 flops=useful_flops(case), dtype=torch.bfloat16)
+    assert math.isfinite(ms) and ms > 0
+    print(f"[bench] {case['case_id']}: {ms:.6f} ms")
