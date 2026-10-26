@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Modified by Hygon in 2026 for BoltOPs DCU/HCU integration.
 """Helpers used by vLLM ``TritonMLA`` decode scheduling."""
 
 from __future__ import annotations

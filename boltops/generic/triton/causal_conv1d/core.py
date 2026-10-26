@@ -1,3 +1,4 @@
+# Modified by Hygon in 2026 for BoltOPs DCU/HCU integration.
 # SPDX-License-Identifier: Apache-2.0
 """Public API and routing for the two causal conv1d Triton kernel variants.
 

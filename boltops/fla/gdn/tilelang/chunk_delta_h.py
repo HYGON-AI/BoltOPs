@@ -1,3 +1,4 @@
+# Copyright (c) Tile-AI.
 # SPDX-License-Identifier: MIT
 # Adapted from TileLang examples/gdn/example_chunk_delta_h.py.
 """TileLang kernels for the GDN chunk state recurrence."""

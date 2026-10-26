@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Modified by Hygon in 2026 for BoltOPs DCU/HCU integration.
 """Vendored vLLM Triton W8A8 block-scaled FP8 GEMM.
 
 Source: ``vllm/model_executor/layers/quantization/utils/fp8_utils.py``
