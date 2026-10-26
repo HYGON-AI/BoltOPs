@@ -27,6 +27,22 @@ def attn_res(
     return impl(prefix, blocks, norm_weight, qk_weight, num_blocks, eps)
 
 
+def hc_combine_norm(
+    residual: torch.Tensor,
+    block_output: torch.Tensor,
+    injection_logits: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+    hc_count: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused HyperConnection gated-residual combine + grouped Gemma RMSNorm."""
+    from boltops.generic.triton.hc_combine_norm import hc_combine_norm as impl
+
+    return impl(
+        residual, block_output, injection_logits, norm_weight, eps, hc_count
+    )
+
+
 def fused_mamba_state_scatter_with_mask(
     dst: torch.Tensor,
     src: torch.Tensor,
@@ -69,4 +85,5 @@ __all__ = [
     "causal_conv1d_fn",
     "causal_conv1d_update",
     "fused_mamba_state_scatter_with_mask",
+    "hc_combine_norm",
 ]
