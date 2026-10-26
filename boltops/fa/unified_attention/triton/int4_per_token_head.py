@@ -1,3 +1,4 @@
+# Modified by Hygon in 2026 for BoltOPs DCU/HCU integration.
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Sub-byte packed (INT4) per-token-head KV cache mode.

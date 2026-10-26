@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Modified by Hygon in 2026 for BoltOPs DCU/HCU integration.
 """Vendored vLLM Triton persistent GEMM (FP16/BF16/FP32).
 
 Source: ``vllm/model_executor/layers/batch_invariant.py``

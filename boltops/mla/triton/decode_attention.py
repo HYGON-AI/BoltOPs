@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Modified by Hygon in 2026 for BoltOPs DCU/HCU integration.
 """Vendored vLLM Triton MLA / GQA decode attention (split-KV).
 
 Upstream: ``vllm/v1/attention/ops/triton_decode_attention.py``
