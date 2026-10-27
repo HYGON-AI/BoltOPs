@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Internal Triton capability detection for BoltOPs operators.
 
 This module is intentionally not exported from :mod:`boltops.utility`. Each

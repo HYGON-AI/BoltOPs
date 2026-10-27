@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """aicc JIT compiler for the fused-MoE HIPC moe_sorting kernel.
 
 Compiles Hygon ``aicc`` sources under ``moe_sorting_hipc/csrc/`` and caches the

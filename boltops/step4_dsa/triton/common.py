@@ -228,7 +228,7 @@ def _shared_memory_limit() -> int:
     The sparse attention kernels stage a whole region-block of keys *and* values in
     shared memory, so their tile size is bounded by the device rather than by the
     geometry.  Hopper allows 227 KiB per block and the ``block_regions=16`` default is
-    sized for it; a 64 KiB device (CDNA/DCU) cannot launch that tile at all and Triton
+    sized for it; a 64 KiB device (CDNA/HCU) cannot launch that tile at all and Triton
     reports OutOfResources at first launch rather than at import.  Ask the driver
     instead of hardcoding either number.
     """
@@ -298,7 +298,7 @@ def shared_table_stride(block_table: torch.Tensor) -> int:
 def _detect_rounded_intrinsics() -> bool:
     """True when the active Triton backend exposes CUDA-style ``*_rn`` libdevice ops.
 
-    CUDA exposes the explicitly rounded scalar intrinsics; HIP/DCU does not.  On HIP
+    CUDA exposes the explicitly rounded scalar intrinsics; HIP/HCU does not.  On HIP
     the plain fp32 operators are already round-to-nearest-even, so fusion is disabled
     at launch instead (see ``_NO_FP_FUSION``).
     """

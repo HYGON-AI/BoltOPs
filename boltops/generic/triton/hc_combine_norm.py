@@ -1,3 +1,4 @@
+# Modified by Hygon in 2026 for BoltOPs HCU integration.
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Fused Triton kernel for the HyperConnection combine + grouped Gemma RMSNorm.

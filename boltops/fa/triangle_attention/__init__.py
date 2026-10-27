@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Triangle attention operator family."""
 
 def triangle_attention_fwd(q, k, v, biases):

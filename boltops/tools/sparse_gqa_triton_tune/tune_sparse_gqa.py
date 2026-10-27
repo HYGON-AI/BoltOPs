@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tune Qwen Sparse-GQA production cases on the current GPU/DCU."""
+"""Tune Qwen Sparse-GQA production cases on the current GPU/HCU."""
 
 from __future__ import annotations
 

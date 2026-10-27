@@ -27,7 +27,7 @@ variables:
   devpi_nightly_password: ""
 
 
-.dcu-runner:
+.hcu-runner:
   tags:
     - nmz
   before_script:
@@ -132,7 +132,7 @@ select:source:
     expire_in: 1 day
 
 .build-wheel:
-  extends: .dcu-runner
+  extends: .hcu-runner
   image: "${BUILD_IMAGE}"
   stage: build
   timeout: 3h
@@ -143,7 +143,7 @@ select:source:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"'
     - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_REF_NAME == "main"'
   before_script:
-    - !reference [.dcu-runner, before_script]
+    - !reference [.hcu-runner, before_script]
     - !reference [.git-auth, before_script]
     - !reference [.python-env, before_script]
     # All Python/Torch matrix jobs integrate the exact target commit selected once
@@ -240,7 +240,7 @@ build:test-wheel:
       HIP_VISIBLE_DEVICES=$(CIsmi need 1 --timeout "${CISMI_TIMEOUT}")
       test -n "${HIP_VISIBLE_DEVICES}"
       export HIP_VISIBLE_DEVICES
-      echo "Allocated DCU: ${HIP_VISIBLE_DEVICES}"
+      echo "Allocated HCU: ${HIP_VISIBLE_DEVICES}"
     - |
       wheel_test_dir=$(mktemp -d)
       python -m pip install --no-deps --target "${wheel_test_dir}" "${WHEEL_OUTPUT}"/*.whl
@@ -269,7 +269,7 @@ build:wheel:dtk2610:
     TORCH_VERSION: "2.11.0"
 
 performance:optest:
-  extends: .dcu-runner
+  extends: .hcu-runner
   image: "${BUILD_IMAGE}"
   # Serialize performance jobs on this runner tag to reduce benchmark interference.
   resource_group: boltops-performance-${RUNNER_TAG}
@@ -297,7 +297,7 @@ performance:optest:
         TORCH_VERSION: ["2.11.0"]
         DTK_VER: ["2604"]
   before_script:
-    - !reference [.dcu-runner, before_script]
+    - !reference [.hcu-runner, before_script]
     - !reference [.git-auth, before_script]
     - !reference [.python-env, before_script]
     # Use the same fixed source/target pair selected for the correctness jobs.
@@ -375,13 +375,13 @@ performance:optest:
       HIP_VISIBLE_DEVICES=$(CIsmi need 1 --timeout "${CISMI_TIMEOUT}")
       test -n "${HIP_VISIBLE_DEVICES}"
       export HIP_VISIBLE_DEVICES
-      echo "Allocated performance DCU: ${HIP_VISIBLE_DEVICES}"
+      echo "Allocated performance HCU: ${HIP_VISIBLE_DEVICES}"
     - |
       touch "${CI_WORK_DIR}/optest-start"
       # Performance only: the accuracy suite still has pre-existing
       # failures (see test/mqa_logits, test/qsa) that would gate every
       # MR, so acc is not run by this job. --gpus pins the run to the
-      # DCU reserved by CIsmi above.
+      # HCU reserved by CIsmi above.
       optest_rc=0
       optest --op_name boltops --test_mode per --gpus "${HIP_VISIBLE_DEVICES}" \
         --test_dir "${CI_PROJECT_DIR}" || optest_rc=$?

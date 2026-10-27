@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Step-4 Dynamic Sparse Attention (DSA) operator package.
 
 12 core numerical APIs plus the ``triton_csa_prefill`` convenience wrapper

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Fused MoE operator package.
 
 Public signature and ship-time backend selection live here (not a runtime

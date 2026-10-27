@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # SPDX-License-Identifier: MIT
 """Benchmark saved MoE configs and write Aiter-compatible performance CSVs.
 

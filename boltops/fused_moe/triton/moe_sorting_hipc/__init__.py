@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """HIPC MoE sorting kernel used by the Triton fused MoE path.
 
 Private to ``boltops.fused_moe.triton`` — not part of the public API.

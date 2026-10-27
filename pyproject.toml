@@ -5,12 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "boltops"
 dynamic = ["version"]
-description = "Hygon DCU AI Compiler ops library (Triton & TileLang & Other DSLs)"
+description = "Hygon HCU AI Compiler ops library (Triton & TileLang & Other DSLs)"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.9"
-authors = [{ name = "Hygon DCU AI Compiler" }]
+authors = [{ name = "Hygon HCU AI Compiler" }]
 dependencies = [
     "packaging",
     "torch",

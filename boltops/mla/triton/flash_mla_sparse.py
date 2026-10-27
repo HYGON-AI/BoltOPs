@@ -1,8 +1,6 @@
-# Modified by Hygon in 2026 for BoltOPs DCU/HCU integration.
+# Modified by Hygon in 2026 for BoltOPs HCU integration.
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-# Modified by Hygon Information Technology Co., Ltd., 2026.
 
 """Triton implementation of the FlashMLA sparse forward interface."""
 

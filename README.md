@@ -6,7 +6,7 @@ Backend Optimized Low-latency Triton/TileLang Operators
 
 ## Introduction
 
-**BoltOPs** (*Backend Optimized Low-latency Triton/TileLang Operators*) is the AI Compiler team's high-performance operator library for Hygon DCU. The name also nods to the **lightning bolt** — low latency and lightning-fast execution by design. It delivers production-ready, benchmark-driven kernels written in Triton, TileLang, and other DSLs behind clean Python APIs, giving inference frameworks and model-side callers tuned DCU throughput without backend-specific glue.
+**BoltOPs** (*Backend Optimized Low-latency Triton/TileLang Operators*) is the AI Compiler team's high-performance operator library for Hygon HCU. The name also nods to the **lightning bolt** — low latency and lightning-fast execution by design. It delivers production-ready, benchmark-driven kernels written in Triton, TileLang, and other DSLs behind clean Python APIs, giving inference frameworks and model-side callers tuned HCU throughput without backend-specific glue.
 
 The library focuses on latency-critical fused operators, correctness-first validation, and deployment-friendly packaging: fast paths where they matter, minimal friction where callers integrate.
 
@@ -249,7 +249,7 @@ pip install optest -i http://10.16.1.201:9929/nightly/dtk2604/+simple/ --trusted
 optest --op_name boltops --test_dir . --test_mode all      # accuracy + performance
 optest --op_name boltops --test_dir . --test_mode acc      # accuracy only
 optest --op_name boltops --test_dir . --test_mode per      # benchmarks only
-optest --op_name boltops --test_dir . --test_mode all --gpus 0,2  # pin specific DCUs
+optest --op_name boltops --test_dir . --test_mode all --gpus 0,2  # pin specific HCUs
 optest --display                                            # HTML report from latest results
 ```
 
@@ -276,3 +276,12 @@ optest --display                                            # HTML report from l
 1. Create `boltops/<op>/` with `triton/` and `tilelang/` impls; put correctness in `test/test_<op>.py` and model-size benches under `@pytest.mark.bench`, then use `--bench` to pick the winner.
 2. Prefer public signatures aligned with vLLM / SGLang (or HIPC / CUDA C); wire ship-time backend selection in `boltops/<op>/__init__.py` and export.
 3. Re-export from `boltops/__init__.py` and add `docs/ops/`.
+
+## License
+
+BoltOPs original code is licensed under the [MIT License](LICENSE). Portions
+adapted from third-party projects retain their original licenses and copyright
+notices; see the source file headers and the module source notes in
+[gemm](boltops/gemm/triton/SOURCE.md), [MLA](boltops/mla/triton/SOURCE.md),
+[MQA logits](boltops/mqa_logits/triton/SOURCE.md), and
+[Step-4 DSA](boltops/step4_dsa/triton/SOURCE.md).

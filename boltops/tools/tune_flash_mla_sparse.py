@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Autotune sparse FlashMLA and emit a version/device/shape config file."""
 
 from __future__ import annotations

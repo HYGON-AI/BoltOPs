@@ -1,3 +1,4 @@
+# Modified by Hygon in 2026 for BoltOPs HCU integration.
 """Triton backend for Kernelized Delta Attention.
 
 Standalone vendor of the directly callable Kimi-K3 KDA Triton kernels from

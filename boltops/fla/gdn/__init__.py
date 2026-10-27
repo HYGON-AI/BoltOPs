@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Public Gated DeltaNet (GDN) operators -- public signature boundary.
 
 Operator names align 1:1 with the vLLM / SGLang public names.

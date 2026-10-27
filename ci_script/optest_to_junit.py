@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Convert optest .optest-results.json to JUnit XML for GitLab CI.
 
 optest output structure:

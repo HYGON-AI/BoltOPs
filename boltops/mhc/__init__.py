@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Public interfaces for the Multi-Head Connection (MHC) operator family."""
 
 from __future__ import annotations

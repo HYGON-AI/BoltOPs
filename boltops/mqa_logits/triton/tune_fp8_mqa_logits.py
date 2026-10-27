@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Autotune BoltOPs Triton ``fp8_mqa_logits`` launch configs on Hygon DCU.
+"""Autotune BoltOPs Triton ``fp8_mqa_logits`` launch configs on Hygon HCU.
 
 Sweeps main-kernel configs (aiter-style + optional matrix_instr_nonkdim) and,
 on the fast path, clear-kernel configs. Times the full host API with CUDA

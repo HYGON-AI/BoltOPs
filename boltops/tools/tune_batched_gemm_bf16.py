@@ -179,7 +179,7 @@ def main() -> None:
         "--max-ilp",
         choices=("both", "on", "off"),
         default="both",
-        help="autotune AMD max-ILP scheduling (default: compare on and off)",
+        help="autotune HCU max-ILP scheduling (default: compare on and off)",
     )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--output", type=Path, required=True)

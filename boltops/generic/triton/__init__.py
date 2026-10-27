@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Triton implementations for the Generic operator family."""
 
 from .attn_res import attn_res
