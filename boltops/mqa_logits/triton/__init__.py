@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Triton backend for MQA logits (prefill).
 
 Public callers should use ``boltops.mqa_logits.triton_mqa_logits``. Low-level

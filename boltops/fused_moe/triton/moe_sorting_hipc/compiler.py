@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """aicc JIT compiler for the fused-MoE HIPC moe_sorting kernel.
 
 Compiles Hygon ``aicc`` sources under ``moe_sorting_hipc/csrc/`` and caches the
@@ -22,6 +24,8 @@ from typing import Iterable
 import torch
 from torch.utils.cpp_extension import get_default_build_root, include_paths, library_paths
 from torch.utils.file_baton import FileBaton
+
+from boltops.utility.runtime_text import format_hcu_message
 
 
 # Keep HIPC kernels compatible with BMZ runtimes that cannot launch v6 objects.
@@ -247,17 +251,24 @@ def load_hipc_extension(
                     include_dirs=[csrc_dir],
                 )
                 verbose = os.environ.get("BOLT_OPS_HIPC_VERBOSE", "0") == "1"
-                subprocess.run(
+                output = []
+                with subprocess.Popen(
                     ["ninja", "-f", str(ninja_file)],
                     cwd=build_dir,
-                    check=True,
-                    stdout=None if verbose else subprocess.PIPE,
-                    stderr=None if verbose else subprocess.STDOUT,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
                     text=True,
-                )
-        except subprocess.CalledProcessError as error:
-            output = error.stdout or ""
-            raise RuntimeError(f"HIPC extension build failed:\n{output}") from error
+                ) as process:
+                    for line in process.stdout:
+                        output.append(line)
+                        if verbose:
+                            print(format_hcu_message(line), end="", flush=True)
+                    returncode = process.wait()
+                if returncode:
+                    diagnostic = format_hcu_message("".join(output))
+                    raise RuntimeError(
+                        f"HIPC extension build failed (exit {returncode}):\n{diagnostic}"
+                    ) from None
         finally:
             baton.release()
     else:

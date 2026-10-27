@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Benchmark case definitions for Unified Attention.
 
 The tuning engine lived here historically; kernel configs are now static

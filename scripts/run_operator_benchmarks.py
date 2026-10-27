@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Run the BoltOps kernel performance benchmarks (auto-discovered).
 
 This script is the optest ``per`` entry, so it stays at this fixed path.

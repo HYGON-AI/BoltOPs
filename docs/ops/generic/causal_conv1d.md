@@ -383,7 +383,7 @@ T=1024/4096/16384 三档（附录 D 统一按此记录），补充 case 覆盖�
 
 ### D.1 平台与测量口径
 
-目标平台为海光 DCU3（gfx936 / BoWenA0），80 CU @ 1.5 GHz，HBM 1.8 TB/s。
+目标平台为海光 HCU3（gfx936 / BoWenA0），80 CU @ 1.5 GHz，HBM 1.8 TB/s。
 硬件峰值按 roofline 口径：FP32 vector 15.36 TFLOPS（80 CU × 64 lanes ×
 2 FLOP × 1.5 GHz）、BF16 packed 30.72 TFLOPS；本算子无 `v_mfma`，MFMA 峰值
 不适用。本机 GPU 时长波动大（同一二进制实测波动可达 ±30%），所有 A/B 均多次
@@ -392,7 +392,7 @@ T=1024/4096/16384 三档（附录 D 统一按此记录），补充 case 覆盖�
 算子本身是**低算术强度**算子：以 fwd medium shape 为例
 （`dim=1536`、T=4096、width=4、BF16 x + FP32 weight），useful FLOPs 仅
 50.3 MFLOP，最小 DRAM 流量约 25.5 MB（按此口径算术强度约 2 FLOP/B），
-远低于 DCU3 的 ridge 点（约 8.5 FLOP/B）。因此性能目标不是逼近算力峰值，
+远低于 HCU3 的 ridge 点（约 8.5 FLOP/B）。因此性能目标不是逼近算力峰值，
 而是控制每 token 的访存请求路径与启动开销。
 
 ### D.2 调优历程总览（基线 → fast_div → vec8 → chunks）
@@ -457,7 +457,7 @@ decode kernel 仅 5–12 µs；b1 只有 18 个 program（不足 1 wave），ker
 ### D.4 fast_div 阶段：SiLU 快速除法（`tl.fdiv_fast`）
 
 fwd / update 的 SiLU 为 `acc / (1 + tl.exp(-acc))`。反汇编显示默认路径在
-DCU3 上生成完整精度的 Newton-Raphson 除法链（约 13 条指令：
+HCU3 上生成完整精度的 Newton-Raphson 除法链（约 13 条指令：
 `v_div_scale ×2 + v_rcp + v_fma ×3 + v_div_fmas + v_div_fixup`），每输出元素
 多出约 10 条指令；fwd 处于 SIMD issue-bound（VALU 仅占 ~58% issue 槽）。
 

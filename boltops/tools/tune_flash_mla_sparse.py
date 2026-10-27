@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Autotune sparse FlashMLA and emit a version/device/shape config file."""
 
 from __future__ import annotations
@@ -11,6 +13,8 @@ from pathlib import Path
 
 import torch
 import triton
+
+from boltops.utility.runtime_text import format_hcu_message
 
 from boltops.mla import flash_mla_sparse_fwd
 from boltops.mla.triton.flash_mla_sparse import (
@@ -155,11 +159,11 @@ def tune_shape(
                     )
                 )
                 tested += 1
-                print(f"  [{index:03d}] {ms:.6f} ms {config}", flush=True)
+                print(f"  [{index:03d}] {ms:.6f} ms {format_hcu_message(config)}", flush=True)
                 if ms < best_ms:
                     best_config, best_ms = dict(config), ms
             except Exception as exc:
-                print(f"  [{index:03d}] FAIL {config}: {exc}", flush=True)
+                print(f"  [{index:03d}] FAIL {format_hcu_message(config)}: {format_hcu_message(exc)}", flush=True)
         if best_config is None:
             raise RuntimeError(f"all candidates failed for shape {shape}")
         return best_config, best_ms
@@ -221,7 +225,7 @@ def main(argv: list[str] | None = None) -> int:
             }
         )
         print(
-            f"BEST {best_ms:.6f} ms ({baseline_ms / best_ms:.3f}x): {best}",
+            f"BEST {best_ms:.6f} ms ({baseline_ms / best_ms:.3f}x): {format_hcu_message(best)}",
             flush=True,
         )
 

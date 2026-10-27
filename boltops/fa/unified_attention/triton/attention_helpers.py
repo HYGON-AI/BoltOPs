@@ -1,4 +1,4 @@
-# Modified by Hygon in 2026 for BoltOPs DCU/HCU integration.
+# Modified by Hygon in 2026 for BoltOPs HCU integration.
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Shared ``@triton.jit`` helpers used by the unified attention kernel

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Causal depthwise-convolution Triton operator.
 
 Re-exports the public entry points so callers can use either

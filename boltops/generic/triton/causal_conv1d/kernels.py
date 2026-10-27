@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Modified by Hygon in 2026 for BoltOPs DCU/HCU integration.
+# Modified by Hygon in 2026 for BoltOPs HCU integration.
 """Standalone port of SGLang causal conv1d Triton kernels (fwd + update).
 
 Faithful to ``sglang.kernels.ops.mamba.causal_conv1d_triton``: the kernels and

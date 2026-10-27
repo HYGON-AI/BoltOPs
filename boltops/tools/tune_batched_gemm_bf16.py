@@ -14,6 +14,8 @@ from pathlib import Path
 import torch
 import triton
 
+from boltops.utility.runtime_text import format_hcu_message
+
 from boltops.gemm.triton.batched_gemm_bf16 import batched_gemm_bf16
 
 
@@ -137,9 +139,9 @@ def tune_shape(
             )
             ms = bench(fn, warmup_ms, rep_ms)
         except Exception as exc:
-            print(f"  [{index:02d}] ERROR {cfg}: {exc}", flush=True)
+            print(f"  [{index:02d}] ERROR {format_hcu_message(cfg)}: {format_hcu_message(exc)}", flush=True)
             continue
-        print(f"  [{index:02d}] {ms:.6f} ms {cfg}", flush=True)
+        print(f"  [{index:02d}] {ms:.6f} ms {format_hcu_message(cfg)}", flush=True)
         if ms < best_ms:
             best_cfg, best_ms = cfg, ms
     del x, w, y
@@ -179,7 +181,7 @@ def main() -> None:
         "--max-ilp",
         choices=("both", "on", "off"),
         default="both",
-        help="autotune AMD max-ILP scheduling (default: compare on and off)",
+        help="autotune HCU max-ILP scheduling (default: compare on and off)",
     )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
@@ -215,7 +217,7 @@ def main() -> None:
         )
         output[str(m)] = cfg
         timing[str(m)] = ms
-        print(f"BEST M={m}: {ms:.6f} ms {cfg}", flush=True)
+        print(f"BEST M={m}: {ms:.6f} ms {format_hcu_message(cfg)}", flush=True)
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(output, indent=4) + "\n")
         timing_path.write_text(json.dumps(timing, indent=4) + "\n")

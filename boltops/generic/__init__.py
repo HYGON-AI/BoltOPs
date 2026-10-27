@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Public interfaces for the Generic operator family.
 
 Operators without a dedicated subpackage declare their public signatures here

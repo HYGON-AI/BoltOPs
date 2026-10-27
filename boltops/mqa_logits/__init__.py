@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """MQA logits operator package (sparse-attention indexer scoring).
 
 * docs: ``docs/ops/mqa_logits_triton.md`` (Triton prefill + FP8 paged),

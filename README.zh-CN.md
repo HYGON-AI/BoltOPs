@@ -6,7 +6,7 @@ Backend Optimized Low-latency Triton/TileLang Operators
 
 ## 介绍
 
-**BoltOPs**（*Backend Optimized Low-latency Triton/TileLang Operators*）是 AI Compiler 团队面向海光 DCU 的高性能算子库。命名同时取自 **lightning bolt（闪电）**：以低时延为目标，追求闪电般的执行速度。它以 Triton、TileLang 等 DSL 实现可量产的、由 benchmark 驱动的 kernel，并通过清晰的 Python API 对外提供，让推理框架与模型侧调用方无需后端胶水即可获得调优后的 DCU 吞吐。
+**BoltOPs**（*Backend Optimized Low-latency Triton/TileLang Operators*）是 AI Compiler 团队面向海光 HCU 的高性能算子库。命名同时取自 **lightning bolt（闪电）**：以低时延为目标，追求闪电般的执行速度。它以 Triton、TileLang 等 DSL 实现可量产的、由 benchmark 驱动的 kernel，并通过清晰的 Python API 对外提供，让推理框架与模型侧调用方无需后端胶水即可获得调优后的 HCU 吞吐。
 
 库聚焦时延敏感的融合算子、正确性优先的验证，以及便于部署的打包方式：该走快路径的地方走快路径，该降低接入成本的地方尽量少摩擦。
 
@@ -245,7 +245,7 @@ pip install optest -i http://10.16.1.201:9929/nightly/dtk2604/+simple/ --trusted
 optest --op_name boltops --test_dir . --test_mode all      # 正确性 + 性能
 optest --op_name boltops --test_dir . --test_mode acc      # 只跑正确性
 optest --op_name boltops --test_dir . --test_mode per      # 只跑性能
-optest --op_name boltops --test_dir . --test_mode all --gpus 0,2  # 指定 DCU
+optest --op_name boltops --test_dir . --test_mode all --gpus 0,2  # 指定 HCU
 optest --display                                            # 用最新结果生成 HTML 报告
 ```
 
@@ -269,3 +269,10 @@ optest --display                                            # 用最新结果生
 1. 新建 `boltops/<op>/`，在 `triton/` 与 `tilelang/` 实现；`test/test_<op>.py` 写正确性，`@pytest.mark.bench` 写模型尺寸测速，用 `--bench` 比出最优。
 2. 公开签名优先对齐 vLLM / SGLang（或 HIPC / CUDA C）；在 `boltops/<op>/__init__.py` 写出厂后端分流并导出。
 3. 在 `boltops/__init__.py` 再导出，并补 `docs/ops/`。
+
+## 许可证
+
+BoltOPs 原创代码采用 [MIT 许可证](LICENSE)。基于第三方项目修改的部分保留其
+原有许可证和版权声明；来源见文件头及模块说明：[GEMM](boltops/gemm/triton/SOURCE.md)、
+[MLA](boltops/mla/triton/SOURCE.md)、[MQA logits](boltops/mqa_logits/triton/SOURCE.md)
+和 [Step-4 DSA](boltops/step4_dsa/triton/SOURCE.md)。

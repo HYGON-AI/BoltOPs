@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # SPDX-License-Identifier: MIT
 """Benchmark saved MoE configs and write Aiter-compatible performance CSVs.
 
@@ -228,7 +229,10 @@ class DeviceGuard:
     """
 
     def __init__(self, device):
-        hip = ctypes.CDLL(ctypes.util.find_library("amdhip64") or "libamdhip64.so")
+        try:
+            hip = ctypes.CDLL(ctypes.util.find_library("amdhip64") or "libamdhip64.so")
+        except OSError:
+            raise OSError("Cannot load the HIP runtime for HCU device monitoring") from None
         bus = ctypes.create_string_buffer(32)
         get_bus = hip.hipDeviceGetPCIBusId
         get_bus.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int]

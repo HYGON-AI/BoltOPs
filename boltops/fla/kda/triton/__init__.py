@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Triton backend for Kernelized Delta Attention.
 
 Standalone vendor of the directly callable Kimi-K3 KDA Triton kernels from

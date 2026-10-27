@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Modified by Hygon in 2026 for BoltOPs DCU/HCU integration.
+# Modified by Hygon in 2026 for BoltOPs HCU integration.
 """Fused Triton kernel for masked Mamba state scatter operations.
 
 This module is intentionally kept close to SGLang's implementation so upstream

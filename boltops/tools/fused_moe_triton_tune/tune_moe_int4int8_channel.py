@@ -1,4 +1,4 @@
-# Modified by Hygon in 2026 for BoltOPs DCU/HCU integration.
+# Modified by Hygon in 2026 for BoltOPs HCU integration.
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the channel-wise W4A8 MoE path."""
 

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Public interfaces for Independent Hyper-Connections (IHC)."""
 
 from __future__ import annotations

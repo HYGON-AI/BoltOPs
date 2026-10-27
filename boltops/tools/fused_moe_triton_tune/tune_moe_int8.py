@@ -1,4 +1,4 @@
-# Modified by Hygon in 2026 for BoltOPs DCU/HCU integration.
+# Modified by Hygon in 2026 for BoltOPs HCU integration.
 # SPDX-License-Identifier: Apache-2.0
 
 # Adapted from https://github.com/sgl-project/sglang/pull/3730

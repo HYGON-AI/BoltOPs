@@ -163,7 +163,7 @@ decode_attention_fwd(
 
 算子为 **in-place 写 `o` / `lse`**，无返回值。Forward-only。
 
-HIP（DCU / ROCm）上自动启用 `waves_per_eu` / `kpack` 等 AMD launch 参数；
+HIP（HCU / ROCm）上自动启用 `waves_per_eu` / `kpack` 等 AMD launch 参数；
 MLA 的 `Lk=576` CUDA 专用 `512+64` tile 在 HIP 上走 `next_power_of_2(Lv)` 分支
 （与上游 vLLM 一致）。
 
