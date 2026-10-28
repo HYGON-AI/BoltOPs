@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Exports, FP8-cache correctness and benchmarks for four-dimensional Decode."""
 
 from __future__ import annotations

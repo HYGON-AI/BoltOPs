@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """MQA logits collection rules.
 
 ``--bench`` runs BoltOPs-only latency cases. Hipc comparisons stay marked

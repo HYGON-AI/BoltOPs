@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Indexer RMS/LayerNorm + partial NeoX RoPE, and the RoPE cache builder.
 
 Vendored from Step-4 DSA handoff ``inference/kernel.py``

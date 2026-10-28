@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+# Upstream reference: https://github.com/vllm-project/vllm/blob/317081fb6dc8b125a3134711a7750707bfd55371/vllm/models/hy_v4/nvidia/hc.py
 # ruff: noqa
 """Eager formulas from Hy4-p vllm/models/hy_v4/nvidia/hc.py."""
 

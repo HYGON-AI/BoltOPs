@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import tempfile
 from pathlib import Path
 
 import torch
@@ -137,9 +138,18 @@ def tune_shape(
             )
             ms = bench(fn, warmup_ms, rep_ms)
         except Exception as exc:
-            print(f"  [{index:02d}] ERROR {cfg}: {exc}", flush=True)
+            with tempfile.NamedTemporaryFile(
+                mode="w", prefix="boltops-tune-", suffix=".log",
+                encoding="utf-8", delete=False,
+            ) as log:
+                log.write(f"config={cfg!r}\n{exc}\n")
+            print(f"  [{index:02d}] ERROR; details: {log.name}", flush=True)
             continue
-        print(f"  [{index:02d}] {ms:.6f} ms {cfg}", flush=True)
+        shown = {
+            ("max_ilp" if k == "amdgpu_enable_max_ilp_scheduling_strategy" else k): v
+            for k, v in cfg.items()
+        }
+        print(f"  [{index:02d}] {ms:.6f} ms {shown}", flush=True)
         if ms < best_ms:
             best_cfg, best_ms = cfg, ms
     del x, w, y
@@ -215,7 +225,11 @@ def main() -> None:
         )
         output[str(m)] = cfg
         timing[str(m)] = ms
-        print(f"BEST M={m}: {ms:.6f} ms {cfg}", flush=True)
+        shown = {
+            ("max_ilp" if k == "amdgpu_enable_max_ilp_scheduling_strategy" else k): v
+            for k, v in cfg.items()
+        }
+        print(f"BEST M={m}: {ms:.6f} ms {shown}", flush=True)
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(output, indent=4) + "\n")
         timing_path.write_text(json.dumps(timing, indent=4) + "\n")

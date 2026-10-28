@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """gfx946 entry point for MHC pre-big-fuse.
 
 Small shapes use the occupancy-3 common split-K kernel.  Larger shapes use the

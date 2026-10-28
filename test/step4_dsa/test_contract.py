@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """CPU-safe contract tests for the Step-4 DSA public facade."""
 
 from __future__ import annotations

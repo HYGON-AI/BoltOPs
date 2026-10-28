@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Shared inputs, FP32 references and capacity checks for FA operator tests."""
 
 from __future__ import annotations

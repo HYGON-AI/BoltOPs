@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """CSA region layout and per-region FP32/FP8 summary compression.
 
 Vendored from Step-4 DSA handoff ``inference/kernel.py`` (``dsa_kernels`` CSA).

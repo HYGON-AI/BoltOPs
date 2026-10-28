@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Correctness and optional performance tests for the private HIPC MoE sorter.
 
 Default ``pytest``: functional correctness / dependency checks.
@@ -25,11 +27,37 @@ _CSRC = (
 
 
 def test_moe_sorting_sources_are_standalone():
-    sources = "\n".join(path.read_text() for path in _CSRC.iterdir() if path.is_file())
+    # Upstream provenance in header comments is not a build dependency.
+    sources = "\n".join(
+        line
+        for path in _CSRC.iterdir()
+        if path.is_file()
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if not line.lstrip().startswith("//")
+    )
     assert "ck_tile" not in sources
     assert "composable_kernel" not in sources
     assert "#include <aiter" not in sources
     assert "#include \"aiter" not in sources
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "#include <ck_tile/core.hpp>",
+        '#include "composable_kernel.hpp"',
+        "#include <aiter/ops.hpp>",
+        '#include "aiter/ops.hpp"',
+    ],
+)
+def test_standalone_source_check_rejects_dependencies(tmp_path, monkeypatch, source):
+    (tmp_path / "kernel.h").write_text(
+        "// Upstream: composable_kernel/include/ck_tile/core.hpp\n" + source,
+        encoding="utf-8",
+    )
+    monkeypatch.setitem(globals(), "_CSRC", tmp_path)
+    with pytest.raises(AssertionError):
+        test_moe_sorting_sources_are_standalone()
 
 
 def _hipc_available() -> bool:

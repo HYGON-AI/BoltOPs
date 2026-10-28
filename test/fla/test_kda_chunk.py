@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Correctness tests for KDA chunk stages and full prefill orchestration."""
 
 from __future__ import annotations

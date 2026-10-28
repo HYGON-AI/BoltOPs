@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Autotune sweep for all activation kernels in moe_activation.py.
 
 Sweeps BLOCK_SIZE_N/D and num_warps for each kernel across M values

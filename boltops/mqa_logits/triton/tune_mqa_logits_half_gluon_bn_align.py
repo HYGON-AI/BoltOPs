@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Full-size launch sweep for Gluon ``mqa_logits_half_gluon_bn_align``.
 
 Same lightop size grid as ``tune_mqa_logits_half.py`` / FP8 bn_align. Ablation

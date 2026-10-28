@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 import csv
 import json
 from concurrent.futures import ProcessPoolExecutor

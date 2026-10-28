@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Correctness tests for signed region top-k (stage 3)."""
 
 from __future__ import annotations

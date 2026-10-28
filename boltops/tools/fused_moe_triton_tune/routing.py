@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Torch routing helpers used by the migrated MoE correctness/tuning programs."""
 
 from __future__ import annotations

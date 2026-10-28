@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # SPDX-License-Identifier: MIT
 """Single-K specialization: legality, rounding tolerance and unchanged fallbacks."""
 from types import SimpleNamespace

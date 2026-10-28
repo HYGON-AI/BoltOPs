@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Reference implementations of the DSA stages.
 
 These are the fp32 specification leg of the parity harness: each function is a

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Shared kernel-benchmark helpers for BoltOps.
 
 The optest ``per`` entry (``scripts/run_operator_benchmarks.py``) is a

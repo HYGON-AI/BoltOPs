@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Correctness and optional GPU-latency benches for paged FP8 MQA logits.
 
 Default pytest run: correctness / contract tests (``kv_block_size`` 1 and 64).

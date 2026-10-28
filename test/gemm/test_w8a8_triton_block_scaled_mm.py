@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Correctness tests for ``w8a8_triton_block_scaled_mm``."""
 
 from __future__ import annotations

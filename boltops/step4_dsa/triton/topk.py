@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Signed region top-k (logical ids) and fused prefill pack.
 
 Vendored from Step-4 DSA handoff ``inference/kernel.py`` (``dsa_kernels`` selector).

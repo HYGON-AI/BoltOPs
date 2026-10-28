@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Step4 geometry, as measured from the shipping checkpoint on 2026-08-11.
 
 Every value here was read out of the checkpoint's safetensors headers (no tensor

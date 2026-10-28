@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Load shipped Triton launch configs for ``fp8_mqa_logits``.
 
 Layout mirrors fused_moe (arch in filename)::

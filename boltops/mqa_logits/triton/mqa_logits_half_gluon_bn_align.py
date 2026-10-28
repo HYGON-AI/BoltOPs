@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+# Upstream reference: https://github.com/ROCm/aiter/blob/bbef5a6f2d3733b293c80d2cee6a8d464e88bc01/aiter/ops/triton/_gluon_kernels/gfx950/attention/fp8_mqa_logits.py
 """Experimental Gluon half (fp16/bf16) MQA logits: BN-aligned dataflow.
 
 Port of half BN without scales. Defaults match FP8 bn_align and half benches:

@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+# Upstream reference: https://github.com/ROCm/aiter/blob/bbef5a6f2d3733b293c80d2cee6a8d464e88bc01/aiter/ops/triton/gemm/basic/gemm_a16w16.py
 """Vendored aiter Triton ``gemm_a16w16`` (FP16/BF16).
 
 Upstream: ROCm/aiter ``aiter.ops.triton.gemm.basic.gemm_a16w16``.

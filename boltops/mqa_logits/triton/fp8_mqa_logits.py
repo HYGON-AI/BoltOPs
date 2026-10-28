@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+# Upstream reference: https://github.com/ROCm/aiter/blob/bbef5a6f2d3733b293c80d2cee6a8d464e88bc01/aiter/ops/triton/_triton_kernels/attention/fp8_mqa_logits.py
 """MQA logits for sparse-attention indexer (prefill / non-paged).
 
 Vendored from hygon aiter ``aiter.ops.triton.attention.fp8_mqa_logits``

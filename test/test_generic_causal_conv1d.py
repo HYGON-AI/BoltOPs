@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Unified causal conv1d API: cross-backend correctness, routing, bake-off.
 
 Both Triton ports (SGLang / vLLM) are exercised through the unified entry

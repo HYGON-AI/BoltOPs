@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Architecture-family dispatch for TileLang MHC kernels."""
 
 from __future__ import annotations

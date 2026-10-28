@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Correctness tests for CSA region layout + compression (stage 1)."""
 
 from __future__ import annotations

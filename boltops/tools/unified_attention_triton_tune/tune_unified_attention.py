@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Offline tuner for the aiter-compatible UnifiedAttention core kernels."""
 
 from __future__ import annotations

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Internal-only tests for HCU WASP/WDRA ``gemm_fp16`` (not a public API)."""
 
 from __future__ import annotations

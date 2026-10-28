@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-# Modified by Hygon in 2026 for BoltOPs HCU integration.
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+# Upstream reference: https://github.com/sgl-project/sglang/blob/c240169265af83800d0b901661c1075f9c5ed3ff/python/sglang/kernels/ops/gemm/int8_kernel.py
 """Vendored SGLang Triton W8A8 block-scaled INT8 GEMM.
 
 Source: ``sglang/kernels/ops/quantization/int8_kernel.py``

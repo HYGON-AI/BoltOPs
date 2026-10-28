@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Smoke / skip-gated tests for ``batched_gemm_a16wfp4``."""
 
 from __future__ import annotations

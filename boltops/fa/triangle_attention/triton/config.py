@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Runtime configuration lookup for TriangleAttention."""
 
 from __future__ import annotations

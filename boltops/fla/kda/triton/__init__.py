@@ -1,4 +1,26 @@
-# Modified by Hygon in 2026 for BoltOPs HCU integration.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# AMD/ROCm vendored copy of the Kimi-K3 KDA triton kernels.
+#
+# Provenance: mirror of vllm/models/kimi_k3/nvidia/ops/third_party/kda (tracker
+# mke-tracker @ 7adebfcf9; FLA vendored per PRs #39/#86). Split per-vendor so
+# AMD can carry gfx950-specific kernel changes without touching the NVIDIA copy.
+#
+# fla-org/flash-linear-attention#869 (the unmerged ROCm fixes our earlier
+# amd_fla shim carried against FLA 0.5.0) is covered here by the *newer* vendored
+# FLA rather than the literal patch:
+#   - transpose-state-layout workaround: N/A (kernels rewritten; no
+#     transpose_state_layout path remains),
+#   - AMD autotune configs: present (is_amd num_warps/num_stages branches),
+#   - OOB-mask correctness fix: present (all tl.load use mask=..., other=0).
+# Validated on gfx950: no core-dump, gsm8k 94.1%.
+#
+# AMD-specific deltas vs the NVIDIA copy: NONE yet (byte-identical). Keep in sync
+# with the NVIDIA copy on FLA updates; any divergence should be an intentional,
+# documented gfx950-specific change (a #869-style AMD-only fix).
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+# Upstream reference: https://github.com/vllm-project/vllm/blob/aeeb36b1f17145975c6713242f2447bb8b98782b/vllm/models/kimi_k3/amd/ops/third_party/kda/__init__.py
 """Triton backend for Kernelized Delta Attention.
 
 Standalone vendor of the directly callable Kimi-K3 KDA Triton kernels from

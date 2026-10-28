@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Correctness tests for ``batched_gemm_bf16`` (aiter Triton batched A16W16)."""
 
 from __future__ import annotations

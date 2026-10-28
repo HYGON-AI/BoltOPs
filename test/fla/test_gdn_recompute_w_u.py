@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Correctness and optional performance tests for ``recompute_w_u_fwd``.
 
 Default ``pytest``: functional / edge-case correctness.

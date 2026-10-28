@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Shared architecture fallback policy for MHC TileLang components."""
 
 from __future__ import annotations

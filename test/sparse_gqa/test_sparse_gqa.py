@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Correctness tests for the production Qwen Sparse-GQA interfaces."""
 
 from __future__ import annotations

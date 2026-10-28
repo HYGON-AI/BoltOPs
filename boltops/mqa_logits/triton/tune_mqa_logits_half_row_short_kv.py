@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Tune half ``mqa_logits_half_row`` on short-KV shapes and compare to BN / Gluon / lightop.
 
 Short-KV grid: N in {66} × M in {16,32,64,127} × H in {8,64} (skip M>N).

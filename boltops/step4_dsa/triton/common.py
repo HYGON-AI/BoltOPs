@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Shared Python helpers for Step-4 DSA Triton kernels.
 
 Vendored from the Step-4 DSA handoff ``inference/kernel.py`` (dsa_kernels /

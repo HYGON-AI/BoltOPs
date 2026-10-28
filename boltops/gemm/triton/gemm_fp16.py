@@ -1,3 +1,8 @@
+# SPDX-License-Identifier: MIT
+# Copyright 2018-2020 Philippe Tillet
+# Copyright 2020-2022 OpenAI
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+# Upstream reference: https://github.com/triton-lang/triton/blob/7c56a5e40f7fd928dfd5c72902d5def0097db73a/python/tutorials/03-matrix-multiplication.py
 """FP16 GEMM Triton kernel with optional WASP/WDRA (gfx946) and barrier knobs.
 
 Public call shape follows vLLM's Triton matmul wrappers

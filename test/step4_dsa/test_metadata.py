@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Correctness tests for prefill / decode sparse metadata (stage 4)."""
 
 from __future__ import annotations

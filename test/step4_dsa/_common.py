@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Shared pytest helpers for Step-4 DSA correctness tests and benchmarks."""
 
 from __future__ import annotations

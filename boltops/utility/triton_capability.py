@@ -93,7 +93,7 @@ def _select_backend(backends: dict) -> tuple[str, object]:
     if "amd" in backends:
         return "amd", backends["amd"]
     raise RuntimeError(
-        f"Neither HCU nor AMD Triton backend is installed; available: {sorted(backends)}"
+        "No compatible HIP Triton backend is installed"
     )
 
 
@@ -113,12 +113,12 @@ def _get_compiler_options() -> tuple[frozenset[str], str]:
 
     if options_class is None:
         raise RuntimeError(
-            f"Cannot find HIPOptions for Triton {backend_name!r} backend"
+            "Cannot find HIPOptions for the selected HIP Triton backend"
         )
     fields = getattr(options_class, "__dataclass_fields__", {})
     if not fields:
         raise RuntimeError(
-            f"Triton {backend_name!r} backend HIPOptions has no dataclass fields"
+            "The selected HIP Triton backend HIPOptions has no dataclass fields"
         )
     return frozenset(fields), backend_name
 

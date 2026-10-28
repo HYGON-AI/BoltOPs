@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Tests for Sparse-GQA capability-versioned runtime configs."""
 
 from __future__ import annotations

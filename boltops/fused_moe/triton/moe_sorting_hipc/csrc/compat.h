@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: MIT
+// Copyright (c) Advanced Micro Devices, Inc., or its affiliates.
+// Modified by Hygon Information Technology Co., Ltd., 2026.
+// Upstream reference: https://github.com/ROCm/composable_kernel/blob/baf508b98fce5a23ab6cee21ad3fc8822ecda125/include/ck_tile/core.hpp
 #pragma once
 
 #include <hip/hip_runtime.h>

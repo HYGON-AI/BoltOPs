@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Sparse GQA decode attention over selected regions, with optional split-KV.
 
 Vendored from Step-4 DSA handoff ``inference/kernel.py`` (``sparse_attn`` decode).

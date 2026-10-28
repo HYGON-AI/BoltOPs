@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Single-query MHA over FP8 KV; reuse the existing split-KV decode kernel."""
 
 from __future__ import annotations

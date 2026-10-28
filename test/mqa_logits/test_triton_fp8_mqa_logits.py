@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Correctness and size-grid performance tests for prefill FP8 MQA logits.
 
 Backends under test: ``row``, ``bn``, ``gluon`` (plus public ``auto``).

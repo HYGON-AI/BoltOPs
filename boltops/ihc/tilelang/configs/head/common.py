@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Default launch policy for ``ihc_head``.
 
 Shares the GEMM tile/split heuristic with ``ihc_pre`` for now.

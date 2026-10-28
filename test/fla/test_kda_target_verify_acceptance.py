@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Acceptance checks for the KDA target-verify kernel against SGLang."""
 
 from __future__ import annotations

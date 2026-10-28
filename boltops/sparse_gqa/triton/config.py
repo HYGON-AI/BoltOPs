@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Persistent tuning configuration helpers for Sparse-GQA."""
 
 from __future__ import annotations

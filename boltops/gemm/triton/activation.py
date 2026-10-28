@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+# Upstream reference: https://github.com/ROCm/aiter/blob/bbef5a6f2d3733b293c80d2cee6a8d464e88bc01/aiter/ops/triton/_triton_kernels/common/activation.py
 """Activation helpers used by vendored aiter GEMM-A16W16 (slim copy).
 
 Source: ``aiter/ops/triton/_triton_kernels/activation.py`` (activation mapping

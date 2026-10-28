@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Optimal FP8 Gluon MQA logits entry.
 
 Ablations (WPP / QPP / ship vs BN layouts / Q-mask / epilogue) showed that the

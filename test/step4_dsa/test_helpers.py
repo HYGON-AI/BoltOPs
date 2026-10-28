@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Regression tests for shared Step-4 runtime configuration helpers."""
 
 from __future__ import annotations

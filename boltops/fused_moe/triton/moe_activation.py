@@ -1,5 +1,9 @@
-# Modified by Hygon in 2026 for BoltOPs HCU integration.
 # SPDX-License-Identifier: Apache-2.0
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
+# Includes vLLM-derived activation code (Apache-2.0) and aiter portions (MIT).
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+# Upstream reference: https://github.com/ROCm/aiter/blob/bbef5a6f2d3733b293c80d2cee6a8d464e88bc01/aiter/ops/triton/_triton_kernels/common/activation.py
 """Shared MoE activation implementation and public Triton entry points.
 
 Terminology:

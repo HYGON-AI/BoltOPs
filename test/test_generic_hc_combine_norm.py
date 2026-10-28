@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Correctness and optional performance tests for ``hc_combine_norm``.
 
 Default ``pytest``: functional / edge-case correctness against an eager fp32

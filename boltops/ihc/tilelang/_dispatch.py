@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Architecture-family dispatch for TileLang IHC kernels."""
 
 from functools import lru_cache

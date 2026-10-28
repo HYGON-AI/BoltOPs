@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Weighted-ReLU indexer logits over e4m3-rounded proxy activations.
 
 Vendored from Step-4 DSA handoff ``inference/kernel.py`` (``dsa_kernels.indexer_logits``).

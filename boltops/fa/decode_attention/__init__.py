@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Decode attention adapters over existing shared kernels."""
 
 from __future__ import annotations

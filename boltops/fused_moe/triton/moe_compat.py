@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Local replacements for non-Triton helpers used by the migrated MoE code."""
 
 from __future__ import annotations

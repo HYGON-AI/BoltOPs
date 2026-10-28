@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Fixed-schedule Kimi-K3 KDA prefill implementation."""
 
 from __future__ import annotations

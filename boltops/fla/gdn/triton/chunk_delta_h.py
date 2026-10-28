@@ -1,4 +1,12 @@
 # SPDX-License-Identifier: MIT
+# Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+# For a list of all contributors, visit:
+#   https://github.com/fla-org/flash-linear-attention/graphs/contributors
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+# Upstream reference: https://github.com/fla-org/flash-linear-attention/blob/3a9ce1c83a13994d824dbb3421e2989d330bb38b/fla/ops/common/chunk_delta_h.py
 
 from __future__ import annotations
 

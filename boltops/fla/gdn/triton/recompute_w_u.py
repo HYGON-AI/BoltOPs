@@ -1,3 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+# Adapt from https://github.com/fla-org/flash-linear-attention/blob/main/fla/ops/gated_delta_rule/wy_fast.py
+# Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
+# Original flash-linear-attention portions retain their MIT license.
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+# Upstream reference: https://github.com/sgl-project/sglang/blob/c240169265af83800d0b901661c1075f9c5ed3ff/python/sglang/kernels/ops/attention/fla/wy_fast.py
 """SGLang/GDN-specific WY recomputation kernels shared by FLA families."""
 
 from __future__ import annotations

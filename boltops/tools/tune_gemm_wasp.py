@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Sweep / record harness for internal ``gemm_fp16`` WASP/WDRA.
 
 One script + ``boltops/gemm/triton/configs/gemm_fp16/`` (created on promote):

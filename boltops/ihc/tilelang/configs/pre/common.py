@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Default launch policy for ``ihc_pre`` (shared GEMM tile/split heuristic)."""
 
 from __future__ import annotations

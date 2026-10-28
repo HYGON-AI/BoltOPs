@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Deterministic synthetic inputs for the DSA parity harness.
 
 Distributions mirror the upstream unit tests so a failure here is attributable to

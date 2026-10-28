@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """ABI, routing, and correctness coverage for UnifiedAttention."""
 
 from __future__ import annotations

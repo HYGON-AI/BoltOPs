@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+# Upstream reference: https://github.com/ROCm/aiter/blob/bbef5a6f2d3733b293c80d2cee6a8d464e88bc01/aiter/ops/triton/_gluon_kernels/gfx950/attention/fp8_mqa_logits.py
 """Experimental Gluon FP8 MQA logits: TTGIR aligned with BN-tile first.
 
 Phase-1: BN dataflow (register Q/W, static_range, no W LDS ping-pong).

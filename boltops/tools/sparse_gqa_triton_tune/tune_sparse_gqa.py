@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Tune Qwen Sparse-GQA production cases on the current GPU/HCU."""
 
 from __future__ import annotations

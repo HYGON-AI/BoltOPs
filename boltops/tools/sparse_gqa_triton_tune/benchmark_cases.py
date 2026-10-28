@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Production-shape simulations shared by Sparse-GQA benchmarks."""
 
 from __future__ import annotations

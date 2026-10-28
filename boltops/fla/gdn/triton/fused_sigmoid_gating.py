@@ -1,4 +1,6 @@
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: Apache-2.0
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+# Upstream reference: https://github.com/sgl-project/sglang/blob/c240169265af83800d0b901661c1075f9c5ed3ff/python/sglang/kernels/ops/attention/linear/fused_sigmoid_gating_recurrent.py
 
 from __future__ import annotations
 

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Autotune BoltOPs Triton ``fp8_mqa_logits`` launch configs on Hygon HCU.
 
 Sweeps main-kernel configs (aiter-style + optional matrix_instr_nonkdim) and,

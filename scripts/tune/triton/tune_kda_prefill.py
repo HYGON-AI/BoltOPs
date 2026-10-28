@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Benchmark and tune KDA prefill-stage Triton configs.
 
 The tuner writes exact ``(arch, B, dtype, shape)`` winners under

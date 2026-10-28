@@ -249,17 +249,23 @@ def load_hipc_extension(
                     include_dirs=[csrc_dir],
                 )
                 verbose = os.environ.get("BOLT_OPS_HIPC_VERBOSE", "0") == "1"
-                subprocess.run(
-                    ["ninja", "-f", str(ninja_file)],
-                    cwd=build_dir,
-                    check=True,
-                    stdout=None if verbose else subprocess.PIPE,
-                    stderr=None if verbose else subprocess.STDOUT,
-                    text=True,
-                )
+                log_path = build_dir / "build.log"
+                if verbose:
+                    print(f"Building HIPC extension; compiler output: {log_path}", flush=True)
+                with log_path.open("w", encoding="utf-8") as log:
+                    subprocess.run(
+                        ["ninja", "-f", str(ninja_file)],
+                        cwd=build_dir,
+                        check=True,
+                        stdout=log,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                    )
         except subprocess.CalledProcessError as error:
-            output = error.stdout or ""
-            raise RuntimeError(f"HIPC extension build failed:\n{output}") from error
+            raise RuntimeError(
+                f"HIPC extension build failed (exit {error.returncode}); "
+                f"compiler output: {log_path}"
+            ) from None
         finally:
             baton.release()
     else:

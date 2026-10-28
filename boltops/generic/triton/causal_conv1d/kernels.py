@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-# Modified by Hygon in 2026 for BoltOPs HCU integration.
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Copyright (c) 2024, Tri Dao.
+# Adapted from https://github.com/Dao-AILab/causal-conv1d/blob/main/causal_conv1d/causal_conv1d_interface.py
+# and https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/mamba/ops/causal_conv1d.py
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+# Upstream reference: https://github.com/sgl-project/sglang/blob/246b3c3eafde7c18748d3bdc6ecd4a65c51d7b7b/python/sglang/kernels/ops/mamba/causal_conv1d_triton.py
 """Standalone port of SGLang causal conv1d Triton kernels (fwd + update).
 
 Faithful to ``sglang.kernels.ops.mamba.causal_conv1d_triton``: the kernels and

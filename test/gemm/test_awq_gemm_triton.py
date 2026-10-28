@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+# Upstream reference: https://github.com/vllm-project/vllm/blob/aeeb36b1f17145975c6713242f2447bb8b98782b/tests/kernels/quantization/test_awq_triton.py
 """Correctness tests for ``awq_gemm_triton`` (aligned with vLLM test_awq_triton)."""
 
 from __future__ import annotations

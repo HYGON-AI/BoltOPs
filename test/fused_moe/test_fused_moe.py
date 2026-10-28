@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Correctness and CUDA-graph benchmarks for the public fused MoE operator."""
 
 from __future__ import annotations

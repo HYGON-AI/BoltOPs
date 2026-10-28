@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Backend sub-package discovery for op packages.
 
 BoltOps op packages follow the ``boltops/<op>/<backend>/`` layout: each

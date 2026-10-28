@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Merge per-split sparse-decode attention states.
 
 Vendored from Step-4 DSA handoff ``inference/kernel.py`` (``sparse_attn.merge_split_states``).

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Original shapes from shape_09_kimi26_128k_s2000.xlsx.
 
 49 cases cover 24 network shapes; 13 cases form the default representative set.

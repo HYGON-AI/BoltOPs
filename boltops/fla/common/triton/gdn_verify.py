@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """FP32 chain/tree verify kernel.
 
 The state tile is [BV, K], so loads, snapshot stores and K reductions use

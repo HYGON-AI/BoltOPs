@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Sparse GQA prefill attention over selected regions (scalar and query-tiled).
 
 Vendored from Step-4 DSA handoff ``inference/kernel.py`` (``sparse_attn`` prefill).

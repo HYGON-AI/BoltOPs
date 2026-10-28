@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Shared pytest hooks for correctness vs performance suites.
 
 Default: run functional/correctness tests only.

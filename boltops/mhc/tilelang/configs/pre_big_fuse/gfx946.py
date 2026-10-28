@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """gfx946 launch policy for ``mhc_pre_big_fuse``.
 
 Common kernels target three resident CTAs per CU.  Persistent kernels target

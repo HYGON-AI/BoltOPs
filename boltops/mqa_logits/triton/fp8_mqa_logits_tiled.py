@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """BN-tile compatibility entry for FP8 MQA logits.
 
 Forwards to ``_fp8_mqa_logits_bn_tile_kernel`` via ``fp8_mqa_logits`` with

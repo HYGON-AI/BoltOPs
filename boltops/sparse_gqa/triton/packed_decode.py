@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+# Upstream reference: https://github.com/yht183/sglang-das/blob/4cc62ab1d0c7a63c770e2a275d42b67ae20c345c/python/sglang/srt/layers/attention/qsa/sparse_attn.py
 """Packed ragged Sparse-GQA decode kernels."""
 
 from __future__ import annotations

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Correctness tests and production benches for sparse decode attention (stage 6)."""
 
 from __future__ import annotations

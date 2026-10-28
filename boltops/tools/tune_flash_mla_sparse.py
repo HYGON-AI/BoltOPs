@@ -9,6 +9,7 @@ import argparse
 import itertools
 import json
 import math
+import tempfile
 from pathlib import Path
 
 import torch
@@ -157,11 +158,20 @@ def tune_shape(
                     )
                 )
                 tested += 1
-                print(f"  [{index:03d}] {ms:.6f} ms {config}", flush=True)
+                shown = {
+                    ("max_ilp" if k == "amdgpu_enable_max_ilp_scheduling_strategy" else k): v
+                    for k, v in config.items()
+                }
+                print(f"  [{index:03d}] {ms:.6f} ms {shown}", flush=True)
                 if ms < best_ms:
                     best_config, best_ms = dict(config), ms
             except Exception as exc:
-                print(f"  [{index:03d}] FAIL {config}: {exc}", flush=True)
+                with tempfile.NamedTemporaryFile(
+                    mode="w", prefix="boltops-tune-", suffix=".log",
+                    encoding="utf-8", delete=False,
+                ) as log:
+                    log.write(f"config={config!r}\n{exc}\n")
+                print(f"  [{index:03d}] FAIL; details: {log.name}", flush=True)
         if best_config is None:
             raise RuntimeError(f"all candidates failed for shape {shape}")
         return best_config, best_ms
@@ -222,8 +232,12 @@ def main(argv: list[str] | None = None) -> int:
                 "valid_candidates": tested,
             }
         )
+        shown = {
+            ("max_ilp" if k == "amdgpu_enable_max_ilp_scheduling_strategy" else k): v
+            for k, v in best.items()
+        }
         print(
-            f"BEST {best_ms:.6f} ms ({baseline_ms / best_ms:.3f}x): {best}",
+            f"BEST {best_ms:.6f} ms ({baseline_ms / best_ms:.3f}x): {shown}",
             flush=True,
         )
 

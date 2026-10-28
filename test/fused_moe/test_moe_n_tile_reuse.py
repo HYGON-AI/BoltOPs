@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Legality, search pruning and persistence of adjacent-N A reuse."""
 import json
 

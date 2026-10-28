@@ -1,5 +1,7 @@
-# Modified by Hygon in 2026 for BoltOPs HCU integration.
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+# Upstream reference: https://github.com/vllm-project/vllm/blob/aeeb36b1f17145975c6713242f2447bb8b98782b/tests/kernels/moe/test_moe.py
 """Tests for the channel-wise W4A8 MoE path."""
 
 import gc

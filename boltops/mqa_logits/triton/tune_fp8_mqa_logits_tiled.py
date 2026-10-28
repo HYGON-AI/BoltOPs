@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Quick launch-parameter sweep for ``fp8_mqa_logits_tiled`` (skill timing)."""
 
 from __future__ import annotations

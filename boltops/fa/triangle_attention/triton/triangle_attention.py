@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """BF16 Triangle Attention forward for pre-scaled ``[B, H, N, D]`` inputs."""
 
 import torch

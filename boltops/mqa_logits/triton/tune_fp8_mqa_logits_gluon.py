@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Full-size launch sweep for FP8 Gluon ``fp8_mqa_logits_gluon`` (Triton 3.6+).
 
 Sweeps the lightop size grid and writes:

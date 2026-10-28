@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Official half-precision (bf16/fp16) MQA-logits test grid — 66 shapes.
 
 The canonical shape set is the union of two production-derived groups:

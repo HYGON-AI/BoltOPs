@@ -1,5 +1,8 @@
-# Modified by Hygon in 2026 for BoltOPs HCU integration.
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Adapted from https://github.com/vllm-project/vllm/blob/main/benchmarks/kernels/benchmark_moe.py
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+# Upstream reference: https://github.com/sgl-project/sglang/blob/c240169265af83800d0b901661c1075f9c5ed3ff/benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py
 
 # Adapted from https://github.com/sgl-project/sglang/pull/3730
 import itertools

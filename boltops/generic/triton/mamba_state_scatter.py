@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-# Modified by Hygon in 2026 for BoltOPs HCU integration.
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+# Upstream reference: https://github.com/sgl-project/sglang/blob/132ade55cd65c3679a60adec563c8e6ca81238c5/python/sglang/kernels/ops/mamba/mamba_state_scatter_triton.py
 """Fused Triton kernel for masked Mamba state scatter operations.
 
 This module is intentionally kept close to SGLang's implementation so upstream

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Performance cases for KDA prefill (fused-gate mainline).
 
 Times the end-to-end prefill entry ``chunk_kda_with_fused_gate_fwd`` on

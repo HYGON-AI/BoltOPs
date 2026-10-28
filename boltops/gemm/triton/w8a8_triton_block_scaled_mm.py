@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-# Modified by Hygon in 2026 for BoltOPs HCU integration.
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+# Upstream reference: https://github.com/vllm-project/vllm/blob/aeeb36b1f17145975c6713242f2447bb8b98782b/vllm/model_executor/layers/quantization/utils/fp8_utils.py
 """Vendored vLLM Triton W8A8 block-scaled FP8 GEMM.
 
 Source: ``vllm/model_executor/layers/quantization/utils/fp8_utils.py``

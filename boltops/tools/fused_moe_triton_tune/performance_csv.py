@@ -229,7 +229,17 @@ class DeviceGuard:
     """
 
     def __init__(self, device):
-        hip = ctypes.CDLL(ctypes.util.find_library("amdhip64") or "libamdhip64.so")
+        try:
+            hip = ctypes.CDLL(ctypes.util.find_library("amdhip64") or "libamdhip64.so")
+        except OSError as error:
+            with tempfile.NamedTemporaryFile(
+                mode="w", prefix="boltops-hip-load-", suffix=".log",
+                encoding="utf-8", delete=False,
+            ) as log:
+                log.write(str(error))
+            raise OSError(
+                f"Cannot load the HIP runtime for device monitoring; details: {log.name}"
+            ) from None
         bus = ctypes.create_string_buffer(32)
         get_bus = hip.hipDeviceGetPCIBusId
         get_bus.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int]

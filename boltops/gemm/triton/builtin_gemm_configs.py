@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """In-code fallback GEMM launch configs (no shipped JSON except AWQ HCU).
 
 These are untuned placeholders so kernels run when ``configs/<kernel>/``

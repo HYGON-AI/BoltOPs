@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Comparison reporting for the parity harness.
 
 Relative error is only meaningful where the expected value is above a floor.

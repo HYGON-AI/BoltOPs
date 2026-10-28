@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
 """Default configuration policy for ``mhc_pre_big_fuse``."""
 
 from __future__ import annotations
