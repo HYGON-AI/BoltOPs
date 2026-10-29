@@ -1,4 +1,5 @@
 stages:
+  - quality-gate
   - prepare
   - build
   - performance
@@ -103,6 +104,22 @@ variables:
       SCRIPT
     - chmod +x /tmp/git-askpass.sh
     - export GIT_ASKPASS=/tmp/git-askpass.sh GIT_TERMINAL_PROMPT=0 GIT_TOKEN="${CI_JOB_TOKEN}"
+
+quality-gate:
+  stage: quality-gate
+  allow_failure: true
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"'
+  tags:
+    - nmz
+  before_script:
+    - !reference [.git-auth, before_script]
+  script:
+    - python -m pip install 'hygon_quality_gate[scanners]'
+    - python -m hygon_pr_gate.install_tools
+    # Fetch the target branch for incremental scanning against the MR commit.
+    - git fetch origin "${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}"
+    - quality-pr-scan --base "origin/${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}" --head "${CI_COMMIT_SHA}"
 
 select:source:
   stage: prepare
