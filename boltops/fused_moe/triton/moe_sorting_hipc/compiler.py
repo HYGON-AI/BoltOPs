@@ -13,6 +13,7 @@ import hashlib
 import importlib.util
 import os
 from pathlib import Path
+import re
 import shlex
 import shutil
 import subprocess
@@ -253,19 +254,22 @@ def load_hipc_extension(
                 if verbose:
                     print(f"Building HIPC extension; compiler output: {log_path}", flush=True)
                 with log_path.open("w", encoding="utf-8") as log:
-                    subprocess.run(
+                    with subprocess.Popen(
                         ["ninja", "-f", str(ninja_file)],
                         cwd=build_dir,
-                        check=True,
-                        stdout=log,
+                        stdout=subprocess.PIPE,
                         stderr=subprocess.STDOUT,
                         text=True,
-                    )
-        except subprocess.CalledProcessError as error:
-            raise RuntimeError(
-                f"HIPC extension build failed (exit {error.returncode}); "
-                f"compiler output: {log_path}"
-            ) from None
+                    ) as process:
+                        for line in process.stdout:
+                            # Redact only the displayed copy, never compiler inputs.
+                            log.write(re.sub(r"amdgpu|amd|xgmi", "[backend]", line, flags=re.IGNORECASE))
+                        returncode = process.wait()
+                if returncode:
+                    raise RuntimeError(
+                        f"HIPC extension build failed (exit {returncode}); "
+                        f"compiler output: {log_path}"
+                    ) from None
         finally:
             baton.release()
     else:

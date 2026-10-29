@@ -220,6 +220,11 @@ def spread_fraction(samples):
     return (max(samples) - min(samples)) / statistics.median(samples)
 
 
+def _display_error(error):
+    """Format a log copy only; never use this text as a runtime identifier."""
+    return re.sub(r"amdgpu|amd|xgmi", "[backend]", str(error), flags=re.IGNORECASE)
+
+
 class DeviceGuard:
     """Detect other containers through KFD sysfs (container-local ps is insufficient).
 
@@ -236,7 +241,7 @@ class DeviceGuard:
                 mode="w", prefix="boltops-hip-load-", suffix=".log",
                 encoding="utf-8", delete=False,
             ) as log:
-                log.write(str(error))
+                log.write(_display_error(error))
             raise OSError(
                 f"Cannot load the HIP runtime for device monitoring; details: {log.name}"
             ) from None
@@ -440,9 +445,9 @@ def benchmark(args):
                 samples[:] = measured
                 break
             except RuntimeError as exc:
-                print(f"CSV_RETRY attempt={attempt + 1}/{args.max_attempts}: {exc}", flush=True)
+                print(f"CSV_RETRY attempt={attempt + 1}/{args.max_attempts}: {_display_error(exc)}", flush=True)
                 if attempt + 1 == args.max_attempts:
-                    raise
+                    raise RuntimeError(_display_error(exc)) from None
                 time.sleep(args.retry_delay)
         return output, statistics.median(samples)
 
