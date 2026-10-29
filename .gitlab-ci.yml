@@ -576,7 +576,14 @@ mirror:github:
       mirror_url="https://${GITHUB_MIRROR_REPO}"
       remote_tip=$(git -c credential.helper= ls-remote "$mirror_url" refs/heads/main)
       expected_sha=$(printf '%s' "$remote_tip" | cut -f1)
+      if [ -n "${expected_sha}" ]; then
+        git -c credential.helper= fetch --no-tags "$mirror_url" refs/heads/main
+        if ! git merge-base --is-ancestor FETCH_HEAD "${CI_COMMIT_SHA}"; then
+          echo "GitHub main contains commits missing from GitLab main; merge them into GitLab before retrying" >&2
+          exit 1
+        fi
+      fi
+      # A normal push also rejects a conflicting GitHub update after the fetch.
       git -c credential.helper= push \
-        "--force-with-lease=refs/heads/main:${expected_sha}" \
         "$mirror_url" "${CI_COMMIT_SHA}:refs/heads/main"
       echo "Mirrored main@${CI_COMMIT_SHA} to ${GITHUB_MIRROR_REPO}"
