@@ -4,9 +4,12 @@ stages:
   - build
   - performance
   - publish
+  - mirror
 
 variables:
   GIT_DEPTH: "0"
+  # Set GITHUB_MIRROR_TOKEN as a masked, protected CI/CD variable (Contents: write).
+  GITHUB_MIRROR_REPO: "github.com/HYGON-AI/BoltOPs.git"
   BASE_COMPILE_IMAGE_ROCKY_PY310: "image.sourcefind.cn:5000/dcu/admin/base/dev:rockylinux8.6-mpi5.0-gcc10.3-cmake3.29-py3.10-mkl2020.4.304"
   BASE_COMPILE_IMAGE_ROCKY_PY312: "harbor.sourcefind.cn:5443/dcu/admin/base/dev:rockylinux8.6-mpi5.0-gcc10.3-cmake3.29-py3.12-mkl2020.4.304"
   PIP_INDEX_URL: "http://10.16.1.201:9929/nightly/dtk2604/+simple/"
@@ -538,3 +541,42 @@ publish:dtk2610:
   needs:
     - job: build:wheel:dtk2610
       artifacts: true
+
+# Publish the complete main history after the push pipeline succeeds.
+mirror:github:
+  stage: mirror
+  timeout: 30m
+  resource_group: boltops-github-mirror
+  tags:
+    - nmz
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == "main"'
+  before_script: !reference [.git-auth, before_script]
+  script:
+    - |
+      set -eu
+      test -n "${GITHUB_MIRROR_TOKEN:-}" || { echo "Set GITHUB_MIRROR_TOKEN in CI/CD variables"; exit 1; }
+      git fetch origin "+refs/heads/main:refs/remotes/origin/main"
+      if [ "$(git rev-parse refs/remotes/origin/main)" != "$CI_COMMIT_SHA" ]; then
+        echo "Skipping outdated main pipeline"
+        exit 0
+      fi
+
+      github_askpass=$(mktemp)
+      trap 'rm -f "$github_askpass"' EXIT
+      cat > "$github_askpass" << 'SCRIPT'
+      #!/bin/sh
+      case "$1" in
+        *Username*) printf '%s\n' 'x-access-token' ;;
+        *Password*) printf '%s\n' "$GITHUB_MIRROR_TOKEN" ;;
+      esac
+      SCRIPT
+      chmod 700 "$github_askpass"
+      export GIT_ASKPASS="$github_askpass" GIT_TERMINAL_PROMPT=0
+      mirror_url="https://${GITHUB_MIRROR_REPO}"
+      remote_tip=$(git -c credential.helper= ls-remote "$mirror_url" refs/heads/main)
+      expected_sha=$(printf '%s' "$remote_tip" | cut -f1)
+      git -c credential.helper= push \
+        "--force-with-lease=refs/heads/main:${expected_sha}" \
+        "$mirror_url" "${CI_COMMIT_SHA}:refs/heads/main"
+      echo "Mirrored main@${CI_COMMIT_SHA} to ${GITHUB_MIRROR_REPO}"
