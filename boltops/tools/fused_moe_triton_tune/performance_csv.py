@@ -29,13 +29,22 @@ import threading
 import time
 
 
+from boltops.tools.fused_moe_triton_tune.common import tune_module_name
+
+
 FIELDS = (
     "arch", "quant_type", "indtype", "token", "inter_dim", "model_dim",
     "expert", "topk", "q_size_n", "q_size_k", "sol_type", "sol_id", "time_us",
 )
 KEY_FIELDS = FIELDS[:-1]
 TRITON_SOLUTION_ID = "triton:fused_moe"
+_NATIVE_SCALE_RECIPES = {
+    "mxfp4": "deepgemm-a128-b1x32",
+    "mxfp8": "vllm-a32-b1x32-e8m0-e8m0",
+}
 FORMATS = {
+    "mxfp8": ("mxfp8_w8a8", "mxfp8_w8a8"),
+    "mxfp4": ("mxfp4_w4a8", "mxfp4_w4a8"),
     "bf16": ("no_quant", "w16a16"),
     "int8_channel": ("int8_w8a8_channel", "w8a8_channel"),
     "fp8_channel": ("f8_w8a8_channel", "w8a8_channel"),
@@ -63,19 +72,27 @@ def parse_config(path):
     path = Path(path)
     match = re.fullmatch(
         r"E=(\d+),N=(\d+),K=(\d+),topk=(\d+),arch=(gfx\w+)"
-        r"(?:,dtype=(\w+))?(?:,block_shape=\[(\d+),(\d+)\])?\.json",
+        r"(?:,dtype=(\w+))?(?:,gemm_type=(dot_scaled))?(?:,scale_recipe=([a-z0-9_-]+))?"
+        r"(?:,block_shape=\[(\d+),(\d+)\])?\.json",
         path.name,
     )
     if not match:
         raise ValueError(f"Expected an exact Gemm1 config: {path.name}")
-    e, n, k, topk, arch, dtype, bn, bk = match.groups()
+    e, n, k, topk, arch, dtype, gemm_type, scale_recipe, bn, bk = match.groups()
     dtype = dtype or ""
     bn, bk = int(bn or 0), int(bk or 0)
     if dtype in ("int8_w8a8", "fp8_w8a8"):
         test_type = dtype.split("_")[0] + ("" if bn and bk else "_channel")
     else:
         test_type = {"": "bf16", "int4_w4a16": "int4",
-                     "int4_w4a8": "int4int8" if bk else "int4int8_channel"}[dtype]
+                     "int4_w4a8": "int4int8" if bk else "int4int8_channel",
+                     "mxfp4_w4a8": "mxfp4", "mxfp8_w8a8": "mxfp8"}[dtype]
+    if test_type in _NATIVE_SCALE_RECIPES:
+        if (gemm_type != "dot_scaled"
+                or scale_recipe != _NATIVE_SCALE_RECIPES[test_type] or bn or bk):
+            raise ValueError("Native MX benchmark requires its supported dot_scaled scale recipe")
+    elif gemm_type or scale_recipe:
+        raise ValueError("Ordinary FP8 benchmark requires a dot configuration")
     # Block [0,64] is omitted by historical W4A16 filenames.
     if test_type in ("int4", "int4int8") and not bk:
         bk = 64
@@ -84,7 +101,8 @@ def parse_config(path):
     ) if ",block_shape=" in path.name else path.stem + ",is_bottom=True.json"
     return dict(e=int(e), n=int(n), k=int(k), topk=int(topk), arch=arch,
                 dtype=dtype or None, block_n=bn, block_k=bk,
-                test_type=test_type, top=path, bottom=path.with_name(bottom_name))
+                test_type=test_type, gemm_type=gemm_type or "dot", scale_recipe=scale_recipe,
+                top=path, bottom=path.with_name(bottom_name))
 
 
 def config_pair(shape):
@@ -113,9 +131,11 @@ def unsupported_batch_sizes(shape, dtype, top, bottom):
 
 def make_row(shape, m, dtype, time_us):
     quant, _ = FORMATS[shape["test_type"]]
+    scale_n, scale_k = ((1, 32) if shape["test_type"] in _NATIVE_SCALE_RECIPES else
+                         (shape["block_n"], shape["block_k"]))
     return dict(zip(FIELDS, (
         shape["arch"], quant, str(dtype), m, shape["n"], shape["k"],
-        shape["e"], shape["topk"], shape["block_n"], shape["block_k"],
+        shape["e"], shape["topk"], scale_n, scale_k,
         "triton", TRITON_SOLUTION_ID, time_us,
     )))
 
@@ -331,11 +351,13 @@ def _from_environment(test_type):
     from boltops.utility.triton_capability import get_triton_capabilities
 
     # Read actual script defaults, rather than guessing K from the file name.
-    module = importlib.import_module(f"{__package__}.tune_moe_{test_type}")
+    os.environ["AUTOTUNE_TEST_TYPE"] = test_type
+    module = importlib.import_module(f"{__package__}.{tune_module_name(test_type)}")
 
     dtype = {"bf16": None, "int8": "int8_w8a8", "int8_channel": "int8_w8a8",
              "fp8": "fp8_w8a8", "fp8_channel": "fp8_w8a8", "int4": "int4_w4a16",
-             "int4int8": "int4_w4a8", "int4int8_channel": "int4_w4a8"}[test_type]
+             "int4int8": "int4_w4a8", "int4int8_channel": "int4_w4a8",
+             "mxfp4": "mxfp4_w4a8", "mxfp8": "mxfp8_w8a8"}[test_type]
     block = None
     if test_type in ("int8", "fp8"):
         block = [int(x) for x in os.environ.get("MOE_BLOCK_SHAPE", "128,128").split(",")]
@@ -344,6 +366,8 @@ def _from_environment(test_type):
     return _TRITON_CONFIGS_DIR / get_triton_capabilities().config_dir_name / get_config_file_name(
         int(os.environ["MOE_NUM_EXPERTS"]), int(os.environ["MOE_HIDDEN_SIZE"]),
         dtype, block, K=module.FFN_HIDDEN_SIZES[0], top_k=module.TOP_KS[0],
+        gemm_type="dot_scaled" if test_type in _NATIVE_SCALE_RECIPES else "dot",
+        scale_recipe=_NATIVE_SCALE_RECIPES.get(test_type),
     )
 
 
@@ -403,26 +427,30 @@ def benchmark(args):
         actual = moe_config_utils.get_moe_configs(
             shape["e"], shape["n"], shape["dtype"], shape["block_n"],
             shape["block_k"], is_bottom, K=shape["k"], top_k=shape["topk"],
+            gemm_type=shape["gemm_type"], scale_recipe=shape["scale_recipe"],
         )
         if actual != {int(m): cfg for m, cfg in expected.items()}:
             raise ValueError("Production lookup does not match the requested config pair")
 
     os.environ.update({
+        "AUTOTUNE_TEST_TYPE": shape["test_type"],
         "MOE_NUM_EXPERTS": str(shape["e"]),
         "MOE_HIDDEN_SIZE": str(shape["n"]), "MOE_FFN_HIDDEN_SIZE": str(shape["k"]),
         "MOE_TOP_K": str(shape["topk"]), "MOE_BATCH_SIZES": ",".join(map(str, batches)),
     })
     if shape["block_n"] and shape["block_k"]:
         os.environ["MOE_BLOCK_SHAPE"] = f"{shape['block_n']},{shape['block_k']}"
-    module = importlib.import_module(f"{__package__}.tune_moe_{shape['test_type']}")
-    input_helper = module.input_helper
+    module = importlib.import_module(f"{__package__}.{tune_module_name(shape['test_type'])}")
+    helper_name = ("_native_mx_inputs" if shape["test_type"] in _NATIVE_SCALE_RECIPES
+                   else "input_helper")
+    input_helper = getattr(module, helper_name)
 
     def seeded_input_helper(*inputs, **kwargs):
         if "seed" in inspect.signature(input_helper).parameters:
             kwargs["seed"] = args.seed
         return input_helper(*inputs, **kwargs)
 
-    module.input_helper = seeded_input_helper
+    setattr(module, helper_name, seeded_input_helper)
     raw = module.fused_experts_impl_benchmark.__wrapped__
     callbacks = [value.fn for name, value in vars(module).items()
                  if name.startswith("bench_fused_moe_") and hasattr(value, "fn")]

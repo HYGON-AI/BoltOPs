@@ -12,17 +12,21 @@ import time
 from pathlib import Path
 
 from boltops.utility.triton_capability import get_triton_capabilities
+from boltops.tools.fused_moe_triton_tune.common import tune_module_name
 
 
-VALID_DEVICE_NAMES = {"zd", "bmz", "nmz", "yy"}
+VALID_DEVICE_NAMES = {"zd", "bmz", "nmz", "yy", "sb"}
 # Site code → GPU ISA used in MoE JSON filenames (arch=...).
 DEVICE_ARCH_MAP = {
     "zd": "gfx928",
     "bmz": "gfx936",
     "nmz": "gfx938",
     "yy": "gfx92a",
+    "sb": "gfx946",
 }
 VALID_TEST_TYPES = {
+    "mxfp4",
+    "mxfp8",
     "int4",
     "int8",
     "int8_channel",
@@ -48,16 +52,19 @@ PRESET_CONFIGS: dict[str, dict[str, object]] = {
 DEFAULT_BATCH_SIZES = "1,2,4,8,16,24,32,64,128,256,512,1024,2048,4096,8192,16384,32768"
 DEFAULT_TOP_K = 8
 TEST_TYPES_SUPPORT_SHARED_EXPERTS = {"bf16", "fp8", "fp8_channel", "int8", "int8_channel"}
-TEST_TYPES_SUPPORT_BLOCK_SHAPE = {"fp8", "int8"}
+TEST_TYPES_SUPPORT_BLOCK_SHAPE = {"fp8", "int8", "mxfp8"}
 FIXED_GROUP_SIZE_BY_TEST: dict[str, int] = {
     "int4": 64,
     "int4int8": 64,
 }
 DEFAULT_BLOCK_SHAPE_BY_TEST: dict[str, tuple[int, int]] = {
     "fp8": (128, 128),
+    "mxfp8": (1, 32),
     "int8": (128, 128),
 }
 DEFAULT_FFN_HIDDEN_SIZE_BY_TEST: dict[str, int] = {
+    "mxfp4": 7168,
+    "mxfp8": 7168,
     "bf16": 7168,
     "fp8": 7168,
     "fp8_channel": 7168,
@@ -88,7 +95,7 @@ _MOE_PROCESS_PATTERNS = (
     re.compile(r"\bpytest\b.*\btune_moe_.*\.py\b"),
     re.compile(
         r"\btune_moe_"
-        r"(bf16|fp8|fp8_channel|int4|int4int8|int4int8_channel|int8|int8_channel)"
+        r"(bf16|fp8|fp8_channel|int4|int4int8|int4int8_channel|int8|int8_channel|mxfp4|mxfp8)"
         r"\.py\b"
     ),
     # The CLI is normally launched as a module in development containers:
@@ -338,7 +345,8 @@ def run_benchmark_step(
         csv_env = bench_env.copy()
         csv_env["BENCHMARK_MODE"] = "0"
         csv_cmd = [sys.executable, "-m", "boltops.tools.fused_moe_triton_tune.performance_csv",
-                   "--test-type", Path(test_script_name).stem.removeprefix("tune_moe_")]
+                   "--test-type", tp_env.get("AUTOTUNE_TEST_TYPE",
+                                            Path(test_script_name).stem.removeprefix("tune_moe_"))]
         if not strict_csv:
             csv_cmd.append("--allow-missing-config")
         csv_rc = run_cmd(
@@ -578,6 +586,14 @@ def expected_json_names(
             block_shape = DEFAULT_BLOCK_SHAPE_BY_TEST["fp8"]
         suffix0 = f",dtype=fp8_w8a8,block_shape=[{block_shape[0]},{block_shape[1]}]"
         suffix1 = f",dtype=fp8_w8a8,is_bottom=True,block_shape=[{block_shape[0]},{block_shape[1]}]"
+    elif test_type == "mxfp8":
+        if block_shape is not None and tuple(block_shape) != (1, 32):
+            raise ValueError("native MXFP8 requires weight block_shape=[1,32]")
+        suffix0 = ",dtype=mxfp8_w8a8,gemm_type=dot_scaled,scale_recipe=vllm-a32-b1x32-e8m0-e8m0"
+        suffix1 = suffix0 + ",is_bottom=True"
+    elif test_type == "mxfp4":
+        suffix0 = ",dtype=mxfp4_w4a8,gemm_type=dot_scaled,scale_recipe=deepgemm-a128-b1x32"
+        suffix1 = suffix0 + ",is_bottom=True"
     elif test_type == "fp8_channel":
         suffix0 = ",dtype=fp8_w8a8"
         suffix1 = ",dtype=fp8_w8a8,is_bottom=True"
@@ -763,7 +779,7 @@ def main() -> int:
         print(f"错误: {exc}", file=sys.stderr)
         return 1
 
-    test_script_name = f"tune_moe_{args.test_type}.py"
+    test_script_name = f"{tune_module_name(args.test_type)}.py"
     test_script_path = script_dir / test_script_name
     if not test_script_path.exists():
         print(f"错误: 未找到测试脚本 {test_script_path}", file=sys.stderr)
@@ -825,6 +841,8 @@ def main() -> int:
                 resolved_block_shape = DEFAULT_BLOCK_SHAPE_BY_TEST[args.test_type]
         else:
             resolved_block_shape = None
+        if args.test_type == "mxfp8" and resolved_block_shape != (1, 32):
+            raise ValueError("native MXFP8 requires weight block_shape=1,32")
     except ValueError as exc:
         print(f"错误: {exc}", file=sys.stderr)
         return 1
@@ -1116,6 +1134,12 @@ def main() -> int:
                     f"要求 MOE_FFN_HIDDEN_SIZE 可被 {block_k} 整除；当前值: {current_ffn_hidden_size}",
                     file=sys.stderr,
                 )
+                return 1
+
+        if args.test_type in ("mxfp4", "mxfp8"):
+            alignment = 128 if args.test_type == "mxfp4" else 32
+            if current_hidden_size % alignment or current_ffn_hidden_size % alignment:
+                print(f"错误: {args.test_type} 的逻辑 hidden/intermediate 必须对齐 {alignment}", file=sys.stderr)
                 return 1
 
         fixed_group_size = FIXED_GROUP_SIZE_BY_TEST.get(args.test_type)

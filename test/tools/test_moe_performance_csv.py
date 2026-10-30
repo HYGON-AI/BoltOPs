@@ -307,3 +307,56 @@ def test_remeasurement_replaces_existing_time(tmp_path):
     assert len(rows) == 1
     assert float(rows[0]["time_us"]) == 35
     assert not list(tmp_path.glob("*.json"))
+
+
+@pytest.mark.parametrize('kind,recipe', [
+    ('mxfp4', 'deepgemm-a128-b1x32'),
+    ('mxfp8', 'vllm-a32-b1x32-e8m0-e8m0'),
+])
+def test_native_mx_config_and_csv_keep_logical_shapes(tmp_path, kind, recipe):
+    dtype = 'mxfp4_w4a8' if kind == 'mxfp4' else 'mxfp8_w8a8'
+    suffix = f'dtype={dtype},gemm_type=dot_scaled,scale_recipe={recipe}'
+    shape = parse_config(tmp_path / f'E=80,N=512,K=2048,topk=8,arch=gfx946,{suffix}.json')
+    assert shape['test_type'] == kind
+    assert shape['gemm_type'] == 'dot_scaled'
+    assert shape['scale_recipe'] == recipe
+    assert shape['bottom'].name.endswith(suffix + ',is_bottom=True.json')
+    assert (shape['block_n'], shape['block_k']) == (0, 0)
+    row = make_row(shape, 12, 'torch.bfloat16', 10.)
+    assert (row['inter_dim'], row['model_dim']) == (512, 2048)
+    assert (row['q_size_n'], row['q_size_k']) == (1, 32)
+    path = upsert_row(tmp_path, kind, row)
+    assert path.name == f'tuned_fmoe_triton_{dtype}.csv'
+
+
+@pytest.mark.parametrize('suffix', [
+    'dtype=mxfp4_w4a8',
+    'dtype=mxfp8_w8a8,gemm_type=dot_scaled,scale_recipe=deepgemm-a128-b1x32',
+    'dtype=fp8_w8a8,gemm_type=dot_scaled',
+])
+def test_csv_rejects_incompatible_scale_recipe(tmp_path, suffix):
+    with pytest.raises(ValueError):
+        parse_config(tmp_path / f'E=80,N=512,K=2048,topk=8,arch=gfx946,{suffix}.json')
+
+
+@pytest.mark.parametrize('kind,recipe', [
+    ('mxfp4', 'deepgemm-a128-b1x32'),
+    ('mxfp8', 'vllm-a32-b1x32-e8m0-e8m0'),
+])
+def test_native_mx_environment_resolves_saved_recipe(monkeypatch, kind, recipe):
+    from types import SimpleNamespace
+    from boltops.tools.fused_moe_triton_tune import performance_csv as exporter
+    from boltops.utility import arch_info
+
+    monkeypatch.setenv('MOE_NUM_EXPERTS', '80')
+    monkeypatch.setenv('MOE_HIDDEN_SIZE', '512')
+    monkeypatch.setenv('AUTOTUNE_TEST_TYPE', kind)
+    monkeypatch.setattr(arch_info, 'get_arch', lambda: 'gfx946')
+    def load(name):
+        assert name.endswith('.tune_moe_bf16')
+        return SimpleNamespace(FFN_HIDDEN_SIZES=[2048], TOP_KS=[8])
+    monkeypatch.setattr(exporter.importlib, 'import_module', load)
+    shape = parse_config(exporter._from_environment(kind))
+    assert shape['test_type'] == kind
+    assert shape['scale_recipe'] == recipe
+    assert (shape['e'], shape['n'], shape['k'], shape['topk']) == (80, 512, 2048, 8)

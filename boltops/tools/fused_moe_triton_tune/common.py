@@ -11,6 +11,11 @@ from pathlib import Path
 from typing import Optional
 
 
+def tune_module_name(test_type: str) -> str:
+    """Native MX shares the existing expert orchestration and benchmark entry."""
+    return "tune_moe_bf16" if test_type in ("mxfp4", "mxfp8") else f"tune_moe_{test_type}"
+
+
 def random_int8_weights(shape, device):
     """Preserve rand->scale->truncate values without full-sized FP32 copies.
 
