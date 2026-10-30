@@ -256,12 +256,18 @@ class DeviceGuard:
         location = (int(bus_id, 16) << 8) | (int(slot, 16) << 3) | int(function, 16)
         self.gpu_id = None
         for node in Path("/sys/class/kfd/kfd/topology/nodes").iterdir():
-            props = dict(line.split() for line in (node / "properties").read_text().splitlines())
-            if int(props.get("location_id", -1)) == location and int(props.get("domain", -1)) == int(domain, 16):
+            try:
+                props = dict(line.split() for line in (node / "properties").read_text().splitlines())
+                if int(props.get("location_id", -1)) != location or int(props.get("domain", -1)) != int(domain, 16):
+                    continue
                 gpu_id = int((node / "gpu_id").read_text())
-                if gpu_id:
-                    self.gpu_id = gpu_id
-                    break
+            except (OSError, ValueError):
+                # KFD still lists nodes this process cannot read; skip them,
+                # while the test GPU itself must still map or fail below.
+                continue
+            if gpu_id:
+                self.gpu_id = gpu_id
+                break
         if self.gpu_id is None:
             raise RuntimeError("Cannot map HIP device to KFD topology; not exporting unchecked timing")
         self.stop = threading.Event()

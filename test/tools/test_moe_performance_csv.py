@@ -180,6 +180,67 @@ def test_foreign_queue_during_measurement_invalidates_result():
     assert guard.contaminated
 
 
+def _device_guard_with_kfd(monkeypatch, tmp_path, nodes):
+    """Build DeviceGuard against a synthetic KFD topology.
+
+    ``nodes`` maps node name to ``(properties, gpu_id)``; a ``None``
+    ``properties`` makes the node unreadable to the process.
+    """
+    import ctypes
+    from boltops.tools.fused_moe_triton_tune import performance_csv as exporter
+
+    root = tmp_path / "kfd" / "topology" / "nodes"
+    for name, (properties, gpu_id) in nodes.items():
+        node = root / name
+        node.mkdir(parents=True)
+        if properties is None:
+            (node / "properties").mkdir()
+        else:
+            (node / "properties").write_text(properties)
+        if gpu_id is not None:
+            (node / "gpu_id").write_text(gpu_id)
+
+    def get_bus(buf, _size, _device):
+        ctypes.memmove(buf, b"0000:07:00.0\0", 13)
+        return 0
+
+    get_bus.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+    get_bus.restype = ctypes.c_int
+
+    class _Hip:
+        @property
+        def hipDeviceGetPCIBusId(self):
+            return get_bus
+
+    real_path = exporter.Path
+
+    def fake_path(*args, **kwargs):
+        target = real_path(*args, **kwargs)
+        return root if str(target) == "/sys/class/kfd/kfd/topology/nodes" else target
+
+    monkeypatch.setattr(ctypes.util, "find_library", lambda _name: "libamdhip64.so")
+    monkeypatch.setattr(ctypes, "CDLL", lambda _name: _Hip())
+    monkeypatch.setattr(exporter, "Path", fake_path)
+    return exporter
+
+
+def test_topology_skips_unreadable_nodes(monkeypatch, tmp_path):
+    exporter = _device_guard_with_kfd(monkeypatch, tmp_path, {
+        "1": (None, None),
+        "3": ("location_id 1792\ndomain 0\ndev 3\n", "42\n"),
+    })
+    assert exporter.DeviceGuard(0).gpu_id == 42
+
+
+def test_topology_still_requires_test_gpu_identified(monkeypatch, tmp_path):
+    exporter = _device_guard_with_kfd(monkeypatch, tmp_path, {
+        "1": ("location_id 999\ndomain 0\ndev 1\n", "7\n"),
+        "2": (None, None),
+    })
+    with pytest.raises(RuntimeError, match="Cannot map HIP device to KFD topology"):
+        exporter.DeviceGuard(0)
+
+
 def test_cli_only_exports_after_success(monkeypatch, tmp_path):
     from boltops.tools.fused_moe_triton_tune import tune_moe_cli as cli
     commands = []
