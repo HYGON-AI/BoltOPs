@@ -94,12 +94,16 @@ def ref_fp8_paged_mqa_logits(
     kv_indices: torch.Tensor,
     max_model_len: int,
 ) -> torch.Tensor:
+    q_fp8 = q_fp8.detach().cpu()
+    kv_cache_fp8 = kv_cache_fp8.detach().cpu()
+    weights = weights.detach().cpu()
+    context_lens = context_lens.detach().cpu()
+    kv_indices = kv_indices.detach().cpu()
     batch_size, next_n, heads, hidden_dim = q_fp8.size()
     block_size = kv_cache_fp8.size(1)
     logits = torch.full(
         (batch_size * next_n, max_model_len),
         float("-inf"),
-        device=q_fp8.device,
         dtype=torch.float32,
     )
     q = q_fp8.float()
@@ -129,14 +133,18 @@ def ref_fp8_paged_mqa_logits_block64(
     block_table: torch.Tensor,
     max_model_len: int,
 ) -> torch.Tensor:
-    """Reference for ``block_size=64`` + ``block_table`` (hipc layout)."""
+    """CPU reference for ``block_size=64`` + ``block_table`` (hipc layout)."""
+    q_fp8 = q_fp8.detach().cpu()
+    kv_cache_fp8 = kv_cache_fp8.detach().cpu()
+    weights = weights.detach().cpu()
+    context_lens = context_lens.detach().cpu()
+    block_table = block_table.detach().cpu()
     batch_size, next_n, heads, hidden_dim = q_fp8.size()
     block_size = kv_cache_fp8.size(1)
     assert block_size == 64
     logits = torch.full(
         (batch_size * next_n, max_model_len),
         float("-inf"),
-        device=q_fp8.device,
         dtype=torch.float32,
     )
     q = q_fp8.float()
@@ -239,7 +247,9 @@ def test_triton_fp8_paged_mqa_logits_block64_correctness(
     assert torch.isfinite(out[valid_mask]).all()
     # Outside the causal window must be exact -inf (not merely very negative).
     assert torch.isneginf(out[~valid_mask]).all()
-    torch.testing.assert_close(out[valid_mask], ref[valid_mask], rtol=5e-2, atol=5e-2)
+    torch.testing.assert_close(
+        out[valid_mask].cpu(), ref[valid_mask.cpu()], rtol=5e-2, atol=5e-2
+    )
 
 
 def _build_block64_inputs(
@@ -343,7 +353,9 @@ def test_triton_fp8_paged_mqa_logits_block64_bucket_correctness(
 
     valid_mask = _valid_logits_mask(context_lens, batch_size, next_n, max_model_len)
     assert torch.isfinite(out[valid_mask]).all()
-    torch.testing.assert_close(out[valid_mask], ref[valid_mask], rtol=5e-2, atol=5e-2)
+    torch.testing.assert_close(
+        out[valid_mask].cpu(), ref[valid_mask.cpu()], rtol=5e-2, atol=5e-2
+    )
 
 
 @GPU_REQUIRED
@@ -992,7 +1004,7 @@ def test_triton_paged_batch_info_enables_graph_capture():
     )
     valid = _valid_logits_mask(context_lens, 4, 1, max_model_len)
     assert torch.isfinite(out[valid]).all(), "graph replay left NaN in valid outputs"
-    torch.testing.assert_close(out[valid], ref[valid], rtol=5e-2, atol=5e-2)
+    torch.testing.assert_close(out[valid].cpu(), ref[valid.cpu()], rtol=5e-2, atol=5e-2)
 
     assert capture() is not None
 
@@ -1080,7 +1092,9 @@ def test_triton_fp8_paged_mqa_logits_correctness(
 
     assert torch.isfinite(out[valid_mask]).all()
     assert torch.isneginf(out[~valid_mask]).all()
-    torch.testing.assert_close(out[valid_mask], ref[valid_mask], rtol=5e-2, atol=5e-2)
+    torch.testing.assert_close(
+        out[valid_mask].cpu(), ref[valid_mask.cpu()], rtol=5e-2, atol=5e-2
+    )
 
 
 @GPU_REQUIRED
@@ -1300,7 +1314,9 @@ def test_triton_fp8_paged_mqa_logits_stage1_default_chunk_q(heads):
     )
     out = out_qk.sum(dim=0)
     valid = torch.arange(max_model_len, device=DEVICE) <= (ctx_len - next_n)
-    torch.testing.assert_close(out[0, valid], ref[0, valid], rtol=5e-2, atol=5e-2)
+    torch.testing.assert_close(
+        out[0, valid].cpu(), ref[0, valid.cpu()], rtol=5e-2, atol=5e-2
+    )
 
 
 @GPU_REQUIRED
@@ -1543,7 +1559,9 @@ def test_triton_paged_fuse_output_init_writes_the_whole_row_from_a_poisoned_buff
     ref = ref_fp8_paged_mqa_logits_block64(
         q, kv, weights, context_lens, block_table, max_model_len
     )
-    torch.testing.assert_close(fused[valid], ref[valid], rtol=5e-2, atol=5e-2)
+    torch.testing.assert_close(
+        fused[valid].cpu(), ref[valid.cpu()], rtol=5e-2, atol=5e-2
+    )
 
     primed = _contract_run(
         q, kv, weights, context_lens, block_table, max_model_len, NEG_INF,

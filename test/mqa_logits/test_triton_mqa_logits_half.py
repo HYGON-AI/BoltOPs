@@ -1,29 +1,17 @@
 # Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # SPDX-License-Identifier: MIT
-"""Official half-precision (bf16/fp16) MQA-logits test grid — 66 shapes.
+"""Official half-precision (bf16/fp16) MQA-logits tests.
 
-The canonical shape set is the union of two production-derived groups:
+Two **mutually exclusive** suites (runtime skip by arch), mirroring FP8:
 
-* **54-shape tune grid** — the prefill grid used by
-  ``boltops/mqa_logits/triton/tune_mqa_logits_half.py``:
-  ``M in {16, 32, 64, 127} x H in {8, 64} x N in {66, 4096, 8192, 16384,
-  32768, 65536, 131072}`` with ``M <= N``.
-* **12-shape "4608 group"** — production prefill shapes covering
-  ``M in {256, 1024, 2048, 4608} x H in {4, 8, 16}``.
+* **non-gfx946** — ``row``/``bn``/``auto`` on the 66-shape grid
+  (:data:`HALF_SIZE_GRID` = 54 tune + 12 ``4608`` production), plus
+  ``vs_hipc`` / report helpers.
+* **gfx946** — BN-WASP (``qg1`` + MLS) on the ``4608`` production group plus
+  a few H=64 tune edges; optest ``per`` collects ``gfx946_prod`` benches.
+  Dispatch unit test is mocked and runs on any host.
 
-Total: ``4x7x2 - 2 + 12 = 66`` shapes, exported as :data:`HALF_SIZE_GRID`.
-
-Concerns covered (half only; FP8 lives in ``test_triton_fp8_mqa_logits.py``):
-
-* **API / backends** — explicit ``row``/``bn``, gluon rejection, optional
-  ``gluon_bn_align``, and ``kv_scales`` must not take the fp8 path.
-* **correctness** (default pytest run) — vs a pure-torch reference, on a
-  compact representative subset, for both dtypes and both ``ks``/``ke``
-  window conventions.
-* **performance** (``pytest --bench``) — BoltOPs-only ``time_ms`` on all 66
-  shapes. Hipc comparison is opt-in (``--bench -k vs_hipc``): two ``time_ms``
-  calls and a regression guard (``hipc/ours >= 0.85``). Prefer the sharded
-  form below: one process per shard keeps timings isolated.
+``ks``/``ke`` conventions and hipc naming notes follow below.
 
 ``ks``/``ke`` conventions
 -------------------------
@@ -50,8 +38,11 @@ Usage
     # correctness only (fast, default)
     pytest test/mqa_logits/test_triton_mqa_logits_half.py
 
-    # BoltOPs-only latency on all 66 shapes
+    # BoltOPs-only latency (non-946: 66-grid; gfx946: gfx946_prod)
     pytest --bench test/mqa_logits/test_triton_mqa_logits_half.py
+
+    # gfx946 BN-WASP production benches (skipped off 946)
+    pytest --bench -k gfx946_prod test/mqa_logits/test_triton_mqa_logits_half.py
 
     # optional hipc comparison (not part of a plain --bench / optest per run)
     pytest --bench -k vs_hipc test/mqa_logits/test_triton_mqa_logits_half.py
@@ -104,6 +95,25 @@ GPU_REQUIRED = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA/HIP device is required"
 )
 
+
+def _is_gfx946() -> bool:
+    from boltops.utility.arch_info import get_arch
+
+    return get_arch() == "gfx946"
+
+
+def _require_gfx946() -> None:
+    """gfx946 BN-WASP suite only."""
+    if not _is_gfx946():
+        pytest.skip("gfx946 BN-WASP suite only")
+
+
+def _skip_if_gfx946() -> None:
+    """Legacy row/bn/66-grid suite; gfx946 uses gfx946_prod BN-WASP tests."""
+    if _is_gfx946():
+        pytest.skip("legacy half suite skipped on gfx946 (see gfx946_prod tests)")
+
+
 # --------------------------------------------------------------------------- #
 # Canonical 66-shape grid
 # --------------------------------------------------------------------------- #
@@ -141,10 +151,27 @@ def _tune_grid() -> Iterator[Tuple[int, int, int]]:
 HALF_SIZE_GRID: Tuple[Tuple[int, int, int], ...] = (
     tuple(_tune_grid()) + _GROUP_4608
 )
-"""The official 66 ``(seq_len, seq_len_kv, num_heads)`` half shapes."""
+"""The official 66 ``(seq_len, seq_len_kv, num_heads)`` half shapes (non-gfx946)."""
 
 assert len(HALF_SIZE_GRID) == 66, f"expected 66 shapes, got {len(HALF_SIZE_GRID)}"
 assert len(set(HALF_SIZE_GRID)) == 66, "HALF_SIZE_GRID has duplicates"
+
+# gfx946 BN-WASP: 4608 production group + H=64 / short-KV edges for MLS path.
+_GFX946_PROD_SHAPES: list[tuple[str, int, int, int]] = [
+    (f"g4608-{m}x{n}-H{h}", m, n, h) for m, n, h in _GROUP_4608
+] + [
+    ("tune-16x66-H8", 16, 66, 8),
+    ("tune-64x4096-H64", 64, 4096, 64),
+    ("tune-64x16384-H64", 64, 16384, 64),
+]
+
+
+def _gfx946_prod_params():
+    for name, s_q, s_k, num_heads in _GFX946_PROD_SHAPES:
+        yield pytest.param(
+            s_q, s_k, num_heads, name, id=f"{name}"
+        )
+
 
 # Correctness: compact coverage of every family (tiny / small-M / large-M,
 # H=4/8/16/64, short and long N), both window conventions.
@@ -230,6 +257,20 @@ def calc_diff(x: torch.Tensor, y: torch.Tensor) -> float:
     return float(1 - sim)
 
 
+def useful_flops(
+    cu_starts: torch.Tensor,
+    cu_ends: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+) -> float:
+    starts = cu_starts.to("cpu").numpy()
+    ends = cu_ends.to("cpu").numpy()
+    total = 0.0
+    for start, end in zip(starts, ends):
+        total += 2.0 * num_heads * head_dim * max(int(end) - int(start), 0)
+    return total
+
+
 def ref_half_mqa_logits(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -239,14 +280,19 @@ def ref_half_mqa_logits(
     *,
     chunk_rows: int = 256,
 ) -> torch.Tensor:
-    """Pure-torch reference; chunked over M to keep the (H, M, N) score small."""
+    """CPU reference; chunked over M to keep the (H, M, N) score small."""
+    q = q.detach().float().cpu()
+    kv = kv.detach().float().cpu()
+    weights = weights.detach().float().cpu()
+    ks = ks.detach().cpu()
+    ke = ke.detach().cpu()
     s_q, _, _ = q.shape
     s_k = kv.shape[0]
-    out = torch.full((s_q, s_k), float("-inf"), device=q.device, dtype=torch.float32)
-    positions = torch.arange(s_k, device=q.device)
+    out = torch.full((s_q, s_k), float("-inf"), dtype=torch.float32)
+    positions = torch.arange(s_k)
     for start in range(0, s_q, chunk_rows):
         end = min(s_q, start + chunk_rows)
-        score = torch.einsum("mhd,nd->hmn", q[start:end].float(), kv.float())
+        score = torch.einsum("mhd,nd->hmn", q[start:end], kv)
         weighted = (score.relu() * weights[start:end].unsqueeze(-1).transpose(0, 1))
         row = weighted.sum(dim=0)
         mask = (positions[None, :] >= ks[start:end, None]) & (
@@ -267,6 +313,7 @@ def _assert_matches_ref(
     atol_diff: float = 2e-2,
 ) -> None:
     ref = ref_half_mqa_logits(q, kv, weights, ks, ke)
+    logits = logits.detach().float().cpu()
     ref_neginf = ref == float("-inf")
     out_neginf = logits == float("-inf")
     assert torch.equal(out_neginf, ref_neginf), "mask (-inf) pattern mismatch"
@@ -294,6 +341,7 @@ def test_triton_mqa_logits_half_correctness(
     num_heads: int,
 ) -> None:
     """66-grid shapes (representative subset) vs pure-torch, both windows."""
+    _skip_if_gfx946()
     from boltops.mqa_logits.triton.mqa_logits_half import get_half_bn_dispatch
 
     q, kv, weights, ks, ke = _make_inputs(s_q, s_k, num_heads, dtype=dtype, mode=mode)
@@ -340,6 +388,7 @@ def test_triton_mqa_logits_half_backends(
     num_heads: int,
 ) -> None:
     """Explicit ``row``/``bn`` paths (``auto`` covered by size-grid correctness)."""
+    _skip_if_gfx946()
     q, kv, weights, ks, ke = _make_inputs(
         s_q, s_k, num_heads, dtype=dtype, mode="sliding"
     )
@@ -350,6 +399,7 @@ def test_triton_mqa_logits_half_backends(
 @GPU_REQUIRED
 @torch.inference_mode()
 def test_triton_mqa_logits_half_rejects_gluon() -> None:
+    _skip_if_gfx946()
     q, kv, weights, ks, ke = _make_inputs(16, 66, 8, dtype=torch.bfloat16, mode="sliding")
     with pytest.raises(ValueError, match="gluon"):
         triton_mqa_logits(q, kv, None, weights, ks, ke, backend="gluon")
@@ -359,6 +409,7 @@ def test_triton_mqa_logits_half_rejects_gluon() -> None:
 @torch.inference_mode()
 def test_triton_mqa_logits_half_gluon_bn_align() -> None:
     """Experimental half Gluon path: one mid shape smoke vs torch ref."""
+    _skip_if_gfx946()
     from boltops.mqa_logits.triton.fp8_mqa_logits_gluon import gluon_prefill_available
 
     if not gluon_prefill_available():
@@ -371,6 +422,45 @@ def test_triton_mqa_logits_half_gluon_bn_align() -> None:
     logits = triton_mqa_logits(
         q, kv, None, weights, ks, ke, backend="gluon_bn_align"
     )
+    _assert_matches_ref(logits, q, kv, weights, ks, ke)
+
+
+# --------------------------------------------------------------------------- #
+# gfx946: BN-WASP (qg1 + MLS) on production shapes
+# --------------------------------------------------------------------------- #
+
+
+def test_half_gfx946_dispatch_always_wasp(monkeypatch: pytest.MonkeyPatch) -> None:
+    """gfx946 half auto must select BN-WASP (mocked arch; any host)."""
+    from boltops.mqa_logits.triton import mqa_config_utils as mcu
+
+    monkeypatch.setattr(mcu.arch_info, "get_arch", lambda *a, **k: "gfx946")
+    for s_q, s_k, h in ((16, 66, 8), (32, 128, 64), (64, 8192, 32)):
+        disp = mcu.get_half_mqa_shape_dispatch(s_q, s_k, h)
+        assert disp.get("path") == "wasp", (s_q, s_k, h, disp)
+
+
+@GPU_REQUIRED
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("s_q,s_k,num_heads,case", list(_gfx946_prod_params()))
+@torch.inference_mode()
+def test_triton_mqa_logits_half_gfx946_prod(
+    dtype: torch.dtype,
+    s_q: int,
+    s_k: int,
+    num_heads: int,
+    case: str,
+) -> None:
+    """gfx946 BN-WASP ``auto`` vs torch ref on production / edge shapes."""
+    _require_gfx946()
+    q, kv, weights, ks, ke = _make_inputs(
+        s_q, s_k, num_heads, dtype=dtype, mode="full"
+    )
+    d_out = torch.empty(s_q, s_k, device=DEVICE, dtype=torch.float32)
+    logits = triton_mqa_logits(
+        q, kv, None, weights, ks, ke, D_out=d_out, backend="auto"
+    )
+    assert logits.data_ptr() == d_out.data_ptr()
     _assert_matches_ref(logits, q, kv, weights, ks, ke)
 
 
@@ -443,7 +533,8 @@ def test_bench_triton_mqa_logits_half(
     bench_repeat: int,
     time_ms,
 ) -> None:
-    """BoltOPs-only latency on the official 66-shape grid (no hipc required)."""
+    """BoltOPs-only latency on the official 66-shape grid (non-gfx946)."""
+    _skip_if_gfx946()
     q, kv, weights, ks, ke = _make_inputs(s_q, s_k, num_heads, mode="full")
     out = torch.empty(s_q, s_k, device=DEVICE, dtype=torch.float32)
 
@@ -453,6 +544,36 @@ def test_bench_triton_mqa_logits_half(
     ms = time_ms(run, bench_warmup, bench_repeat)
     print(
         f"[bench half] {s_q}x{s_k} H={num_heads}: {ms * 1e3:.1f} us",
+        flush=True,
+    )
+
+
+@GPU_REQUIRED
+@pytest.mark.bench
+@pytest.mark.parametrize("s_q,s_k,num_heads,case", list(_gfx946_prod_params()))
+@torch.inference_mode()
+def test_bench_triton_mqa_logits_half_gfx946_prod(
+    s_q: int,
+    s_k: int,
+    num_heads: int,
+    case: str,
+    bench_warmup: int,
+    bench_repeat: int,
+    time_ms,
+) -> None:
+    """optest ``per``: gfx946 BN-WASP on production / edge shapes."""
+    _require_gfx946()
+    q, kv, weights, ks, ke = _make_inputs(s_q, s_k, num_heads, mode="full")
+    out = torch.empty(s_q, s_k, device=DEVICE, dtype=torch.float32)
+
+    def run():
+        triton_mqa_logits(q, kv, None, weights, ks, ke, D_out=out, backend="auto")
+
+    flops = useful_flops(ks, ke, num_heads, HEAD_DIM)
+    ms = time_ms(run, bench_warmup, bench_repeat, flops=flops)
+    print(
+        f"[bench half gfx946_prod] {case} auto {s_q}x{s_k} H={num_heads}: "
+        f"{ms:.3f} ms, {flops / (ms * 1e-3) / 1e12:.2f} TFLOPS",
         flush=True,
     )
 
@@ -476,6 +597,7 @@ def test_bench_triton_mqa_logits_half_vs_hipc(
     Two ``time_ms`` calls (ours, then hipc). Skipped when hipc is not
     installed. A ratio under the guard is measured once more before failing.
     """
+    _skip_if_gfx946()
     lightop = pytest.importorskip("lightop")
 
     q, kv, weights, ks, ke = _make_inputs(s_q, s_k, num_heads, mode="full")
@@ -523,6 +645,7 @@ def test_triton_mqa_logits_half_report(
     Local table/JSON only (not an optest bench). Skipped unless
     ``HALF_GRID_REPORT=1``.
     """
+    _skip_if_gfx946()
     if os.environ.get("HALF_GRID_REPORT") != "1":
         pytest.skip("set HALF_GRID_REPORT=1 to emit the 66-shape report")
 
