@@ -172,7 +172,7 @@ def _parse_log_cases(log_content):
 def parse_log_file(log_content):
     batch_matches = list(
         re.finditer(
-            r'^(?:Test:|Test Count \d+:)\s*m=(\d+),',
+            r'^(?:Test:|Test Count \d+:)\s*(?:m|BATCH_SIZE)=(\d+),',
             log_content,
             re.MULTILINE,
         )
@@ -193,7 +193,15 @@ def parse_log_file(log_content):
         )
         batch_size = int(match.group(1))
         all_results.extend((*result, batch_size) for result in section_results)
-    return all_results
+    # Process-isolated outer searches repeat the same explicit M. Compare
+    # complete GEMM1+GEMM2 pairs across shards, never keep the last shard or
+    # mix GEMMs from different BM/layouts.
+    best_by_batch = {}
+    for result in all_results:
+        batch = result[-1]
+        if batch not in best_by_batch or result[4] < best_by_batch[batch][4]:
+            best_by_batch[batch] = result
+    return [best_by_batch[batch] for batch in sorted(best_by_batch)]
 
 
 def get_special_key(idx):
@@ -203,6 +211,13 @@ def get_special_key(idx):
     else:
         # 超过64后，使用2的幂次：128, 256, 512, 1024, ...
         return 2 ** (idx - 8 + 6)  # 从2^7(128)开始
+
+
+def validate_expected_batches(results, batches):
+    expected = set(map(int, batches.replace(",", " ").split()))
+    actual = {result[-1] for result in results if len(result) == 8}
+    if actual != expected:
+        raise ValueError(f"Incomplete autotune results: expected M={sorted(expected)}, got M={sorted(actual)}")
 
 
 def _result_key_and_fields(idx, result):
@@ -312,6 +327,8 @@ def main():
             log_content = f.read()
 
         parsed_results = parse_log_file(log_content)
+        if os.environ.get("AUTOTUNE_EXPECTED_BATCHES"):
+            validate_expected_batches(parsed_results, os.environ["AUTOTUNE_EXPECTED_BATCHES"])
         print_results(parsed_results)
 
         save_results_to_json(parsed_results, output_json1, output_json2)
@@ -330,8 +347,10 @@ def main():
             print(f"所有文件已成功拷贝到 {config_dir}")
         except PermissionError:
             print(f"错误: 没有权限写入目录 {config_dir}，请使用sudo运行或检查权限")
+            raise
         except Exception as e:
             print(f"错误: 拷贝文件时出错: {str(e)}")
+            raise
     except FileNotFoundError:
         print(f"错误: 找不到日志文件 '{log_file}'")
         sys.exit(1)

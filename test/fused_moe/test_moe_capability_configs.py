@@ -9,7 +9,6 @@ from pathlib import Path
 import pytest
 import torch
 import triton
-from triton.runtime.errors import HSACOError
 
 from boltops.fused_moe.triton import moe_config_utils, mxfp4
 from boltops.tools.fused_moe_triton_tune import autotune_patches
@@ -757,13 +756,13 @@ def test_checked_in_moe_configs_have_explicit_shape_selectors():
         # both. Do not require an unvalidated fuzzy range for an exact config.
 
 
-def test_autotune_skips_unloadable_hip_candidate():
+def test_autotune_does_not_rank_a_partial_search_after_hip_load_error():
     def broken_bench(_kernel_call, _quantiles):
         raise RuntimeError("Triton Error [HIP]: Code: 500, named symbol not found")
 
-    robust_bench = autotune_patches._skip_invalid_hip_loads(broken_bench)
+    robust_bench = autotune_patches._check_hip_loads(broken_bench)
 
-    with pytest.raises(HSACOError, match="named symbol not found"):
+    with pytest.raises(RuntimeError, match="fresh process.*partial ranking.*named symbol not found"):
         robust_bench(lambda: None, (0.5, 0.2, 0.8))
 
 
@@ -771,7 +770,7 @@ def test_autotune_does_not_hide_other_runtime_errors():
     def broken_bench(_kernel_call, _quantiles):
         raise RuntimeError("device-side assert triggered")
 
-    robust_bench = autotune_patches._skip_invalid_hip_loads(broken_bench)
+    robust_bench = autotune_patches._check_hip_loads(broken_bench)
 
     with pytest.raises(RuntimeError, match="device-side assert"):
         robust_bench(lambda: None, (0.5, 0.2, 0.8))

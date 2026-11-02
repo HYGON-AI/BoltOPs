@@ -360,3 +360,173 @@ def test_native_mx_environment_resolves_saved_recipe(monkeypatch, kind, recipe):
     assert shape['test_type'] == kind
     assert shape['scale_recipe'] == recipe
     assert (shape['e'], shape['n'], shape['k'], shape['topk']) == (80, 512, 2048, 8)
+
+
+def test_fresh_csv_process_timeout_retries_only_owned_leaf(monkeypatch):
+    from types import SimpleNamespace
+    from boltops.tools.fused_moe_triton_tune import performance_csv as exporter
+    calls, killed = [], []
+
+    class Child:
+        def __init__(self, command, **kwargs):
+            self.pid = 100 + len(calls)
+            calls.append((command, kwargs))
+
+        def wait(self, timeout=None):
+            if self.pid == 100 and timeout is not None:
+                raise exporter.subprocess.TimeoutExpired(calls[0][0], timeout)
+            return 0
+
+    monkeypatch.setattr(exporter.subprocess, 'Popen', Child)
+    monkeypatch.setattr(exporter.os, 'killpg', lambda *args: killed.append(args))
+    args = SimpleNamespace(batch_sizes='8,1,8', max_attempts=2, process_timeout=5)
+    exporter.benchmark_in_fresh_processes(args, ['--config', 'exact.json'])
+    assert [command[-1] for command, _ in calls] == ['1', '1', '8']
+    assert all(kwargs['start_new_session'] for _, kwargs in calls)
+    assert all('--_single-batch' in command for command, _ in calls)
+    assert killed == [(100, exporter.signal.SIGKILL)]
+
+
+def test_cli_checks_every_m_in_separate_process_and_keeps_failures(monkeypatch, tmp_path):
+    from boltops.tools.fused_moe_triton_tune import tune_moe_cli as cli
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append((command, kwargs['env'].copy()))
+        return 1 if kwargs['env'].get('MOE_BATCH_SIZES') == '1' else 0
+
+    monkeypatch.setattr(cli, 'run_cmd', run)
+    assert cli.run_benchmark_step(script_dir=tmp_path, test_script_name='tune_moe_fp8.py',
+           tp_env={'MOE_BATCH_SIZES': '1,8192'}, tp=1, ep_size=1, break_on_error=False) == 1
+    assert [env['MOE_BATCH_SIZES'] for _, env in calls] == ['1', '8192']
+    assert all('pytest' in command for command, _ in calls)  # No CSV after failure.
+
+
+def test_csv_does_not_retry_a_failed_correctness_or_config_check(monkeypatch):
+    from types import SimpleNamespace
+    from boltops.tools.fused_moe_triton_tune import performance_csv as exporter
+    calls = []
+
+    def start(command, **kwargs):
+        calls.append(command)
+        return SimpleNamespace(wait=lambda **kwargs: 3)
+
+    monkeypatch.setattr(exporter.subprocess, 'Popen', start)
+    args = SimpleNamespace(batch_sizes='1,8', max_attempts=3, process_timeout=5)
+    with pytest.raises(exporter.subprocess.CalledProcessError):
+        exporter.benchmark_in_fresh_processes(args, ['--config', 'exact.json'])
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize('ignore_term', [False, True])
+def test_csv_cancellation_cleans_up_only_owned_process_group(monkeypatch, ignore_term):
+    from types import SimpleNamespace
+    from boltops.tools.fused_moe_triton_tune import performance_csv as exporter
+    killed = []
+
+    waits = []
+
+    def wait(timeout=None):
+        waits.append(timeout)
+        if len(waits) == 1:
+            raise KeyboardInterrupt
+        if ignore_term and len(waits) == 2:
+            raise exporter.subprocess.TimeoutExpired('csv child', timeout)
+        return 0
+
+    monkeypatch.setattr(exporter.subprocess, 'Popen', lambda *a, **k: SimpleNamespace(pid=123, wait=wait))
+    monkeypatch.setattr(exporter.os, 'killpg', lambda *args: killed.append(args))
+    args = SimpleNamespace(batch_sizes='1', max_attempts=1, process_timeout=5)
+    with pytest.raises(KeyboardInterrupt):
+        exporter.benchmark_in_fresh_processes(args, ['--config', 'exact.json'])
+    expected = [(123, exporter.signal.SIGTERM)]
+    if ignore_term:
+        expected.append((123, exporter.signal.SIGKILL))
+    assert killed == expected
+    assert waits == ([5, 5, None] if ignore_term else [5, 5])
+
+
+@pytest.mark.parametrize('groups', [1, 2, 4])
+def test_csv_resets_inherited_training_groups(monkeypatch, groups):
+    from boltops.tools.fused_moe_triton_tune import performance_csv as exporter
+    from boltops.tools.fused_moe_triton_tune.common import resolve_device_settings
+
+    # Keep all environment writes local to this test.
+    monkeypatch.setattr(exporter.os, 'environ', dict(exporter.os.environ))
+    exporter.os.environ.update(AUTOTUNE_DEVICE_COUNT=str(groups),
+        AUTOTUNE_NUM_GROUPS_RUN=str(groups), AUTOTUNE_START_GROUP='3', CUR_GROUP='3')
+    exporter._prepare_environment(2)
+    assert resolve_device_settings(8) == (2, 1, 1)
+    assert exporter.os.environ['AUTOTUNE_START_GROUP'] == exporter.os.environ['CUR_GROUP'] == '0'
+
+
+def test_csv_sigterm_reaps_leaf_and_restores_handler(monkeypatch):
+    from types import SimpleNamespace
+    from boltops.tools.fused_moe_triton_tune import performance_csv as exporter
+    killed = []
+    previous = exporter.signal.getsignal(exporter.signal.SIGTERM)
+
+    waits = []
+
+    def wait(timeout=None):
+        waits.append(timeout)
+        if len(waits) == 1:
+            exporter.signal.raise_signal(exporter.signal.SIGTERM)
+        return 0
+
+    monkeypatch.setattr(exporter.subprocess, 'Popen', lambda *a, **k: SimpleNamespace(pid=123, wait=wait))
+    monkeypatch.setattr(exporter.os, 'killpg', lambda *args: killed.append(args))
+    args = SimpleNamespace(batch_sizes='1', max_attempts=1, process_timeout=5)
+    monkeypatch.setattr(exporter, '_main', lambda: exporter.benchmark_in_fresh_processes(args, []))
+    with pytest.raises(SystemExit) as error:
+        exporter.main()
+    assert error.value.code == 128 + exporter.signal.SIGTERM
+    assert killed == [(123, exporter.signal.SIGTERM)]
+    assert waits == [5, 5]
+    assert exporter.signal.getsignal(exporter.signal.SIGTERM) == previous
+
+
+def test_csv_sigterm_cleans_up_real_detached_leaf():
+    import os
+    import select
+    import signal
+    import subprocess
+    import sys
+
+    # No CUDA context or files: exercise the real supervisor with a CPU sleeper.
+    code = """
+import subprocess, sys
+from types import SimpleNamespace
+from boltops.tools.fused_moe_triton_tune import performance_csv as exporter
+real_popen = subprocess.Popen
+def start(command, **kwargs):
+    child = real_popen([sys.executable, '-c', 'import time; time.sleep(60)'], **kwargs)
+    def wait(timeout=None):
+        if timeout is not None:
+            print(child.pid, flush=True)
+        return child.wait(timeout=timeout)
+    return SimpleNamespace(pid=child.pid, wait=wait)
+exporter.subprocess.Popen = start
+args = SimpleNamespace(batch_sizes='1', max_attempts=1, process_timeout=60)
+exporter._main = lambda: exporter.benchmark_in_fresh_processes(args, [])
+exporter.main()
+"""
+    parent = subprocess.Popen([sys.executable, '-u', '-c', code], stdout=subprocess.PIPE, text=True)
+    leaf = None
+    try:
+        assert select.select([parent.stdout], [], [], 10)[0], 'Supervisor did not start'
+        leaf = int(parent.stdout.readline())
+        parent.terminate()
+        assert parent.wait(timeout=5) == 128 + signal.SIGTERM
+        with pytest.raises(ProcessLookupError):
+            os.kill(leaf, 0)
+    finally:
+        if parent.poll() is None:
+            parent.kill()
+            parent.wait()
+        if leaf is not None:
+            try:
+                os.killpg(leaf, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        parent.stdout.close()

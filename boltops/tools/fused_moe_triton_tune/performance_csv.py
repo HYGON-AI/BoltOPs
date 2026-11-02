@@ -22,8 +22,11 @@ import math
 import os
 from pathlib import Path
 import re
+import signal
 import socket
 import statistics
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -377,7 +380,8 @@ def _prepare_environment(device):
         "TRAINING_MODE": "0", "BENCHMARK_MODE": "0", "TRITON_COMPILE_ONLY": "0",
         "EP_SIZE": "1", "MOE_NUM_SHARED_EXPERTS": "0", "MOE_ACTIVATION": "silu",
         "MOE_IS_GATED": "1", "AUTOTUNE_DEVICE_START_ID": str(device),
-        "AUTOTUNE_DEVICE_COUNT": "1", "NUM_GROUPS_RUN": "1", "CUR_GROUP": "0",
+        "AUTOTUNE_DEVICE_COUNT": "1", "AUTOTUNE_NUM_GROUPS_RUN": "1",
+        "AUTOTUNE_START_GROUP": "0", "CUR_GROUP": "0",
     })
     os.environ.pop("TOPK_IDS_DIR", None)
 
@@ -518,7 +522,50 @@ def benchmark(args):
             torch.cuda.empty_cache()
 
 
-def main():
+def benchmark_in_fresh_processes(args, arguments):
+    """Release HIP modules and graph allocations after each measured M."""
+    batches = sorted({int(value) for value in args.batch_sizes.replace(",", " ").split()})
+    if not batches or min(batches) <= 0:
+        raise ValueError("batch sizes must be positive integers")
+    for batch in batches:
+        command = [sys.executable, "-u", "-m", "boltops.tools.fused_moe_triton_tune.performance_csv",
+                   *arguments, "--_single-batch", "--batch-sizes", str(batch)]
+        for attempt in range(args.max_attempts):
+            child = subprocess.Popen(command, start_new_session=True)
+            try:
+                rc = child.wait(timeout=args.process_timeout)
+            except subprocess.TimeoutExpired:
+                # Only this leaf's process group (including its compiler),
+                # never another GPU's tuning job or the CLI supervisor.
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                child.wait()
+                print(f"CSV_PROCESS_TIMEOUT M={batch} attempt={attempt + 1}/{args.max_attempts}", flush=True)
+                if attempt + 1 == args.max_attempts:
+                    raise
+                continue
+            except BaseException:
+                try:
+                    os.killpg(child.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    child.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(child.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    child.wait()
+                raise
+            if rc:
+                raise subprocess.CalledProcessError(rc, command)
+            break
+
+
+def _main():
     parser = argparse.ArgumentParser(description=__doc__)
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--config", help="Exact Gemm1 JSON; normal runtime lookup must match")
@@ -536,8 +583,11 @@ def main():
                         help="Maximum (max-min)/median across repeats; default 5%%")
     parser.add_argument("--max-attempts", type=int, default=3)
     parser.add_argument("--retry-delay", type=float, default=10)
+    parser.add_argument("--process-timeout", type=float, default=600,
+                        help="Maximum seconds per M's fresh process; timed-out leaves are retried")
+    parser.add_argument("--_single-batch", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
-    if args.repeats < 3 or args.rep_ms <= 0 or args.max_spread <= 0 or args.max_attempts < 1 or args.retry_delay < 0:
+    if args.repeats < 3 or args.rep_ms <= 0 or args.max_spread <= 0 or args.max_attempts < 1 or args.retry_delay < 0 or args.process_timeout <= 0:
         parser.error("Need >=3 repeats and positive timing/stability limits")
     if args.test_type:
         # Aiter's 13 columns cannot distinguish these operation semantics.
@@ -548,7 +598,25 @@ def main():
             print("CSV export skipped: schema supports only gated SiLU, EP=1, no shared experts")
             return
         args.batch_sizes = args.batch_sizes or os.environ.get("MOE_BATCH_SIZES")
-    benchmark(args)
+    elif args.batch_sizes is None and Path(args.config).exists():
+        args.batch_sizes = ",".join(json.loads(Path(args.config).read_text()))
+    if args.batch_sizes and not args._single_batch:
+        benchmark_in_fresh_processes(args, sys.argv[1:])
+    else:
+        benchmark(args)
+
+
+def main():
+    def terminate(signum, _frame):
+        # Let the supervisor reap its owned process group and let CSV writers
+        # release their locks through normal exception/finally unwinding.
+        raise SystemExit(128 + signum)
+
+    previous = signal.signal(signal.SIGTERM, terminate)
+    try:
+        _main()
+    finally:
+        signal.signal(signal.SIGTERM, previous)
 
 
 if __name__ == "__main__":

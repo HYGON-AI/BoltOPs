@@ -12,7 +12,7 @@ from unittest.mock import patch
 import torch
 import triton
 import triton.language as tl
-from triton.runtime.errors import HSACOError
+from boltops.tools.fused_moe_triton_tune.common import autotune_outer_configs
 
 import boltops.fused_moe.triton.moe_op as moe_op
 from boltops.fused_moe.triton import mxfp4, mxfp8
@@ -37,25 +37,25 @@ mode_best_config_tune = False
 
 _SCHEDULE_OPTION_NAMES = ("instruction_sched_variant", "schedule_hint")
 _LARGE_MOE_TOKEN_THRESHOLD = 2048
-_SKIPPABLE_HIP_LOAD_ERRORS = ("named symbol not found",)
 
 
-def _skip_invalid_hip_loads(do_bench):
-    """Make a broken HSACO one invalid candidate instead of aborting a tune."""
+def _check_hip_loads(do_bench):
+    """Never publish a partial ranking after process-wide HIP resource failure."""
 
     def robust_do_bench(kernel_call, quantiles):
         try:
             return do_bench(kernel_call, quantiles)
         except RuntimeError as exc:
             message = str(exc)
-            if not any(marker in message for marker in _SKIPPABLE_HIP_LOAD_ERRORS):
+            if "named symbol not found" not in message:
                 raise
-            print(f"[autotune] skip unloadable HIP candidate: {message}")
-            # Triton's Autotuner already maps HSACOError to an infinite timing.
-            # The HCU loader reports the same invalid-code-object condition as
-            # a generic RuntimeError, which would otherwise abort every later
-            # config (including smaller BLOCK_SIZE_M candidates).
-            raise HSACOError(message) from exc
+            # This also occurs when HIP exhausts this process's VMA budget,
+            # not just for an invalid HSACO. Mapping it to HSACOError/infinity
+            # silently excludes every later candidate and biases the winner.
+            raise RuntimeError(
+                "HIP module lookup failed; restart this autotune shard in a fresh "
+                f"process instead of accepting a partial ranking: {message}"
+            ) from exc
 
     return robust_do_bench
 
@@ -773,7 +773,7 @@ def dynamic_autotune(fn):
                     perf_profiling=False,
                     rep=20
                 )(self.kernel_fn)
-                autotuned_fn.__dict__["do_bench"] = _skip_invalid_hip_loads(
+                autotuned_fn.__dict__["do_bench"] = _check_hip_loads(
                     autotuned_fn.do_bench
                 )
 
@@ -797,23 +797,12 @@ def generate_config_lists():
     config_count = 0
 
     if mode_best_config_tune == False:
-        block_size_m_options = [2**i for i in range(4, 9)]       # 16 to 256
-
-        bottom_a_mls_options = (
-            (False, True)
-            if test_type in ("bf16", "fp8", "fp8_channel", "int8", "int8_channel")
-            else (False,)
-        )
-
-        for block_m in block_size_m_options:
-            for bottom_a_use_mls_load in bottom_a_mls_options:
-                config = {
-                    "BLOCK_SIZE_M": block_m,
-                    "bottom_a_use_mls_load": bottom_a_use_mls_load,
-                }
-                config_count += 1
-                print(f"Config {config_count}: {config}")
-                configs.append(config)
+        for config in autotune_outer_configs(
+            test_type, os.environ.get("AUTOTUNE_OUTER_CONFIG")
+        ):
+            config_count += 1
+            print(f"Config {config_count}: {config}")
+            configs.append(config)
     else:
         # bs=16 & gemm1 best config
         config = { "BLOCK_SIZE_M": 16 }
@@ -907,7 +896,7 @@ def _native_mxfp4_autotune(kernel):
                          "MUL_ROUTED_WEIGHT", "STATIC_A", "FUSE_SWIGLU", "ALPHA", "LIMIT"],
                     rep=20,
                 )(kernel)
-                tuner.__dict__["do_bench"] = _skip_invalid_hip_loads(tuner.do_bench)
+                tuner.__dict__["do_bench"] = _check_hip_loads(tuner.do_bench)
                 output_n = named["N"] // 2 if named.get("FUSE_SWIGLU", False) else named["N"]
                 grid = lambda meta: (_grid[0], triton.cdiv(output_n, meta["BN"]))
                 if compile_only:
@@ -960,7 +949,7 @@ def fused_experts_impl(*args, **kwargs):
     original_native_query = getattr(native_module, native_name)
     configs = k100_ai_config_lists
     if native:
-        configs = [dict(BLOCK_SIZE_M=bm) for bm in (16, 32, 64, 128)]
+        configs = autotune_outer_configs(test_type, os.environ.get("AUTOTUNE_OUTER_CONFIG"))
     if hidden.shape[0] >= 32:
         configs = list(reversed(configs))
     # Repeated candidates must receive the same original input for inplace.

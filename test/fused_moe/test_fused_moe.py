@@ -27,7 +27,6 @@ from boltops.fused_moe.triton.moe_activation import (  # noqa: E402
 from boltops.fused_moe.triton.moe_compat import pertoken_quant  # noqa: E402
 from boltops.tools.fused_moe_triton_tune.routing import fused_topk  # noqa: E402
 from boltops.tools.fused_moe_triton_tune.performance_csv import (  # noqa: E402
-    DeviceGuard,
     spread_fraction,
 )
 from boltops.utility import arch_info  # noqa: E402
@@ -1317,28 +1316,39 @@ def test_fused_moe_benchmark(
     torch.cuda.synchronize()
     # Same graph timer and five-sample median as the tune CLI's CSV benchmark.
     # do_bench_cudagraph interprets rep as a target measurement duration in ms.
-    guard = DeviceGuard(torch.cuda.current_device())
     for attempt in range(3):
-        guard.wait_until_exclusive()
-        with guard:
-            samples_us = [
-                float(triton.testing.do_bench_cudagraph(run, rep=bench_repeat)) * 1000
-                for _ in range(5)
-            ]
+        samples_us = [
+            float(triton.testing.do_bench_cudagraph(run, rep=bench_repeat)) * 1000
+            for _ in range(5)
+        ]
         assert all(0 < value < float("inf") for value in samples_us)
         spread = spread_fraction(samples_us)
-        if not guard.contaminated and spread <= 0.03:
+        if spread <= 0.03:
             break
-        print(f"[bench] retry={attempt + 1}/3 spread={spread:.2%} "
-              f"foreign_queue={guard.contaminated}")
+        print(f"[bench] retry={attempt + 1}/3 spread={spread:.2%}")
     else:
-        pytest.fail("MoE graph timings remained unstable or the GPU was shared")
+        pytest.fail("MoE graph timings remained unstable")
     print(
         f"[bench] fused_moe arch={arch_info.get_arch()} mode={mode} "
         f"M={num_tokens} E={experts} N={n} K={k} topk=8 dtype={dtype} "
         f"block_shape={kwargs['block_shape']} CUDA-graph median={median(samples_us):.3f} us "
         f"samples_us={[round(value, 3) for value in samples_us]}"
     )
+
+
+def test_fused_moe_benchmark_does_not_probe_kfd(monkeypatch):
+    def unexpected_probe(*args, **kwargs):
+        pytest.fail("Operator benchmarks must not inspect KFD queues")
+
+    monkeypatch.setitem(globals(), "DeviceGuard", unexpected_probe)
+    monkeypatch.setitem(globals(), "DEVICE", "cpu")
+    monkeypatch.setitem(globals(), "fused_topk", lambda *args, **kwargs: (None, None))
+    monkeypatch.setitem(globals(), "fused_experts", lambda x, *args, **kwargs: x.clone())
+    monkeypatch.setattr(arch_info, "get_arch", lambda: "gfx938")
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(triton.testing, "do_bench_cudagraph", lambda fn, **kwargs: 0.001)
+    shape = ("bf16", 1, 2, 4, torch.bfloat16, (None, None), {"block_shape": None})
+    test_fused_moe_benchmark(shape, num_tokens=1, bench_warmup=0, bench_repeat=50)
 
 
 @GPU_REQUIRED
