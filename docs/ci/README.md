@@ -44,7 +44,7 @@
 
 测试版本在 `ci.yml` 的 `build2610.strategy.matrix.torch_version` 中维护，当前仅包含 `2.11.0` 和 `2.13.0`。两组均使用 DTK26.10、Python3.12、NumPy1.26.4；版本变更通过 PR 评审。
 
-PR 和手动触发时，两组构建均执行正确性测试，之后两组均运行性能测试；main push 时仅构建，两组都成功后由一个 `publish-2610` 任务发布全部 DTK2610 wheel。`ci-result` 要求两组构建成功；PR/手动触发还要求两组性能均成功，push 则要求性能跳过。构建和性能矩阵通过 YAML 锚点 `&torch_versions` 与别名 `*torch_versions` 复用同一个版本列表。
+PR 和手动触发时，两组构建均执行正确性测试，之后两组均运行性能测试；main push 时仅构建，两组都成功后由一个 `publish-2610` 任务发布全部 DTK2610 wheel。`ci-result` 要求两组构建成功；PR/手动触发还要求两组性能均成功，push 则要求性能跳过。为兼容组织质量门禁的 Workflow 解析器，当前使用显式值，不使用 YAML 锚点和别名；修改版本时需同时更新构建和性能矩阵。
 
 升级版本时，检查对应的 DTK/Python 容器及 HCU Torch/Triton/TileLang 包是否可用。不同 DTK 若需要不同版本，应拆开配置，不能只为减少重复而强行共用。发布任务的 Python3.12 容器只用于上传 wheel，不决定 wheel 的目标 Python 版本。
 

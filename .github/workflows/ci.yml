@@ -25,15 +25,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        torch_version: &torch_versions
+        torch_version:
         - '2.11.0'
         - '2.13.0'
     uses: ./.github/workflows/_build-test-wheel.yml
     with:
       dtk_version: '26.10'
       dtk_ver: '2610'
-      py_version: &ci_python '3.12'
-      numpy_version: &ci_numpy '1.26.4'
+      py_version: '3.12'
+      numpy_version: '1.26.4'
       torch_version: ${{ matrix.torch_version }}
       run_tests: ${{ github.event_name != 'push' }}
   # Test both Torch versions, each using its existing DTK26.10 wheel.
@@ -45,13 +45,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        torch_version: *torch_versions
+        torch_version:
+        - '2.11.0'
+        - '2.13.0'
     uses: ./.github/workflows/_performance.yml
     with:
       dtk_version: '26.10'
       dtk_ver: '2610'
-      py_version: *ci_python
-      numpy_version: *ci_numpy
+      py_version: '3.12'
+      numpy_version: '1.26.4'
       torch_version: ${{ matrix.torch_version }}
   publish-2610:
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
