@@ -4,7 +4,10 @@ Vendored Triton MQA logits sources:
 
 - `fp8_mqa_logits.py` — hygon aiter lineage (row + BN-tile kernels).
   **Internal** float8 kernels used by public ``triton_mqa_logits`` when
-  ``kv_scales`` is provided.
+  ``kv_scales`` is provided (non-gfx946).
+- `mqa_logits_wasp.py` — **gfx946** WASP: float8 head-serial N-loop
+  (prologue MLS / ``force_grouped`` / ``chunk8_mls`` / ``Q_GROUP``;
+  ``backend="wasp"`` aliases head-serial) and half BN-WASP (``Q_GROUP=1`` + MLS).
 - `mqa_logits_half.py` — dedicated fp16/bf16 BN path (ship `by_shape` / defaults).
 - `mqa_logits_half_row.py` — dedicated fp16/bf16 per-row path (short-KV).
 - `mqa_logits_half_gluon_bn_align.py` — **experimental** half Gluon BN-aligned
@@ -15,7 +18,8 @@ Vendored Triton MQA logits sources:
 - `fp8_mqa_logits_gluon_bn_align.py` — **experimental** BN-aligned Gluon + optional
   QPP/WPP / layout ablations.
 - `fp8_mqa_logits_tiled.py` — thin BN forwarder (compat / tune helper).
-- `mqa_config_utils.py` — arch JSON load + float8 / half dispatch helpers.
+- `mqa_config_utils.py` — arch JSON load + float8 / half dispatch helpers
+  (gfx946 → head_serial / half wasp).
 
 **Paged decode (FP8)**
 
@@ -28,10 +32,11 @@ Call sites: vLLM `rocm_fp8_mqa_logits`, SGLang DSA indexer (ROCm → aiter).
 
 Public Triton entries:
 
-* ``triton_mqa_logits`` — prefill; ``backend=None|"auto"|"row"|"bn"|"gluon"``
-  plus experimental ``gluon_bn_align`` / ``gluon_opt``; optional ``D_out``.
-  - ``kv_scales`` provided → float8 path
-  - ``kv_scales is None`` → half path
+* ``triton_mqa_logits`` — prefill; ``backend=None|"auto"|"row"|"bn"|"wasp"|
+  "head_serial"|"gluon"`` plus experimental ``gluon_bn_align`` / ``gluon_opt``;
+  optional ``D_out``.
+  - ``kv_scales`` provided → float8 path (gfx946 auto → head-serial)
+  - ``kv_scales is None`` → half path (gfx946 auto → BN-WASP)
 * ``triton_fp8_paged_mqa_logits`` (+ ``_stage1`` / ``_prepare`` /
   ``_build_bucket_schedule``) — FP8 paged decode
 

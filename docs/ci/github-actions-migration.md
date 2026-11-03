@@ -1,6 +1,6 @@
 # BoltOPs GitHub Actions 迁移与编写说明
 
-当前交付为待试运行的迁移代码，基于 GitLab main 的 27c0c0ab。GitLab CI 暂时保留，正式切换需按下面的顺序操作，避免重复发布。参考 lightop/master 的 pr-test.yml、release-pypi.yml 和 .github/scripts/ 结构，沿用 BW1100 runner 与预装 DTK 的 RockyLinux 容器。
+当前迁移分支已合入 GitLab main 的 e4c2c58（2026-11-03 同步），保留 GitLab 原始提交历史及 GitHub CI 改造。GitLab CI 暂时保留，正式切换需按下面的顺序操作，避免重复发布。参考 lightop/master 的 pr-test.yml、release-pypi.yml 和 .github/scripts/ 结构，沿用 BW1100 runner 与预装 DTK 的 RockyLinux 容器。
 
 ## 1. 先理解整体流程
 
@@ -66,7 +66,7 @@ Settings → Actions → Runners：确保 BW1100 runner/runner group 允许 Bolt
 
 当前 GitHub 登录账号 guochenyang99 对 BoltOPs 只有 pull 权限。迁移修改位于 `ci/github-actions-migration` 分支；origin 指向 HYGON-AI/BoltOPs，fork 指向 guochenyang99/BoltOPs。
 
-先由维护者确认最新 GitLab main 已同步到 GitHub（本次读取 GitHub main 仍为 778e274，GitLab 为 27c0c0ab）。先整合/同步代码，再把迁移补丁应用到 GitHub 新建分支，避免直接从旧 GitHub 基线遗漏近期算子/测试修复。
+当前迁移分支已整合 GitLab main@e4c2c58，但这不代表 GitHub main 已更新。维护者合入 PR 前应确认 GitLab 是否又有新提交；如有，应再次合并并验证，避免遗漏近期算子/测试修复。
 
 可将交付 zip 中的 .github/ 与 docs/ci/ 合入该分支，或者使用交付 patch：
 

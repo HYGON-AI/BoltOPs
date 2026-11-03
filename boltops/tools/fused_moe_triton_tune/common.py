@@ -7,8 +7,36 @@ import sys
 from contextlib import contextmanager
 from dataclasses import dataclass
 import importlib
+import json
 from pathlib import Path
 from typing import Optional
+
+
+def tune_module_name(test_type: str) -> str:
+    """Native MX shares the existing expert orchestration and benchmark entry."""
+    return "tune_moe_bf16" if test_type in ("mxfp4", "mxfp8") else f"tune_moe_{test_type}"
+
+
+def autotune_outer_configs(test_type: str, selection: str | None = None) -> list[dict]:
+    """Canonical BM/bridge-layout space, optionally one process-local shard."""
+    native = test_type in {"mxfp4", "mxfp8"}
+    layouts = (False, True) if test_type in {
+        "bf16", "fp8", "fp8_channel", "int8", "int8_channel"
+    } else (False,)
+    configs = ([{"BLOCK_SIZE_M": bm} for bm in (16, 32, 64, 128)] if native else
+               [{"BLOCK_SIZE_M": bm, "bottom_a_use_mls_load": layout}
+                for bm in (16, 32, 64, 128, 256) for layout in layouts])
+    if selection is not None:
+        selected = json.loads(selection)
+        if (not isinstance(selected, dict)
+                or set(selected) != ({"BLOCK_SIZE_M"} if native else
+                                     {"BLOCK_SIZE_M", "bottom_a_use_mls_load"})
+                or type(selected["BLOCK_SIZE_M"]) is not int
+                or (not native and type(selected["bottom_a_use_mls_load"]) is not bool)
+                or selected not in configs):
+            raise ValueError(f"Invalid autotune outer config: {selection}")
+        return [selected]
+    return configs
 
 
 def random_int8_weights(shape, device):
@@ -416,8 +444,9 @@ def resolve_device_settings(total_cuda_devices: int) -> tuple[int, int, int]:
             f"Invalid device range: start={device_start_id}, count={device_count}, total={total_cuda_devices}"
         )
 
-    # 简化规则：run group 数量永远等于 device_count。
-    num_groups_run = device_count
+    num_groups_run = get_env_int("AUTOTUNE_NUM_GROUPS_RUN", device_count)
+    if not 1 <= num_groups_run <= device_count:
+        raise ValueError(f"AUTOTUNE_NUM_GROUPS_RUN must be in [1, {device_count}], got {num_groups_run}")
 
     return device_start_id, device_count, num_groups_run
 
@@ -667,7 +696,7 @@ def split_run_batches(full_batches: list[int], group_count: int) -> list[list[in
             )
             for min_batch, max_batch in rules
         ]
-        if all(groups):
+        if all(groups) and sorted(batch for group in groups for batch in group) == sorted(full_batches):
             return groups
 
     return _split_fallback_evenly(full_batches, group_count)

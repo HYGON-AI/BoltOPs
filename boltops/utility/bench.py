@@ -222,6 +222,9 @@ def time_ms(
     that cannot be captured fall back to plain event timing.  Errors
     unrelated to capture (e.g. a broken kernel) are re-raised so they
     fail loudly instead of being timed with the fallback path.
+    Graph capture times on the toolchain's own side stream, so the
+    caller's current stream is synchronized first: input initialization
+    completes before any timed kernel starts.
     ``use_graph=False`` times with plain events only (no capture
     attempt) -- the owner's explicit choice, e.g. for calls with host
     work or for side-by-side event comparisons.
@@ -256,6 +259,9 @@ def time_ms(
             ),
             "event",
         )
+    import torch
+
+    torch.cuda.current_stream().synchronize()
     try:
         return (
             float(cudagraph_bench(run, rep=repeat_ms, return_mode=return_mode)),

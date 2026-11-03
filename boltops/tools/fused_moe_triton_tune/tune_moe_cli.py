@@ -2,6 +2,7 @@
 # Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # SPDX-License-Identifier: MIT
 import argparse
+import json
 import os
 import re
 import signal
@@ -12,17 +13,21 @@ import time
 from pathlib import Path
 
 from boltops.utility.triton_capability import get_triton_capabilities
+from boltops.tools.fused_moe_triton_tune.common import tune_module_name
 
 
-VALID_DEVICE_NAMES = {"zd", "bmz", "nmz", "yy"}
+VALID_DEVICE_NAMES = {"zd", "bmz", "nmz", "yy", "sb"}
 # Site code → GPU ISA used in MoE JSON filenames (arch=...).
 DEVICE_ARCH_MAP = {
     "zd": "gfx928",
     "bmz": "gfx936",
     "nmz": "gfx938",
     "yy": "gfx92a",
+    "sb": "gfx946",
 }
 VALID_TEST_TYPES = {
+    "mxfp4",
+    "mxfp8",
     "int4",
     "int8",
     "int8_channel",
@@ -48,16 +53,19 @@ PRESET_CONFIGS: dict[str, dict[str, object]] = {
 DEFAULT_BATCH_SIZES = "1,2,4,8,16,24,32,64,128,256,512,1024,2048,4096,8192,16384,32768"
 DEFAULT_TOP_K = 8
 TEST_TYPES_SUPPORT_SHARED_EXPERTS = {"bf16", "fp8", "fp8_channel", "int8", "int8_channel"}
-TEST_TYPES_SUPPORT_BLOCK_SHAPE = {"fp8", "int8"}
+TEST_TYPES_SUPPORT_BLOCK_SHAPE = {"fp8", "int8", "mxfp8"}
 FIXED_GROUP_SIZE_BY_TEST: dict[str, int] = {
     "int4": 64,
     "int4int8": 64,
 }
 DEFAULT_BLOCK_SHAPE_BY_TEST: dict[str, tuple[int, int]] = {
     "fp8": (128, 128),
+    "mxfp8": (1, 32),
     "int8": (128, 128),
 }
 DEFAULT_FFN_HIDDEN_SIZE_BY_TEST: dict[str, int] = {
+    "mxfp4": 7168,
+    "mxfp8": 7168,
     "bf16": 7168,
     "fp8": 7168,
     "fp8_channel": 7168,
@@ -88,7 +96,7 @@ _MOE_PROCESS_PATTERNS = (
     re.compile(r"\bpytest\b.*\btune_moe_.*\.py\b"),
     re.compile(
         r"\btune_moe_"
-        r"(bf16|fp8|fp8_channel|int4|int4int8|int4int8_channel|int8|int8_channel)"
+        r"(bf16|fp8|fp8_channel|int4|int4int8|int4int8_channel|int8|int8_channel|mxfp4|mxfp8)"
         r"\.py\b"
     ),
     # The CLI is normally launched as a module in development containers:
@@ -97,10 +105,10 @@ _MOE_PROCESS_PATTERNS = (
     # containing the same text is not mistaken for the CLI process itself.
     re.compile(
         rf"^{_PYTHON_COMMAND_RE}(?:\s+-\S+)*\s+-m\s+"
-        r"boltops\.tools\.fused_moe_triton_tune\.tune_moe_cli(?:\s|$)"
+        r"boltops\.tools\.fused_moe_triton_tune\.(?:tune_moe_cli|performance_csv)(?:\s|$)"
     ),
     re.compile(
-        rf"^{_PYTHON_COMMAND_RE}(?:\s+-\S+)*\s+(?:\S*/)?tune_moe_cli\.py(?:\s|$)"
+        rf"^{_PYTHON_COMMAND_RE}(?:\s+-\S+)*\s+(?:\S*/)?(?:tune_moe_cli|performance_csv)\.py(?:\s|$)"
     ),
     re.compile(
         rf"^(?:{_PYTHON_COMMAND_RE}(?:\s+-\S+)*\s+)?"
@@ -320,25 +328,36 @@ def run_benchmark_step(
     bench_env["TRAINING_MODE"] = "0"
     bench_env["BENCHMARK_MODE"] = "1"
 
-    bench_rc = run_cmd(
-        ["pytest", "-v", "-s", test_script_name],
-        cwd=script_dir,
-        env=bench_env,
-        check=False,
-    )
+    # A new CUDA/HIP context per M bounds module/graph allocator lifetime.
+    batches = parse_int_list(bench_env["MOE_BATCH_SIZES"], "MOE_BATCH_SIZES") if bench_env.get("MOE_BATCH_SIZES") else [None]
+    bench_rc = 0
+    for batch in batches:
+        case_env = bench_env.copy()
+        if batch is not None:
+            case_env["MOE_BATCH_SIZES"] = str(batch)
+        rc = run_cmd(
+            [sys.executable, "-u", "-m", "pytest", "-v", "-s", test_script_name],
+            cwd=script_dir, env=case_env, check=False,
+        )
+        if rc:
+            bench_rc = rc
+            if break_on_error:
+                break
     if bench_rc != 0:
         message = f"TP={tp} benchmark/correctness 失败 (rc={bench_rc})，请查看终端输出"
         if break_on_error:
             print(f"错误: {message}", file=sys.stderr)
             return bench_rc
         print(f"警告: {message}")
+        return bench_rc
 
     if bench_rc == 0:
         print("Step5: Export measured full-MoE performance CSV")
         csv_env = bench_env.copy()
         csv_env["BENCHMARK_MODE"] = "0"
         csv_cmd = [sys.executable, "-m", "boltops.tools.fused_moe_triton_tune.performance_csv",
-                   "--test-type", Path(test_script_name).stem.removeprefix("tune_moe_")]
+                   "--test-type", tp_env.get("AUTOTUNE_TEST_TYPE",
+                                            Path(test_script_name).stem.removeprefix("tune_moe_"))]
         if not strict_csv:
             csv_cmd.append("--allow-missing-config")
         csv_rc = run_cmd(
@@ -352,7 +371,7 @@ def run_benchmark_step(
     print("--------------------------------")
     print(f"All steps for TP={tp}, EP_SIZE={ep_size} completed")
     print("--------------------------------")
-    return 0
+    return bench_rc
 
 
 def kill_moe_processes() -> tuple[list[int], list[int]]:
@@ -435,6 +454,45 @@ def kill_moe_processes() -> tuple[list[int], list[int]]:
     return term_sent, kill_sent
 
 
+def run_isolated_group(script_dir: Path, test_script_name: str) -> int:
+    """One group owns its GPU; fresh children retain the full search space."""
+    from boltops.tools.fused_moe_triton_tune.common import (
+        autotune_outer_configs, build_run_group_ids, resolve_device_settings,
+    )
+
+    env = os.environ.copy()
+    batches = parse_int_list(env["MOE_BATCH_SIZES"], "MOE_BATCH_SIZES")
+    start = int(env["AUTOTUNE_DEVICE_START_ID"])
+    count = int(env["AUTOTUNE_DEVICE_COUNT"])
+    _, _, groups_run = resolve_device_settings(start + count)
+    groups = build_run_group_ids(start, count, groups_run, sorted(set(batches)), start_group=0)
+    group_id = int(env["CUR_GROUP"])
+    if group_id not in groups:
+        return 0  # More requested groups than M points.
+    device, batches = groups[group_id]
+    env.update(AUTOTUNE_DEVICE_START_ID=str(device), AUTOTUNE_DEVICE_COUNT="1",
+               AUTOTUNE_NUM_GROUPS_RUN="1", AUTOTUNE_START_GROUP="0", CUR_GROUP="0")
+    test_type = env.get("AUTOTUNE_TEST_TYPE", Path(test_script_name).stem.removeprefix("tune_moe_"))
+    for batch in batches:
+        env["MOE_BATCH_SIZES"] = str(batch)
+        # Small M already prunes most outer tiles; large M can otherwise
+        # accumulate tens of thousands of HIP modules in one process.
+        outers = list(reversed(autotune_outer_configs(test_type))) if batch >= 2048 else [None]
+        for outer in outers:
+            if outer is None:
+                env.pop("AUTOTUNE_OUTER_CONFIG", None)
+            else:
+                env["AUTOTUNE_OUTER_CONFIG"] = json.dumps(outer)
+            print(f"Autotune process: group={group_id}, device={device}, M={batch}, outer={outer}", flush=True)
+            child = subprocess.run(
+                [sys.executable, "-u", "-m", "pytest", "-v", "-s", test_script_name],
+                cwd=script_dir, env=env, check=False,
+            )
+            if child.returncode:
+                return child.returncode
+    return 0
+
+
 def run_parallel_pytest_groups(
     *,
     script_dir: Path,
@@ -458,8 +516,12 @@ def run_parallel_pytest_groups(
 
         log_file = log_dir / log_name_builder(group_id)
         log_fp = log_file.open("w", encoding="utf-8")
+        command = ([sys.executable, "-u", "-m", "pytest", "-v", "-s", test_script_name]
+                   if triton_compile_only else
+                   [sys.executable, "-u", "-m", "boltops.tools.fused_moe_triton_tune.tune_moe_cli",
+                    "_run-group", test_script_name])
         proc = subprocess.Popen(
-            ["pytest", "-v", "-s", test_script_name],
+            command,
             cwd=str(script_dir),
             env=env,
             stdout=log_fp,
@@ -578,6 +640,14 @@ def expected_json_names(
             block_shape = DEFAULT_BLOCK_SHAPE_BY_TEST["fp8"]
         suffix0 = f",dtype=fp8_w8a8,block_shape=[{block_shape[0]},{block_shape[1]}]"
         suffix1 = f",dtype=fp8_w8a8,is_bottom=True,block_shape=[{block_shape[0]},{block_shape[1]}]"
+    elif test_type == "mxfp8":
+        if block_shape is not None and tuple(block_shape) != (1, 32):
+            raise ValueError("native MXFP8 requires weight block_shape=[1,32]")
+        suffix0 = ",dtype=mxfp8_w8a8,gemm_type=dot_scaled,scale_recipe=vllm-a32-b1x32-e8m0-e8m0"
+        suffix1 = suffix0 + ",is_bottom=True"
+    elif test_type == "mxfp4":
+        suffix0 = ",dtype=mxfp4_w4a8,gemm_type=dot_scaled,scale_recipe=deepgemm-a128-b1x32"
+        suffix1 = suffix0 + ",is_bottom=True"
     elif test_type == "fp8_channel":
         suffix0 = ",dtype=fp8_w8a8"
         suffix1 = ",dtype=fp8_w8a8,is_bottom=True"
@@ -763,7 +833,7 @@ def main() -> int:
         print(f"错误: {exc}", file=sys.stderr)
         return 1
 
-    test_script_name = f"tune_moe_{args.test_type}.py"
+    test_script_name = f"{tune_module_name(args.test_type)}.py"
     test_script_path = script_dir / test_script_name
     if not test_script_path.exists():
         print(f"错误: 未找到测试脚本 {test_script_path}", file=sys.stderr)
@@ -825,6 +895,8 @@ def main() -> int:
                 resolved_block_shape = DEFAULT_BLOCK_SHAPE_BY_TEST[args.test_type]
         else:
             resolved_block_shape = None
+        if args.test_type == "mxfp8" and resolved_block_shape != (1, 32):
+            raise ValueError("native MXFP8 requires weight block_shape=1,32")
     except ValueError as exc:
         print(f"错误: {exc}", file=sys.stderr)
         return 1
@@ -891,6 +963,9 @@ def main() -> int:
         "MOE_BLOCK_SHAPE",
         "MOE_ACTIVATION",
         "MOE_IS_GATED",
+        "AUTOTUNE_OUTER_CONFIG",
+        "AUTOTUNE_EXPECTED_BATCHES",
+        "AUTOTUNE_START_GROUP",
         "MOE_ACTIVATION_SITU_BETA",
         "MOE_ACTIVATION_SITU_LINEAR_BETA",
         "AUTOTUNE_DEVICE_START_ID",
@@ -1058,19 +1133,8 @@ def main() -> int:
         print("Dry-run mode: 仅展示参数，不执行训练。")
         return 0
 
-    # 训练模式默认先清理已有 MoE 相关进程，避免并发任务互相干扰。
-    if not args.benchmark:
-        try:
-            term_sent, kill_sent = kill_moe_processes()
-        except Exception as exc:
-            print(f"错误: 自动清理已有 MoE 进程失败: {exc}", file=sys.stderr)
-            return 1
-        if term_sent:
-            print(f"检测到已有 MoE 进程，已发送 SIGTERM 清理: {term_sent}")
-            if kill_sent:
-                print(f"仍存活进程已发送 SIGKILL: {kill_sent}")
-        else:
-            print("未检测到运行中的 MoE 相关进程。")
+    # Explicit --kill still performs cleanup. Starting an isolated worker
+    # must not terminate independent MoE jobs on other GPUs.
 
     # 每次训练任务启动前清理本次 tp-list 对应目录，避免历史日志干扰；
     # benchmark-only 模式需要复用已有 config，故不清理。
@@ -1116,6 +1180,12 @@ def main() -> int:
                     f"要求 MOE_FFN_HIDDEN_SIZE 可被 {block_k} 整除；当前值: {current_ffn_hidden_size}",
                     file=sys.stderr,
                 )
+                return 1
+
+        if args.test_type in ("mxfp4", "mxfp8"):
+            alignment = 128 if args.test_type == "mxfp4" else 32
+            if current_hidden_size % alignment or current_ffn_hidden_size % alignment:
+                print(f"错误: {args.test_type} 的逻辑 hidden/intermediate 必须对齐 {alignment}", file=sys.stderr)
                 return 1
 
         fixed_group_size = FIXED_GROUP_SIZE_BY_TEST.get(args.test_type)
@@ -1225,7 +1295,8 @@ def main() -> int:
             break_on_error=break_on_error,
         )
         if not run_ok:
-            print(f"警告: TP={tp} autotune 分组存在失败")
+            print(f"错误: TP={tp} autotune 分组存在失败，不发布不完整的调优结果", file=sys.stderr)
+            return 1
 
         merged_log_file = log_dir / f"autotune_v12_{args.device_name}_{args.ep_size}_{args.test_type}.log"
         print(f"Merging logs to: {merged_log_file}")
@@ -1245,6 +1316,7 @@ def main() -> int:
         print(f"Output config json(bottom): {out_json1}")
 
         try:
+            parse_env = dict(tp_env, AUTOTUNE_EXPECTED_BATCHES=tp_env["MOE_BATCH_SIZES"])
             run_cmd(
                 [
                     sys.executable,
@@ -1254,15 +1326,13 @@ def main() -> int:
                     str(out_json1),
                 ],
                 cwd=script_dir,
-                env=tp_env,
+                env=parse_env,
                 check=True,
             )
         except subprocess.CalledProcessError as exc:
             message = f"TP={tp} 日志解析失败 (rc={exc.returncode})"
-            if break_on_error:
-                print(f"错误: {message}", file=sys.stderr)
-                return exc.returncode or 1
-            print(f"警告: {message}，继续后续步骤")
+            print(f"错误: {message}，不使用旧配置继续回放", file=sys.stderr)
+            return exc.returncode or 1
 
         bench_ret = run_benchmark_step(
             script_dir=script_dir,
@@ -1281,6 +1351,8 @@ def main() -> int:
 
 if __name__ == "__main__":
     try:
+        if len(sys.argv) == 3 and sys.argv[1] == "_run-group":
+            raise SystemExit(run_isolated_group(Path(__file__).resolve().parent, sys.argv[2]))
         raise SystemExit(main())
     except KeyboardInterrupt:
         print("Interrupted by user.", file=sys.stderr)

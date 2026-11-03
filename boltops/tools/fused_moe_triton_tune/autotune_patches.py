@@ -1,35 +1,26 @@
 # Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # SPDX-License-Identifier: MIT
 import os
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
+from contextvars import ContextVar
+import functools
+import importlib
+import inspect
 from itertools import product
-from typing import Optional, List, Dict, Any
 from unittest.mock import patch
 
 import torch
 import triton
 import triton.language as tl
-from triton.runtime.errors import HSACOError
+from boltops.tools.fused_moe_triton_tune.common import autotune_outer_configs
 
 import boltops.fused_moe.triton.moe_op as moe_op
+from boltops.fused_moe.triton import mxfp4, mxfp8
 import boltops.utility.arch_info as arch_info
-from boltops.fused_moe.triton.moe_compat import per_token_quant_triton, per_block_quant_wrapper
-from boltops.fused_moe.triton import (
-    triton_moe_sum,
-    moe_align_block_size,
-)
-from boltops.fused_moe.triton.fused_moe import (
-    _should_use_naive_block_assignment,
-)
-from boltops.fused_moe.triton.moe_activation import (
-    _normalize_activation_and_gate,
-    adjust_N_for_activation,
-    _apply_activation,
-)
 from boltops.utility.triton_capability import get_triton_capabilities
 
 
-capMLS = arch_info.get_arch() in ("gfx938", "gfx92a")
+capMLS = moe_op.support_mls()
 triton_capabilities = get_triton_capabilities()
 
 training_mode = int(os.environ.get("TRAINING_MODE", "0"))
@@ -44,45 +35,27 @@ mode_autotune = True if training_mode == 1 else False
 print(f"{mode_autotune=} {test_type=}")
 mode_best_config_tune = False
 
-_ALLOWED_OUTPUT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _SCHEDULE_OPTION_NAMES = ("instruction_sched_variant", "schedule_hint")
 _LARGE_MOE_TOKEN_THRESHOLD = 2048
-_SKIPPABLE_HIP_LOAD_ERRORS = ("named symbol not found",)
 
 
-def _max_autotune_total_tokens(
-    num_tokens: int,
-    topk: int,
-    num_experts: int,
-    *,
-    allow_sorted_bridge: bool,
-    max_block_m: int = 256,
-) -> int:
-    """Size tuning buffers for the largest legal sorted-bridge padding."""
-    max_padded_tokens = (
-        min(num_tokens * topk, num_experts + 1) * (max_block_m - 1)
-        if allow_sorted_bridge
-        else 0
-    )
-    return num_tokens * topk + max_padded_tokens
-
-
-def _skip_invalid_hip_loads(do_bench):
-    """Make a broken HSACO one invalid candidate instead of aborting a tune."""
+def _check_hip_loads(do_bench):
+    """Never publish a partial ranking after process-wide HIP resource failure."""
 
     def robust_do_bench(kernel_call, quantiles):
         try:
             return do_bench(kernel_call, quantiles)
         except RuntimeError as exc:
             message = str(exc)
-            if not any(marker in message for marker in _SKIPPABLE_HIP_LOAD_ERRORS):
+            if "named symbol not found" not in message:
                 raise
-            print(f"[autotune] skip unloadable HIP candidate: {message}")
-            # Triton's Autotuner already maps HSACOError to an infinite timing.
-            # The HCU loader reports the same invalid-code-object condition as
-            # a generic RuntimeError, which would otherwise abort every later
-            # config (including smaller BLOCK_SIZE_M candidates).
-            raise HSACOError(message) from exc
+            # This also occurs when HIP exhausts this process's VMA budget,
+            # not just for an invalid HSACO. Mapping it to HSACOError/infinity
+            # silently excludes every later candidate and biases the winner.
+            raise RuntimeError(
+                "HIP module lookup failed; restart this autotune shard in a fresh "
+                f"process instead of accepting a partial ranking: {message}"
+            ) from exc
 
     return robust_do_bench
 
@@ -275,22 +248,6 @@ def _keep_autotune_config(
     return True
 
 
-def _default_output_dtype(hidden_dtype: torch.dtype) -> torch.dtype:
-    return torch.bfloat16 if hidden_dtype == torch.bfloat16 else torch.float16
-
-
-def _compute_type_from_output_dtype(output_dtype: torch.dtype) -> tl.dtype:
-    if output_dtype == torch.bfloat16:
-        return tl.bfloat16
-    if output_dtype == torch.float16:
-        return tl.float16
-    if output_dtype == torch.float32:
-        return tl.float32
-    raise ValueError(
-        f"Unsupported output_dtype: {output_dtype}, expected one of {_ALLOWED_OUTPUT_DTYPES}"
-    )
-
-
 if test_type == "int4int8":
     mode_autotune_min_block_size_k1  = 64
     mode_autotune_max_block_size_k1 = 64
@@ -363,7 +320,15 @@ def generate_config2_lists(
     supports_n_tiles=None,
     runtime_args=None,
 ):
-    is_gemm1 = MUL_ROUTED_WEIGHT == False
+    if (runtime_args or {}).get("use_mxfp8", False):
+        # Only the regular non-combined loop has native FP8 scaled dot.
+        return [triton.Config(dict(BLOCK_SIZE_N=bn, BLOCK_SIZE_K=128,
+                                  GROUP_SIZE_M=1, COMBINE_SCALE_LOAD=False,
+                                  USE_MLS_LOAD=False), num_warps=4, num_stages=1)
+                for index, bn in enumerate((64, 128))
+                if not compile_only or index % num_groups_compile == cur_group]
+    phase = (runtime_args or {}).get("_autotune_is_bottom")
+    is_gemm1 = not phase if phase is not None else not MUL_ROUTED_WEIGHT
     if supports_n_tiles is None:
         supports_n_tiles = test_type in ("int8", "int8_channel", "bf16", "fp8", "fp8_channel")
     # Shape-only callers can generate candidates without GPU tensors. The real
@@ -403,6 +368,11 @@ def generate_config2_lists(
     else:
         block_size_k_options = [2**i for i in range(mode_autotune_min_block_size_k.bit_length() - 1,
                                                 min(mode_autotune_max_block_size_k.bit_length(), (K.bit_length())))]
+
+    if reuse_args.get("use_int4_w4a8") and reuse_args.get("group_k", 0) > 0:
+        # This kernel dequantizes one complete weight/activation group per
+        # iteration; smaller tiles are not legal alternatives to the group.
+        block_size_k_options = [reuse_args["group_k"]]
 
     if torch.is_tensor(num_input_tokens):
         num_input_tokens = int(num_input_tokens.item())
@@ -625,6 +595,7 @@ class MyHeuristics(triton.KernelInterface):
 
     def __init__(self, fn, arg_names, values) -> None:
         self.fn = fn
+        self.__name__ = getattr(fn, "__name__", "")
         self.values = values
         self.arg_names = arg_names
 
@@ -645,15 +616,63 @@ def apply_my_heuristics(ori_fn):
             new_fn = MyHeuristics(ori_fn.fn, ori_fn.arg_names, ori_fn.values)
     return new_fn
 
-# 修改装饰器函数，使其支持动态配置生成
+
+def _prune_configs_by_runtime_constraints(configs, runtime):
+    """Filter candidates using the same tile/layout constraints as the GEMM."""
+    N, K = runtime["N"], runtime["K"]
+    group_k = runtime.get("group_k", 0)
+    split = int(runtime.get("SPLIT_K", 1))
+    min_mls_block_k = {
+        "bf16": 32, "fp8": 64, "fp8_channel": 64,
+        "int8": 64, "int8_channel": 64,
+    }.get(test_type, 0)
+    pruned = []
+    for cfg in configs:
+        cfg_kwargs = cfg.kwargs
+        bk = cfg_kwargs["BLOCK_SIZE_K"]
+        bn = cfg_kwargs["BLOCK_SIZE_N"]
+        if not runtime.get("use_mxfp8", False) and group_k > 0 and (bk > group_k or group_k % bk):
+            continue
+        if runtime.get("use_int4_w4a8") and group_k > 0:
+            if bk != runtime.get("group_size") or K % bk:
+                continue
+        if runtime.get("use_mxfp8", False) and (
+                cfg_kwargs.get("COMBINE_SCALE_LOAD", False) or bk % 32
+                or cfg_kwargs.get("N_TILES_PER_CTA", 1) != 1):
+            continue
+        if cfg_kwargs.get("COMBINE_SCALE_LOAD", False):
+            if (bk != group_k or K % (2 * bk)
+                    or runtime.get("stride_ask") != 1
+                    or runtime.get("MUL_ROUTED_WEIGHT", False)
+                    or not (runtime.get("use_fp8_w8a8", False)
+                            or runtime.get("use_int8_w8a8", False))):
+                continue
+        if cfg_kwargs.get("USE_MLS_LOAD", False) and (K % bk or N % bn):
+            continue
+        if cfg_kwargs.get("bottom_a_use_mls_load", False) and (
+                not cfg_kwargs.get("a_sorted", runtime.get("a_sorted", False))
+                or runtime.get("c_sorted", False)):
+            continue
+        if split > 1 and K % (cfg_kwargs["BLOCK_SIZE_K"] * split):
+            continue
+        if cfg_kwargs.get("N_TILES_PER_CTA") == 2 and not _keep_n_tile_reuse(
+            cfg_kwargs, runtime, cfg.num_warps
+        ):
+            continue
+        uses_mls = (cfg_kwargs.get("USE_MLS_LOAD", False)
+                    or cfg_kwargs.get("bottom_a_use_mls_load", False))
+        if uses_mls and bk < min_mls_block_k:
+            continue
+        pruned.append(cfg)
+    return pruned
+
+
 def dynamic_autotune(fn):
-    # 创建一个可以使用下标语法的类
     class SubscriptableKernel:
         def __init__(self, kernel_fn):
             self.kernel_fn = kernel_fn
 
         def __getitem__(self, grid):
-            # 返回一个函数，该函数在调用时会使用给定的grid调用内核
             def launcher(*args, **kwargs):
                 kernel_name = getattr(self.kernel_fn, "__name__", "")
                 # 优先按参数名绑定，避免依赖固定位置导致签名变更即错位
@@ -678,12 +697,9 @@ def dynamic_autotune(fn):
                         raise RuntimeError(f"dynamic_autotune expected scalar K, got tensor shape={tuple(K.shape)}")
                     K = int(K.item())
 
-                # BLOCK_SIZE_M 获取
                 BLOCK_SIZE_M = kwargs.get('BLOCK_SIZE_M', 16)
 
-                # MUL_ROUTED_WEIGHT 是第 35 个参数
                 MUL_ROUTED_WEIGHT = kwargs.get('MUL_ROUTED_WEIGHT', False)
-                # per_channel_quant 是第 36 个参数
                 per_channel_quant = kwargs.get('per_channel_quant', False) or (
                     "channelwise" in kernel_name
                 )
@@ -693,12 +709,10 @@ def dynamic_autotune(fn):
                     or kwargs.get('bottom_a_use_mls_load', False)
                 )
 
-                # 确保所有参数都不是None
                 BLOCK_SIZE_M = 16 if BLOCK_SIZE_M is None else BLOCK_SIZE_M
                 N = 16 if N is None else N
                 K = 16 if K is None else K
 
-                # 动态生成配置列表
                 topk_weights = kwargs.get(
                     "topk_weights_ptr", named_args.get("topk_weights_ptr")
                 )
@@ -720,12 +734,20 @@ def dynamic_autotune(fn):
                     top_k=kwargs.get("top_k", named_args.get("top_k", 1)),
                     num_input_tokens=num_input_tokens,
                     supports_n_tiles="N_TILES_PER_CTA" in arg_names,
-                    runtime_args={**named_args, **kwargs, "N": N, "K": K},
+                    runtime_args={**named_args, **kwargs, "N": N, "K": K,
+                                  "_autotune_is_bottom": _tuning_phase.get()},
                 )
-                if "int4" in test_type:
-                    for cfg in dynamic_configs:
-                        cfg.kwargs.pop("bottom_a_use_mls_load", None)
-                        cfg.kwargs.pop("a_sorted", None)
+                for cfg in dynamic_configs:
+                    # Layout flags are host decisions. Only expose constexprs
+                    # implemented by this kernel (WNA16 has no sorted-A ABI).
+                    for name in ("bottom_a_use_mls_load", "a_sorted", "USE_MLS_LOAD",
+                                 "COMBINE_SCALE_LOAD"):
+                        if name not in arg_names:
+                            cfg.kwargs.pop(name, None)
+                # Filter before constructing Autotuner: its single-config run
+                # bypasses early_config_prune, while warmup does not.
+                dynamic_configs = _prune_configs_by_runtime_constraints(
+                    dynamic_configs, {**named_args, **kwargs, "N": N, "K": K})
                 if not dynamic_configs:
                     if compile_only:
                         # A compile shard can legitimately receive no candidates.
@@ -735,86 +757,52 @@ def dynamic_autotune(fn):
                         f"N={N}, K={K}, BLOCK_SIZE_M={BLOCK_SIZE_M}, "
                         f"a_sorted={bottom_a_sorted}"
                     )
-                def _prune_configs_by_runtime_constraints(configs, named_args, **_kwargs):
-                    pruned = []
-                    for cfg in configs:
-                        cfg_kwargs = cfg.kwargs
-                        if cfg_kwargs.get("N_TILES_PER_CTA") == 2 and not _keep_n_tile_reuse(
-                            cfg_kwargs, {**named_args, **_kwargs}, cfg.num_warps
-                        ):
-                            continue
-                        cfg_use_mls = bool(cfg_kwargs.get("USE_MLS_LOAD", False))
-                        cfg_bottom_mls = bool(cfg_kwargs.get("bottom_a_use_mls_load", False))
-                        cfg_block_k = int(cfg_kwargs.get("BLOCK_SIZE_K", 0))
-                        cfg_uses_matrix_load_mls = cfg_use_mls or cfg_bottom_mls
-                        if cfg_uses_matrix_load_mls:
-                            if test_type == "bf16" and cfg_block_k < 32:
-                                continue
-                            if test_type in ["fp8", "fp8_channel", "int8", "int8_channel"] and cfg_block_k < 64:
-                                continue
-                        pruned.append(cfg)
-                    return pruned
-
                 launch_kwargs = dict(kwargs)
-                launch_kwargs.pop("a_sorted", None)
-                launch_kwargs.pop("bottom_a_use_mls_load", None)
-                # This field belongs to each candidate, not the outer BM config.
-                launch_kwargs.pop("N_TILES_PER_CTA", None)
-                # 应用autotune装饰器
+                # The production launcher supplies a complete baseline config.
+                # Candidate-owned fields must have a single source of truth.
+                for cfg in dynamic_configs:
+                    for name in cfg.all_kwargs():
+                        launch_kwargs.pop(name, None)
                 autotuned_fn = triton.autotune(
                     configs=dynamic_configs,
-                    key=['EM', 'N', 'K', 'num_valid_tokens', 'MUL_ROUTED_WEIGHT',
-                        'BLOCK_SIZE_M', 'BLOCK_SIZE_N', 'BLOCK_SIZE_K', 'USE_MLS_LOAD', 'GROUP_SIZE_M', 'per_channel_quant'],
+                    key=[name for name in ('EM', 'N', 'K', 'num_valid_tokens',
+                         'MUL_ROUTED_WEIGHT', 'BLOCK_SIZE_M', 'per_channel_quant',
+                         'use_mxfp8', 'group_n', 'group_k')
+                         if name in arg_names],
                     perf_debug=True,
                     perf_profiling=False,
-                    prune_configs_by={"early_config_prune": _prune_configs_by_runtime_constraints},
                     rep=20
                 )(self.kernel_fn)
-                autotuned_fn.__dict__["do_bench"] = _skip_invalid_hip_loads(
+                autotuned_fn.__dict__["do_bench"] = _check_hip_loads(
                     autotuned_fn.do_bench
                 )
 
-                # 使用grid调用autotuned内核
                 print(f"DEBUG - {compile_only=}, kwargs keys being passed to kernel:{list(launch_kwargs.keys())}")
                 if compile_only:
                     return autotuned_fn.warmup(*args, grid=grid, **launch_kwargs)
                 else:
-                    return autotuned_fn[grid](*args, **launch_kwargs)
+                    result = autotuned_fn[grid](*args, **launch_kwargs)
+                    if len(dynamic_configs) == 1:
+                        _ensure_single_config_timing(autotuned_fn, lambda: autotuned_fn[grid](*args, **launch_kwargs))
+                        _print_best_config(autotuned_fn)
+                    return result
 
             return launcher
 
-    # 返回可下标的内核对象
     return SubscriptableKernel(apply_my_heuristics(fn))
 
 
-# @triton.autotune
-# 改写这段代码，使用多层 for循环 实现 config list的生成，其中：
-# 1> BLOCK_SIZE_M 的 范围 从 32 到 128， 只能是 2的幂次。
-# 2> BLOCK_SIZE_N 的 范围 从 64 到 1024  只能是 2的幂次。
-# 3> BLOCK_SIZE_K 的 范围 从 32 到 256， 只能是 2的幂次。
-# 4> GROUP_SIZE_M 的范围 从 1 到 8， 只能是2的幂次。
 def generate_config_lists():
     configs = []
     config_count = 0
 
     if mode_best_config_tune == False:
-        block_size_m_options = [2**i for i in range(4, 9)]       # 16 to 256
-
-        bottom_a_mls_options = (
-            (False, True)
-            if test_type in ("bf16", "fp8", "fp8_channel", "int8", "int8_channel")
-            else (False,)
-        )
-
-        for block_m in block_size_m_options:
-            for bottom_a_use_mls_load in bottom_a_mls_options:
-                config = {
-                    "BLOCK_SIZE_M": block_m,
-                    "bottom_a_use_mls_load": bottom_a_use_mls_load,
-                }
-                config_count += 1
-                print(f"Config {config_count}: {config}")
-                configs.append(config)
+        for config in autotune_outer_configs(
+            test_type, os.environ.get("AUTOTUNE_OUTER_CONFIG")
+        ):
+            config_count += 1
+            print(f"Config {config_count}: {config}")
+            configs.append(config)
     else:
         # bs=16 & gemm1 best config
         config = { "BLOCK_SIZE_M": 16 }
@@ -844,849 +832,197 @@ def next_power_of_2(n):
 
 k100_ai_config_lists = generate_config_lists() if mode_autotune else [ ]
 
-def fused_moe(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    C: torch.Tensor,
-    A_scale: Optional[torch.Tensor],
-    B_scale: Optional[torch.Tensor],
-    B_zp: Optional[torch.Tensor],
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    sorted_token_ids: torch.Tensor,
-    expert_ids: torch.Tensor,
-    num_tokens_post_padded: torch.Tensor,
-    mul_routed_weight: bool,
-    top_k: int,
-    compute_type: tl.dtype,
-    use_fp8_w8a8: bool = False,
-    use_int8_w8a8: bool = False,
-    use_int8_w8a16: bool = False,
-    use_int4_w4a16: bool = False,
-    use_int4_w4a8: bool = False,
-    use_mxfp4_w4a4: bool = False,
-    per_channel_quant: bool = False,
-    block_shape: Optional[List[int]] = None,
-    c_sorted: bool = False,
-    bottom_a_use_mls_load: bool = False,
-    naive_block_assignment: bool = False,
-    scale_bias_with_routed_weight: bool = False,
-    B_bias: Optional[torch.Tensor] = None,
-    config: Optional[Dict[str, Any]] = None,
-) -> None:
-    assert topk_weights is not None or not mul_routed_weight
-    assert topk_weights is None or topk_weights.stride(1) == 1
-    assert sorted_token_ids.stride(0) == 1
 
-    if use_fp8_w8a8 or use_int8_w8a8:
-        assert B_scale is not None
-        assert (block_shape is None
-                or triton.cdiv(B.size(-2), block_shape[0]) == B_scale.size(-2))
-        assert (block_shape is None
-                or triton.cdiv(B.size(-1), block_shape[1]) == B_scale.size(-1))
-
-    elif use_int8_w8a16 or use_int4_w4a16 or use_int4_w4a8:
-        assert B_scale is not None
-        assert block_shape is None or block_shape[0] == 0
-    else:
-        assert A_scale is None
-        assert B_scale is None
-
-    total_tokens = A.size(0)
-    num_tokens = topk_ids.numel()
-    sorted_weights = None
-    a_sorted = bool(bottom_a_use_mls_load)
-    bottom_a_use_mls_load = a_sorted and capMLS
-    if naive_block_assignment:
-        assert not a_sorted and not c_sorted
-
-    if config is None:
-       assert "BLOCK_SIZE_M need be set when autotune for moe!"
-
-    if naive_block_assignment:
-        EM = num_tokens * config["BLOCK_SIZE_M"]
-    else:
-        EM = sorted_token_ids.size(0)
-    if not naive_block_assignment and A.size(0) < config["BLOCK_SIZE_M"]:
-        # optimize for small batch_size.
-        # We assume that top_ids of each token is unique, so
-        # so num_valid_experts <= batch_size <= BLOCK_SIZE_M,
-        # and we can skip some invalid blocks.
-        EM = min(sorted_token_ids.size(0),
-                 A.size(0) * top_k * config['BLOCK_SIZE_M'])
-    grid = lambda META: (triton.cdiv(EM, META['BLOCK_SIZE_M']) * triton.cdiv(
-        B.size(1), META['BLOCK_SIZE_N'] * META.get('N_TILES_PER_CTA', 1)), )
-
-    if (use_int8_w8a16 or use_int4_w4a16 or use_int4_w4a8) and \
-            block_shape is not None and block_shape[1] > 0:
-        assert B_scale is not None and B_scale.ndim == 3
-        assert B_zp is None or B_zp.ndim == 3
-        offset_max = 2**32 - 1
-        use_addr_offset_int64_a = A.numel() * A.element_size() >= offset_max
-        use_addr_offset_int64_b = B.numel() * B.element_size() >= offset_max
-        use_addr_offset_int64_c = C.numel() * C.element_size() >= offset_max
-
-        if use_int4_w4a8:
-            moe_op.fused_moe_kernel_gptq_awq_w4a8[grid](
-                A,
-                B,
-                C,
-                A_scale,
-                B_scale,
-                B_zp,
-                topk_weights,
-                sorted_token_ids,
-                sorted_weights,
-                expert_ids,
-                num_tokens_post_padded,
-                B.size(1),
-                A.size(1),
-                EM,
-                num_tokens,
-                A.stride(0),
-                A.stride(1),
-                B.stride(0),
-                B.stride(2),
-                B.stride(1),
-                C.stride(-2),
-                C.stride(-1),
-                A_scale.stride(0)
-                if A_scale is not None and A_scale.ndim == 2 else 0,
-                A_scale.stride(1)
-                if A_scale is not None and A_scale.ndim == 2 else 0,
-                B_scale.stride(0),
-                B_scale.stride(2),
-                B_scale.stride(1),
-                B_zp.stride(0) if B_zp is not None else 0,
-                B_zp.stride(2) if B_zp is not None else 0,
-                B_zp.stride(1) if B_zp is not None else 0,
-                group_k=block_shape[1],
-                group_size=block_shape[1],
-                MUL_ROUTED_WEIGHT=mul_routed_weight,
-                USE_ADDR_OFFSET_INT64_A=use_addr_offset_int64_a,
-                USE_ADDR_OFFSET_INT64_B=use_addr_offset_int64_b,
-                USE_ADDR_OFFSET_INT64_C=use_addr_offset_int64_c,
-                top_k=top_k,
-                compute_type=compute_type,
-                has_zp=B_zp is not None,
-                use_int4_w4a16=use_int4_w4a16,
-                use_int4_w4a8=use_int4_w4a8,
-                use_int8_w8a16=use_int8_w8a16,
-                ck_sorting=False,
-                ck_topk=8,
-                NUM_XCDS=1,
-                **config
-            )
-            return
-
-        moe_op.fused_moe_kernel_gptq_awq[grid](
-            A,
-            B,
-            C,
-            B_scale,
-            B_zp,
-            topk_weights,
-            sorted_token_ids,
-            sorted_weights,
-            expert_ids,
-            num_tokens_post_padded,
-            B.size(1),
-            A.size(1),
-            EM,
-            num_tokens,
-            A.stride(0),
-            A.stride(1),
-            B.stride(0),
-            B.stride(2),
-            B.stride(1),
-            C.stride(-2),
-            C.stride(-1),
-            B_scale.stride(0),
-            B_scale.stride(2),
-            B_scale.stride(1),
-            B_zp.stride(0) if B_zp is not None else 0,
-            B_zp.stride(2) if B_zp is not None else 0,
-            B_zp.stride(1) if B_zp is not None else 0,
-            group_size=block_shape[1],
-            MUL_ROUTED_WEIGHT=mul_routed_weight,
-            USE_ADDR_OFFSET_INT64_A=use_addr_offset_int64_a,
-            USE_ADDR_OFFSET_INT64_B=use_addr_offset_int64_b,
-            USE_ADDR_OFFSET_INT64_C=use_addr_offset_int64_c,
-            top_k=top_k,
-            compute_type=compute_type,
-            has_zp=B_zp is not None,
-            use_int4_w4a16=use_int4_w4a16,
-            use_int8_w8a16=use_int8_w8a16,
-            ck_sorting=False,
-            ck_topk=8,
-            NUM_XCDS=1,
-            **config,
-        )
-    else:
-        offset_max = 2**32 - 1
-        use_addr_offset_int64_a = A.numel() * A.element_size() >= offset_max
-        use_addr_offset_int64_c = C.numel() * C.element_size() >= offset_max
-        use_addr_offset_int64_b = B.numel() * B.element_size() >= offset_max
-
-        if use_int4_w4a8 and per_channel_quant:
-            assert B_scale is not None and B_scale.ndim in (2, 3)
-            assert B_zp is None
-            channelwise_config = config.copy()
-            block_size_k = channelwise_config.pop("BLOCK_SIZE_K", None)
-            channelwise_config.pop("USE_MLS_LOAD", None)
-            channelwise_config.pop("COMBINE_SCALE_LOAD", None)
-            w4a8_grid = lambda META: (
-                triton.cdiv(EM, META["BLOCK_SIZE_M"]) * triton.cdiv(B.size(1), META["BLOCK_SIZE_N"]),
-            )
-            channelwise_kwargs = dict(
-                MUL_ROUTED_WEIGHT=mul_routed_weight,
-                USE_ADDR_OFFSET_INT64_A=use_addr_offset_int64_a,
-                USE_ADDR_OFFSET_INT64_B=use_addr_offset_int64_b,
-                USE_ADDR_OFFSET_INT64_C=use_addr_offset_int64_c,
-                top_k=top_k,
-                compute_type=compute_type,
-                use_int4_w4a8=use_int4_w4a8,
-                ck_sorting=False,
-                ck_topk=8,
-                NUM_XCDS=1,
-                **channelwise_config,
-            )
-            if block_size_k is not None:
-                channelwise_kwargs["BLOCK_SIZE_K"] = block_size_k
-            return moe_op.fused_moe_kernel_gptq_awq_w4a8_channelwise[w4a8_grid](
-                A,
-                B,
-                C,
-                A_scale,
-                B_scale,
-                topk_weights,
-                sorted_token_ids,
-                sorted_weights,
-                expert_ids,
-                num_tokens_post_padded,
-                B.size(1),
-                A.size(1),
-                EM,
-                num_tokens,
-                A.stride(0),
-                A.stride(1),
-                B.stride(0),
-                B.stride(2),
-                B.stride(1),
-                C.stride(-2),
-                C.stride(-1),
-                A_scale.stride(0)
-                if A_scale is not None and A_scale.ndim == 2 else 0,
-                A_scale.stride(1)
-                if A_scale is not None and A_scale.ndim == 2 else 0,
-                B_scale.stride(0),
-                B_scale.stride(1),
-                **channelwise_kwargs,
-            )
-
-        SPLIT_K = splitk_size # 0
-        if mul_routed_weight or A.size(0) > 32:
-            SPLIT_K = 0
-
-        if SPLIT_K != 0 and not naive_block_assignment:
-            grid = lambda META: (triton.cdiv(EM, META['BLOCK_SIZE_M']) * triton.cdiv(
-                    B.shape[1], META['BLOCK_SIZE_N']), SPLIT_K)
-            assert B.size(2) % (256 * SPLIT_K) == 0, "B.size(2) must be divisible by BLOCK_SIZE_K * SPLIT_K"
-
-            splitk_cache = torch.zeros((SPLIT_K,) + C.shape, device=C.device,dtype=C.dtype)
-
-            use_addr_offset_int64_c = C.numel() * C.element_size() * SPLIT_K >= offset_max
-
-            moe_op.fused_moe_splitk_kernel[grid](
-                A,
-                B,
-                splitk_cache,
-                topk_weights,
-                num_tokens_post_padded,
-                expert_ids,
-                sorted_token_ids,
-                sorted_weights,
-                A_scale,
-                B_scale,
-                B.size(1),
-                B.size(2),
-                EM,
-                topk_ids.numel(),
-                A.stride(0),
-                A.stride(1),
-                B.stride(0),
-                B.stride(2),
-                B.stride(1),
-                splitk_cache.stride(-3),
-                splitk_cache.stride(-2),
-                splitk_cache.stride(-1),
-                A_scale.stride(0)
-                if A_scale is not None and A_scale.ndim == 2 else 0,
-                A_scale.stride(1)
-                if A_scale is not None and A_scale.ndim == 2 else 0,
-                B_scale.stride(0)
-                if B_scale is not None and B_scale.ndim >= 2 else 0,
-                B_scale.stride(2)
-                if B_scale is not None and B_scale.ndim == 3 else 0,
-                B_scale.stride(1)
-                if B_scale is not None and B_scale.ndim >= 2 else 0,
-                A.size(0),
-                0 if block_shape is None else block_shape[0],
-                0 if block_shape is None else block_shape[1],
-                MUL_ROUTED_WEIGHT=mul_routed_weight,
-                SPLIT_K=SPLIT_K,
-                USE_ADDR_OFFSET_INT64_A=use_addr_offset_int64_a,
-                USE_ADDR_OFFSET_INT64_B=use_addr_offset_int64_b,
-                USE_ADDR_OFFSET_INT64_C=use_addr_offset_int64_c,
-                top_k=top_k,
-                compute_type=compute_type,
-                use_fp8_w8a8=use_fp8_w8a8,
-                use_int8_w8a8=use_int8_w8a8,
-                use_int8_w8a16=use_int8_w8a16,
-                per_channel_quant=per_channel_quant,
-                c_sorted=c_sorted,
-                a_sorted=a_sorted,
-                bottom_a_use_mls_load=bottom_a_use_mls_load,
-                ck_sorting=False,
-                ck_topk=8,
-                NUM_XCDS=1,
-                **config,
-            )
-            C.copy_(torch.sum(splitk_cache.to(torch.float32), dim=0).to(C.dtype))
-        else:
-            moe_op.fused_moe_kernel[grid](
-                A,
-                B,
-                C,
-                topk_weights,
-                num_tokens_post_padded,
-                expert_ids,
-                sorted_token_ids,
-                sorted_weights,
-                A_scale,
-                B_scale,
-                (B_bias if B_bias is not None else B),
-                B.size(1),
-                B.size(2),
-                EM,
-                topk_ids.numel(),
-                A.stride(0),
-                A.stride(1),
-                B.stride(0),
-                B.stride(2),
-                B.stride(1),
-                C.stride(-2),
-                C.stride(-1),
-                A_scale.stride(0)
-                if A_scale is not None and A_scale.ndim == 2 else 0,
-                A_scale.stride(1)
-                if A_scale is not None and A_scale.ndim == 2 else 0,
-                B_scale.stride(0)
-                if B_scale is not None and B_scale.ndim >= 2 else 0,
-                B_scale.stride(2)
-                if B_scale is not None and B_scale.ndim == 3 else 0,
-                B_scale.stride(1)
-                if B_scale is not None and B_scale.ndim >= 2 else 0,
-                B_bias.stride(0) if B_bias is not None else B.stride(0),
-                B_bias.stride(1) if B_bias is not None else B.stride(1),
-                A.size(0),
-                0 if block_shape is None else block_shape[0],
-                0 if block_shape is None else block_shape[1],
-                MUL_ROUTED_WEIGHT=mul_routed_weight,
-                USE_ADDR_OFFSET_INT64_A=use_addr_offset_int64_a,
-                USE_ADDR_OFFSET_INT64_B=use_addr_offset_int64_b,
-                USE_ADDR_OFFSET_INT64_C=use_addr_offset_int64_c,
-                top_k=top_k,
-                compute_type=compute_type,
-                use_fp8_w8a8=use_fp8_w8a8,
-                use_int8_w8a8=use_int8_w8a8,
-                use_int8_w8a16=use_int8_w8a16,
-                per_channel_quant=per_channel_quant,
-                c_sorted=c_sorted,
-                a_sorted=a_sorted,
-                bottom_a_use_mls_load=bottom_a_use_mls_load,
-                ck_sorting=False,
-                ck_topk=8,
-                naive_block_assignment=naive_block_assignment,
-                NUM_XCDS=1,
-                SCALE_BIAS_WITH_ROUTED_WEIGHT=scale_bias_with_routed_weight,
-                ADD_BIAS=B_bias is not None,
-                **config,
-            )
-
-def fused_experts_impl(hidden_states: torch.Tensor,
-                       w1: torch.Tensor,
-                       w2: torch.Tensor,
-                       topk_weights: torch.Tensor,
-                       topk_ids: torch.Tensor,
-                       output_dtype: Optional[torch.dtype] = None,
-                       inplace: bool = False,
-                       activation: str = "silu",
-                       is_gated: Optional[bool] = None,
-                       b1: Optional[torch.Tensor] = None,
-                       b2: Optional[torch.Tensor] = None,
-                       apply_router_weight_on_input: bool = False,
-                       use_fp8_w8a8: bool = False,
-                       use_int8_w8a8: bool = False,
-                       use_int8_w8a16: bool = False,
-                       use_int4_w4a16: bool = False,
-                       use_int4_w4a8: bool = False,
-                       per_channel_quant: bool = False,
-                       global_num_experts: int = -1,
-                       expert_map: Optional[torch.Tensor] = None,
-                       w1_scale: Optional[torch.Tensor] = None,
-                       w2_scale: Optional[torch.Tensor] = None,
-                       w1_zp: Optional[torch.Tensor] = None,
-                       w2_zp: Optional[torch.Tensor] = None,
-                       a1_scale: Optional[torch.Tensor] = None,
-                       a2_scale: Optional[torch.Tensor] = None,
-                       block_shape: Optional[List[int]] = None,
-                       no_combine: bool = False,
-                       routed_scaling_factor: Optional[float] = 1.0,
-                       gemm1_alpha: Optional[float] = None,
-                       gemm1_limit: Optional[float] = None,
-                       activation_situ_beta: Optional[float] = None,
-                       activation_situ_linear_beta: Optional[float] = None):
-    if routed_scaling_factor is None:
-        routed_scaling_factor = 1.0
-
-    activation, is_gated = _normalize_activation_and_gate(activation, is_gated)
-    activation_out_dim = adjust_N_for_activation(w1.shape[1], is_gated)
-
-    # Check constraints.
-    if use_int4_w4a16 or use_int4_w4a8:
-        if is_gated:
-            assert hidden_states.shape[1] // 2 == w1.shape[2], "Hidden size mismatch"
-        else:
-            assert hidden_states.shape[1] == w1.shape[2], "Hidden size mismatch"
-    else:
-        assert hidden_states.shape[1] == w1.shape[2], "Hidden size mismatch"
-
-    assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
-    assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
-    assert w1.stride(-1) == 1, "Stride of last dimension must be 1"
-    assert w2.stride(-1) == 1, "Stride of last dimension must be 1"
-    assert hidden_states.dtype in [
-        torch.float32, torch.float16, torch.bfloat16, torch.int8,  torch.float8_e4m3fn
-    ]
-
-    num_tokens, _ = hidden_states.shape
-    E, N, _ = w1.shape
-    if global_num_experts == -1:
-        global_num_experts = E
-    top_k_num = topk_ids.shape[1]
-    # We execute the fused_moe kernel in chunks to circumvent this issue:
-    # https://github.com/vllm-project/vllm/issues/5938
-    CHUNK_SIZE = 65536
-    M = min(num_tokens, CHUNK_SIZE)
+# Keep orchestration in the production module: quantization, activation, router
+# folding, chunking and Split-K must not acquire a second implementation here.
+_production = importlib.import_module("boltops.fused_moe.triton.fused_moe")
+_production_experts = _production.fused_experts_impl
+# The custom-op wrapper hides its Python signature. Bind against its actual
+# registered schema, so new public parameters/defaults stay in sync.
+_experts_signature = inspect.Signature([
+    inspect.Parameter(argument.name,
+                      inspect.Parameter.KEYWORD_ONLY if argument.kwarg_only
+                      else inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                      default=argument.default_value if argument.has_default_value()
+                      else inspect.Parameter.empty)
+    for argument in torch.ops.boltops.fused_experts_impl.default._schema.arguments
+])
+_production_gemm = moe_op.fused_moe
+_tuning_phase = ContextVar("moe_tuning_is_bottom", default=None)
 
 
-    # bottom_a_use_mls_load selects the sorted GEMM1-to-GEMM2 bridge even on
-    # devices without MLS, where GEMM2 reads it with ordinary buffer loads.
-    # Reserve the sorted padding independently of the hardware MLS capability.
-    can_use_bottom_a_sorted = not use_int4_w4a8
+def _ensure_single_config_timing(tuner, launch):
+    # Triton bypasses benchmarking when only one candidate survives a shard.
+    if not hasattr(tuner, "configs_timings"):
+        tuner.configs_timings = {
+            tuner.best_config: tuner.do_bench(launch, quantiles=(0.5, 0.2, 0.8))
+        }
 
 
-    topk = top_k_num
-    max_total_tokens = _max_autotune_total_tokens(
-        M,
-        topk,
-        E,
-        allow_sorted_bridge=can_use_bottom_a_sorted,
-    )
+def _print_best_config(autotuner, *, native_mxfp4=False):
+    """Emit the historical parser ABI, independently of Triton's debug format."""
+    config = autotuner.best_config
+    values = dict(config.kwargs)
+    if native_mxfp4:
+        values = dict(BLOCK_SIZE_N=values["BN"], BLOCK_SIZE_K=128,
+                      GROUP_SIZE_M=1, COMBINE_SCALE_LOAD=False)
+    values.update(num_warps=config.num_warps, num_stages=config.num_stages)
+    timing = autotuner.configs_timings[config]
+    milliseconds = timing[0] if isinstance(timing, (list, tuple)) else timing
+    print("fused_moe_kernel:")
+    print("* 0: " + ", ".join(f"{key}: {value}" for key, value in values.items()))
+    print(f"  : times(best): {milliseconds} ms")
 
 
-    # We can reuse the memory between these because by the time we need
-    # cache3, we're done with cache1
-    # cache13 needs to be large enough for intermediate_cache1 which can be up to
-    # max_total_tokens * N due to padding, and also for intermediate_cache3
-    if output_dtype is None:
-        output_dtype = _default_output_dtype(hidden_states.dtype)
-    if output_dtype not in _ALLOWED_OUTPUT_DTYPES:
-        raise ValueError(
-            f"Unsupported output_dtype: {output_dtype}, expected one of {_ALLOWED_OUTPUT_DTYPES}"
-        )
-    compute_type = _compute_type_from_output_dtype(output_dtype)
-    intermediate_dtype = output_dtype
-
-    cache13 = torch.zeros(max_total_tokens * max(N, w2.shape[1]),
-                          device=hidden_states.device,
-                          dtype=intermediate_dtype)
-    # intermediate_cache1 = cache13[:M * top_k_num * N].view(
-    #     (M, topk_ids.shape[1], N))
-    intermediate_cache3 = cache13[:M * topk * w2.shape[1]].view(
-        (M, topk, w2.shape[1]))
-
-    if no_combine:
-        assert not inplace, "no_combine + inplace is not supported"
-        out_hidden_states = torch.zeros(
-            (num_tokens, topk, w2.shape[1]),
-            device=hidden_states.device,
-            dtype=intermediate_dtype,
-        )
-    elif inplace:
-        out_hidden_states = hidden_states
-    else:
-        out_hidden_states = torch.zeros(hidden_states.shape, device=hidden_states.device, dtype=intermediate_dtype)
-
-    for chunk in range((num_tokens // CHUNK_SIZE) + 1):
-        begin_chunk_idx, end_chunk_idx = (chunk * CHUNK_SIZE,
-                                          min((chunk + 1) * CHUNK_SIZE,
-                                              num_tokens))
-        curr_hidden_states = hidden_states[begin_chunk_idx:end_chunk_idx]
-        tokens_in_chunk, _ = curr_hidden_states.shape
-
-        if tokens_in_chunk == 0:
-            break
-
-        # autotune
-        config_count = 0
-        num_tokens = curr_hidden_states.shape[0]
-        num_tokens_aligned = next_power_of_2(num_tokens)
-
-        # 当 num_tokens >= 32 时，以相反顺序遍历配置列表, 以加速training
-        config_list = list(reversed(k100_ai_config_lists)) if num_tokens >= 32 else k100_ai_config_lists
-        for config in config_list:
-            config_count += 1
-            print(f"Config {config_count}: {config}")
-            bottom_a_use_mls_load = bool(
-                config.get("bottom_a_use_mls_load", False)
-            )
-            kernel_config = {"BLOCK_SIZE_M": config["BLOCK_SIZE_M"]}
-
-            # when compile_only=True, num_tokens == 1 we also check and prune configs
-            if not compile_only:
-                if (config['BLOCK_SIZE_M'] > max(num_tokens_aligned, 16)):
-                    print(f"{config} skiped, {num_tokens_aligned=}")
-                    continue
-                # eg. top_k_num = 8, E = 256
-                # 16: 16*8*1/256 = 1
-                # 32: 32*8*2/256 = 2
-                # 64: 64*8*2/256 = 4
-                # 128: 128*8*2/256 = 8
-                # 256: 256*8*2/256 = 16
-                # 512: 512*8*2/256 = 32
-                # 1024: 1024*8*2/256 = 64
-                # 2048: 2048*8*2/256 = 128
-                # 4096: 4096*8*2/256 = 256
-                # 8192: 8192*8*2/256 = 512
-                # 16384: 16384*8*2/256 = 1024
-                # For top_k=1 with many experts, keep both the small M tiles
-                # needed by sparse per-expert routing and BLOCK_SIZE_M=128,
-                # the smallest PP-capable M tile.  The route-density estimate
-                # alone can otherwise remove every PP candidate.
-                min_block_m_ceiling = (
-                    128
-                    if top_k_num == 1 and num_tokens >= 2048
-                    else 32
-                )
-                tune_block_size_m_max = max(
-                    num_tokens_aligned * top_k_num * 2 / E,
-                    min_block_m_ceiling,
-                )
-                if (config['BLOCK_SIZE_M'] > tune_block_size_m_max):
-                    print(f"{config} skiped, {tune_block_size_m_max=}")
-                    continue
-                if (
-                    num_tokens >= 2048
-                    and top_k_num > 1
-                    and config['BLOCK_SIZE_M'] <= 32
-                ):
-                    print(f"{config} skiped, {num_tokens=}")
-                    continue
-
-            padded_tokens = (
-                min(tokens_in_chunk * topk, E + 1) * (config["BLOCK_SIZE_M"] - 1)
-                if bottom_a_use_mls_load
-                else 0
-            )
-
-            total_tokens = tokens_in_chunk * topk + padded_tokens
-            intermediate_cache1 = cache13[: total_tokens * N].view(
-                (total_tokens, N),
-            )
-            intermediate_cache2 = torch.zeros(
-                    (total_tokens, activation_out_dim),
-                    device=hidden_states.device,
-                    dtype=intermediate_dtype,
-                )
-
-            curr_topk_ids = topk_ids[begin_chunk_idx:end_chunk_idx]
-            curr_topk_weights = topk_weights[begin_chunk_idx:end_chunk_idx]
-
-            num_routes = tokens_in_chunk * topk
-            naive_block_assignment = _should_use_naive_block_assignment(
-                num_routes=num_routes,
-                global_num_experts=global_num_experts,
-                has_expert_map=expert_map is not None,
-                bottom_a_sorted=bottom_a_use_mls_load,
-                use_int8_w8a16=use_int8_w8a16,
-                use_int4_w4a16=use_int4_w4a16,
-                use_int4_w4a8=use_int4_w4a8,
-                use_block_quant=block_shape is not None,
-            )
-            if naive_block_assignment:
-                assert curr_topk_weights.is_contiguous(), (
-                    "Top-k weights must be contiguous for naive block assignment"
-                )
-                route_ids = curr_topk_ids.contiguous().view(-1)
-                sorted_token_ids = route_ids
-                expert_ids = route_ids
-                num_tokens_post_padded = route_ids
-            else:
-                sorted_token_ids, expert_ids, num_tokens_post_padded = (
-                    moe_align_block_size(
-                        curr_topk_ids,
-                        config["BLOCK_SIZE_M"],
-                        global_num_experts,
-                        expert_map,
-                    )
-                )
-
-            if (use_int8_w8a8 or use_fp8_w8a8 or use_int4_w4a8) and per_channel_quant:
-                quant_dtype = torch.float8_e4m3fn if use_fp8_w8a8 else torch.int8
-                if curr_hidden_states.dtype == torch.float16 or curr_hidden_states.dtype == torch.bfloat16:
-                    input_q, input_scale = per_token_quant_triton(curr_hidden_states, quant_dtype=quant_dtype)
-                else:
-                    input_q, input_scale = curr_hidden_states, a1_scale
-                fused_moe(input_q,
-                            w1,
-                            intermediate_cache1,
-                            input_scale,
-                            w1_scale,
-                            w1_zp,
-                            curr_topk_weights,
-                            curr_topk_ids,
-                            sorted_token_ids,
-                            expert_ids,
-                            num_tokens_post_padded,
-                            apply_router_weight_on_input,
-                            top_k_num,
-                            compute_type=compute_type,
-                            use_fp8_w8a8=use_fp8_w8a8,
-                            use_int8_w8a8=use_int8_w8a8,
-                            use_int8_w8a16=use_int8_w8a16,
-                            use_int4_w4a16=use_int4_w4a16,
-                            use_int4_w4a8=use_int4_w4a8,
-                            per_channel_quant=per_channel_quant,
-                            block_shape=block_shape,
-                            c_sorted=bottom_a_use_mls_load,
-                            naive_block_assignment=naive_block_assignment,
-                            B_bias=b1,
-                            config=kernel_config)
-            elif block_shape is not None and (use_int8_w8a8 or use_int4_w4a8 or use_fp8_w8a8):
-                quant_dtype = torch.float8_e4m3fn if use_fp8_w8a8 else torch.int8
-                if curr_hidden_states.dtype == torch.float16 or curr_hidden_states.dtype == torch.bfloat16:
-                    input_q, input_scale = per_block_quant_wrapper((1, block_shape[1]))(per_token_quant_triton)(curr_hidden_states, quant_dtype=quant_dtype)
-                else:
-                    input_q, input_scale = curr_hidden_states, a1_scale
-                fused_moe(input_q,
-                            w1,
-                            intermediate_cache1,
-                            input_scale,
-                            w1_scale,
-                            w1_zp,
-                            curr_topk_weights,
-                            curr_topk_ids,
-                            sorted_token_ids,
-                            expert_ids,
-                            num_tokens_post_padded,
-                            apply_router_weight_on_input,
-                            top_k_num,
-                            compute_type=compute_type,
-                            use_fp8_w8a8=use_fp8_w8a8,
-                            use_int8_w8a8=use_int8_w8a8,
-                            use_int8_w8a16=use_int8_w8a16,
-                            use_int4_w4a16=use_int4_w4a16,
-                            use_int4_w4a8=use_int4_w4a8,
-                            per_channel_quant=per_channel_quant,
-                            block_shape=block_shape,
-                            c_sorted=bottom_a_use_mls_load,
-                            naive_block_assignment=naive_block_assignment,
-                            B_bias=b1,
-                            config=kernel_config)
-            else:
-                fused_moe(curr_hidden_states,
-                            w1,
-                            intermediate_cache1,
-                            a1_scale,
-                            w1_scale,
-                            w1_zp,
-                            curr_topk_weights,
-                            curr_topk_ids,
-                            sorted_token_ids,
-                            expert_ids,
-                            num_tokens_post_padded,
-                            apply_router_weight_on_input,
-                            top_k_num,
-                            compute_type=compute_type,
-                            use_fp8_w8a8=use_fp8_w8a8,
-                            use_int8_w8a8=use_int8_w8a8,
-                            use_int8_w8a16=use_int8_w8a16,
-                            use_int4_w4a16=use_int4_w4a16,
-                            use_int4_w4a8=use_int4_w4a8,
-                            per_channel_quant=per_channel_quant,
-                            block_shape=block_shape,
-                            c_sorted=bottom_a_use_mls_load,
-                            naive_block_assignment=naive_block_assignment,
-                            B_bias=b1,
-                            config=kernel_config)
-            _apply_activation(
-                activation=activation,
-                is_gated=is_gated,
-                activated_out=intermediate_cache2,
-                ffn1_out_2d=intermediate_cache1.view(-1, N),
-                gemm1_alpha=gemm1_alpha,
-                gemm1_limit=gemm1_limit,
-                activation_situ_beta=activation_situ_beta,
-                activation_situ_linear_beta=activation_situ_linear_beta,
-            )
-            # intermediate_cache1 and intermediate_cache3 share cache13.
-            intermediate_cache1.fill_(0)
-            if (use_int8_w8a8 or use_fp8_w8a8 or use_int4_w4a8) and per_channel_quant:
-                quant_dtype = torch.float8_e4m3fn if use_fp8_w8a8 else torch.int8
-                if intermediate_cache2.dtype == torch.float16 or intermediate_cache2.dtype == torch.bfloat16:
-                    bridge_q, bridge_scale = per_token_quant_triton(intermediate_cache2, quant_dtype=quant_dtype)
-                else:
-                    bridge_q, bridge_scale = intermediate_cache2, a2_scale
-                fused_moe(bridge_q,
-                            w2,
-                            intermediate_cache3,
-                            bridge_scale,
-                            w2_scale,
-                            w2_zp,
-                            curr_topk_weights,
-                            curr_topk_ids,
-                            sorted_token_ids,
-                            expert_ids,
-                            num_tokens_post_padded,
-                            (not apply_router_weight_on_input) and (not no_combine),
-                            1,
-                            compute_type=compute_type,
-                            use_fp8_w8a8=use_fp8_w8a8,
-                            use_int8_w8a8=use_int8_w8a8,
-                            use_int8_w8a16=use_int8_w8a16,
-                            use_int4_w4a16=use_int4_w4a16,
-                            use_int4_w4a8=use_int4_w4a8,
-                            per_channel_quant=per_channel_quant,
-                            block_shape=block_shape,
-                            bottom_a_use_mls_load=bottom_a_use_mls_load,
-                            naive_block_assignment=naive_block_assignment,
-                            scale_bias_with_routed_weight=(not apply_router_weight_on_input) and (not no_combine),
-                            B_bias=b2,
-                            config=kernel_config)
-            elif block_shape is not None and (use_int8_w8a8 or use_int4_w4a8 or use_fp8_w8a8):
-                quant_dtype = torch.float8_e4m3fn if use_fp8_w8a8 else torch.int8
-                if intermediate_cache2.dtype == torch.float16 or intermediate_cache2.dtype == torch.bfloat16:
-                    bridge_q, bridge_scale = per_block_quant_wrapper((1, block_shape[1]))(per_token_quant_triton)(intermediate_cache2, quant_dtype=quant_dtype)
-                else:
-                    bridge_q, bridge_scale = intermediate_cache2, a2_scale
-                fused_moe(bridge_q,
-                            w2,
-                            intermediate_cache3,
-                            bridge_scale,
-                            w2_scale,
-                            w2_zp,
-                            curr_topk_weights,
-                            curr_topk_ids,
-                            sorted_token_ids,
-                            expert_ids,
-                            num_tokens_post_padded,
-                            (not apply_router_weight_on_input) and (not no_combine),
-                            1,
-                            compute_type=compute_type,
-                            use_fp8_w8a8=use_fp8_w8a8,
-                            use_int8_w8a8=use_int8_w8a8,
-                            use_int8_w8a16=use_int8_w8a16,
-                            use_int4_w4a16=use_int4_w4a16,
-                            use_int4_w4a8=use_int4_w4a8,
-                            per_channel_quant=per_channel_quant,
-                            block_shape=block_shape,
-                            bottom_a_use_mls_load=bottom_a_use_mls_load,
-                            naive_block_assignment=naive_block_assignment,
-                            scale_bias_with_routed_weight=(not apply_router_weight_on_input) and (not no_combine),
-                            B_bias=b2,
-                            config=kernel_config)
-            else:
-                fused_moe(intermediate_cache2,
-                            w2,
-                            intermediate_cache3,
-                            a2_scale,
-                            w2_scale,
-                            w2_zp,
-                            curr_topk_weights,
-                            curr_topk_ids,
-                            sorted_token_ids,
-                            expert_ids,
-                            num_tokens_post_padded,
-                            (not apply_router_weight_on_input) and (not no_combine),
-                            1,
-                            compute_type=compute_type,
-                            use_fp8_w8a8=use_fp8_w8a8,
-                            use_int8_w8a8=use_int8_w8a8,
-                            use_int8_w8a16=use_int8_w8a16,
-                            use_int4_w4a16=use_int4_w4a16,
-                            use_int4_w4a8=use_int4_w4a8,
-                            per_channel_quant=per_channel_quant,
-                            block_shape=block_shape,
-                            bottom_a_use_mls_load=bottom_a_use_mls_load,
-                            naive_block_assignment=naive_block_assignment,
-                            scale_bias_with_routed_weight=(not apply_router_weight_on_input) and (not no_combine),
-                            B_bias=b2,
-                            config=kernel_config)
+def _native_mxfp4_autotune(kernel):
+    class NativeKernel:
+        def __getitem__(self, _grid):
+            def launch(*args, **kwargs):
+                named = dict(zip(kernel.arg_names, args))
+                named.update(kwargs)
+                named.pop("BN", None)
+                named.pop("num_warps", None)
+                named.pop("num_stages", None)
+                configs = [triton.Config({"BN": bn}, num_warps=4, num_stages=1)
+                           for index, bn in enumerate((64, 128))
+                           if not compile_only or index % num_groups_compile == cur_group]
+                if not configs:
+                    if compile_only:
+                        return []
+                    raise RuntimeError("MXFP4 tuning shard has no candidates")
+                tuner = triton.autotune(
+                    configs=configs,
+                    key=["N", "K", "BM", "A_GROUP_SIZE", "A_FORMAT", "B_FORMAT",
+                         "MUL_ROUTED_WEIGHT", "STATIC_A", "FUSE_SWIGLU", "ALPHA", "LIMIT"],
+                    rep=20,
+                )(kernel)
+                tuner.__dict__["do_bench"] = _check_hip_loads(tuner.do_bench)
+                output_n = named["N"] // 2 if named.get("FUSE_SWIGLU", False) else named["N"]
+                grid = lambda meta: (_grid[0], triton.cdiv(output_n, meta["BN"]))
+                if compile_only:
+                    return tuner.warmup(grid=grid, **named)
+                result = tuner[grid](**named)
+                _ensure_single_config_timing(tuner, lambda: tuner[grid](**named))
+                _print_best_config(tuner, native_mxfp4=True)
+                return result
+            return launch
+    return NativeKernel()
 
 
-            if no_combine:
-                out_hidden_states[begin_chunk_idx:end_chunk_idx].copy_(intermediate_cache3)
-            else:
-                triton_moe_sum(
-                    intermediate_cache3.view(*intermediate_cache3.shape),
-                    out_hidden_states[begin_chunk_idx:end_chunk_idx],
-                    routed_scaling_factor=routed_scaling_factor,
-                )
-            if end_chunk_idx < hidden_states.shape[0]:
-                intermediate_cache3.fill_(0)
-    return out_hidden_states
+def _tuning_config(base, outer, *, is_bottom, supports_splitk=False, k=None):
+    config = base.copy()
+    config.update(BLOCK_SIZE_M=outer["BLOCK_SIZE_M"], N_TILES_PER_CTA=1,
+                  _autotune_is_bottom=is_bottom)
+    # Sorted bridge changes both GEMMs, so it is chosen by the outer search.
+    sorted_bridge = bool(outer.get("bottom_a_use_mls_load", False))
+    config.pop("a_sorted", None)
+    config.pop("bottom_a_use_mls_load", None)
+    if is_bottom:
+        config.update(a_sorted=sorted_bridge, bottom_a_use_mls_load=sorted_bridge)
+    # Candidate BK belongs to the kernel search; allocate Split-K partials
+    # through the production launcher, with a baseline dividing K.
+    config.pop("SPLIT_K", None)
+    if supports_splitk:
+        config["SPLIT_K"] = splitk_size if not is_bottom else 0
+        if config["SPLIT_K"] > 1:
+            if k is None or k % splitk_size:
+                raise ValueError("MoE K must be divisible by SPLITK_SIZE")
+            while k % (config["BLOCK_SIZE_K"] * splitk_size):
+                config["BLOCK_SIZE_K"] //= 2
+    return config
+
+
+@functools.wraps(_production_experts)
+def fused_experts_impl(*args, **kwargs):
+    if not mode_autotune:
+        return _production_experts(*args, **kwargs)
+    bound = _experts_signature.bind(*args, **kwargs)
+    bound.apply_defaults()
+    hidden = bound.arguments["hidden_states"]
+    native = bound.arguments["use_mxfp4_w4a8"] or bound.arguments["use_mxfp8"]
+    supports_splitk = not any(bound.arguments[name] for name in (
+        "use_fp8_w8a8", "use_int8_w8a8", "use_int8_w8a16",
+        "use_int4_w4a16", "use_int4_w4a8", "use_mxfp4_w4a8", "use_mxfp8"))
+    original_query = _production.get_optimal_moe_config_func
+    native_module = mxfp8 if bound.arguments["use_mxfp8"] else mxfp4
+    native_name = "get_mxfp8_moe_config" if bound.arguments["use_mxfp8"] else "get_mxfp4_moe_config"
+    original_native_query = getattr(native_module, native_name)
+    configs = k100_ai_config_lists
+    if native:
+        configs = autotune_outer_configs(test_type, os.environ.get("AUTOTUNE_OUTER_CONFIG"))
+    if hidden.shape[0] >= 32:
+        configs = list(reversed(configs))
+    # Repeated candidates must receive the same original input for inplace.
+    saved_input = hidden.clone() if bound.arguments["inplace"] else None
+    output = None
+    index = 0
+    for outer in configs:
+        if not compile_only and outer["BLOCK_SIZE_M"] > max(next_power_of_2(hidden.shape[0]), 16):
+            continue
+        index += 1
+        print(f"Config {index}: {outer}")
+
+        def query(*query_args, **query_kwargs):
+            base_query = original_query(*query_args, **query_kwargs)
+            bottom = query_kwargs.get("is_bottom", False)
+            def select(tokens):
+                selected = base_query(tokens)
+                base = selected[0] if bottom else selected
+                config = _tuning_config(
+                    base, outer, is_bottom=bottom, supports_splitk=supports_splitk,
+                    k=bound.arguments["w1"].shape[-1])
+                return (config, outer["BLOCK_SIZE_M"]) if bottom else config
+            return select
+
+        def native_query(tokens, *, is_bottom=False, **selectors):
+            selected = original_native_query(tokens, is_bottom=is_bottom, **selectors)
+            base = selected[0] if is_bottom else selected
+            config = _tuning_config(base, outer, is_bottom=is_bottom)
+            return (config, outer["BLOCK_SIZE_M"]) if is_bottom else config
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(_production, "get_optimal_moe_config_func", query))
+            stack.enter_context(patch.object(native_module, native_name, native_query))
+            if saved_input is not None:
+                hidden.copy_(saved_input)
+            output = _production_experts(**bound.arguments)
+    if output is None:
+        raise RuntimeError("No legal outer MoE autotune configurations")
+    return output
+
+
+@functools.wraps(_production_gemm)
+def fused_moe(*args, **kwargs):
+    """Attach explicit GEMM phase without changing the production kernel ABI."""
+    config = kwargs.get("config")
+    phase = None
+    if config is not None:
+        config = config.copy()
+        phase = config.pop("_autotune_is_bottom", None)
+        kwargs["config"] = config
+    token = _tuning_phase.set(phase)
+    try:
+        return _production_gemm(*args, **kwargs)
+    finally:
+        _tuning_phase.reset(token)
 
 
 @contextmanager
 def patched_environment():
-    patchers = []
-    try:
+    """Patch both public and legacy package entries; always restore on exit."""
+    with ExitStack() as stack:
         if mode_autotune:
-            patchers.append(patch(
-                'boltops.fused_moe.triton.moe_op.fused_moe_kernel_gptq_awq',
-                new=dynamic_autotune(moe_op.fused_moe_kernel_gptq_awq)
+            for name in ("fused_moe_kernel_gptq_awq", "fused_moe_kernel",
+                         "fused_moe_splitk_kernel", "fused_moe_persistent_kernel",
+                         "fused_moe_kernel_gptq_awq_w4a8",
+                         "fused_moe_kernel_gptq_awq_w4a8_channelwise"):
+                stack.enter_context(patch.object(moe_op, name, dynamic_autotune(getattr(moe_op, name))))
+            stack.enter_context(patch.object(
+                mxfp4, "_moe_gemm_mxfp4_kernel",
+                _native_mxfp4_autotune(mxfp4._moe_gemm_mxfp4_kernel),
             ))
-            patchers.append(patch(
-                'boltops.fused_moe.triton.moe_op.fused_moe_kernel',
-                new=dynamic_autotune(moe_op.fused_moe_kernel)
-            ))
-            patchers.append(patch(
-                'boltops.fused_moe.triton.moe_op.fused_moe_splitk_kernel',
-                new=dynamic_autotune(moe_op.fused_moe_splitk_kernel)
-            ))
-            patchers.append(patch(
-                'boltops.fused_moe.triton.moe_op.fused_moe_kernel_gptq_awq_w4a8',
-                new=dynamic_autotune(moe_op.fused_moe_kernel_gptq_awq_w4a8)
-            ))
-            patchers.append(patch(
-                'boltops.fused_moe.triton.moe_op.fused_moe_kernel_gptq_awq_w4a8_channelwise',
-                new=dynamic_autotune(moe_op.fused_moe_kernel_gptq_awq_w4a8_channelwise)
-            ))
-            patchers.append(patch(
-                'boltops.fused_moe.triton.fused_experts_impl',
-                new=fused_experts_impl
-            ))
-            for patcher in patchers:
-                patcher.start()
-            print("All patches applied successfully")
+            stack.enter_context(patch.object(moe_op, "fused_moe", fused_moe))
+            stack.enter_context(patch.object(_production, "invoke_fused_moe_kernel", fused_moe))
+            stack.enter_context(patch.object(_production, "fused_experts_impl", fused_experts_impl))
+            stack.enter_context(patch("boltops.fused_moe.triton.fused_experts_impl", fused_experts_impl))
         yield
-    finally:
-        for patcher in reversed(patchers):
-            try:
-                patcher.stop()
-            except RuntimeError:
-                pass
-        if patchers:
-            print("All patches reverted successfully")

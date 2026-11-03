@@ -13,6 +13,8 @@ from typing import Any, Dict, Optional, List
 from boltops.utility import logger
 import boltops.utility.arch_info as arch_info
 from boltops.fused_moe.triton.moe_config_utils import get_optimal_moe_config_func
+from boltops.fused_moe.triton.mxfp4 import moe_gemm_mxfp4
+from boltops.fused_moe.triton.mxfp8 import moe_gemm_mxfp8
 
 @functools.lru_cache()
 def distinguish_moe_kernel_name():
@@ -21,7 +23,7 @@ def distinguish_moe_kernel_name():
 
 @functools.lru_cache()
 def support_mls():
-    return arch_info.get_arch() in ("gfx938")
+    return arch_info.get_arch() in ("gfx938", "gfx92a", "gfx946")
 
 capMLS = support_mls()
 splitk_size = int(os.environ.get("SPLITK_SIZE", "0"))
@@ -1360,6 +1362,7 @@ def fused_moe_kernel(
     ADD_BIAS: tl.constexpr,
     single_k_tile: tl.constexpr,
     N_TILES_PER_CTA: tl.constexpr = 1,
+    use_mxfp8: tl.constexpr = False,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -1406,7 +1409,11 @@ def fused_moe_kernel(
         # and all values in the memory are non-negative.
         tl.assume(sorted_token_ids_ptr.to(tl.int64) >= 0)
 
-    if group_k > 0:
+    if use_mxfp8:
+        tl.static_assert(not COMBINE_SCALE_LOAD and N_TILES_PER_CTA == 1,
+                         "MXFP8 supports only non-combined single-N-tile loads")
+        tl.static_assert(BLOCK_SIZE_K % 32 == 0)
+    if group_k > 0 and not use_mxfp8:
         tl.static_assert(BLOCK_SIZE_K <= group_k and group_k % BLOCK_SIZE_K == 0,
             "BLOCK_SIZE_K must be divisible by GROUP_SIZE_K")
     if COMBINE_SCALE_LOAD: # used for use_int8_w8a8
@@ -1561,8 +1568,6 @@ def fused_moe_kernel(
                 else:
                     # Channel INT8 keeps the dot result in i32; BF16 uses f32.
                     acc = tl.dot(a, b)
-                if MUL_ROUTED_WEIGHT:
-                    acc = acc * route_weight[:, None]
                 if use_int8_w8a8 and per_channel_quant and group_k == 0 and group_n == 0:
                     b_scale = tl.load(
                         b_scale_ptr + off_experts * stride_bse
@@ -1570,17 +1575,19 @@ def fused_moe_kernel(
                     )
                     acc = acc * a_scale[:, None] * b_scale
 
-                # Convert before adding bias, then mask both padding rows and N tails.
-                acc = acc.to(compute_type)
+                # Match vLLM: dequantize, add bias, then apply routing in FP32.
                 if ADD_BIAS:
                     bias_ptrs = b_bias_ptr + (
                         off_experts.to(tl.int64) * stride_bbe
                         + offs_cn[None, :].to(tl.int64) * stride_bbn
                     )
                     bias = tl.load(bias_ptrs, mask=offs_cn[None, :] < N, other=0.0)
-                    if SCALE_BIAS_WITH_ROUTED_WEIGHT:
+                    if SCALE_BIAS_WITH_ROUTED_WEIGHT and not MUL_ROUTED_WEIGHT:
                         bias = bias * route_weight[:, None]
-                    acc = acc + bias.to(acc.dtype)
+                    acc = acc + bias.to(tl.float32)
+                if MUL_ROUTED_WEIGHT:
+                    acc = acc * route_weight[:, None]
+                acc = acc.to(compute_type)
                 c_row = offs_token_id if c_sorted else offs_token
                 if USE_ADDR_OFFSET_INT64_C:
                     c_ptrs = c_ptr + (
@@ -1804,7 +1811,22 @@ def fused_moe_kernel(
                             offsets=[mls_offs_k, (pid_n * BLOCK_SIZE_N) % N])
 
             # We accumulate along the K dimension.
-            if use_int8_w8a16:
+            if use_mxfp8:
+                # vLLM 77f58e530450, _mxfp8_grouped_gemm_kernel:
+                # A/B have one uint8 E8M0 scale per K32 group.
+                offs_sk = k * (BLOCK_SIZE_K // 32) + tl.arange(0, BLOCK_SIZE_K // 32)
+                scale_mask = offs_sk * 32 < K
+                sa = tl.load(
+                    a_scale_ptr + a_row[:, None].to(tl.int64) * stride_asm
+                    + offs_sk[None, :] * stride_ask,
+                    token_mask[:, None] & scale_mask[None, :], other=0)
+                sb = tl.load(
+                    b_scale_ptr + off_experts.to(tl.int64) * stride_bse
+                    + offs_bn[:, None].to(tl.int64) * stride_bsn
+                    + offs_sk[None, :] * stride_bsk,
+                    scale_mask[None, :], other=0)
+                accumulator += tl.dot_scaled(a, sa, 'e4m3', b, sb, 'e4m3')
+            elif use_int8_w8a16:
                 accumulator = tl.dot(a, b.to(compute_type), acc=accumulator)
             elif use_fp8_w8a8 or use_int8_w8a8:
                 if group_k > 0 and group_n > 0:
@@ -1832,6 +1854,28 @@ def fused_moe_kernel(
             b_ptrs += BLOCK_SIZE_K * stride_bk
             mls_offs_k += BLOCK_SIZE_K
 
+    if use_int8_w8a16:
+        accumulator = accumulator * b_scale
+    elif (use_fp8_w8a8 or use_int8_w8a8) and not (group_k > 0 and group_n > 0):
+        accumulator = accumulator * a_scale * b_scale
+
+    if ADD_BIAS:
+        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        bias_ptrs = b_bias_ptr + (
+            off_experts.to(tl.int64) * stride_bbe
+            + offs_cn[None, :].to(tl.int64) * stride_bbn
+        )
+        if block_n_diviable:
+            bias = tl.load(bias_ptrs)
+        else:
+            bias = tl.load(bias_ptrs, mask=offs_cn[None, :] < N, other=0.0)
+        if SCALE_BIAS_WITH_ROUTED_WEIGHT and not MUL_ROUTED_WEIGHT:
+            if ck_sorting:
+                moe_weight = tl.load(sorted_weights_ptr + offs_token_id, mask=token_mask, other=0)
+            else:
+                moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
+            bias = bias * moe_weight[:, None]
+        accumulator = accumulator + bias.to(tl.float32)
     if MUL_ROUTED_WEIGHT:
         # Both of them can work well.
         if ck_sorting:
@@ -1844,33 +1888,7 @@ def fused_moe_kernel(
                                 other=0)
         accumulator = accumulator * moe_weight[:, None]
 
-    if use_int8_w8a16:
-        accumulator = (accumulator * b_scale).to(compute_type)
-    elif use_fp8_w8a8 or use_int8_w8a8:
-        if group_k > 0 and group_n > 0:
-            accumulator = accumulator.to(compute_type)
-        else:
-            accumulator = (accumulator * a_scale * b_scale).to(compute_type)
-    else:
-        accumulator = accumulator.to(compute_type)
-
-    if ADD_BIAS:
-        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-        bias_ptrs = b_bias_ptr + (
-            off_experts.to(tl.int64) * stride_bbe
-            + offs_cn[None, :].to(tl.int64) * stride_bbn
-        )
-        if block_n_diviable:
-            bias = tl.load(bias_ptrs)
-        else:
-            bias = tl.load(bias_ptrs, mask=offs_cn[None, :] < N, other=0.0)
-        if SCALE_BIAS_WITH_ROUTED_WEIGHT:
-            if ck_sorting:
-                moe_weight = tl.load(sorted_weights_ptr + offs_token_id, mask=token_mask, other=0)
-            else:
-                moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
-            bias = bias * moe_weight[:, None]
-        accumulator = accumulator + bias.to(accumulator.dtype)
+    accumulator = accumulator.to(compute_type)
     # -----------------------------------------------------------
     # Write back the block of the output
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -2313,27 +2331,8 @@ def fused_moe_splitk_kernel(
             b_ptrs += BLOCK_SIZE_K * stride_bk
             mls_offs_k += BLOCK_SIZE_K
 
-    if MUL_ROUTED_WEIGHT:
-        # Both of them can work well.
-        if ck_sorting:
-            moe_weight = tl.load(sorted_weights_ptr + offs_token_id,
-                                mask=token_mask,
-                                other=0)
-        else:
-            moe_weight = tl.load(topk_weights_ptr + offs_token,
-                                mask=token_mask,
-                                other=0)
-        accumulator = accumulator * moe_weight[:, None]
-
-    if use_int8_w8a16:
-        accumulator = (accumulator * b_scale).to(compute_type)
-    elif use_fp8_w8a8 or use_int8_w8a8:
-        if group_k > 0 and group_n > 0:
-            accumulator = accumulator.to(compute_type)
-        else:
-            accumulator = (accumulator * a_scale * b_scale).to(compute_type)
-    else:
-        accumulator = accumulator.to(compute_type)
+    # Quantized Split-K remains unsupported (see the guard above). Keep
+    # floating partials in FP32; this path only handles unweighted GEMMs.
     # -----------------------------------------------------------
     # Write back the block of the output
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -2358,6 +2357,32 @@ def fused_moe_splitk_kernel(
 
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
+
+
+@triton.jit
+def _moe_splitk_reduce(P, C, Sorted, Experts, Padded,
+                      ROUTES, N, stride_split, stride_cm, stride_cn,
+                      SPLIT_K: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
+                      CK: tl.constexpr, CK_TOPK: tl.constexpr,
+                      C_SORTED: tl.constexpr):
+    """Unweighted BF16/FP16 Split-K: FP32 reduction and one conversion."""
+    block = tl.program_id(0)
+    if block * BM >= tl.load(Padded):
+        return
+    expert = tl.load(Experts + block)
+    if expert < 0:
+        return
+    slot = block * BM + tl.arange(0, BM)
+    route = decode_sorted_token_id(tl.load(Sorted + slot), CK, CK_TOPK)
+    row = slot if C_SORTED else route
+    n = tl.program_id(1) * BN + tl.arange(0, BN)
+    mask = (route[:, None] < ROUTES) & (route[:, None] >= 0) & (n[None, :] < N)
+    offset = row[:, None].to(tl.int64) * N + n[None, :]
+    acc = tl.zeros((BM, BN), tl.float32)
+    for part in range(SPLIT_K):
+        acc += tl.load(P + part.to(tl.int64) * stride_split + offset, mask, other=0.)
+    tl.store(C + row[:, None].to(tl.int64) * stride_cm + n[None, :] * stride_cn,
+             acc, mask)
 
 
 def _fused_moe_persistent_kernel_repr(specialization):
@@ -2768,6 +2793,11 @@ def fused_moe_persistent_kernel(
                     b_ptrs += BLOCK_SIZE_K * stride_bk
                     mls_offs_k += BLOCK_SIZE_K
 
+            if use_int8_w8a16:
+                accumulator = accumulator * b_scale
+            elif (use_fp8_w8a8 or use_int8_w8a8) and not (group_k > 0 and group_n > 0):
+                accumulator = accumulator * a_scale * b_scale
+
             if MUL_ROUTED_WEIGHT:
                 # Both of them can work well.
                 if ck_sorting:
@@ -2779,16 +2809,7 @@ def fused_moe_persistent_kernel(
                                         mask=token_mask,
                                         other=0)
                 accumulator = accumulator * moe_weight[:, None]
-
-            if use_int8_w8a16:
-                accumulator = (accumulator * b_scale).to(compute_type)
-            elif use_fp8_w8a8 or use_int8_w8a8:
-                if group_k > 0 and group_n > 0:
-                    accumulator = accumulator.to(compute_type)
-                else:
-                    accumulator = (accumulator * a_scale * b_scale).to(compute_type)
-            else:
-                accumulator = accumulator.to(compute_type)
+            accumulator = accumulator.to(compute_type)
             # -----------------------------------------------------------
             # Write back the block of the output
             offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -2855,7 +2876,46 @@ def fused_moe(
     scale_bias_with_routed_weight: bool = False,
     B_bias: Optional[torch.Tensor] = None,
     config: Optional[Dict[str, Any]] = None,
+    use_mxfp4_w4a8: bool = False,
+    use_mxfp8: bool = False,
 ) -> None:
+    if use_mxfp8:
+        if config is not None and (
+                config.get("COMBINE_SCALE_LOAD", False) or config.get("USE_MLS_LOAD", False)
+                or config.get("N_TILES_PER_CTA", 1) != 1
+                or config.get("BLOCK_SIZE_K", 128) != 128
+                or config.get("SPLIT_K", 0) > 1):
+            raise ValueError("MXFP8 requires the non-combined regular kernel with BK=128")
+        if any((use_fp8_w8a8, use_int8_w8a8, use_int8_w8a16, use_int4_w4a16,
+                use_int4_w4a8, use_mxfp4_w4a4, use_mxfp4_w4a8, per_channel_quant)):
+            raise ValueError("MXFP8 cannot be combined with other quantization schemes")
+        if B_zp is not None or B_bias is not None or c_sorted or a_sorted or naive_block_assignment:
+            raise ValueError("MXFP8 requires route-indexed A/C and no bias or zero points")
+        moe_gemm_mxfp8(A, B, C, A_scale, B_scale, topk_ids,
+                       sorted_token_ids, expert_ids, num_tokens_post_padded,
+                       kernel=fused_moe_kernel, top_k=top_k, block_shape=block_shape or (1, 32),
+                       ck_sorting=ck_sorting, ck_topk=ck_topk,
+                       topk_weights=topk_weights, mul_routed_weight=mul_routed_weight,
+                       sorted_weights=sorted_weights,
+                       block_size_m=16 if config is None else config.get("BLOCK_SIZE_M", 16),
+                       block_size_n=64 if config is None else config.get("BLOCK_SIZE_N", 64))
+        return
+    if use_mxfp4_w4a8:
+        if any((use_fp8_w8a8, use_int8_w8a8, use_int8_w8a16, use_int4_w4a16,
+                use_int4_w4a8, use_mxfp4_w4a4, per_channel_quant)):
+            raise ValueError("packed MXFP4 cannot be combined with other quantization schemes")
+        if B_zp is not None:
+            raise ValueError("packed MXFP4 GEMM does not support zero points")
+        if c_sorted or a_sorted or naive_block_assignment:
+            raise ValueError("packed MXFP4 currently requires ordinary route-indexed A/C")
+        moe_gemm_mxfp4(A, B, C, A_scale, B_scale, topk_ids,
+                       sorted_token_ids, expert_ids, num_tokens_post_padded,
+                       top_k=top_k, ck_sorting=ck_sorting, ck_topk=ck_topk,
+                       topk_weights=topk_weights, mul_routed_weight=mul_routed_weight,
+                       bias=B_bias,
+                       block_size_m=16 if config is None else config.get("BLOCK_SIZE_M", 16),
+                       block_size_n=64 if config is None else config.get("BLOCK_SIZE_N", 64))
+        return
     assert topk_weights is not None or not mul_routed_weight
     assert topk_weights is None or topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
@@ -2890,7 +2950,8 @@ def fused_moe(
             use_mxfp4_w4a4=use_mxfp4_w4a4,
             block_shape=block_shape,
             is_bottom=mul_routed_weight)
-        config = moe_config_func(M)
+        selected = moe_config_func(topk_ids.size(0))
+        config = selected[0] if isinstance(selected, tuple) else selected
 
     config = config.copy()
     n_tiles_per_cta = config.pop("N_TILES_PER_CTA", 1)
@@ -2901,7 +2962,7 @@ def fused_moe(
         if (
             use_int4_w4a16 or use_int4_w4a8 or use_int8_w8a16 or use_mxfp4_w4a4
             or (not naive_block_assignment
-                and (_USE_MOE_PERSISTENT_KERNEL or selected_split_k > 1))
+                and ((_USE_MOE_PERSISTENT_KERNEL and B_bias is None) or selected_split_k > 1))
         ):
             raise ValueError("N_TILES_PER_CTA=2 is supported only by the regular W8A8/BF16 kernel")
 
@@ -2936,8 +2997,8 @@ def fused_moe(
 
     if (use_int8_w8a16 or use_int4_w4a16 or use_int4_w4a8) and \
             block_shape is not None and block_shape[1] > 0:
-        if B_bias is not None and use_int4_w4a8:
-            raise ValueError("B_bias is not supported in fused_moe_kernel_gptq_awq_w4a8 yet")
+        if B_bias is not None:
+            raise ValueError("B_bias is not supported in grouped WNA16/W4A8 GEMM")
         assert B_scale is not None and B_scale.ndim == 3
         assert B_zp is None or B_zp.ndim == 3
         offset_max = 2**32 - 1
@@ -3138,7 +3199,9 @@ def fused_moe(
         if mul_routed_weight:
             SPLIT_K = 0
 
-        if _USE_MOE_PERSISTENT_KERNEL and not naive_block_assignment:
+        # The persistent ABI has no bias input; preserve bias semantics through
+        # the regular kernel instead of silently discarding it.
+        if _USE_MOE_PERSISTENT_KERNEL and not naive_block_assignment and B_bias is None:
             # Note: the sms count is irrelevant to occupancy(lds and regs).
             NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count * 2
 
@@ -3214,9 +3277,11 @@ def fused_moe(
                     B.shape[1], META['BLOCK_SIZE_N']), SPLIT_K)
             assert B.size(2) % (BLOCK_SIZE_K * SPLIT_K) == 0, "B.size(2) must be divisible by BLOCK_SIZE_K * SPLIT_K"
 
-            splitk_cache = torch.zeros((SPLIT_K,) + C.shape, device=C.device,dtype=C.dtype)
-
-            use_addr_offset_int64_c = C.numel() * C.element_size() * SPLIT_K >= offset_max
+            splitk_cache = torch.zeros(
+                (SPLIT_K, C.numel() // B.size(1), B.size(1)),
+                device=C.device, dtype=torch.float32,
+            )
+            use_addr_offset_int64_c = splitk_cache.numel() * splitk_cache.element_size() >= offset_max
 
             fused_moe_splitk_kernel[grid](
                 A,
@@ -3275,7 +3340,16 @@ def fused_moe(
                 COMBINE_SCALE_LOAD=config.pop("COMBINE_SCALE_LOAD", None),
                 **config,
             )
-            torch.sum(splitk_cache, dim=0, out=C)
+            _moe_splitk_reduce[(triton.cdiv(EM, config["BLOCK_SIZE_M"]),
+                               triton.cdiv(B.size(1), 128))](
+                splitk_cache, C, sorted_token_ids, expert_ids, num_tokens_post_padded,
+                topk_ids.numel(), B.size(1), splitk_cache.stride(0),
+                C.stride(-2), C.stride(-1),
+                SPLIT_K=SPLIT_K, BM=config["BLOCK_SIZE_M"], BN=128,
+                CK=ck_sorting, CK_TOPK=ck_topk,
+                C_SORTED=c_sorted,
+                num_warps=4,
+            )
             # # C.copy_(torch.sum(splitk_cache.to(torch.float32), dim=0).to(C.dtype))
             # triton_splitk_reduce(splitk_cache, C)
         else:

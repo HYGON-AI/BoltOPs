@@ -4,12 +4,16 @@
 
 from __future__ import annotations
 
+import importlib
+import inspect
+
 from statistics import median
 from typing import Optional
 
 import pytest
 import torch
 import torch.nn.functional as F
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 triton = pytest.importorskip("triton")
 import triton.testing  # noqa: E402
@@ -23,7 +27,6 @@ from boltops.fused_moe.triton.moe_activation import (  # noqa: E402
 from boltops.fused_moe.triton.moe_compat import pertoken_quant  # noqa: E402
 from boltops.tools.fused_moe_triton_tune.routing import fused_topk  # noqa: E402
 from boltops.tools.fused_moe_triton_tune.performance_csv import (  # noqa: E402
-    DeviceGuard,
     spread_fraction,
 )
 from boltops.utility import arch_info  # noqa: E402
@@ -43,6 +46,11 @@ from boltops.utility.triton_capability import (  # noqa: E402
 DEVICE = "cuda"
 GPU_REQUIRED = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA/HIP device is required"
+)
+MXFP_REQUIRED = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is None
+    or arch_info.get_arch() != "gfx946",
+    reason="native MXFP tests require gfx946",
 )
 BLOCK_PINGPONG_REQUIRED = pytest.mark.skipif(
     not get_triton_capabilities().supports("use_block_pingpong"),
@@ -1308,25 +1316,701 @@ def test_fused_moe_benchmark(
     torch.cuda.synchronize()
     # Same graph timer and five-sample median as the tune CLI's CSV benchmark.
     # do_bench_cudagraph interprets rep as a target measurement duration in ms.
-    guard = DeviceGuard(torch.cuda.current_device())
     for attempt in range(3):
-        guard.wait_until_exclusive()
-        with guard:
-            samples_us = [
-                float(triton.testing.do_bench_cudagraph(run, rep=bench_repeat)) * 1000
-                for _ in range(5)
-            ]
+        samples_us = [
+            float(triton.testing.do_bench_cudagraph(run, rep=bench_repeat)) * 1000
+            for _ in range(5)
+        ]
         assert all(0 < value < float("inf") for value in samples_us)
         spread = spread_fraction(samples_us)
-        if not guard.contaminated and spread <= 0.03:
+        if spread <= 0.03:
             break
-        print(f"[bench] retry={attempt + 1}/3 spread={spread:.2%} "
-              f"foreign_queue={guard.contaminated}")
+        print(f"[bench] retry={attempt + 1}/3 spread={spread:.2%}")
     else:
-        pytest.fail("MoE graph timings remained unstable or the GPU was shared")
+        pytest.fail("MoE graph timings remained unstable")
     print(
         f"[bench] fused_moe arch={arch_info.get_arch()} mode={mode} "
         f"M={num_tokens} E={experts} N={n} K={k} topk=8 dtype={dtype} "
         f"block_shape={kwargs['block_shape']} CUDA-graph median={median(samples_us):.3f} us "
         f"samples_us={[round(value, 3) for value in samples_us]}"
     )
+
+
+def test_fused_moe_benchmark_does_not_probe_kfd(monkeypatch):
+    def unexpected_probe(*args, **kwargs):
+        pytest.fail("Operator benchmarks must not inspect KFD queues")
+
+    monkeypatch.setitem(globals(), "DeviceGuard", unexpected_probe)
+    monkeypatch.setitem(globals(), "DEVICE", "cpu")
+    monkeypatch.setitem(globals(), "fused_topk", lambda *args, **kwargs: (None, None))
+    monkeypatch.setitem(globals(), "fused_experts", lambda x, *args, **kwargs: x.clone())
+    monkeypatch.setattr(arch_info, "get_arch", lambda: "gfx938")
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(triton.testing, "do_bench_cudagraph", lambda fn, **kwargs: 0.001)
+    shape = ("bf16", 1, 2, 4, torch.bfloat16, (None, None), {"block_shape": None})
+    test_fused_moe_benchmark(shape, num_tokens=1, bench_warmup=0, bench_repeat=50)
+
+
+@GPU_REQUIRED
+@pytest.mark.parametrize("entry", ["legacy_positional", "legacy_keyword", "wrapper", "weighted"])
+@pytest.mark.parametrize("width", [128, 137])
+def test_moe_sum_preserves_legacy_launch_contract(entry, width):
+    x = (torch.arange(3 * 2 * width).reshape(3, 2, width).float() / 256).bfloat16()
+    weights = torch.tensor([[.2, .8], [.7, .3], [.4, .6]])
+    expected = torch.zeros(3, width)
+    expected_fused = torch.zeros(3, width)
+    for rank in range(2):
+        value = x[:, rank].float()
+        if entry == "weighted":
+            # Emulate FP32 FMA on CPU: FP64 holds the product and sum
+            # exactly here, followed by one FP32 rounding.
+            expected_fused = (expected_fused.double()
+                              + value.double() * weights[:, rank, None].double()).float()
+            value = value * weights[:, rank, None]
+        expected += value
+    expected = (expected * 1.25).bfloat16()
+    expected_fused = (expected_fused * 1.25).bfloat16()
+    device_x = x.cuda()
+    result = torch.empty((3, width), dtype=torch.bfloat16, device="cuda")
+    core = fused_moe_module
+    if entry in ("wrapper", "weighted"):
+        if entry == "weighted":
+            # The optional route input also supports noncontiguous weights.
+            device_weights = torch.stack((weights, weights), -1).cuda()[..., 0]
+            core.triton_moe_sum(device_x, result, 1.25, router_weights=device_weights)
+        else:
+            core.triton_moe_sum(device_x, result, 1.25)
+    else:
+        strides = (*result.stride(), *device_x.stride())
+        if entry == "legacy_positional":
+            core.moe_sum_kernel[(3 * triton.cdiv(width, 128),)](
+                result, device_x, 3, width, 2, 1.25, 128, *strides,
+                triton.language.bfloat16, num_warps=4,
+            )
+        else:
+            core.moe_sum_kernel[(3 * triton.cdiv(width, 128),)](
+                result, device_x, M=3, N=width, topk=2, routed_scaling_factor=1.25,
+                BLOCK_SIZE=128, stride_output_m=strides[0], stride_output_n=strides[1],
+                stride_input_m=strides[2], stride_input_k=strides[3], stride_input_n=strides[4],
+                compute_type=triton.language.bfloat16, num_warps=4,
+            )
+    actual = result.cpu()
+    if entry == "weighted":
+        # Compilers may fuse each weighted accumulation. At BF16 halfway
+        # points, fused and unfused FP32 arithmetic can round differently.
+        assert torch.all((actual == expected) | (actual == expected_fused))
+    else:
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def _quantize_mxfp4_reference(x, *, return_scales=False, group_size=128):
+    groups = x.float().reshape(x.shape[0], -1, group_size)
+    if group_size == 32:
+        maximum = groups.abs().amax(-1)
+        rounded = ((maximum.view(torch.int32) + 0x200000) & -0x800000).view(torch.float32)
+        exponent = (torch.floor(torch.log2(rounded)) - 8).clamp(-127, 127)
+        scale = torch.exp2(exponent)
+        q = (groups * torch.exp2(-exponent)[..., None]).to(torch.float8_e4m3fn)
+        if return_scales:
+            return q.reshape(x.shape), (exponent + 127).to(torch.uint8)
+        return (q.float() * scale[..., None]).reshape(x.shape)
+    maximum = groups.abs().amax(-1)
+    # Both native g128 input quantization and packed activation quantization
+    # floor the scale after division. The generic Triton fallback differs.
+    raw_scale = (maximum.clamp_min(1.e-10) / 448).clamp_min(1.e-10)
+    bits = raw_scale.contiguous().view(torch.int32)
+    exponent = ((bits >> 23) & 255) + ((bits & 0x7fffff) != 0).int()
+    scale = (exponent << 23).view(torch.float32)
+    q = (groups / scale[..., None]).clamp(-448, 448).to(torch.float8_e4m3fn)
+    if return_scales:
+        return q.reshape(x.shape), scale
+    return (q.float() * scale[..., None]).reshape(x.shape)
+
+
+def _decode_mxfp4_reference(packed, scales):
+    codes = torch.stack((packed & 15, packed >> 4), -1).flatten(-2).long()
+    lut = torch.tensor([0., .5, 1., 1.5, 2., 3., 4., 6.])
+    values = lut[codes & 7] * torch.where(codes & 8 != 0, -1., 1.)
+    return values * torch.exp2(scales.float() - 127).repeat_interleave(32, -1)
+
+
+def _mxfp4_reference_gemm(a, w, dtype=torch.bfloat16):
+    # Same scaled K32 accumulation and output conversion as the raw GEMM.
+    result = torch.zeros(a.shape[0], w.shape[0])
+    for k in range(0, a.shape[-1], 32):
+        result += a[:, k:k+32] @ w[:, k:k+32].T
+    return result.to(dtype)
+
+
+@MXFP_REQUIRED
+@pytest.mark.parametrize('case', [
+    'dense', 'sparse_routing', 'clamp_no_combine', 'chunked', 'prequantized_chunked',
+    'static', 'static_bias', 'static_clamp', 'static_input_router',
+    'static_input_router_zero', 'static_prequantized_chunked',
+    'static_expert_map_chunked', 'static_no_combine', 'static_input_router_no_combine',
+    'prequantized_g128_swiglustep', 'prequantized_g128_situ',
+    'expert_map_chunked', 'swiglustep', 'situ',
+    'input_router', 'input_router_chunked', 'input_router_inplace',
+    'input_router_no_combine', 'input_router_fp16',
+    'input_router_zero', 'input_router_inplace_chunked',
+    'input_router_expert_map_chunked',
+])
+def test_public_mxfp4_cpu_reference(monkeypatch, case):
+    static = case.startswith('static')
+    input_router = 'input_router' in case
+    no_combine = 'no_combine' in case
+    group_size = 32 if static else 128
+    clamp = .25 if case in ('clamp_no_combine', 'swiglustep', 'static_clamp') else None
+    activation = 'swigluoai' if static else ('swiglustep' if 'swiglustep' in case else ('situ' if 'situ' in case else 'silu'))
+    if 'chunked' in case:
+        monkeypatch.setenv('TRITON_FUSED_MOE_CHUNK_SIZE', '2')
+    torch.manual_seed(429)
+    m, experts, hidden, intermediate, topk = 3, 3, 128, 128, 2
+    if case == 'sparse_routing':
+        experts = 64
+    if static:
+        intermediate = 96  # Exercise packed K tails and paired gate/up N tails.
+    x = (torch.randn(m, hidden) * .2).bfloat16()
+    ids = torch.tensor([[2, 0], [0, 2], [2, 0]], dtype=torch.int32)
+    weights = torch.tensor([[.2, .8], [.7, .3], [.4, .6]])
+    if input_router and not static:
+        ids, weights = ids[:, :1].contiguous(), weights[:, :1].contiguous()
+        topk = 1
+    if case in ('input_router_zero', 'static_input_router_zero'):
+        weights[1].zero_()
+    if case == 'input_router_fp16':
+        x = x.half()
+    w1 = torch.randint(0, 256, (experts, intermediate*2, hidden//2), dtype=torch.uint8)
+    w2 = torch.randint(0, 256, (experts, hidden, intermediate//2), dtype=torch.uint8)
+    s1 = torch.randint(121, 125, (experts, intermediate*2, hidden//32), dtype=torch.uint8)
+    s2 = torch.randint(121, 125, (experts, hidden, intermediate//32), dtype=torch.uint8)
+    if case == 'swiglustep':
+        # Exercise values above 7, so overriding the upstream fixed limit
+        # with the deliberately different gemm1_limit=.25 is observable.
+        # Exact GEMM1 result: 128 * .125 * 1 == 16 in both halves.
+        x.fill_(.125)
+        w1.fill_(0x22)
+        s1.fill_(127)
+    expert_map = None
+    if 'expert_map' in case:
+        # Global experts 0/2 are local in reversed order; expert 1 is absent.
+        expert_map = torch.tensor([1, -1, 0], dtype=torch.int32)
+        ids[1, -1] = 1
+        w1, w2, s1, s2 = (t[[2, 0]].contiguous() for t in (w1, w2, s1, s2))
+    b1, b2 = _decode_mxfp4_reference(w1, s1), _decode_mxfp4_reference(w2, s2)
+    static_s1, static_s2 = torch.tensor([.013]), torch.tensor([.017])
+    bias1 = torch.randn(w1.shape[:2]) * .15 if static and case != 'static' else None
+    bias2 = torch.randn(w2.shape[:2]) * .15 if static and case != 'static' else None
+    alpha = 1.3 if case == 'static_clamp' else 1.702
+    prepared_x = x * weights.to(x.dtype) if input_router and not static else x
+    a = ((x.float() / static_s1).to(torch.float8_e4m3fn).float() if static else
+         _quantize_mxfp4_reference(prepared_x, group_size=group_size))
+    routes = []
+    for token in range(m):
+        for rank, global_expert in enumerate(ids[token].tolist()):
+            expert = global_expert if expert_map is None else expert_map[global_expert].item()
+            if expert == -1:
+                routes.append(torch.zeros(hidden, dtype=x.dtype))
+                continue
+            g1 = _mxfp4_reference_gemm(
+                a[token:token+1], b1[expert], torch.float32 if group_size == 32 else x.dtype)
+            if static:
+                g1 = g1 * static_s1
+                if bias1 is not None:
+                    g1 += bias1[expert]
+            gate, up = g1.float().chunk(2, -1)
+            if static:
+                limit = 7. if clamp is None else clamp
+                gate, up = gate.clamp(max=limit), up.clamp(-limit, limit)
+                act = gate * torch.sigmoid(alpha * gate) * (up + 1.)
+                if input_router:
+                    act *= weights[token, rank]
+            elif activation == 'situ':
+                act = (1.5 * torch.tanh(gate / 1.5) * torch.sigmoid(gate)
+                       * (2.0 * torch.tanh(up / 2.0)))
+            elif activation == 'swiglustep':
+                act = (gate / (1 + torch.exp(-gate))).clamp(max=7.) * up.clamp(-7., 7.)
+            else:
+                if clamp is not None:
+                    gate, up = gate.clamp(max=clamp), up.clamp(-clamp, clamp)
+                act = up * gate / (1 + torch.exp(-gate))
+            # The copied vLLM packed SiLU quantizer rounds through BF16.
+            if group_size == 128:
+                act = act.bfloat16() if activation == 'silu' else act.to(x.dtype)
+            quantized_act = ((act / static_s2).to(torch.float8_e4m3fn).float() if static else
+                             _quantize_mxfp4_reference(act, group_size=group_size))
+            g2 = _mxfp4_reference_gemm(
+                quantized_act, b2[expert],
+                torch.float32 if group_size == 32 else x.dtype)[0]
+            if static:
+                g2 = g2 * static_s2
+                if bias2 is not None:
+                    g2 += bias2[expert]
+            if group_size == 32 and not no_combine and not input_router:
+                g2 *= weights[token, rank]
+            routes.append(g2.to(x.dtype))
+    route_output = torch.stack(routes).reshape(m, topk, hidden)
+    if no_combine:
+        expected = route_output
+    else:
+        combined = torch.zeros(m, hidden)
+        for k in range(topk):
+            combined += route_output[:, k].float() * (1. if input_router or group_size == 32 else weights[:, k, None])
+        expected = (combined * 1.25).to(x.dtype)
+
+    core = importlib.import_module('boltops.fused_moe.triton.fused_moe')
+
+    def make_cpu_routes(topk_ids, block_size, num_experts, expert_map=None):
+        # Same flattened-route ABI as vLLM's align helper; GPU sorting remains
+        # outside this test's scope. The actual global->local mapping matters.
+        flat = topk_ids.cpu().flatten().tolist()
+        local_map = None if expert_map is None else expert_map.cpu().tolist()
+        sorted_routes, expert_blocks = [], []
+        for e in range(num_experts):
+            selected = [i for i, expert in enumerate(flat) if expert == e]
+            padded = ((len(selected) + block_size - 1) // block_size) * block_size
+            sorted_routes += selected + [len(flat)] * (padded - len(selected))
+            local_expert = e if local_map is None else local_map[e]
+            expert_blocks += [local_expert] * (padded // block_size)
+        return (torch.tensor(sorted_routes, dtype=torch.int32),
+                torch.tensor(expert_blocks, dtype=torch.int32),
+                torch.tensor([len(sorted_routes)], dtype=torch.int32))
+
+    def cpu_align(*args):
+        return tuple(t.cuda() for t in make_cpu_routes(*args))
+
+    def cpu_ck(topk_ids, topk_weights, num_experts, model_dim, dtype,
+               block_size, expert_mask=None):
+        assert expert_mask is None
+        routes, blocks, padded = make_cpu_routes(topk_ids, block_size, num_experts)
+        encoded = torch.where(
+            routes < topk_ids.numel(),
+            (routes % topk) * (1 << 24) + routes // topk,
+            torch.full_like(routes, 0x00ffffff),
+        )
+        return encoded.cuda(), None, blocks.cuda(), padded.cuda(), None, None
+
+    monkeypatch.setattr(core, 'moe_align_block_size', cpu_align)
+    monkeypatch.setattr(core, 'moe_sorting_ck', cpu_ck)
+    input_q, input_scale = _quantize_mxfp4_reference(
+        x, return_scales=True, group_size=group_size)
+    prequantized = 'prequantized' in case
+    if static:
+        input_q = (x.float() / static_s1).to(torch.float8_e4m3fn)
+        input_scale = static_s1
+    if case == 'prequantized_g32_fp32':
+        input_scale = torch.exp2(input_scale.float() - 127)
+    device_x = (input_q if prequantized else x).cuda()
+    actual = fused_experts(
+        device_x, w1.cuda(), w2.cuda(),
+        weights.cuda(), ids.cuda(),
+        a1_scale=input_scale.cuda() if prequantized else (static_s1.cuda() if static else None),
+        a2_scale=static_s2.cuda() if static else None,
+        b1=None if bias1 is None else bias1.cuda(), b2=None if bias2 is None else bias2.cuda(),
+        gemm1_alpha=alpha if static else None,
+        output_dtype=x.dtype,
+        inplace='inplace' in case,
+        apply_router_weight_on_input=input_router,
+        activation=activation,
+        activation_situ_beta=1.5 if activation == 'situ' else None,
+        activation_situ_linear_beta=2.0 if activation == 'situ' else None,
+        expert_map=None if expert_map is None else expert_map.cuda(),
+        use_mxfp4_w4a8=True,
+        use_ue8m0=True, w1_scale=s1.cuda(), w2_scale=s2.cuda(),
+        block_shape=[1, 32], gemm1_limit=clamp, no_combine=no_combine,
+        routed_scaling_factor=1.25,
+    )
+    if 'inplace' in case:
+        assert actual.data_ptr() == device_x.data_ptr()
+    torch.testing.assert_close(actual.cpu(), expected, rtol=.03, atol=.003)
+
+
+@pytest.mark.parametrize('prequantized', [False, True])
+def test_mxfp4_input_router_rejects_unsupported_preparation(prequantized):
+    x = torch.zeros(1, 128, dtype=torch.bfloat16)
+    if prequantized:
+        x = x.to(torch.float8_e4m3fn)
+    topk = 1 if prequantized else 2
+    match = 'before FP8 quantization' if prequantized else 'require topk=1'
+    with pytest.raises(ValueError, match=match):
+        fused_experts(
+            x, torch.zeros(1, 256, 64, dtype=torch.uint8),
+            torch.zeros(1, 128, 64, dtype=torch.uint8),
+            torch.ones(1, topk), torch.zeros(1, topk, dtype=torch.int32),
+            use_mxfp4_w4a8=True, apply_router_weight_on_input=True,
+            w1_scale=torch.full((1, 256, 4), 127, dtype=torch.uint8),
+            w2_scale=torch.full((1, 128, 4), 127, dtype=torch.uint8))
+
+
+def test_public_mxfp4_rejects_incompatible_weight_block():
+    # Validation happens before GPU work and must propagate through the public
+    # wrapper, rather than silently selecting another quantization algorithm.
+    x = torch.zeros(1, 128, dtype=torch.bfloat16)
+    w1 = torch.zeros(1, 256, 64, dtype=torch.uint8)
+    w2 = torch.zeros(1, 128, 64, dtype=torch.uint8)
+    with pytest.raises(ValueError, match='weight block_shape must be'):
+        fused_experts(
+            x, w1, w2, torch.ones(1, 1), torch.zeros(1, 1, dtype=torch.int32),
+            use_mxfp4_w4a8=True, block_shape=[1, 128],
+            w1_scale=torch.full((1, 256, 4), 127, dtype=torch.uint8),
+            w2_scale=torch.full((1, 128, 4), 127, dtype=torch.uint8),
+        )
+
+
+@pytest.mark.parametrize('quant_flag', ['use_int4_w4a16', 'use_int4_w4a8'])
+@pytest.mark.parametrize('gated', [False, True])
+@pytest.mark.parametrize('hidden', [128, 64, 129])
+def test_packed_int4_hidden_dimension_is_independent_of_gating(
+        monkeypatch, quant_flag, gated, hidden):
+    core = importlib.import_module('boltops.fused_moe.triton.fused_moe')
+
+    class DimensionAccepted(Exception):
+        pass
+
+    def stop_before_allocation(*args, **kwargs):
+        raise DimensionAccepted
+
+    monkeypatch.setattr(core, 'get_optimal_moe_config_func', stop_before_allocation)
+    expected = DimensionAccepted if hidden == 128 else AssertionError
+    match = None if hidden == 128 else 'Hidden size mismatch'
+    # Stop at configuration selection: only the CPU-side public shape
+    # contract is under test, without invoking a GPU kernel or quantizer.
+    with pytest.raises(expected, match=match):
+        fused_experts(
+            torch.zeros(1, hidden, dtype=torch.bfloat16),
+            torch.zeros(1, 256 if gated else 128, 64, dtype=torch.uint8),
+            torch.zeros(1, hidden, 64, dtype=torch.uint8),
+            torch.ones(1, 1), torch.zeros(1, 1, dtype=torch.int32),
+            is_gated=gated, **{quant_flag: True})
+
+
+@pytest.mark.parametrize('case,match', [
+    ('missing_scale', 'require a1_scale and output_dtype'),
+    ('missing_dtype', 'require a1_scale and output_dtype'),
+    ('a2_scale', 'MXFP4 requires gated'),
+    ('inplace', 'inplace MXFP4 requires output_dtype'),
+])
+def test_public_mxfp4_prequantized_contract(case, match):
+    x = torch.zeros(1, 128).to(torch.float8_e4m3fn)
+    w1 = torch.zeros(1, 256, 64, dtype=torch.uint8)
+    w2 = torch.zeros(1, 128, 64, dtype=torch.uint8)
+    with pytest.raises(ValueError, match=match):
+        fused_experts(
+            x, w1, w2, torch.ones(1, 1), torch.zeros(1, 1, dtype=torch.int32),
+            use_mxfp4_w4a8=True,
+            a1_scale=None if case == 'missing_scale' else torch.ones(1, 1),
+            output_dtype=None if case == 'missing_dtype' else torch.bfloat16,
+            a2_scale=torch.ones(1, 1) if case == 'a2_scale' else None,
+            inplace=case == 'inplace',
+            w1_scale=torch.full((1, 256, 4), 127, dtype=torch.uint8),
+            w2_scale=torch.full((1, 128, 4), 127, dtype=torch.uint8),
+        )
+
+
+@pytest.mark.parametrize('prequantized', [False, True])
+def test_public_fake_output_contract(prequantized):
+
+    with FakeTensorMode():
+        dtype = torch.float8_e4m3fn if prequantized else torch.float32
+        x = torch.empty(2, 128, dtype=dtype)
+        ids = torch.empty(2, 2, dtype=torch.int32)
+        w1 = torch.empty(3, 256, 64 if prequantized else 128,
+                         dtype=torch.uint8 if prequantized else dtype)
+        w2 = torch.empty(3, 128, 64 if prequantized else 128,
+                         dtype=torch.uint8 if prequantized else dtype)
+        out = fused_experts(
+            x, w1, w2, torch.empty(2, 2), ids, no_combine=True,
+            use_mxfp4_w4a8=prequantized,
+            a1_scale=torch.empty(2, 1) if prequantized else None,
+            output_dtype=torch.bfloat16 if prequantized else None,
+            w1_scale=torch.empty(3, 256, 4, dtype=torch.uint8) if prequantized else None,
+            w2_scale=torch.empty(3, 128, 4, dtype=torch.uint8) if prequantized else None,
+        )
+        assert out.shape == (2, 2, 128)
+        assert out.dtype == (torch.bfloat16 if prequantized else torch.float32)
+
+
+def test_moe_fake_preserves_legacy_fn_key_position():
+    signature = inspect.signature(fused_moe_module.fused_moe_fake)
+    names = list(signature.parameters)
+    # fn_key was the last positional parameter before adding MX flags.
+    assert names.index("fn_key") == 33
+    x = torch.empty(2, 128)
+    ids = torch.zeros(2, 2, dtype=torch.int32)
+    bound = signature.bind_partial(x, torch.empty(3, 256, 128),
+                                   torch.empty(3, 128, 128), torch.ones(2, 2), ids)
+    bound.apply_defaults()
+    legacy_args = list(bound.args[:34])
+    legacy_args[-1] = "legacy-key"
+    assert signature.bind(*legacy_args).arguments["fn_key"] == "legacy-key"
+    result = fused_moe_module.fused_moe_fake(*legacy_args)
+    assert result.shape == x.shape and result.dtype == x.dtype
+
+
+@pytest.mark.parametrize("flag", ["use_mxfp4_w4a8", "use_mxfp8"])
+def test_public_fake_accepts_positional_mx_flags(flag):
+    parameters = [p for p in inspect.signature(fused_moe_module.fused_moe_fake).parameters.values()
+                  if p.name != "fn_key"]
+    signature = inspect.Signature(parameters)
+    with FakeTensorMode():
+        x = torch.empty(2, 128, dtype=torch.bfloat16)
+        bound = signature.bind_partial(
+            x, torch.empty(3, 256, 128), torch.empty(3, 128, 128),
+            torch.empty(2, 2), torch.empty(2, 2, dtype=torch.int32),
+            no_combine=True, gemm1_beta=.3, **{flag: True},
+        )
+        bound.apply_defaults()
+        result = torch.ops.boltops.fused_experts_impl(*bound.args)
+        assert result.shape == (2, 2, 128) and result.dtype == x.dtype
+
+
+def _quantize_w8a8_reference(x, dtype):
+    limit = 127 if dtype == torch.int8 else 448
+    scale = x.float().abs().amax(-1, keepdim=True).clamp_min(1.e-10) / limit
+    q = x.float() / scale
+    if dtype == torch.int8:
+        q = q.round()
+    return q.to(dtype).float(), scale
+
+
+@GPU_REQUIRED
+@pytest.mark.parametrize('dtype,prequantized,persistent,fold', [
+    (torch.int8, False, False, False), (torch.float8_e4m3fn, False, False, False),
+    (torch.float8_e4m3fn, True, False, False), (torch.float8_e4m3fn, False, True, False),
+    (torch.float8_e4m3fn, False, False, True),
+], ids=['int8', 'fp8', 'fp8-prequantized-chunked', 'fp8-persistent-bias', 'fp8-router-fold'])
+def test_public_w8a8_dequant_bias_then_router(monkeypatch, dtype, prequantized, persistent, fold):
+    if persistent:
+        op = importlib.import_module('boltops.fused_moe.triton.moe_op')
+        monkeypatch.setattr(op, '_USE_MOE_PERSISTENT_KERNEL', True)
+    if prequantized:
+        monkeypatch.setenv('TRITON_FUSED_MOE_CHUNK_SIZE', '2')
+    torch.manual_seed(617)
+    m, experts, width, topk = 3, 3, 128, 2
+    x = (torch.randn(m, width) * .1).bfloat16()
+    ids = torch.tensor([[2, 0], [0, 2], [2, 0]], dtype=torch.int32)
+    router = torch.tensor([[.003, .997], [.15, .85], [.9, .1]])
+    if dtype == torch.int8:
+        w1 = torch.randint(-64, 64, (experts, 2*width, width), dtype=dtype)
+        w2 = torch.randint(-64, 64, (experts, width, width), dtype=dtype)
+        scale_max = .02
+    else:
+        w1 = (torch.randn(experts, 2*width, width) * 3).to(dtype)
+        w2 = (torch.randn(experts, width, width) * 3).to(dtype)
+        scale_max = .1
+    s1 = torch.rand(experts, 2*width) * scale_max + .001
+    s2 = torch.rand(experts, width) * scale_max + .001
+    b1 = (torch.randn(experts, 2*width) * .03).bfloat16()
+    b2 = (torch.randn(experts, width) * .03).bfloat16()
+    aq, sa = _quantize_w8a8_reference(x, dtype)
+    routes = []
+    for token in range(m):
+        for rank, expert in enumerate(ids[token].tolist()):
+            acc1 = aq[token] @ w1[expert].float().T
+            g1 = (acc1 * sa[token] * s1[expert] + b1[expert].float()).bfloat16()
+            gate, up = g1.float().chunk(2)
+            act = (gate / (1 + torch.exp(-gate)) * up).bfloat16()
+            q2, sa2 = _quantize_w8a8_reference(act[None, :], dtype)
+            acc2 = q2[0] @ w2[expert].float().T
+            # vLLM: dequantize -> add bias -> multiply router -> cast.
+            if fold:
+                out = (acc2 * (sa2[0] * router[token, rank]) * s2[expert]
+                       + b2[expert].float() * router[token, rank])
+            else:
+                out = (acc2 * sa2[0] * s2[expert] + b2[expert].float()) * router[token, rank]
+            routes.append(out.bfloat16())
+    routes = torch.stack(routes).reshape(m, topk, width)
+    expected = (routes[:, 0].float() + routes[:, 1].float()).bfloat16()
+
+    core = importlib.import_module('boltops.fused_moe.triton.fused_moe')
+    if not fold:
+        # Upstream-order oracle cases isolate dequant/bias/router ordering.
+        monkeypatch.setattr(core, '_should_fold_router_weight', lambda **kwargs: False)
+
+    def config_query(*args, is_bottom=False, **kwargs):
+        def query(_m):
+            cfg = dict(BLOCK_SIZE_M=16, BLOCK_SIZE_N=16, BLOCK_SIZE_K=32,
+                       GROUP_SIZE_M=1, COMBINE_SCALE_LOAD=False,
+                       num_warps=4, num_stages=1)
+            return (cfg, 16) if is_bottom else cfg
+        return query
+
+    def cpu_sort(*args):
+        routes, blocks, sorted_weights = [], [], []
+        chunk_ids = args[0].cpu().flatten().tolist()
+        chunk_weights = args[1].cpu().flatten().tolist()
+        for expert in range(experts):
+            selected = [i for i, e in enumerate(chunk_ids) if e == expert]
+            if not selected:
+                continue
+            routes.extend([(i % topk) * (1 << 24) + i // topk for i in selected])
+            routes.extend([0x00ffffff] * (16 - len(selected)))
+            sorted_weights.extend([chunk_weights[i] for i in selected])
+            sorted_weights.extend([0.] * (16 - len(selected)))
+            blocks.append(expert)
+        return (torch.tensor(routes, dtype=torch.int32).cuda(),
+                torch.tensor(sorted_weights).cuda(),
+                torch.tensor(blocks, dtype=torch.int32).cuda(),
+                torch.tensor([len(routes)], dtype=torch.int32).cuda(), None, None)
+
+    monkeypatch.setattr(core, 'get_optimal_moe_config_func', config_query)
+    monkeypatch.setattr(core, 'moe_sorting_ck', cpu_sort)
+    actual = fused_experts(
+        (aq.to(dtype) if prequantized else x).cuda(),
+        w1.cuda(), w2.cuda(), router.cuda(), ids.cuda(),
+        a1_scale=sa.cuda() if prequantized else None, output_dtype=torch.bfloat16,
+        b1=b1.cuda(), b2=b2.cuda(), w1_scale=s1.cuda(), w2_scale=s2.cuda(),
+        use_int8_w8a8=dtype == torch.int8, use_fp8_w8a8=dtype != torch.int8,
+        per_channel_quant=True,
+    )
+    torch.testing.assert_close(actual.cpu(), expected, rtol=.03, atol=.003)
+
+
+@MXFP_REQUIRED
+@pytest.mark.parametrize('case', [
+    'dynamic', 'sparse_routing', 'dynamic_fp16', 'strided_routing', 'bf16_router',
+    'chunked_ep', 'chunked_ep_invalid', 'chunked_ep_strided_router',
+    'no_combine', 'swigluoai', 'silu_alpha', 'shared',
+])
+def test_public_mxfp8_cpu_reference(monkeypatch, case):
+    torch.manual_seed(673)
+    m, e, k, n, topk = 3, 3, 128, 128, 2
+    if case == 'sparse_routing':
+        e = 64
+    group, bo = 32, 1
+    x = (torch.randn(m, k) * .2).bfloat16()
+    if case == 'dynamic_fp16':
+        x = x.half()
+    w1 = (torch.randn(e, 2*n, k) * 2).to(torch.float8_e4m3fn)
+    w2 = (torch.randn(e, k, n) * 2).to(torch.float8_e4m3fn)
+    s1 = torch.randint(121, 125, (e, 2*n//bo, k//group), dtype=torch.uint8)
+    s2 = torch.randint(121, 125, (e, k//bo, n//group), dtype=torch.uint8)
+    b1 = w1.float() * torch.exp2(s1.float()-127).repeat_interleave(bo, 1).repeat_interleave(group, 2)
+    b2 = w2.float() * torch.exp2(s2.float()-127).repeat_interleave(bo, 1).repeat_interleave(group, 2)
+    ids = torch.tensor([[2, 0], [0, 2], [2, 0]], dtype=torch.int32)
+    weights = torch.tensor([[.2, .8], [.7, .3], [.4, .6]])
+    if case == 'bf16_router':
+        weights = weights.bfloat16().float()
+    if case == 'chunked_ep_invalid':
+        ids[0, 0], ids[1, 1], ids[2, 0] = -1, e, 1
+    expert_map = torch.tensor([0, -1, 1], dtype=torch.int32) if case.startswith('chunked_ep') else None
+    if expert_map is not None:
+        monkeypatch.setenv('TRITON_FUSED_MOE_CHUNK_SIZE', '2')
+    def native_quant(value):
+        blocked = value.float().reshape(value.shape[0], -1, 32)
+        amax = blocked.abs().amax(-1).clamp_min(torch.finfo(torch.float32).tiny)
+        exponent = (torch.ceil(torch.log2(amax / 448.)) + 127).clamp(0, 254)
+        q = (blocked * torch.exp2(127 - exponent)[..., None]).to(torch.float8_e4m3fn)
+        return (q.float() * torch.exp2(exponent - 127)[..., None]).reshape(value.shape)
+    av = native_quant(x)
+    expected = torch.zeros(m, topk, k, dtype=torch.float32)
+    for token in range(m):
+        for rank, ge in enumerate(ids[token].tolist()):
+            if ge < 0 or ge >= e:
+                continue
+            expert = ge if expert_map is None else expert_map[ge].item()
+            if expert < 0:
+                continue
+            g1 = av[token:token+1] @ b1[expert].T
+            g1 = g1.to(x.dtype).float()
+            gate, up = g1.chunk(2, -1)
+            if case == 'swigluoai':
+                gate, up = gate.clamp(max=.15), up.clamp(-.15, .15)
+                act = gate * torch.sigmoid(1.2 * gate) * (up + .3)
+            else:
+                act = gate * torch.sigmoid((1.2 if case == 'silu_alpha' else 1.) * gate) * up
+            a2 = native_quant(act)
+            g2 = (a2 @ b2[expert].T)[0]
+            if case != 'no_combine':
+                g2 *= weights[token, rank]
+            expected[token, rank] = g2
+    expected = (expected if case == 'no_combine' else expected.sum(1)).to(x.dtype)
+
+    core = importlib.import_module('boltops.fused_moe.triton.fused_moe')
+    def align(topk_ids, block_size, num_experts, local_map=None):
+        flat = topk_ids.cpu().flatten().tolist()
+        mapping = None if local_map is None else local_map.cpu().tolist()
+        routes, blocks = [], []
+        for expert in range(num_experts):
+            selected = [i for i, value in enumerate(flat) if value == expert]
+            padded = triton.cdiv(len(selected), block_size) * block_size
+            routes += selected + [len(flat)] * (padded - len(selected))
+            blocks += [expert if mapping is None else mapping[expert]] * (padded // block_size)
+        return tuple(t.cuda() for t in (torch.tensor(routes, dtype=torch.int32),
+                     torch.tensor(blocks, dtype=torch.int32), torch.tensor([len(routes)], dtype=torch.int32)))
+    def ck(topk_ids, topk_weights, num_experts, model_dim, dtype, block_size, expert_mask=None):
+        assert topk_ids.is_contiguous()
+        assert topk_weights.is_contiguous() and topk_weights.dtype == torch.float32
+        routes, blocks, padded = align(topk_ids, block_size, num_experts)
+        cpu = routes.cpu()
+        safe = cpu.clamp_max(topk_ids.numel()-1)
+        sw = topk_weights.cpu().flatten()[safe]
+        encoded = torch.where(cpu < topk_ids.numel(), (cpu % topk) * (1 << 24) + cpu // topk,
+                              torch.full_like(cpu, 0x00ffffff))
+        return encoded.cuda(), sw.cuda(), blocks, padded, None, None
+    if case != 'chunked_ep_invalid':
+        monkeypatch.setattr(core, 'moe_align_block_size', align)
+    monkeypatch.setattr(core, 'moe_sorting_ck', ck)
+    device_weights = (torch.stack((weights, weights), -1).cuda()[..., 0]
+                      if case in ('chunked_ep_strided_router', 'strided_routing') else weights.cuda())
+    if case == 'bf16_router':
+        device_weights = device_weights.bfloat16()
+    device_ids = (torch.stack((ids, ids), -1).cuda()[..., 0]
+                  if case == 'strided_routing' else ids.cuda())
+    actual = fused_experts(
+        x.cuda(), w1.cuda(), w2.cuda(), device_weights, device_ids,
+        activation='swigluoai' if case == 'swigluoai' else 'silu',
+        gemm1_alpha=1.2 if case in ('swigluoai', 'silu_alpha') else None,
+        gemm1_beta=.3 if case == 'swigluoai' else None,
+        gemm1_limit=.15 if case == 'swigluoai' else None,
+        use_mxfp8=True, w1_scale=s1.cuda(), w2_scale=s2.cuda(), block_shape=[bo, group],
+        output_dtype=x.dtype,
+        expert_map=expert_map.cuda() if expert_map is not None else None,
+        global_num_experts=e-1 if case == 'shared' else e, no_combine=case == 'no_combine',
+    )
+    torch.testing.assert_close(actual.cpu(), expected, rtol=.025, atol=.003)
+
+
+@pytest.mark.parametrize('case', ['block128', 'fp32_scale', 'packed_scale'])
+def test_public_mxfp8_rejects_non_native_recipe(case):
+    x = torch.zeros(1, 128, dtype=torch.bfloat16)
+    w1 = torch.zeros(1, 256, 128, dtype=torch.float8_e4m3fn)
+    w2 = torch.zeros(1, 128, 128, dtype=torch.float8_e4m3fn)
+    scale_dtype = {'block128': torch.uint8, 'fp32_scale': torch.float32,
+                   'packed_scale': torch.int32}[case]
+    with pytest.raises(ValueError, match='native MXFP8 requires'):
+        fused_experts(
+            x, w1, w2, torch.ones(1, 1), torch.zeros(1, 1, dtype=torch.int32),
+            use_mxfp8=True, block_shape=[128, 128] if case == 'block128' else [1, 32],
+            w1_scale=torch.ones(1, 256, 4, dtype=scale_dtype),
+            w2_scale=torch.ones(1, 128, 4, dtype=scale_dtype))
+
+
+@pytest.mark.parametrize('case', ['bias', 'input_router', 'prequantized', 'output_dtype'])
+def test_public_mxfp8_rejects_unsupported_native_options(case):
+    x = torch.zeros(1, 128, dtype=torch.bfloat16)
+    if case == 'prequantized':
+        x = x.to(torch.float8_e4m3fn)
+    w1 = torch.zeros(1, 256, 128, dtype=torch.float8_e4m3fn)
+    w2 = torch.zeros(1, 128, 128, dtype=torch.float8_e4m3fn)
+    with pytest.raises(ValueError, match='native MXFP8'):
+        fused_experts(
+            x, w1, w2, torch.ones(1, 1), torch.zeros(1, 1, dtype=torch.int32),
+            use_mxfp8=True, b1=torch.zeros(1, 256) if case == 'bias' else None,
+            apply_router_weight_on_input=case == 'input_router',
+            output_dtype=torch.float32 if case == 'output_dtype' else None,
+            w1_scale=torch.ones(1, 256, 4, dtype=torch.uint8),
+            w2_scale=torch.ones(1, 128, 4, dtype=torch.uint8))
+
+
+def test_public_mxfp4_rejects_unverified_dynamic_g32():
+    with pytest.raises(ValueError, match='dynamic MXFP4 fused_experts requires G128'):
+        fused_experts(
+            torch.zeros(1, 128, dtype=torch.float8_e4m3fn),
+            torch.zeros(1, 256, 64, dtype=torch.uint8),
+            torch.zeros(1, 128, 64, dtype=torch.uint8),
+            torch.ones(1, 1), torch.zeros(1, 1, dtype=torch.int32),
+            use_mxfp4_w4a8=True, output_dtype=torch.bfloat16,
+            a1_scale=torch.full((1, 4), 127, dtype=torch.uint8),
+            w1_scale=torch.full((1, 256, 4), 127, dtype=torch.uint8),
+            w2_scale=torch.full((1, 128, 4), 127, dtype=torch.uint8))

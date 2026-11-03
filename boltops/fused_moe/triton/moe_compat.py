@@ -8,6 +8,29 @@ from typing import Optional
 
 import torch
 
+from .quant import (
+    dynamic_per_group_quant_fp8_power2,
+    dynamic_per_token_quant_fp8_i8,
+)
+
+
+# The helper below retains its upstream Apache-2.0 license; the local
+# compatibility helpers in this module retain their original MIT license.
+# Copyright contributors to the vLLM project.
+# SPDX-License-Identifier: Apache-2.0
+# vLLM (Apache-2.0), 77f58e530450416d217e4816727a35910bf3d9bf:
+# fp8_utils._upcast_e8m0_to_fp32. Explicit checkpoint preparation only.
+def _upcast_e8m0_to_fp32(scale: torch.Tensor) -> torch.Tensor:
+    """Upcast E8M0 (exponent-only) scale to float32.
+
+    E8M0 stores only the 8-bit biased exponent (bias=127). To convert
+    to float32 we place those 8 bits into the exponent field of an
+    IEEE-754 float32 (bits 23-30) with sign=0 and mantissa=0.
+    """
+    exp_bits = scale.view(torch.uint8).to(torch.int32)
+    fp32_bits = exp_bits << 23
+    return fp32_bits.view(torch.float32)
+
 
 def pertoken_quant(
     x: torch.Tensor,
@@ -35,18 +58,22 @@ def per_token_quant_triton(
     quant_dtype: torch.dtype = torch.int8,
     num_rows: Optional[torch.Tensor] = None,
     num_rows_factor: int = 1,
+    scale_ue8m0: bool = False,
 ):
     if scale is not None:
         raise ValueError("unsupported: static per token quant")
     if num_rows is not None or num_rows_factor != 1:
         raise ValueError("num_rows quantization is not used by fused_moe")
 
-    from boltops.fused_moe.triton.quant import dynamic_per_token_quant_fp8_i8
-
     shape = x.shape
     output = torch.empty(shape, dtype=quant_dtype, device=x.device)
     scale = torch.empty((*shape[:-1], 1), dtype=torch.float32, device=x.device)
-    dynamic_per_token_quant_fp8_i8(
+    quantizer = (
+        dynamic_per_group_quant_fp8_power2
+        if scale_ue8m0
+        else dynamic_per_token_quant_fp8_i8
+    )
+    quantizer(
         output.view(-1, shape[-1]), x.view(-1, shape[-1]), scale.view(-1)
     )
     return output, scale
@@ -57,7 +84,9 @@ def per_token_quant_triton(
 per_token_quant_hip = per_token_quant_triton
 
 
-def per_block_quant_wrapper(block_shape=(1, 128)):
+def per_block_quant_wrapper(
+    block_shape=(1, 128), *, scale_ue8m0=False
+):
     def decorator(per_token_quant_func):
         def wrapper(x, scale=None, quant_dtype=torch.int8):
             block_m, block_n = block_shape
@@ -66,8 +95,9 @@ def per_block_quant_wrapper(block_shape=(1, 128)):
             )
             assert block_m == 1, "only support 1xN block, TODO: support MxN"
             m, n = x.shape
+            extra = {"scale_ue8m0": True} if scale_ue8m0 else {}
             values, scales = per_token_quant_func(
-                x.view(-1, block_n), scale=scale, quant_dtype=quant_dtype
+                x.view(-1, block_n), scale=scale, quant_dtype=quant_dtype, **extra
             )
             return values.view(m, n), scales.view(m, n // block_n)
 

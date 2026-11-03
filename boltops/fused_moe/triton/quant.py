@@ -9,6 +9,7 @@ import triton
 import triton.language as tl
 import torch
 from triton.language.extra import libdevice
+from triton.language.target_info import current_target
 
 
 _PER_TOKEN_QUANT_4ROW_PROGRAMS_PER_CU = 16
@@ -368,6 +369,26 @@ def dynamic_per_token_quant_fp8_i8(
 
 
 @triton.jit
+def _mxfp4_pack_cvt(qx, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_M: tl.constexpr):
+    # Native RNE rounds these midpoint magnitudes down. Advance one FP32 ULP
+    # to preserve the software quantizer's ties-away rounding.
+    magnitude = tl.abs(qx)
+    round_up = ((magnitude == 0.25) | (magnitude == 1.25)
+                | (magnitude == 2.5) | (magnitude == 5.0))
+    qx = (qx.to(tl.uint32, bitcast=True) + round_up.to(tl.uint32)).to(tl.float32, bitcast=True)
+    lo, hi = tl.split(qx.reshape(BLOCK_SIZE_M, BLOCK_SIZE_N // 2, 2))
+    return tl.inline_asm_elementwise(
+        "v_cvt_scale_pk_fp4_f32 $0, $1, $2, $3 op_sel:[0,0,0,1]",
+        "=v,v,v,v",
+        # E8M0 127 is scale=1; op_sel selects compact FP4 in the low byte.
+        args=[lo, hi, 127],
+        dtype=tl.int32,
+        is_pure=True,
+        pack=1,
+    ).to(tl.uint8)
+
+
+@triton.jit
 def _mxfp4_quant_op(
     x,
     BLOCK_SIZE_N,
@@ -396,6 +417,10 @@ def _mxfp4_quant_op(
 
     # Compute quantized x
     qx = x * quant_scale
+
+    if current_target().arch == "gfx946":
+        x_fp4 = _mxfp4_pack_cvt(qx, BLOCK_SIZE_N, BLOCK_SIZE_M)
+        return x_fp4, bs_e8m0.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS)
 
     # Convert quantized fp32 tensor to uint32 before converting to mxfp4 format
     # Note: MXFP4  S:1-bit, E:2-bit, M:1-bit
@@ -606,3 +631,31 @@ def dynamic_mxfp4_quant(
     )
 
     return (x_fp4, blockscale_e8m0)
+
+
+@triton.jit
+def _per_group_fp8_power2_quant_kernel(Q, S, X, COLS: tl.constexpr,
+                                      BLOCK: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64)
+    col = tl.arange(0, BLOCK)
+    x = tl.load(X + row * COLS + col, col < COLS, other=0).to(tl.float32)
+    amax = tl.maximum(tl.max(tl.abs(x)), 1.e-10)
+    # Match vLLM's per-token-group FP8 quantizer operation order.
+    scale_raw = amax * (1.0 / 448.0)
+    scale = tl.math.exp2(tl.ceil(tl.log2(scale_raw)))
+    q = tl.clamp(x / scale, -448.0, 448.0).to(Q.dtype.element_ty)
+    tl.store(Q + row * COLS + col, q, col < COLS)
+    # Keep decoded power-of-two scales for the portable block GEMM.
+    tl.store(S + row, scale)
+
+
+def dynamic_per_group_quant_fp8_power2(qx, x, scales):
+    """FP8E4M3 per-row quantization with UE8M0-compatible FP32 scales."""
+    if x.ndim != 2 or not x.is_contiguous() or not qx.is_contiguous():
+        raise ValueError('power-of-two FP8 quantization requires contiguous matrices')
+    if qx.dtype != torch.float8_e4m3fn or scales.dtype != torch.float32:
+        raise ValueError('power-of-two FP8 quantization requires E4M3 and FP32 scale buffers')
+    if x.numel():
+        _per_group_fp8_power2_quant_kernel[(x.shape[0],)](
+            qx, scales, x, x.shape[1], triton.next_power_of_2(x.shape[1]), num_warps=4)
+    return qx, scales

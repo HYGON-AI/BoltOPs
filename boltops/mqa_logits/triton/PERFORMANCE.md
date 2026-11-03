@@ -8,18 +8,40 @@ not dominate short shapes.
 
 | Backend | When | Notes |
 | --- | --- | --- |
-| **row** | Tiny KV (`N≤128`) under auto dispatch | Tuned `block_kv` / warps / stages from shipped JSON |
-| **bn** | No Gluon, mid/large | 2D tile `BN∈{64,128}`, optional `head_split_k`; Q prefetch + `W_GROUP` |
-| **gluon** | Gluon available, mid/large (float8) | KV LDS + Q double-buf + W_GROUP ping-pong; BN-style epilogue; launch knobs from coarse Q/KV/H ``by_region`` |
+| **head_serial** | **gfx946** float8 auto (`backend="wasp"` aliases here) | N-loop head-serial: H=8 prologue MLS; short-KV large-M H=8→`force_grouped` BM32/qg8; mid/large H→`chunk8_mls`; else `Q_GROUP` |
+| **wasp** | gfx946 **half** auto / `backend="wasp"` | Half BN-WASP: one CTA owns all heads; default `Q_GROUP=1` + MLS Q; window on store |
+| **row** | Tiny KV (`N≤128`) under auto (non-946) | Tuned `block_kv` / warps / stages from shipped JSON |
+| **bn** | No Gluon, mid/large (non-946) | 2D tile `BN∈{64,128}`, optional `head_split_k`; Q prefetch + `W_GROUP` |
+| **gluon** | Gluon available, mid/large (float8, non-946) | KV LDS + Q double-buf + W_GROUP ping-pong; BN-style epilogue; launch knobs from coarse Q/KV/H ``by_region`` |
 
-Public auto (**float8**): Gluon → `row|gluon`; else → `row|bn`
+Public auto (**gfx946**): float8 → **head_serial** only (FP8 BN-WASP removed;
+``backend="wasp"`` aliases head-serial); half still **BN-WASP** (`path=wasp`).
+
+Public auto (**other arches, float8**): Gluon → `row|gluon`; else → `row|bn`
 (`get_fp8_mqa_shape_dispatch` in `mqa_config_utils.py`).
 
-Public auto (**half** fp16/bf16): dedicated ``row|bn`` via
+Public auto (**other arches, half**): dedicated ``row|bn`` via
 `get_half_mqa_shape_dispatch` — short-KV shapes where shipped compare shows
 row beating BN go to ``mqa_logits_half_row``; else tuned ``mqa_logits_half``
 BN (exact ``by_shape``, then optional ``by_region`` / ``by_seq_kv``). Half Gluon
 (`backend="gluon_bn_align"`, BN-style epilogue default) is **opt-in**, not auto.
+
+## gfx946 (gem5)
+
+``fangzx_boltops`` / ``GPU_CHIP=sb``. Speedup from host wall-clock after
+synchronize; TFLOPS from sim/kernel event time on the same probes. Logical
+FLOPs ≈ ``2·M·H·D·N`` (full window, D=128). Probe shapes only.
+
+| Path | vs prior default |
+| --- | --- |
+| FP8 **head_serial** vs old BN-WASP / ``bn`` | short-KV H8 large-M often ~1.7–3× vs BN-WASP; mid/large beats prior ``bn``/``row`` |
+| Half BN-WASP vs short-KV ``wasp_row`` (H8 / H32 / H64) | ~4–6× / ~2.7–3× / ~1.8–2× |
+| Half BN-WASP (**qg1+MLS**) vs ORIG BN (938-style) | gem5 14-proxy: **geo ~2.4×** (min ~0.9× on tiny `16×66 H8`; long-N / H4–64 often **~2–5×**) |
+
+| Shape | event ms | ~TFLOPS |
+| --- | ---: | ---: |
+| Half BN-WASP one-M-tile ``64×8192`` H4 | 0.022 | ~24 |
+| Half BN-WASP one-M-tile ``16×8192`` H64 | 0.114 | ~19 |
 
 ## vs hipc (prefill size grid)
 
@@ -51,11 +73,15 @@ hipc; auto dispatch keeps those on **row**.
 ## Reproduce
 
 ```bash
-# Prefill FP8 correctness (row / bn / gluon + auto grid)
+# Prefill FP8: non-gfx946 → row/bn/gluon suite; gfx946 → prod head-serial
 pytest -q test/mqa_logits/test_triton_fp8_mqa_logits.py
 
-# Prefill half correctness (official 66-shape grid subset)
+# Prefill half: non-gfx946 → 66-grid; gfx946 → BN-WASP gfx946_prod
 pytest -q test/mqa_logits/test_triton_mqa_logits_half.py
+
+# gfx946 prod-size benches (FP8 head-serial / half BN-WASP; skipped off 946)
+pytest -q --bench -k gfx946_prod test/mqa_logits/test_triton_fp8_mqa_logits.py
+pytest -q --bench -k gfx946_prod test/mqa_logits/test_triton_mqa_logits_half.py
 
 # --bench alone is BoltOPs-only. Hipc comparison needs -k vs_hipc
 # (optest per does not pass it, so CI does not time hipc).

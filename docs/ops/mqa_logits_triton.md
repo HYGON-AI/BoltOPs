@@ -12,21 +12,26 @@
 ```python
 from boltops.mqa_logits import triton_mqa_logits
 
-# Prefill float8：必须传 kv_scales；auto 为 row|gluon / row|bn
+# Prefill float8：必须传 kv_scales
+#   gfx946 auto → head_serial；其它 arch → row|gluon / row|bn
 logits = triton_mqa_logits(Q_fp8, KV_fp8, kv_scales, weights, cu_starts, cu_ends)
-# Prefill half：kv_scales 必须为 None；auto 为 row|bn
+# Prefill half：kv_scales 必须为 None
+#   gfx946 auto → BN-WASP；其它 arch → row|bn
 logits = triton_mqa_logits(Q_bf16, KV_bf16, None, weights, cu_starts, cu_ends)
-# 强制路径
+# 强制路径（float8 ``wasp`` 等价 head_serial；half ``wasp`` → BN-WASP）
 logits = triton_mqa_logits(..., backend="bn", D_out=prealloc)
 ```
 
-测试：
+测试（**gfx946 / 非 946 互斥**：同文件内 runtime skip，只跑当前 arch 对应套件）：
 
 ```bash
 pytest -q test/mqa_logits/
-# --bench 只跑 BoltOPs。hipc 对比要加 -k vs_hipc（默认 CI 不跑）
+# --bench 只跑 BoltOPs。hipc 对比要加 -k vs_hipc（默认 CI / optest per 不跑）
 pytest -q test/mqa_logits/test_triton_fp8_mqa_logits.py --bench -s -k size_grid
 pytest -q test/mqa_logits/test_triton_mqa_logits_half.py --bench -s -k test_bench_triton_mqa_logits_half
+# gfx946 生产 shape（FP8 head-serial / half BN-WASP；非 946 自动 skip）
+pytest -q test/mqa_logits/test_triton_fp8_mqa_logits.py --bench -s -k gfx946_prod
+pytest -q test/mqa_logits/test_triton_mqa_logits_half.py --bench -s -k gfx946_prod
 pytest -q test/mqa_logits/test_triton_fp8_paged_mqa_logits.py --bench -s -k test_bench_triton_fp8_paged_mqa_logits_gpu
 pytest -q test/mqa_logits/test_triton_fp8_mqa_logits.py --bench -s -k vs_hipc_size
 pytest -q test/mqa_logits/test_triton_fp8_mqa_logits.py --bench -s -k vs_hipc_prod
@@ -41,7 +46,7 @@ TileLang：`docs/ops/mqa_logits_tilelang.md`。
 溯源：`boltops/mqa_logits/triton/SOURCE.md`。  
 性能笔记：`boltops/mqa_logits/triton/PERFORMANCE.md`。  
 Launch 配置：`configs/triton_<capability>/fp8_mqa_logits*,arch=<gfx>.json` 与 half 对应 JSON；
-已入库 gfx938（`triton_3_6` + `triton_3_2`）。
+已入库 gfx938（`triton_3_6` + `triton_3_2`）。gfx946 路径为代码内 launch 启发式（无单独 JSON）。
 
 ---
 
@@ -59,9 +64,10 @@ Prefill / dense KV：对每个 query 行，在 `[cu_starts, cu_ends)` 内计算
 
 | `backend` | 含义 |
 | --- | --- |
-| `None` / `"auto"` | float8：有 Gluon → `row` \| `gluon`，否则 `row` \| `bn`；半精度：`row` \| `bn` |
-| `"row"` / `"bn"` | 强制对应路径 |
-| `"gluon"` | 强制 Gluon tiled（仅 float8） |
+| `None` / `"auto"` | **gfx946**：float8 → `head_serial`；half → BN-WASP（`path=wasp`）。**其它 arch**：float8 有 Gluon → `row` \| `gluon`，否则 `row` \| `bn`；half → `row` \| `bn` |
+| `"row"` / `"bn"` | 强制对应路径（非 946 主力；946 上仍可显式调用） |
+| `"wasp"` / `"head_serial"` | float8：`wasp` 别名 `head_serial`（需 gfx946）；half：`"wasp"` → BN-WASP（需 gfx946） |
+| `"gluon"` | 强制 Gluon tiled（仅 float8；非 946 auto） |
 | `"gluon_bn_align"` / `"gluon_opt"` | **experimental**；不进 auto |
 
 ### 参数

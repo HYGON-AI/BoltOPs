@@ -1,16 +1,18 @@
 # Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # SPDX-License-Identifier: MIT
-import json
+import functools
 import importlib
+import json
 import re
 from pathlib import Path
 
 import pytest
-from triton.runtime.errors import HSACOError
+import torch
+import triton
 
-from boltops.fused_moe.triton import moe_config_utils
-from boltops.tools.fused_moe_triton_tune import moe_log_parser
+from boltops.fused_moe.triton import moe_config_utils, mxfp4
 from boltops.tools.fused_moe_triton_tune import autotune_patches
+from boltops.tools.fused_moe_triton_tune import moe_log_parser
 from boltops.tools.fused_moe_triton_tune import tune_moe_cli
 from boltops.utility.triton_capability import TritonCapabilities
 
@@ -606,20 +608,6 @@ def test_bottom_a_sorted_layout_is_an_outer_fused_moe_choice(
     }
 
 
-def test_autotune_buffer_reserves_sorted_bridge_padding_without_mls(monkeypatch):
-    monkeypatch.setattr(autotune_patches, "capMLS", False)
-
-    total = autotune_patches._max_autotune_total_tokens(
-        13104,
-        1,
-        392,
-        allow_sorted_bridge=True,
-    )
-
-    assert total == 13104 + 393 * 255
-    assert total > 13104
-
-
 def test_gemm2_inner_search_keeps_outer_bottom_a_mls_choice(monkeypatch):
     class _NoCompilerOptions:
         @staticmethod
@@ -768,13 +756,13 @@ def test_checked_in_moe_configs_have_explicit_shape_selectors():
         # both. Do not require an unvalidated fuzzy range for an exact config.
 
 
-def test_autotune_skips_unloadable_hip_candidate():
+def test_autotune_does_not_rank_a_partial_search_after_hip_load_error():
     def broken_bench(_kernel_call, _quantiles):
         raise RuntimeError("Triton Error [HIP]: Code: 500, named symbol not found")
 
-    robust_bench = autotune_patches._skip_invalid_hip_loads(broken_bench)
+    robust_bench = autotune_patches._check_hip_loads(broken_bench)
 
-    with pytest.raises(HSACOError, match="named symbol not found"):
+    with pytest.raises(RuntimeError, match="fresh process.*partial ranking.*named symbol not found"):
         robust_bench(lambda: None, (0.5, 0.2, 0.8))
 
 
@@ -782,7 +770,7 @@ def test_autotune_does_not_hide_other_runtime_errors():
     def broken_bench(_kernel_call, _quantiles):
         raise RuntimeError("device-side assert triggered")
 
-    robust_bench = autotune_patches._skip_invalid_hip_loads(broken_bench)
+    robust_bench = autotune_patches._check_hip_loads(broken_bench)
 
     with pytest.raises(RuntimeError, match="device-side assert"):
         robust_bench(lambda: None, (0.5, 0.2, 0.8))
@@ -894,3 +882,285 @@ def test_sorted_bridge_does_not_force_mls(monkeypatch):
     assert fused_moe_impl._bottom_a_uses_sorted_layout(config, False)
     assert not fused_moe_impl._bottom_a_uses_mls(config, False)
     assert not fused_moe_impl._bottom_a_uses_sorted_layout(config, True)
+
+
+def _tuning_baseline_config(*args, is_bottom=False, **kwargs):
+    def select(tokens):
+        config = dict(BLOCK_SIZE_M=16, BLOCK_SIZE_N=64, BLOCK_SIZE_K=32,
+                      GROUP_SIZE_M=1, COMBINE_SCALE_LOAD=False,
+                      num_warps=4, num_stages=1)
+        return (config, 16) if is_bottom else config
+    return select
+
+
+@pytest.mark.parametrize('kind', ['bf16', 'fp8', 'int8', 'int4', 'w4a8', 'mxfp4'])
+def test_tuning_reuses_production_and_forwards_parameters(monkeypatch, kind):
+    original = autotune_patches._production_experts
+    calls = []
+    flags = dict(
+        bf16={}, fp8=dict(use_fp8_w8a8=True, use_ue8m0=True),
+        int8=dict(use_int8_w8a8=True), int4=dict(use_int4_w4a16=True),
+        w4a8=dict(use_int4_w4a8=True),
+        mxfp4=dict(use_mxfp4_w4a8=True, use_ue8m0=True))[kind]
+    a = torch.ones(3, 128)
+    scale = torch.ones(1)
+    monkeypatch.setattr(autotune_patches, 'mode_autotune', True)
+    monkeypatch.setattr(autotune_patches, 'compile_only', 0)
+    monkeypatch.setattr(autotune_patches, 'k100_ai_config_lists', [dict(BLOCK_SIZE_M=16)])
+    monkeypatch.setattr(fused_moe_impl, 'get_optimal_moe_config_func', _tuning_baseline_config)
+
+    @functools.wraps(original)
+    def production(*args, **kwargs):
+        assert torch.equal(kwargs['hidden_states'], a)
+        for key, value in flags.items():
+            assert kwargs[key] == value
+        assert kwargs['w1_scale'] is scale
+        # Resolve both phases with the real selector call contract.
+        if kind == 'mxfp4':
+            top = mxfp4.get_mxfp4_moe_config(3)
+            bottom, max_bm = mxfp4.get_mxfp4_moe_config(3, is_bottom=True)
+        else:
+            top = fused_moe_impl.get_optimal_moe_config_func(None, None, None)(3)
+            bottom, max_bm = fused_moe_impl.get_optimal_moe_config_func(None, None, None, is_bottom=True)(3)
+        assert top['_autotune_is_bottom'] is False
+        assert bottom['_autotune_is_bottom'] is True
+        assert top['BLOCK_SIZE_M'] == bottom['BLOCK_SIZE_M'] == max_bm
+        kwargs['hidden_states'].add_(1)  # simulate an inplace production output
+        calls.append(True)
+        return kwargs['hidden_states']
+
+    monkeypatch.setattr(autotune_patches, '_production_experts', production)
+    result = autotune_patches.fused_experts_impl(a.clone(), torch.empty(1), torch.empty(1),
+                                    torch.ones(3, 1), torch.zeros(3, 1).int(),
+                                    inplace=True, w1_scale=scale, **flags)
+    assert calls == [True]
+    assert torch.equal(result, a + 1)
+
+
+def test_outer_candidates_receive_same_inplace_input(monkeypatch):
+    original = autotune_patches._production_experts
+    values = []
+    @functools.wraps(original)
+    def production(*args, **kwargs):
+        values.append(kwargs['hidden_states'].clone())
+        kwargs['hidden_states'].mul_(2)
+        return kwargs['hidden_states']
+    monkeypatch.setattr(autotune_patches, '_production_experts', production)
+    monkeypatch.setattr(autotune_patches, 'mode_autotune', True)
+    monkeypatch.setattr(autotune_patches, 'compile_only', 0)
+    monkeypatch.setattr(autotune_patches, 'k100_ai_config_lists', [dict(BLOCK_SIZE_M=16), dict(BLOCK_SIZE_M=32)])
+    a = torch.ones(33, 8)
+    autotune_patches.fused_experts_impl(a, torch.empty(1), torch.empty(1),
+                           torch.ones(33, 1), torch.zeros(33, 1).int(), inplace=True)
+    assert len(values) == 2
+    assert all(torch.equal(x, torch.ones_like(x)) for x in values)
+    assert torch.equal(a, torch.full_like(a, 2))
+
+
+def test_patch_covers_module_alias_and_restores_after_error(monkeypatch):
+    package = importlib.import_module('boltops.fused_moe.triton')
+    before = (fused_moe_impl.fused_experts_impl, package.fused_experts_impl,
+              fused_moe_impl.invoke_fused_moe_kernel, autotune_patches.moe_op.fused_moe,
+              autotune_patches.moe_op.fused_moe_kernel, mxfp4._moe_gemm_mxfp4_kernel)
+    monkeypatch.setattr(autotune_patches, 'mode_autotune', True)
+    with pytest.raises(RuntimeError, match='test failure'):
+        with autotune_patches.patched_environment():
+            assert fused_moe_impl.fused_experts_impl is package.fused_experts_impl is autotune_patches.fused_experts_impl
+            assert fused_moe_impl.invoke_fused_moe_kernel is autotune_patches.moe_op.fused_moe is autotune_patches.fused_moe
+            raise RuntimeError('test failure')
+    after = (fused_moe_impl.fused_experts_impl, package.fused_experts_impl,
+             fused_moe_impl.invoke_fused_moe_kernel, autotune_patches.moe_op.fused_moe,
+             autotune_patches.moe_op.fused_moe_kernel, mxfp4._moe_gemm_mxfp4_kernel)
+    assert before == after
+
+
+def test_folded_gemm2_phase_does_not_depend_on_router_flag(monkeypatch):
+    monkeypatch.setattr(autotune_patches, 'mode_autotune_min_block_size_n1', 16)
+    monkeypatch.setattr(autotune_patches, 'mode_autotune_max_block_size_n1', 32)
+    monkeypatch.setattr(autotune_patches, 'mode_autotune_min_block_size_n2', 64)
+    monkeypatch.setattr(autotune_patches, 'mode_autotune_max_block_size_n2', 128)
+    configs = autotune_patches.generate_config2_lists(
+        N=256, K=256, MUL_ROUTED_WEIGHT=False,
+        runtime_args={'_autotune_is_bottom': True}, supports_n_tiles=False)
+    assert configs and all(c.kwargs['BLOCK_SIZE_N'] in (64, 128) for c in configs)
+
+
+def test_native_tuning_log_roundtrip(monkeypatch, tmp_path):
+    monkeypatch.setattr(moe_config_utils, 'get_compatible_triton_config_dirs', lambda *args: [tmp_path])
+    monkeypatch.setattr(moe_config_utils.arch_info, 'get_arch', lambda: 'gfx946')
+    names = tune_moe_cli.expected_json_names(device_name='sb', test_type='mxfp4',
+                                            local_e=3, local_n=128, K=256, top_k=2)
+    assert all(',gemm_type=dot_scaled' in name for name in names)
+    log = "Test: m=3, n=128\nConfig 1: {'BLOCK_SIZE_M': 16}\n"
+    for bn in (128, 64):
+        log += ('fused_moe_kernel:\n* 0: BLOCK_SIZE_N: ' + str(bn) +
+                ', BLOCK_SIZE_K: 128, GROUP_SIZE_M: 1, COMBINE_SCALE_LOAD: False, '
+                'num_warps: 4, num_stages: 1\n  : times(best): 0.01 ms\n')
+    results = moe_log_parser.parse_log_file(log)
+    assert len(results) == 1
+    moe_log_parser.save_results_to_json(results, tmp_path / names[0], tmp_path / names[1])
+    moe_config_utils.get_moe_configs.cache_clear()
+    try:
+        top = mxfp4.get_mxfp4_moe_config(3, E=3, N=128, K=256, top_k=2)
+        bottom, max_bm = mxfp4.get_mxfp4_moe_config(3, E=3, N=128, K=256, top_k=2, is_bottom=True)
+        assert top['BLOCK_SIZE_N'] == 128 and bottom['BLOCK_SIZE_N'] == 64
+        assert top['BLOCK_SIZE_M'] == max_bm == 16
+    finally:
+        moe_config_utils.get_moe_configs.cache_clear()
+
+
+@pytest.mark.parametrize('compile_only', [0, 1])
+@pytest.mark.parametrize('case', ['group', 'combine', 'mls', 'single-invalid'])
+def test_candidates_obey_runtime_contract_before_autotuner(monkeypatch, compile_only, case):
+    # Runtime Autotuner skips early pruning for a single config.
+    monkeypatch.setattr(autotune_patches, 'compile_only', compile_only)
+    monkeypatch.setattr(autotune_patches, 'test_type', 'fp8')
+    runtime = dict(N=128, K=256, BLOCK_SIZE_M=16, group_k=64,
+                   stride_ask=1, use_fp8_w8a8=True, MUL_ROUTED_WEIGHT=False)
+    variants = dict(
+        group=[dict(BLOCK_SIZE_K=bk) for bk in (32, 64, 128)],
+        combine=[dict(BLOCK_SIZE_K=bk, COMBINE_SCALE_LOAD=True) for bk in (32, 64)],
+        mls=[dict(BLOCK_SIZE_K=64, BLOCK_SIZE_N=bn, USE_MLS_LOAD=True)
+             for bn in (128, 256)],
+        **{'single-invalid': [dict(BLOCK_SIZE_K=128)]})
+    candidates = [triton.Config(dict({'BLOCK_SIZE_N': 128}, **v))
+                  for v in variants[case]]
+    monkeypatch.setattr(autotune_patches, 'generate_config2_lists', lambda **kw: candidates)
+    class Kernel:
+        __name__ = 'fused_moe_kernel'
+        arg_names = list(runtime) + ['BLOCK_SIZE_N', 'BLOCK_SIZE_K',
+                                    'COMBINE_SCALE_LOAD', 'USE_MLS_LOAD']
+    class Captured(Exception):
+        pass
+    def autotune(*, configs, **kw):
+        expected = {'group': [32, 64], 'combine': [64], 'mls': [64]}
+        assert [c.kwargs['BLOCK_SIZE_K'] for c in configs] == expected[case]
+        assert all(c.kwargs.get('BLOCK_SIZE_N', 128) <= 128 for c in configs)
+        raise Captured
+    monkeypatch.setattr(triton, 'autotune', autotune)
+    launch = autotune_patches.dynamic_autotune(Kernel())[(1,)]
+    if case == 'single-invalid':
+        if compile_only:
+            assert launch(**runtime) == []
+        else:
+            with pytest.raises(RuntimeError, match='No legal autotune candidates'):
+                launch(**runtime)
+    else:
+        with pytest.raises(Captured):
+            launch(**runtime)
+
+
+@pytest.mark.parametrize('group_k', [32, 64, 128])
+def test_grouped_w4a8_search_uses_actual_group_size(monkeypatch, group_k):
+    monkeypatch.setattr(autotune_patches, 'test_type', 'int4int8')
+    for phase in (1, 2):
+        for bound in ('min', 'max'):
+            monkeypatch.setattr(autotune_patches, f'mode_autotune_{bound}_block_size_k{phase}',
+                                64, raising=False)
+    monkeypatch.setattr(autotune_patches, 'compile_only', 0)
+    configs = autotune_patches.generate_config2_lists(
+        BLOCK_SIZE_M=16, N=128, K=256, supports_n_tiles=False,
+        runtime_args=dict(use_int4_w4a8=True, group_k=group_k))
+    assert configs
+    assert {c.kwargs['BLOCK_SIZE_K'] for c in configs} == {group_k}
+
+
+@pytest.mark.parametrize("is_bottom", [False, True])
+@pytest.mark.parametrize("selector", ["K=6144,topk=8,", "KMin=4096,KMod=1024,topk=8,", ""])
+def test_dot_scaled_configs_are_isolated(monkeypatch, tmp_path, is_bottom, selector):
+    root = _load_configs(monkeypatch, tmp_path, "3.6")
+    prefix = f"E=256,N=512,{selector}arch=gfx936,dtype=fp8_w8a8"
+    block = ",block_shape=[128,128]"
+    for bottom in (False, True):
+        phase = ",is_bottom=True" if bottom else ""
+        _write_config(root, "3.6", prefix + phase + block + ".json", "dot")
+    query = dict(block_n=128, block_k=128, is_bottom=is_bottom, K=6144, top_k=8)
+    assert moe_config_utils.get_moe_configs(256, 512, "fp8_w8a8", **query) == {
+        1: {"marker": "dot"}}
+    assert moe_config_utils.get_moe_configs(
+        256, 512, "fp8_w8a8", gemm_type="dot_scaled", **query) is None
+    for bottom in (False, True):
+        phase = ",is_bottom=True" if bottom else ""
+        _write_config(root, "3.2", prefix + ",gemm_type=dot_scaled" + phase + block + ".json", "scaled")
+    moe_config_utils.get_moe_configs.cache_clear()
+    assert moe_config_utils.get_moe_configs(
+        256, 512, "fp8_w8a8", gemm_type="dot_scaled", **query) == {
+            1: {"marker": "scaled"}}
+    assert moe_config_utils.get_moe_configs(256, 512, "fp8_w8a8", **query) == {
+        1: {"marker": "dot"}}
+    # Even the legacy fallback must not cross instruction families.
+    for path in root.rglob("*.json"):
+        if "gemm_type=dot_scaled" not in path.name:
+            path.unlink()
+    moe_config_utils.get_moe_configs.cache_clear()
+    assert moe_config_utils.get_moe_configs(256, 512, "fp8_w8a8", **query) is None
+
+
+def test_moe_config_gemm_type_filename(monkeypatch):
+    monkeypatch.setattr(moe_config_utils.arch_info, "get_arch", lambda: "gfx938")
+    kwargs = dict(E=256, N=512, dtype="fp8_w8a8", K=6144, top_k=8)
+    old = "E=256,N=512,K=6144,topk=8,arch=gfx938,dtype=fp8_w8a8.json"
+    assert moe_config_utils.get_config_file_name(**kwargs) == old
+    assert moe_config_utils.get_config_file_name(**kwargs, gemm_type="dot") == old
+    assert moe_config_utils.get_config_file_name(**kwargs, gemm_type="dot_scaled") == (
+        old[:-5] + ",gemm_type=dot_scaled.json")
+    with pytest.raises(ValueError, match="gemm_type"):
+        moe_config_utils.get_config_file_name(**kwargs, gemm_type="invalid")
+
+
+@pytest.mark.parametrize("arch,supported", [
+    ("gfx936", False), ("gfx938", True), ("gfx92a", True), ("gfx946", True),
+])
+def test_moe_mls_arch_support(monkeypatch, arch, supported):
+    moe_op = autotune_patches.moe_op
+    monkeypatch.setattr(moe_op.arch_info, "get_arch", lambda: arch)
+    moe_op.support_mls.cache_clear()
+    try:
+        assert moe_op.support_mls() is supported
+    finally:
+        moe_op.support_mls.cache_clear()
+
+
+@pytest.mark.parametrize('bottom', [False, True])
+@pytest.mark.parametrize('dtype', ['mxfp8_w8a8', 'mxfp4_w4a8'])
+def test_native_mx_recipe_configs_do_not_cross_fallback(monkeypatch, tmp_path, bottom, dtype):
+    root = _load_configs(monkeypatch, tmp_path, '3.6')
+    kwargs = dict(E=256, N=512, dtype=dtype, K=6144, top_k=8,
+                  gemm_type='dot_scaled', is_bottom=bottom)
+    recipes = ['native-e8m0', 'static-fp32']
+    for recipe in recipes:
+        for phase in (False, True):
+            name = moe_config_utils.get_config_file_name(**{**kwargs, 'is_bottom': phase}, scale_recipe=recipe)
+            _write_config(root, '3.6', name, recipe)
+    for recipe in recipes:
+        result = moe_config_utils.get_moe_configs(**kwargs, scale_recipe=recipe)
+        assert result == {1: {'marker': recipe}}
+    assert moe_config_utils.get_moe_configs(**kwargs, scale_recipe='missing-recipe') is None
+    # A bottom-only family cannot override the shared top/bottom selector.
+    for path in root.rglob('*.json'):
+        if 'is_bottom=True' not in path.name:
+            path.unlink()
+    moe_config_utils.get_moe_configs.cache_clear()
+    assert moe_config_utils.get_moe_configs(**kwargs, scale_recipe=recipes[0]) is None
+
+
+def test_mxfp8_autotune_excludes_combined_loads():
+    runtime = dict(N=130, K=160, group_k=32, use_mxfp8=True)
+    configs = autotune_patches.generate_config2_lists(runtime_args=runtime)
+    configs = autotune_patches._prune_configs_by_runtime_constraints(configs, runtime)
+    assert configs
+    assert all(c.kwargs['BLOCK_SIZE_K'] % 32 == 0 and not c.kwargs['COMBINE_SCALE_LOAD'] for c in configs)
+
+
+def test_mxfp8_cli_uses_scaled_recipe_names():
+    names = tune_moe_cli.expected_json_names(device_name='nmz', test_type='mxfp8',
+        local_e=256, local_n=512, K=6144, top_k=8, block_shape=(1, 32))
+    assert all(',gemm_type=dot_scaled,scale_recipe=vllm-a32-b1x32-e8m0-e8m0' in name for name in names)
+    assert ',is_bottom=True' in names[1]
+
+
+@pytest.mark.parametrize('block', [(1, 128), (128, 128)])
+def test_mxfp8_cli_rejects_non_native_blocks(block):
+    with pytest.raises(ValueError, match='native MXFP8 requires'):
+        tune_moe_cli.expected_json_names(device_name='nmz', test_type='mxfp8',
+            local_e=256, local_n=512, K=6144, top_k=8, block_shape=block)

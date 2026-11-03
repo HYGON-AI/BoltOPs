@@ -22,11 +22,17 @@ import math
 import os
 from pathlib import Path
 import re
+import signal
 import socket
 import statistics
+import subprocess
+import sys
 import tempfile
 import threading
 import time
+
+
+from boltops.tools.fused_moe_triton_tune.common import tune_module_name
 
 
 FIELDS = (
@@ -35,7 +41,13 @@ FIELDS = (
 )
 KEY_FIELDS = FIELDS[:-1]
 TRITON_SOLUTION_ID = "triton:fused_moe"
+_NATIVE_SCALE_RECIPES = {
+    "mxfp4": "deepgemm-a128-b1x32",
+    "mxfp8": "vllm-a32-b1x32-e8m0-e8m0",
+}
 FORMATS = {
+    "mxfp8": ("mxfp8_w8a8", "mxfp8_w8a8"),
+    "mxfp4": ("mxfp4_w4a8", "mxfp4_w4a8"),
     "bf16": ("no_quant", "w16a16"),
     "int8_channel": ("int8_w8a8_channel", "w8a8_channel"),
     "fp8_channel": ("f8_w8a8_channel", "w8a8_channel"),
@@ -63,19 +75,27 @@ def parse_config(path):
     path = Path(path)
     match = re.fullmatch(
         r"E=(\d+),N=(\d+),K=(\d+),topk=(\d+),arch=(gfx\w+)"
-        r"(?:,dtype=(\w+))?(?:,block_shape=\[(\d+),(\d+)\])?\.json",
+        r"(?:,dtype=(\w+))?(?:,gemm_type=(dot_scaled))?(?:,scale_recipe=([a-z0-9_-]+))?"
+        r"(?:,block_shape=\[(\d+),(\d+)\])?\.json",
         path.name,
     )
     if not match:
         raise ValueError(f"Expected an exact Gemm1 config: {path.name}")
-    e, n, k, topk, arch, dtype, bn, bk = match.groups()
+    e, n, k, topk, arch, dtype, gemm_type, scale_recipe, bn, bk = match.groups()
     dtype = dtype or ""
     bn, bk = int(bn or 0), int(bk or 0)
     if dtype in ("int8_w8a8", "fp8_w8a8"):
         test_type = dtype.split("_")[0] + ("" if bn and bk else "_channel")
     else:
         test_type = {"": "bf16", "int4_w4a16": "int4",
-                     "int4_w4a8": "int4int8" if bk else "int4int8_channel"}[dtype]
+                     "int4_w4a8": "int4int8" if bk else "int4int8_channel",
+                     "mxfp4_w4a8": "mxfp4", "mxfp8_w8a8": "mxfp8"}[dtype]
+    if test_type in _NATIVE_SCALE_RECIPES:
+        if (gemm_type != "dot_scaled"
+                or scale_recipe != _NATIVE_SCALE_RECIPES[test_type] or bn or bk):
+            raise ValueError("Native MX benchmark requires its supported dot_scaled scale recipe")
+    elif gemm_type or scale_recipe:
+        raise ValueError("Ordinary FP8 benchmark requires a dot configuration")
     # Block [0,64] is omitted by historical W4A16 filenames.
     if test_type in ("int4", "int4int8") and not bk:
         bk = 64
@@ -84,7 +104,8 @@ def parse_config(path):
     ) if ",block_shape=" in path.name else path.stem + ",is_bottom=True.json"
     return dict(e=int(e), n=int(n), k=int(k), topk=int(topk), arch=arch,
                 dtype=dtype or None, block_n=bn, block_k=bk,
-                test_type=test_type, top=path, bottom=path.with_name(bottom_name))
+                test_type=test_type, gemm_type=gemm_type or "dot", scale_recipe=scale_recipe,
+                top=path, bottom=path.with_name(bottom_name))
 
 
 def config_pair(shape):
@@ -113,9 +134,11 @@ def unsupported_batch_sizes(shape, dtype, top, bottom):
 
 def make_row(shape, m, dtype, time_us):
     quant, _ = FORMATS[shape["test_type"]]
+    scale_n, scale_k = ((1, 32) if shape["test_type"] in _NATIVE_SCALE_RECIPES else
+                         (shape["block_n"], shape["block_k"]))
     return dict(zip(FIELDS, (
         shape["arch"], quant, str(dtype), m, shape["n"], shape["k"],
-        shape["e"], shape["topk"], shape["block_n"], shape["block_k"],
+        shape["e"], shape["topk"], scale_n, scale_k,
         "triton", TRITON_SOLUTION_ID, time_us,
     )))
 
@@ -256,12 +279,18 @@ class DeviceGuard:
         location = (int(bus_id, 16) << 8) | (int(slot, 16) << 3) | int(function, 16)
         self.gpu_id = None
         for node in Path("/sys/class/kfd/kfd/topology/nodes").iterdir():
-            props = dict(line.split() for line in (node / "properties").read_text().splitlines())
-            if int(props.get("location_id", -1)) == location and int(props.get("domain", -1)) == int(domain, 16):
+            try:
+                props = dict(line.split() for line in (node / "properties").read_text().splitlines())
+                if int(props.get("location_id", -1)) != location or int(props.get("domain", -1)) != int(domain, 16):
+                    continue
                 gpu_id = int((node / "gpu_id").read_text())
-                if gpu_id:
-                    self.gpu_id = gpu_id
-                    break
+            except (OSError, ValueError):
+                # KFD still lists nodes this process cannot read; skip them,
+                # while the test GPU itself must still map or fail below.
+                continue
+            if gpu_id:
+                self.gpu_id = gpu_id
+                break
         if self.gpu_id is None:
             raise RuntimeError("Cannot map HIP device to KFD topology; not exporting unchecked timing")
         self.stop = threading.Event()
@@ -325,11 +354,13 @@ def _from_environment(test_type):
     from boltops.utility.triton_capability import get_triton_capabilities
 
     # Read actual script defaults, rather than guessing K from the file name.
-    module = importlib.import_module(f"{__package__}.tune_moe_{test_type}")
+    os.environ["AUTOTUNE_TEST_TYPE"] = test_type
+    module = importlib.import_module(f"{__package__}.{tune_module_name(test_type)}")
 
     dtype = {"bf16": None, "int8": "int8_w8a8", "int8_channel": "int8_w8a8",
              "fp8": "fp8_w8a8", "fp8_channel": "fp8_w8a8", "int4": "int4_w4a16",
-             "int4int8": "int4_w4a8", "int4int8_channel": "int4_w4a8"}[test_type]
+             "int4int8": "int4_w4a8", "int4int8_channel": "int4_w4a8",
+             "mxfp4": "mxfp4_w4a8", "mxfp8": "mxfp8_w8a8"}[test_type]
     block = None
     if test_type in ("int8", "fp8"):
         block = [int(x) for x in os.environ.get("MOE_BLOCK_SHAPE", "128,128").split(",")]
@@ -338,6 +369,8 @@ def _from_environment(test_type):
     return _TRITON_CONFIGS_DIR / get_triton_capabilities().config_dir_name / get_config_file_name(
         int(os.environ["MOE_NUM_EXPERTS"]), int(os.environ["MOE_HIDDEN_SIZE"]),
         dtype, block, K=module.FFN_HIDDEN_SIZES[0], top_k=module.TOP_KS[0],
+        gemm_type="dot_scaled" if test_type in _NATIVE_SCALE_RECIPES else "dot",
+        scale_recipe=_NATIVE_SCALE_RECIPES.get(test_type),
     )
 
 
@@ -347,7 +380,8 @@ def _prepare_environment(device):
         "TRAINING_MODE": "0", "BENCHMARK_MODE": "0", "TRITON_COMPILE_ONLY": "0",
         "EP_SIZE": "1", "MOE_NUM_SHARED_EXPERTS": "0", "MOE_ACTIVATION": "silu",
         "MOE_IS_GATED": "1", "AUTOTUNE_DEVICE_START_ID": str(device),
-        "AUTOTUNE_DEVICE_COUNT": "1", "NUM_GROUPS_RUN": "1", "CUR_GROUP": "0",
+        "AUTOTUNE_DEVICE_COUNT": "1", "AUTOTUNE_NUM_GROUPS_RUN": "1",
+        "AUTOTUNE_START_GROUP": "0", "CUR_GROUP": "0",
     })
     os.environ.pop("TOPK_IDS_DIR", None)
 
@@ -397,26 +431,30 @@ def benchmark(args):
         actual = moe_config_utils.get_moe_configs(
             shape["e"], shape["n"], shape["dtype"], shape["block_n"],
             shape["block_k"], is_bottom, K=shape["k"], top_k=shape["topk"],
+            gemm_type=shape["gemm_type"], scale_recipe=shape["scale_recipe"],
         )
         if actual != {int(m): cfg for m, cfg in expected.items()}:
             raise ValueError("Production lookup does not match the requested config pair")
 
     os.environ.update({
+        "AUTOTUNE_TEST_TYPE": shape["test_type"],
         "MOE_NUM_EXPERTS": str(shape["e"]),
         "MOE_HIDDEN_SIZE": str(shape["n"]), "MOE_FFN_HIDDEN_SIZE": str(shape["k"]),
         "MOE_TOP_K": str(shape["topk"]), "MOE_BATCH_SIZES": ",".join(map(str, batches)),
     })
     if shape["block_n"] and shape["block_k"]:
         os.environ["MOE_BLOCK_SHAPE"] = f"{shape['block_n']},{shape['block_k']}"
-    module = importlib.import_module(f"{__package__}.tune_moe_{shape['test_type']}")
-    input_helper = module.input_helper
+    module = importlib.import_module(f"{__package__}.{tune_module_name(shape['test_type'])}")
+    helper_name = ("_native_mx_inputs" if shape["test_type"] in _NATIVE_SCALE_RECIPES
+                   else "input_helper")
+    input_helper = getattr(module, helper_name)
 
     def seeded_input_helper(*inputs, **kwargs):
         if "seed" in inspect.signature(input_helper).parameters:
             kwargs["seed"] = args.seed
         return input_helper(*inputs, **kwargs)
 
-    module.input_helper = seeded_input_helper
+    setattr(module, helper_name, seeded_input_helper)
     raw = module.fused_experts_impl_benchmark.__wrapped__
     callbacks = [value.fn for name, value in vars(module).items()
                  if name.startswith("bench_fused_moe_") and hasattr(value, "fn")]
@@ -484,7 +522,50 @@ def benchmark(args):
             torch.cuda.empty_cache()
 
 
-def main():
+def benchmark_in_fresh_processes(args, arguments):
+    """Release HIP modules and graph allocations after each measured M."""
+    batches = sorted({int(value) for value in args.batch_sizes.replace(",", " ").split()})
+    if not batches or min(batches) <= 0:
+        raise ValueError("batch sizes must be positive integers")
+    for batch in batches:
+        command = [sys.executable, "-u", "-m", "boltops.tools.fused_moe_triton_tune.performance_csv",
+                   *arguments, "--_single-batch", "--batch-sizes", str(batch)]
+        for attempt in range(args.max_attempts):
+            child = subprocess.Popen(command, start_new_session=True)
+            try:
+                rc = child.wait(timeout=args.process_timeout)
+            except subprocess.TimeoutExpired:
+                # Only this leaf's process group (including its compiler),
+                # never another GPU's tuning job or the CLI supervisor.
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                child.wait()
+                print(f"CSV_PROCESS_TIMEOUT M={batch} attempt={attempt + 1}/{args.max_attempts}", flush=True)
+                if attempt + 1 == args.max_attempts:
+                    raise
+                continue
+            except BaseException:
+                try:
+                    os.killpg(child.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    child.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(child.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    child.wait()
+                raise
+            if rc:
+                raise subprocess.CalledProcessError(rc, command)
+            break
+
+
+def _main():
     parser = argparse.ArgumentParser(description=__doc__)
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--config", help="Exact Gemm1 JSON; normal runtime lookup must match")
@@ -502,8 +583,11 @@ def main():
                         help="Maximum (max-min)/median across repeats; default 5%%")
     parser.add_argument("--max-attempts", type=int, default=3)
     parser.add_argument("--retry-delay", type=float, default=10)
+    parser.add_argument("--process-timeout", type=float, default=600,
+                        help="Maximum seconds per M's fresh process; timed-out leaves are retried")
+    parser.add_argument("--_single-batch", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
-    if args.repeats < 3 or args.rep_ms <= 0 or args.max_spread <= 0 or args.max_attempts < 1 or args.retry_delay < 0:
+    if args.repeats < 3 or args.rep_ms <= 0 or args.max_spread <= 0 or args.max_attempts < 1 or args.retry_delay < 0 or args.process_timeout <= 0:
         parser.error("Need >=3 repeats and positive timing/stability limits")
     if args.test_type:
         # Aiter's 13 columns cannot distinguish these operation semantics.
@@ -514,7 +598,25 @@ def main():
             print("CSV export skipped: schema supports only gated SiLU, EP=1, no shared experts")
             return
         args.batch_sizes = args.batch_sizes or os.environ.get("MOE_BATCH_SIZES")
-    benchmark(args)
+    elif args.batch_sizes is None and Path(args.config).exists():
+        args.batch_sizes = ",".join(json.loads(Path(args.config).read_text()))
+    if args.batch_sizes and not args._single_batch:
+        benchmark_in_fresh_processes(args, sys.argv[1:])
+    else:
+        benchmark(args)
+
+
+def main():
+    def terminate(signum, _frame):
+        # Let the supervisor reap its owned process group and let CSV writers
+        # release their locks through normal exception/finally unwinding.
+        raise SystemExit(128 + signum)
+
+    previous = signal.signal(signal.SIGTERM, terminate)
+    try:
+        _main()
+    finally:
+        signal.signal(signal.SIGTERM, previous)
 
 
 if __name__ == "__main__":
