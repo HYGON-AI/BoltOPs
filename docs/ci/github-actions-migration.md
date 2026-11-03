@@ -40,7 +40,7 @@ GitHub BoltOPs → Settings → Secrets and variables → Actions → Variables�
 
 | Variable | 值/含义 |
 |---|---|
-| PYPI_URL | 通用 devpi 服务根地址（包含 http:// 与端口，无 /nightly 后缀）；现 GitLab 为 http://10.16.1.201:9929 |
+| PYPI_URL | 通用 devpi 服务根地址（包含 http:// 与端口，无 /nightly 后缀）；构建及性能任务默认 http://10.16.1.201:9929，与 lightop 一样支持 fork PR 的变量缺失场景；发布任务仍读取组织/仓库 Variable |
 | TRITON_PYPI_URL | Triton/DTK2610 镜像根地址；可与 PYPI_URL 相同，未设置时回退到 PYPI_URL |
 | AICC_INSTALLER_URL | 默认使用提供的 http://42.228.13.241:18000/ai_cc/Nightly/hcu_llvm_installer.sh；可配置覆盖 |
 | RESOURCE_SERVER_URL | 可选，准备脚本单独使用时用于拼接 AICC 地址的回退值 |
@@ -48,7 +48,7 @@ GitHub BoltOPs → Settings → Secrets and variables → Actions → Variables�
 
 Secret：PYPI_PASSWORD，使用现有 nightly 发布密码（不要把密码写入文件或 PR）。直接使用授权给 BoltOPs 的组织级 Secret，也可以配置仓库级 Secret。
 
-最少需要 Variable `PYPI_URL` 和发布 Secret `PYPI_PASSWORD`。两者都可以使用已授权给 BoltOPs 的组织级配置，无需在仓库重复设置；其他构建 Variables 也可以使用组织级或仓库级配置。GitHub 自动提供工作流使用的 `GITHUB_TOKEN`，这套 CI 不需要额外配置 GitHub PAT 或 `GITHUB_MIRROR_TOKEN`。原仓库中的 fork PR 工作流使用原仓库的 Variables；在个人 fork 单独运行时，需要另行配置可访问的构建环境和 Variables。
+发布需要 Variable `PYPI_URL` 和发布 Secret `PYPI_PASSWORD`。两者都可以使用已授权给 BoltOPs 的组织级配置，无需在仓库重复设置；其他构建 Variables 也可以使用组织级或仓库级配置。GitHub 自动提供工作流使用的 `GITHUB_TOKEN`，这套 CI 不需要额外配置 GitHub PAT 或 `GITHUB_MIRROR_TOKEN`。fork PR 运行可能拿不到 `vars`；构建与性能任务为非敏感包源地址提供默认值，不能仅依赖组织变量授权。个人 fork 还需要能使用对应 runner。发布 Secret 不提供默认值，也不传给 PR 构建与性能任务。
 
 发布任务与 lightop 一样，不绑定 GitHub Environment，无需创建 nightly 环境；工作流中的条件限制仅在 main 分支 push 后发布。
 
