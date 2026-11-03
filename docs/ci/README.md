@@ -48,6 +48,8 @@ PR 和手动触发时，两组构建均执行正确性测试，之后两组均�
 
 升级版本时，检查对应的 DTK/Python 容器及 HCU Torch/Triton/TileLang 包是否可用。不同 DTK 若需要不同版本，应拆开配置，不能只为减少重复而强行共用。发布任务的 Python3.12 容器只用于上传 wheel，不决定 wheel 的目标 Python 版本。
 
+Torch 与 NumPy 保持矩阵中的版本约束；Triton、TileLang 和 apache-tvm-ffi 不固定版本，由 pip 按依赖兼容性解析。Triton 使用内网 HCU 索引；TileLang/FFI 安装额外使用阿里云源解析依赖。安装后执行 `pip check`，校验 Triton/TileLang 的 DTK、Torch 构建标签，并在日志中输出实际版本。包源更新可能改变解析结果，失败时应核对配套包，不能通过移除 Torch 约束或强装不兼容依赖绕过。
+
 发布任务调用 `_publish.yml`；在 `ci.yml` 中通过 `with.dtk_ver` 和 `with.dtk_pkg_name` 配置目标版本及真实 DTK 包名。发布密码通过 `secrets.PYPI_PASSWORD` 显式传给复用工作流，不放在 `with` 中。DTK 包名必须与发布服务实际使用的名称一致，不能仅通过替换版本号生成。
 
 学习、配置与切换步骤见 [GitHub Actions 迁移说明](github-actions-migration.md)。

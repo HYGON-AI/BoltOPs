@@ -21,10 +21,11 @@ cat "${CI_WORK_DIR}/constraints.txt"
 
 python -m pip install --force-reinstall --no-deps --constraint "${CI_WORK_DIR}/constraints.txt" --index-url "${TORCH_INDEX_URL}" "torch==${TORCH_VERSION}"
 python -m pip install --constraint "${CI_WORK_DIR}/constraints.txt" "torch==${TORCH_VERSION}" pytest PyYAML "numpy==${NUMPY_VERSION}" pandas build wheel ciupload cismi ninja optest
-python -m pip install --constraint "${CI_WORK_DIR}/constraints.txt" --index-url "${TRITON_INDEX_URL}" "triton==3.6.0"
+# Resolve the HCU DSL packages against the selected Torch instead of pinning
+# their public versions. Keep Torch/NumPy constraints and validate vendor tags.
+python -m pip install --constraint "${CI_WORK_DIR}/constraints.txt" --index-url "${TRITON_INDEX_URL}" triton
 python -m pip show torch triton
-python -m pip install --constraint "${CI_WORK_DIR}/constraints.txt" "apache-tvm-ffi==0.1.11" -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
-python -m pip install --constraint "${CI_WORK_DIR}/constraints.txt" --index-url "${TRITON_INDEX_URL}" "tilelang==0.1.12" --extra-index-url https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
+python -m pip install --constraint "${CI_WORK_DIR}/constraints.txt" --index-url "${TRITON_INDEX_URL}" tilelang apache-tvm-ffi --extra-index-url https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
 python -m pip check
 python -m pip show torch triton tilelang apache-tvm-ffi numpy
 python - <<'PY'
@@ -44,13 +45,14 @@ assert torch_package_version.split("+", 1)[0] == expected_torch, (torch_package_
 assert numpy.__version__ == os.environ["NUMPY_VERSION"], numpy.__version__
 expected_dtk_tag = f"dtk{os.environ['DTK_VER']}"
 assert expected_dtk_tag in torch_package_version, (torch_package_version, expected_dtk_tag)
-triton_version = version("triton")
 expected_torch_tag = "torch" + expected_torch.replace(".", "")
-assert triton_version.startswith("3.6.0+"), triton_version
-assert expected_torch_tag in triton_version, (triton_version, expected_torch_tag)
-assert expected_dtk_tag in triton_version, (triton_version, expected_dtk_tag)
+for package in ("triton", "tilelang"):
+    package_version = version(package)
+    assert expected_torch_tag in package_version, (package, package_version, expected_torch_tag)
+    assert expected_dtk_tag in package_version, (package, package_version, expected_dtk_tag)
 print(f"Validated dependency set: torch={torch.__version__}, numpy={numpy.__version__}")
 print(f"Python runtime: {sys.executable}; version={sys.version}; prefix={sys.prefix}; base_prefix={sys.base_prefix}")
 print(f"Torch runtime: version={version('torch')}; path={torch.__file__}")
 print(f"Triton runtime: version={version('triton')}; path={triton.__file__}")
+print(f"TileLang package: version={version('tilelang')}; apache-tvm-ffi={version('apache-tvm-ffi')}")
 PY
