@@ -48,7 +48,7 @@ PR 和手动触发时，两组构建均执行正确性测试，之后两组均�
 
 升级版本时，检查对应的 DTK/Python 容器及 HCU Torch/Triton/TileLang 包是否可用。不同 DTK 若需要不同版本，应拆开配置，不能只为减少重复而强行共用。发布任务的 Python3.12 容器只用于上传 wheel，不决定 wheel 的目标 Python 版本。
 
-Torch 与 NumPy 保持矩阵中的版本约束；Triton、TileLang 和 apache-tvm-ffi 不固定版本。直接使用 pip 从内网 HCU 索引安装 Triton、TileLang；FFI 单独从阿里云源安装，安装 TileLang 时不添加公共额外索引。没有单独的 wheel 筛选脚本。内网缺少当前 Torch 的配套 TileLang 时，安装或构建标签校验仍会失败，需要提供兼容包；不回退到公共版、不跳过测试。安装后执行 `pip check`，校验 Triton/TileLang 的 DTK、Torch 构建标签，并在日志中输出实际版本。包源更新可能改变解析结果，失败时应核对配套包，不能通过移除 Torch 约束或强装不兼容依赖绕过。
+Torch 与 NumPy 保持矩阵中的版本约束；Triton、TileLang 和 apache-tvm-ffi 不写死版本。Triton 使用内网 HCU 索引。`setup-env.sh` 内嵌代码通过 `pip index versions --json` 查询内网 TileLang，选择匹配当前 DTK/Torch 的最新兼容构建，再把完整 HCU 版本交给 pip；普通依赖允许从阿里云源解析，FFI 版本由 TileLang 声明的范围决定，不提前安装公共源最新版。没有单独的 wheel 筛选脚本。内网缺少当前 Torch 的配套 TileLang 时明确失败；不回退到公共版、不跳过测试。安装后执行 `pip check`，校验 Triton/TileLang 的 DTK、Torch 构建标签，并在日志中输出实际版本。包源更新可能改变解析结果，失败时应核对配套包，不能通过移除 Torch 约束或强装不兼容依赖绕过。
 
 发布任务调用 `_publish.yml`；在 `ci.yml` 中通过 `with.dtk_ver` 和 `with.dtk_pkg_name` 配置目标版本及真实 DTK 包名。发布密码通过 `secrets.PYPI_PASSWORD` 显式传给复用工作流，不放在 `with` 中。DTK 包名必须与发布服务实际使用的名称一致，不能仅通过替换版本号生成。
 

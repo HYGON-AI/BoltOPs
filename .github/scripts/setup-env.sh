@@ -25,10 +25,28 @@ python -m pip install --constraint "${CI_WORK_DIR}/constraints.txt" "torch==${TO
 # their public versions. Keep Torch/NumPy constraints and validate vendor tags.
 python -m pip install --constraint "${CI_WORK_DIR}/constraints.txt" --index-url "${TRITON_INDEX_URL}" triton
 python -m pip show torch triton
-# Install the ordinary FFI dependency separately. Do not expose a public
-# extra index when resolving TileLang itself: it must come from the HCU index.
-python -m pip install --constraint "${CI_WORK_DIR}/constraints.txt" --index-url https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com apache-tvm-ffi
-python -m pip install --constraint "${CI_WORK_DIR}/constraints.txt" --index-url "${TRITON_INDEX_URL}" tilelang
+# Query only the HCU index, then resolve that exact vendor build's dependencies
+# using both indexes. No static TileLang/FFI version and no public TileLang fallback.
+tilelang_version=$(python - <<'PY'
+import json
+import os
+import subprocess
+import sys
+
+result = subprocess.check_output([
+    sys.executable, "-m", "pip", "index", "versions", "tilelang", "--json",
+    "--index-url", os.environ["TRITON_INDEX_URL"],
+], text=True)
+versions = json.loads(result)["versions"]  # pip sorts compatible versions newest first.
+tags = {f"dtk{os.environ['DTK_VER']}", "torch" + os.environ["TORCH_VERSION"].replace(".", "")}
+selected = next((v for v in versions if tags.issubset(set(v.partition("+")[2].split(".")))), None)
+if selected is None:
+    raise SystemExit(f"ERROR: No HCU TileLang matching {sorted(tags)}; available versions: {versions}")
+print(selected)
+PY
+)
+echo "Selected HCU TileLang: ${tilelang_version}"
+python -m pip install --constraint "${CI_WORK_DIR}/constraints.txt" --index-url "${TRITON_INDEX_URL}" "tilelang==${tilelang_version}" --extra-index-url https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
 python -m pip check
 python -m pip show torch triton tilelang apache-tvm-ffi numpy
 python - <<'PY'
