@@ -201,6 +201,14 @@ def main() -> int:
         print(f"Failed to read optest results {results_file}: {exc}")
         print(f"Wrote failure JUnit report to {JUNIT_OUTPUT}")
         return 1
+    # A readable JSON file alone does not prove that any tests actually ran.
+    if not data.get("per", {}).get("tests") and not data.get("acc", {}).get("rows"):
+        xml_str = make_error_suite(f"No test records in optest results {results_file}")
+        JUNIT_OUTPUT.parent.mkdir(parents=True, exist_ok=True)
+        JUNIT_OUTPUT.write_text(xml_str, encoding="utf-8")
+        print(f"No test records in optest results {results_file}; wrote failure JUnit report")
+        return 1
+
     branch = data.get("branch", "?")
     commit = data.get("commit", "?")[:8]
     version_dir = results_file.parent.name

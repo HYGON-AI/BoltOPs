@@ -4,16 +4,18 @@
 
 ## 1. 先理解整体流程
 
-PR 到 main：已有 Quality Gate 并行检查；四组 build2064-test 构建、修复 wheel 并运行正确性测试；performance 下载其中 py3.12/torch2.11.0 的同一个 wheel，执行性能测试。DTK 26.10 独立 build2610，仅构建。ci-result 汇总三项结果，失败、取消或跳过都不会误报成功。
+PR 到 main：已有 Quality Gate 并行检查；build2610 使用 DTK26.10、Python3.12，分别构建 Torch2.11.0 和 Torch2.13.0 的 wheel 并运行正确性测试。两组成功后，performance 分别下载这两个版本的 wheel，在 DTK26.10 上运行两组性能测试。ci-result 要求两组构建与两组性能均成功。DTK26.04 的构建与发布已移除。
 
-push 到 main：只构建和修复 wheel，不再运行正确性或性能测试。DTK 26.04 四组 wheel 构建成功后发布；DTK 26.10 在自己构建成功后发布。PR 阶段完成测试，合入后不重复测试。workflow_dispatch 运行构建和测试，仅验证、不发布。Actions 不执行 GitLab → GitHub 镜像任务。
+push 到 main：只构建和修复 wheel，不再运行正确性或性能测试。DTK26.10 的 Torch2.11.0、2.13.0 两组均构建成功后统一发布。PR 阶段完成正确性与性能测试，合入后不重复测试。workflow_dispatch 运行构建、正确性与性能测试，仅验证、不发布。Actions 不执行 GitLab → GitHub 镜像任务。此次版本调整只修改 GitHub CI，旧 GitLab CI 仍需按正式切换步骤停用。
 
 ## 2. 文件怎么写、怎么看
 
 | 文件 | 职责 |
 |---|---|
 | .github/workflows/ci.yml | 事件、矩阵、依赖 needs、制品传递、发布条件 |
-| .github/workflows/_build-test-wheel.yml | workflow_call 复用构建流程，避免五种组合重复写步骤 |
+| .github/workflows/_build-test-wheel.yml | workflow_call 复用构建流程，供 Torch2.11.0、2.13.0 两组调用 |
+| .github/workflows/_performance.yml | 接收 DTK26.10 / Torch2.11.0 或 2.13.0，分别执行性能测试并上传独立报告 |
+| .github/workflows/_publish.yml | workflow_call 接收 DTK 标识、包名及发布密码，统一下载、校验、发布 wheel |
 | .github/scripts/checkout-source.sh | 校验实际 checkout 的事件 SHA |
 | .github/scripts/common.sh | 每一步加载 DTK；设置索引、输出目录和唯一运行标识 |
 | .github/scripts/setup-env.sh | 安装 AICC、精确选择 Torch/Triton/TileLang/NumPy 并验证版本 |
@@ -26,7 +28,7 @@ push 到 main：只构建和修复 wheel，不再运行正确性或性能测试�
 
 PR checkout 采用 github.sha（GitHub 生成的 PR 合并提交），所有矩阵与性能任务使用同一个 SHA，包含目标分支集成结果。push 则验证实际提交。无需像 GitLab 那样在每个 job 临时 merge main。
 
-构建矩阵：DTK2604 × Python3.10/3.12 × Torch2.10.0/2.11.0；NumPy 分别 1.24.3/1.26.4。DTK2610 为 Python3.12、Torch2.11.0、NumPy1.26.4。性能只跑 DTK2604/Python3.12/Torch2.11.0。
+构建矩阵：DTK2610 × Python3.12 × Torch2.11.0/2.13.0；NumPy1.26.4。只有两组，不再构建 DTK2604 或 Torch2.10.0。启用前需要确认 DTK2610 包源提供相应 HCU Torch，以及兼容的 Triton/TileLang；版本号和构建标签仍会在环境准备阶段校验。
 
 统一入口为`.github/scripts/_build_hcu_wheel.sh`，旧 `build_wheel.sh` 转发到新入口；GitLab 与 GitHub CI 都调用同一脚本。环境需预先准备，入口不隐式安装工具。检查通过后输出 wheel，测试和发布使用同一构建路径。
 
@@ -52,8 +54,6 @@ Secret：PYPI_PASSWORD，使用现有 nightly 发布密码（不要把密码写�
 
 Settings → Actions → Runners：确保 BW1100 runner/runner group 允许 BoltOPs 使用。lightop 能使用不代表 BoltOPs 自动有权使用。确认机器可拉取以下镜像、访问 devpi/AICC、具备 /dev/kfd、/dev/dri、/opt/hyhal 和足够共享内存：
 
-- 26.04-rockylinux8.6-py3.10
-- 26.04-rockylinux8.6-py3.12
 - 26.10-rockylinux8.6-py3.12
 
 镜像需允许 Actions Node20 动作运行；若私有仓库要求认证，需要额外配置 container.credentials，当前参考 lightop 使用 runner 已有的镜像访问方式。
@@ -64,7 +64,7 @@ Settings → Actions → Runners：确保 BW1100 runner/runner group 允许 Bolt
 
 ## 4. 把文件提交到 GitHub、试跑
 
-当前 GitHub 登录账号 guochenyang99 对 BoltOPs 只有 pull 权限。迁移修改位于本地 `ci/github-actions-migration` 分支，尚未提交；origin 指向 HYGON-AI/BoltOPs，fork 指向 guochenyang99/BoltOPs。
+当前 GitHub 登录账号 guochenyang99 对 BoltOPs 只有 pull 权限。迁移修改位于 `ci/github-actions-migration` 分支；origin 指向 HYGON-AI/BoltOPs，fork 指向 guochenyang99/BoltOPs。
 
 先由维护者确认最新 GitLab main 已同步到 GitHub（本次读取 GitHub main 仍为 778e274，GitLab 为 27c0c0ab）。先整合/同步代码，再把迁移补丁应用到 GitHub 新建分支，避免直接从旧 GitHub 基线遗漏近期算子/测试修复。
 
@@ -79,7 +79,7 @@ git commit -m 'ci: add GitHub Actions build test and nightly workflows'
 git push -u fork ci/github-actions-migration
 ```
 
-从原仓库分支或个人 fork 创建 PR 到 main；如页面要求，等待维护者批准工作流运行。检查四组 build2064-test、build2610、performance、ci-result 及已有 Quality Gate。PR 不会发布，也不接触 PYPI_PASSWORD。下载 artifact 核对 wheel、JUnit 和性能报告。
+从原仓库分支或个人 fork 创建 PR 到 main；如页面要求，等待维护者批准工作流运行。检查 build2610 和 performance 各自的 Torch2.11.0、2.13.0 两组、ci-result 及已有 Quality Gate。PR 不会发布，也不接触 PYPI_PASSWORD。下载 artifact 核对 wheel、JUnit 与性能报告。两组 DTK26.10 性能路径均需在 BW1100 上实际验证。
 
 由于需要真实内网 runner、编译器和 GPU，本地只能验证 YAML/Actions 表达式、Bash 语法、矩阵和脚本迁移逻辑；未实际运行 GPU 构建、测试或上传。
 
@@ -98,12 +98,16 @@ PR 验证通过后，安排同一次切换窗口：
 ## 6. 本地验证
 
 ```bash
-actionlint -config-file .github/actionlint.yaml .github/workflows/ci.yml .github/workflows/_build-test-wheel.yml
+actionlint -config-file .github/actionlint.yaml .github/workflows/ci.yml .github/workflows/_build-test-wheel.yml .github/workflows/_performance.yml .github/workflows/_publish.yml
 for f in .github/scripts/*.sh; do bash -n "$f"; done
 git diff --check
 ```
 
 原性能测试可能因 GPU 共享而慢或失败；迁移保留现有测试标准，不将失败改成忽略。optest 自身也可能修改已约束的 NumPy，原始日志中曾出现；若 GitHub 实测复现，应单独修复 optest 的环境安装逻辑。
+
+性能阶段虽然下载并安装构建产物，但 `scripts/run_operator_benchmarks.py` 会将仓库根目录插入 `sys.path`，pytest 配置也包含 `pythonpath = ["."]`，因此当前不能保证实际测量的是安装的 wheel，而非同一提交的仓库源码。若要求性能阶段严格验证 wheel，需要同时调整 benchmark 的导入方式和 optest 的环境准备行为，并在 runner 上确认实际导入路径。正确性测试通过复制测试到临时目录来隔离源码。
+
+本地重复打包前会清理 setuptools 的 `build/` 目录，避免已删除源码被残留文件带入 wheel。报告转换对缺失、空 JSON 或无测试记录的结果返回失败，并生成失败 JUnit，防止未执行测试却显示成功。
 
 Shell 入口由 `.gitattributes` 固定为 LF 换行，避免 Windows 提交的 CRLF 影响 Linux 执行。临时目录标识包含 job 名称，区分构建与性能任务；性能制品显式上传隐藏文件，保留 `.optest-results.json`。AICC 目前按大版本选择最新包，Torch/Triton 按包源解析后验证版本与 DTK/Torch 标签；包源可访问性、最新 AICC 是否适配、optest 是否改动依赖仍需在 BW1100 试跑确认。
 

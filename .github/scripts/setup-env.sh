@@ -45,7 +45,7 @@ assert numpy.__version__ == os.environ["NUMPY_VERSION"], numpy.__version__
 expected_dtk_tag = f"dtk{os.environ['DTK_VER']}"
 assert expected_dtk_tag in torch_package_version, (torch_package_version, expected_dtk_tag)
 triton_version = version("triton")
-expected_torch_tag = {"2.10.0": "torch2100", "2.11.0": "torch2110"}[expected_torch]
+expected_torch_tag = "torch" + expected_torch.replace(".", "")
 assert triton_version.startswith("3.6.0+"), triton_version
 assert expected_torch_tag in triton_version, (triton_version, expected_torch_tag)
 assert expected_dtk_tag in triton_version, (triton_version, expected_dtk_tag)

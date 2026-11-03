@@ -81,6 +81,9 @@ if [ ! -f pyproject.toml ]; then
   echo "ERROR: Project configuration not found: ${repo_dir}/pyproject.toml" >&2
   exit 1
 fi
+# setuptools can retain deleted source files in build/lib between local builds.
+# Keep the clean-build behavior of the original build_wheel.sh entry point.
+rm -rf -- build
 mkdir -p "$out_dir"
 staging_dir=$(mktemp -d)
 trap 'rm -rf -- "$staging_dir"' EXIT
