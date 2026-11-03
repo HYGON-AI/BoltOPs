@@ -1,0 +1,217 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
+name: BoltOPs CI
+on:
+  pull_request:
+    branches:
+    - main
+    types:
+    - opened
+    - synchronize
+    - reopened
+    - ready_for_review
+  push:
+    branches:
+    - main
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: boltops-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  build2064-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        py_version:
+        - '3.10'
+        - '3.12'
+        torch_version:
+        - 2.10.0
+        - 2.11.0
+        include:
+        - py_version: '3.10'
+          numpy_version: 1.24.3
+        - py_version: '3.12'
+          numpy_version: 1.26.4
+    uses: ./.github/workflows/_build-test-wheel.yml
+    with:
+      dtk_version: '26.04'
+      dtk_ver: '2604'
+      py_version: ${{ matrix.py_version }}
+      numpy_version: ${{ matrix.numpy_version }}
+      torch_version: ${{ matrix.torch_version }}
+      run_tests: ${{ github.event_name != 'push' }}
+  build2610:
+    uses: ./.github/workflows/_build-test-wheel.yml
+    with:
+      dtk_version: '26.10'
+      dtk_ver: '2610'
+      py_version: '3.12'
+      numpy_version: 1.26.4
+      torch_version: 2.11.0
+      run_tests: false
+  performance:
+    needs:
+    - build2064-test
+    runs-on:
+    - self-hosted
+    - BW1100
+    timeout-minutes: 180
+    concurrency:
+      group: boltops-performance-BW1100
+      cancel-in-progress: false
+    container:
+      image: ${{ vars.DTK_IMAGE_REGISTRY || '10.16.1.152:5000/hcu/base/dtk' }}:26.04-rockylinux8.6-py3.12
+      options: --device=/dev/kfd --device=/dev/dri --group-add video -v /opt/hyhal/:/opt/hyhal/:ro --shm-size=80G --cap-add=SYS_PTRACE
+        --security-opt seccomp=unconfined --privileged=true
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYPI_URL: ${{ vars.PYPI_URL }}
+      TRITON_PYPI_URL: ${{ vars.TRITON_PYPI_URL || vars.PYPI_URL }}
+      AICC_INSTALLER_URL: ${{ vars.AICC_INSTALLER_URL || 'http://42.228.13.241:18000/ai_cc/Nightly/hcu_llvm_installer.sh' }}
+      RESOURCE_SERVER_URL: ${{ vars.RESOURCE_SERVER_URL }}
+      MAX_JOBS: '32'
+      CISMI_TIMEOUT: '3600'
+      PYTHONUNBUFFERED: '1'
+      DTK_VER: '2604'
+      PYTHON_VERSION: '3.12'
+      NUMPY_VERSION: 1.26.4
+      TORCH_VERSION: 2.11.0
+    steps:
+    - name: Checkout integrated source
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.sha }}
+        fetch-depth: 0
+        persist-credentials: false
+    - name: Verify source
+      run: bash .github/scripts/checkout-source.sh
+    - name: Download tested wheel
+      uses: actions/download-artifact@v4
+      with:
+        name: wheel-dtk2604-py3.12-torch2.11.0
+        path: output
+    - name: Install compiler and dependencies
+      run: bash .github/scripts/setup-env.sh
+    - name: Run performance suite
+      run: bash .github/scripts/performance.sh
+    - name: Upload performance reports and logs
+      if: ${{ always() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: performance-reports
+        path: |
+          scripts/*_boltops_output.xml
+          optest_artifacts/
+        include-hidden-files: true
+        if-no-files-found: warn
+        retention-days: 7
+    if: ${{ github.event_name != 'push' }}
+  publish-2604:
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    needs:
+    - build2064-test
+    runs-on:
+    - self-hosted
+    - BW1100
+    timeout-minutes: 180
+    container:
+      image: ${{ vars.DTK_IMAGE_REGISTRY || '10.16.1.152:5000/hcu/base/dtk' }}:26.04-rockylinux8.6-py3.12
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYPI_URL: ${{ vars.PYPI_URL }}
+      PYPI_PASSWORD: ${{ secrets.PYPI_PASSWORD }}
+      DTK_VER: '2604'
+      DTK_PKG_NAME: DTK-26.04-rc4-centos8-x86_64.tar.gz
+    steps:
+    - name: Checkout integrated source
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.sha }}
+        fetch-depth: 0
+        persist-credentials: false
+    - name: Download repaired wheels
+      uses: actions/download-artifact@v4
+      with:
+        pattern: wheel-dtk2604-*
+        path: output
+        merge-multiple: true
+    - name: Verify and publish nightly wheels
+      run: bash .github/scripts/publish.sh
+    - name: Upload published wheels
+      uses: actions/upload-artifact@v4
+      with:
+        name: published-dtk2604
+        path: publish_wheels/dtk2604/*.whl
+        if-no-files-found: error
+        retention-days: 30
+  publish-2610:
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    needs:
+    - build2610
+    runs-on:
+    - self-hosted
+    - BW1100
+    timeout-minutes: 180
+    container:
+      image: ${{ vars.DTK_IMAGE_REGISTRY || '10.16.1.152:5000/hcu/base/dtk' }}:26.04-rockylinux8.6-py3.12
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYPI_URL: ${{ vars.PYPI_URL }}
+      PYPI_PASSWORD: ${{ secrets.PYPI_PASSWORD }}
+      DTK_VER: '2610'
+      DTK_PKG_NAME: DTK-26.10-Rocky8.6-x86_64.tar.gz
+    steps:
+    - name: Checkout integrated source
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.sha }}
+        fetch-depth: 0
+        persist-credentials: false
+    - name: Download repaired wheels
+      uses: actions/download-artifact@v4
+      with:
+        pattern: wheel-dtk2610-*
+        path: output
+        merge-multiple: true
+    - name: Verify and publish nightly wheels
+      run: bash .github/scripts/publish.sh
+    - name: Upload published wheels
+      uses: actions/upload-artifact@v4
+      with:
+        name: published-dtk2610
+        path: publish_wheels/dtk2610/*.whl
+        if-no-files-found: error
+        retention-days: 30
+  ci-result:
+    if: ${{ always() }}
+    needs:
+    - build2064-test
+    - build2610
+    - performance
+    runs-on: ubuntu-latest
+    env:
+      BUILD: ${{ needs.build2064-test.result }}
+      BUILD_2610: ${{ needs.build2610.result }}
+      PERFORMANCE: ${{ needs.performance.result }}
+      EVENT_NAME: ${{ github.event_name }}
+    steps:
+    - name: Require completed CI jobs
+      shell: bash
+      run: |
+        set -euo pipefail
+        test "$BUILD" = success
+        test "$BUILD_2610" = success
+        if [ "$EVENT_NAME" = push ]; then
+          test "$PERFORMANCE" = skipped
+        else
+          test "$PERFORMANCE" = success
+        fi

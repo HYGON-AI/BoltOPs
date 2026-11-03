@@ -212,7 +212,7 @@ select:source:
     - GIT_COMMIT=$(git rev-parse --short=6 HEAD)
     - export WHEEL_OUTPUT="${CI_PROJECT_DIR}/output/dtk${DTK_VER}/py${PYTHON_VERSION}/torch${TORCH_VERSION}"
     - mkdir -p "${WHEEL_OUTPUT}"
-    - python -m build --wheel --outdir "${CI_WORK_DIR}/dist"
+    - bash .github/scripts/_build_hcu_wheel.sh --out-dir "${CI_WORK_DIR}/dist"
     - CIUpload REPAIR --dtk_version ${DTK_VER} --torch_version ${TORCH_VERSION} --git_commit ${GIT_COMMIT} --outputdir "${WHEEL_OUTPUT}" -f "${CI_WORK_DIR}"/dist/*.whl
   artifacts:
     when: always
@@ -415,7 +415,7 @@ performance:optest:
       fi
 
       report_rc=0
-      python ci_script/optest_to_junit.py "${CI_PROJECT_DIR}" "${RUNNER_TAG}_dtk${DTK_VER}_py${PYTHON_VERSION}_torch${TORCH_VERSION}" \
+      python scripts/ci/optest_to_junit.py "${CI_PROJECT_DIR}" "${RUNNER_TAG}_dtk${DTK_VER}_py${PYTHON_VERSION}_torch${TORCH_VERSION}" \
         "${results_file}" || report_rc=$?
       echo "optest exit=${optest_rc}; report exit=${report_rc}" | tee -a "${artifact_dir}/collection.log"
       if [ "${optest_rc}" -ne 0 ] || [ "${report_rc}" -ne 0 ]; then
