@@ -20,12 +20,15 @@ printf 'torch==%s\nnumpy==%s\n' "${TORCH_VERSION}" "${NUMPY_VERSION}" > "${CI_WO
 cat "${CI_WORK_DIR}/constraints.txt"
 
 python -m pip install --force-reinstall --no-deps --constraint "${CI_WORK_DIR}/constraints.txt" --index-url "${TORCH_INDEX_URL}" "torch==${TORCH_VERSION}"
-python -m pip install --constraint "${CI_WORK_DIR}/constraints.txt" "torch==${TORCH_VERSION}" pytest PyYAML "numpy==${NUMPY_VERSION}" pandas build wheel ciupload cismi ninja optest
+python -m pip install --constraint "${CI_WORK_DIR}/constraints.txt" "torch==${TORCH_VERSION}" pytest PyYAML "numpy==${NUMPY_VERSION}" pandas build wheel packaging ciupload cismi ninja optest
 # Resolve the HCU DSL packages against the selected Torch instead of pinning
 # their public versions. Keep Torch/NumPy constraints and validate vendor tags.
 python -m pip install --constraint "${CI_WORK_DIR}/constraints.txt" --index-url "${TRITON_INDEX_URL}" triton
 python -m pip show torch triton
-python -m pip install --constraint "${CI_WORK_DIR}/constraints.txt" --index-url "${TRITON_INDEX_URL}" tilelang apache-tvm-ffi --extra-index-url https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
+tilelang_wheel=$(python .github/scripts/select-hcu-wheel.py \
+  --index-url "${TRITON_INDEX_URL}" --package tilelang \
+  --dtk-ver "${DTK_VER}" --torch-version "${TORCH_VERSION}")
+python -m pip install --constraint "${CI_WORK_DIR}/constraints.txt" --index-url "${TRITON_INDEX_URL}" "${tilelang_wheel}" apache-tvm-ffi --extra-index-url https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
 python -m pip check
 python -m pip show torch triton tilelang apache-tvm-ffi numpy
 python - <<'PY'
