@@ -20,9 +20,7 @@
     → .github/scripts/setup-env.sh
     → .github/scripts/_build_hcu_wheel.sh
     → .github/scripts/test-wheel.sh（按事件决定）
-  → .github/workflows/_performance.yml（PR/手动运行，Torch2.11.0/2.13.0）
-    → .github/scripts/setup-env.sh
-    → .github/scripts/performance.sh
+    → .github/scripts/performance.sh（PR/手动运行）
       → scripts/ci/optest_to_junit.py
   → .github/workflows/_publish.yml（main push）
     → .github/scripts/publish.sh
@@ -30,12 +28,12 @@
 
 `.github/scripts/common.sh` 由需要 DTK 的 CI 脚本加载，负责公共初始化。`quality-gate.yml` 是独立的 PR 质量检查工作流。GitLab 保留在根目录的 `.gitlab-ci.yml`，使用同一个构建入口和报告工具。
 
-`_performance.yml` 分别接收 DTK26.10、Python3.12、Torch2.11.0/2.13.0，下载各自构建产物后运行性能测试，不额外构建 wheel。报告制品名称包含 DTK、Python 和 Torch 版本，避免两组上传冲突。实际硬件兼容性需要在 BW1100 上验证。
+`_build-test-wheel.yml` 分别接收 DTK26.10、Python3.12、Torch2.11.0/2.13.0，在同一个 job 中依次构建、运行正确性与性能测试，不需要下载 wheel 或重复安装环境。报告制品名称包含 DTK、Python 和 Torch 版本，避免两组上传冲突。实际硬件兼容性需要在 BW1100 上验证。
 
 ## 命名与维护
 
 - 新增 GitHub 工作流和 CI 脚本使用小写短横线命名，如 `setup-env.sh`。
-- `_build-test-wheel.yml`、`_performance.yml` 和 `_publish.yml` 表示供其他工作流调用的配置；`_` 是约定，不是 GitHub 功能开关。
+- `_build-test-wheel.yml` 和 `_publish.yml` 表示供其他工作流调用的配置；`_` 是约定，不是 GitHub 功能开关。
 - 统一构建脚本保留既定名称 `.github/scripts/_build_hcu_wheel.sh`。
 - CI 产物不放在脚本目录；wheel 使用 `output/`，性能日志使用 `optest_artifacts/`，按工作流上传为 artifact。
 - 移动文件后，同步更新 GitHub/GitLab 引用和文档，不复制第二套实现。
@@ -44,7 +42,7 @@
 
 测试版本在 `ci.yml` 的 `build2610.strategy.matrix.torch_version` 中维护，当前仅包含 `2.11.0` 和 `2.13.0`。两组均使用 DTK26.10、Python3.12、NumPy1.26.4；版本变更通过 PR 评审。
 
-PR 和手动触发时，两组构建均执行正确性测试，之后两组均运行性能测试；main push 时仅构建，两组都成功后由一个 `publish-2610` 任务发布全部 DTK2610 wheel。`ci-result` 要求两组构建成功；PR/手动触发还要求两组性能均成功，push 则要求性能跳过。为兼容组织质量门禁的 Workflow 解析器，当前使用显式值，不使用 YAML 锚点和别名；修改版本时需同时更新构建和性能矩阵。
+PR 和手动触发时，每个 Torch 版本独立执行构建、正确性测试和性能测试；三者在 `_build-test-wheel.yml` 的同一个 build job 内顺序执行，只安装一次环境。不同版本不共享成功条件，但为避免性能互扰，完整 job 使用同一 concurrency group 排队。main push 时仅构建，两组都成功后由一个 `publish-2610` 任务发布全部 DTK2610 wheel。`ci-result` 检查两个版本的完整工作流结果，任一版本失败仍会失败。为兼容组织质量门禁的 Workflow 解析器，当前使用显式值，不使用 YAML 锚点和别名；修改版本时只需更新 ci.yml 的 Torch 矩阵。
 
 升级版本时，检查对应的 DTK/Python 容器及 HCU Torch/Triton/TileLang 包是否可用。不同 DTK 若需要不同版本，应拆开配置，不能只为减少重复而强行共用。发布任务的 Python3.12 容器只用于上传 wheel，不决定 wheel 的目标 Python 版本。
 

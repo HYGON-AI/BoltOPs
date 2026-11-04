@@ -21,7 +21,8 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   build2610:
-    name: build2610 (torch${{ matrix.torch_version }})
+    # Each matrix entry runs build, correctness, then performance independently.
+    name: DTK2610 (torch${{ matrix.torch_version }})
     strategy:
       fail-fast: false
       matrix:
@@ -36,25 +37,6 @@ jobs:
       numpy_version: '1.26.4'
       torch_version: ${{ matrix.torch_version }}
       run_tests: ${{ github.event_name != 'push' }}
-  # Test both Torch versions, each using its existing DTK26.10 wheel.
-  performance:
-    name: performance (torch${{ matrix.torch_version }})
-    if: ${{ github.event_name != 'push' }}
-    needs:
-    - build2610
-    strategy:
-      fail-fast: false
-      matrix:
-        torch_version:
-        - '2.11.0'
-        - '2.13.0'
-    uses: ./.github/workflows/_performance.yml
-    with:
-      dtk_version: '26.10'
-      dtk_ver: '2610'
-      py_version: '3.12'
-      numpy_version: '1.26.4'
-      torch_version: ${{ matrix.torch_version }}
   publish-2610:
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     needs:
@@ -69,20 +51,12 @@ jobs:
     if: ${{ always() }}
     needs:
     - build2610
-    - performance
     runs-on: ubuntu-latest
     env:
       BUILD_2610: ${{ needs.build2610.result }}
-      PERFORMANCE: ${{ needs.performance.result }}
-      EVENT_NAME: ${{ github.event_name }}
     steps:
     - name: Require completed CI jobs
       shell: bash
       run: |
         set -euo pipefail
         test "$BUILD_2610" = success
-        if [ "$EVENT_NAME" = push ]; then
-          test "$PERFORMANCE" = skipped
-        else
-          test "$PERFORMANCE" = success
-        fi
