@@ -9,7 +9,7 @@ Port of half BN without scales. Defaults match FP8 bn_align and half benches:
 Half W is tiny; W LDS ping-pong is usually a net loss vs BN / plain Gluon.
 
 MFMA: ``instr_shape=[16,16,16]``, ``k_width=4``, shared ``vec=4/maxPhase=16``
-(matching half BN TTGIR), ``AMDMFMALayout(transposed=True)`` (mmacLayout=2).
+(matching half BN TTGIR), explicit ``MmacLayout.LIT`` (mmacLayout=2).
 
 Launch: ``mqa_logits_half_gluon_bn_align(...)`` or half ``backend="gluon_bn_align"``.
 """
@@ -146,8 +146,8 @@ if _GLUON_AVAILABLE:
         mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
             version=MFMA_VERSION,
             instr_shape=[16, 16, 16],
-            # True → HCU mmacLayout=INTERLEAVE(2), matching half BN accelerate.
-            transposed=True,
+            # Explicit LIT (2), matching half BN accelerate.
+            mmac_layout=gl.amd.MmacLayout.LIT,
             warps_per_cta=[1, NumWarps],
             tiles_per_warp=[M_TILES, KV_TILES_N],
         )
