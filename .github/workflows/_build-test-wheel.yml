@@ -30,10 +30,6 @@ jobs:
     - self-hosted
     - BW1100
     timeout-minutes: 360
-    # Serialize the full chain to preserve the performance sampling lock.
-    concurrency:
-      group: boltops-performance-BW1100
-      cancel-in-progress: false
     container:
       image: ${{ vars.DTK_IMAGE_REGISTRY || '10.16.1.152:5000/hcu/base/dtk' }}:${{ inputs.dtk_version }}-rockylinux8.6-py${{ inputs.py_version
         }}

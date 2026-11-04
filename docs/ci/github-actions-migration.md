@@ -4,7 +4,7 @@
 
 ## 1. 先理解整体流程
 
-PR 到 main：已有 Quality Gate 并行检查；build2610 使用 DTK26.10、Python3.12，分别构建 Torch2.11.0 和 Torch2.13.0 的 wheel 并运行正确性测试。每个版本在 _build-test-wheel.yml 的同一个 build job 中顺序执行构建、正确性和性能测试；沿用同一环境和本地 wheel。为避免性能互扰，完整 job 使用同一 concurrency group 排队。ci-result 要求两组构建与两组性能均成功。DTK26.04 的构建与发布已移除。
+PR 到 main：已有 Quality Gate 并行检查；build2610 使用 DTK26.10、Python3.12，分别构建 Torch2.11.0 和 Torch2.13.0 的 wheel 并运行正确性测试。每个版本在 _build-test-wheel.yml 的同一个 build job 中顺序执行构建、正确性和性能测试；沿用同一环境和本地 wheel。不同版本可在 runner 资源充足时并行执行，性能测试也可能同时运行。ci-result 要求两组构建与两组性能均成功。DTK26.04 的构建与发布已移除。
 
 push 到 main：只构建和修复 wheel，不再运行正确性或性能测试。DTK26.10 的 Torch2.11.0、2.13.0 两组均构建成功后统一发布。PR 阶段完成正确性与性能测试，合入后不重复测试。workflow_dispatch 运行构建、正确性与性能测试，仅验证、不发布。Actions 不执行 GitLab → GitHub 镜像任务。此次版本调整只修改 GitHub CI，旧 GitLab CI 仍需按正式切换步骤停用。
 
@@ -57,7 +57,7 @@ Settings → Actions → Runners：确保 BW1100 runner/runner group 允许 Bolt
 
 镜像需允许 Actions Node20 动作运行；若私有仓库要求认证，需要额外配置 container.credentials，当前参考 lightop 使用 runner 已有的镜像访问方式。
 
-完整 build job 的 concurrency group 为 boltops-performance-BW1100；cancel-in-progress=false 防止打断当前性能采样，但 GitHub concurrency 最多保留一个 pending job，新 pending 可能替换旧 pending；它不是完整 FIFO。该锁也不覆盖其他仓库（例如 lightop），GPU 仍可能被其他任务占用。
+build job 不设置共享 concurrency 锁，两个 Torch 版本可并行编译及测试。CIsmi 分配空闲 HCU，但不能隔离共享 CPU、内存和 I/O 的性能干扰。工作流级别仍会取消同一 PR 的旧运行。
 
 与 lightop 一样，同仓库 PR 和 fork PR 均可进入构建及 GPU 测试流程，不检查来源仓库是否相同。使用 pull_request 事件，不使用 pull_request_target。是否等待维护者批准由 GitHub 仓库/组织的 Actions fork 工作流审批设置决定；需管理员确认 BW1100 runner 对 BoltOPs 可用。PR 不进入发布任务，发布 Secret 只用于 main push 的发布任务。
 

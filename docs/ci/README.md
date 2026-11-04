@@ -42,7 +42,7 @@
 
 测试版本在 `ci.yml` 的 `build2610.strategy.matrix.torch_version` 中维护，当前仅包含 `2.11.0` 和 `2.13.0`。两组均使用 DTK26.10、Python3.12、NumPy1.26.4；版本变更通过 PR 评审。
 
-PR 和手动触发时，每个 Torch 版本独立执行构建、正确性测试和性能测试；三者在 `_build-test-wheel.yml` 的同一个 build job 内顺序执行，只安装一次环境。不同版本不共享成功条件，但为避免性能互扰，完整 job 使用同一 concurrency group 排队。main push 时仅构建，两组都成功后由一个 `publish-2610` 任务发布全部 DTK2610 wheel。`ci-result` 检查两个版本的完整工作流结果，任一版本失败仍会失败。为兼容组织质量门禁的 Workflow 解析器，当前使用显式值，不使用 YAML 锚点和别名；修改版本时只需更新 ci.yml 的 Torch 矩阵。
+PR 和手动触发时，每个 Torch 版本独立执行构建、正确性测试和性能测试；三者在 `_build-test-wheel.yml` 的同一个 build job 内顺序执行，只安装一次环境。不同版本不共享成功条件，可在 runner 资源充足时并行执行；性能测试也可能并行，使用 CIsmi 分配空闲 HCU。main push 时仅构建，两组都成功后由一个 `publish-2610` 任务发布全部 DTK2610 wheel。`ci-result` 检查两个版本的完整工作流结果，任一版本失败仍会失败。为兼容组织质量门禁的 Workflow 解析器，当前使用显式值，不使用 YAML 锚点和别名；修改版本时只需更新 ci.yml 的 Torch 矩阵。
 
 升级版本时，检查对应的 DTK/Python 容器及 HCU Torch/Triton/TileLang 包是否可用。不同 DTK 若需要不同版本，应拆开配置，不能只为减少重复而强行共用。发布任务的 Python3.12 容器只用于上传 wheel，不决定 wheel 的目标 Python 版本。
 
