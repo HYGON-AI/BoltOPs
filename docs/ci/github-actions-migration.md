@@ -19,9 +19,9 @@ push 到 main：只构建和修复 wheel，不再运行正确性或性能测试�
 | .github/scripts/common.sh | 每一步加载 DTK；设置索引、输出目录和唯一运行标识 |
 | .github/scripts/setup-env.sh | 安装 AICC、精确选择 Torch/Triton/TileLang/NumPy 并验证版本 |
 | .github/scripts/_build_hcu_wheel.sh | 统一检查环境并打包；CIUpload REPAIR 由复用工作流执行 |
-| .github/scripts/test-wheel.sh | 把 wheel 安装到临时目录，在该目录运行 test，避免误测源码 |
-| .github/scripts/performance.sh | 下载的 wheel 安装到环境中，运行 optest，收集 JSON、日志、JUnit |
-| .github/scripts/publish.sh | 校验同名 wheel 解包内容一致，去重后 CIUpload NIGHTLY |
+| .github/scripts/test-correctness.sh | 把 wheel 安装到临时目录，在该目录运行 test，避免误测源码 |
+| .github/scripts/test-performance.sh | 安装本 job 构建的 wheel，运行 optest，收集 JSON、日志、JUnit |
+| .github/scripts/publish.sh | 收集 wheel 到发布目录，使用 CIUpload NIGHTLY 上传 |
 
 先写触发条件 on，再写矩阵和 container，然后给每个动作写一个 shell 脚本，最后用 needs 串起来。不要把 Actions 的 `${{ ... }}` 写进独立 shell 文件；先通过 env 传入，脚本只使用 `${VAR}`。
 

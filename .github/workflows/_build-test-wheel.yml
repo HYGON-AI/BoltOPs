@@ -81,10 +81,10 @@ jobs:
           -f "${CI_WORK_DIR}"/dist/*.whl
     - name: Run correctness tests
       if: ${{ inputs.run_tests }}
-      run: bash .github/scripts/test-wheel.sh
+      run: bash .github/scripts/test-correctness.sh
     - name: Run performance tests
       if: ${{ inputs.run_tests }}
-      run: bash .github/scripts/performance.sh
+      run: bash .github/scripts/test-performance.sh
     - name: Upload performance reports and logs
       if: ${{ always() && inputs.run_tests }}
       uses: actions/upload-artifact@v4

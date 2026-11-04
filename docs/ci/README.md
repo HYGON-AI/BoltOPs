@@ -19,8 +19,8 @@
   → .github/workflows/_build-test-wheel.yml
     → .github/scripts/setup-env.sh
     → .github/scripts/_build_hcu_wheel.sh
-    → .github/scripts/test-wheel.sh（按事件决定）
-    → .github/scripts/performance.sh（PR/手动运行）
+    → .github/scripts/test-correctness.sh（按事件决定）
+    → .github/scripts/test-performance.sh（PR/手动运行）
       → scripts/ci/optest_to_junit.py
   → .github/workflows/_publish.yml（main push）
     → .github/scripts/publish.sh
