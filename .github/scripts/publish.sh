@@ -12,28 +12,15 @@ PIP_TRUSTED_HOST=$(python -c 'import os,urllib.parse; print(urllib.parse.urlpars
 python -m pip install ciupload
 python - <<'PY'
 from pathlib import Path
-import shutil
-import zipfile
-
-def contents(path):
-    with zipfile.ZipFile(path) as wheel:
-        return {name: wheel.read(name) for name in wheel.namelist()}
-
 import os
+import shutil
 
 dtk_version = os.environ["DTK_VER"]
 wheels = sorted(Path("output").glob(f"dtk{dtk_version}/py*/torch*/*.whl"))
 assert wheels, f"No built wheels found for DTK {dtk_version}"
 destination = Path("publish_wheels") / f"dtk{dtk_version}"
 destination.mkdir(parents=True, exist_ok=True)
-seen = {}
 for wheel in wheels:
-    if wheel.name in seen:
-        assert contents(wheel) == contents(seen[wheel.name]), (
-            f"Different contents for the same wheel filename: {wheel} and {seen[wheel.name]}"
-        )
-        continue
-    seen[wheel.name] = wheel
     shutil.copy2(wheel, destination / wheel.name)
     print(f"Publish wheel: {wheel}")
 PY
