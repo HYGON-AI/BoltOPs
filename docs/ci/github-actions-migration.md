@@ -4,7 +4,7 @@
 
 ## 1. 先理解整体流程
 
-PR 到 main：已有 Quality Gate 并行检查；build2610 使用 DTK26.10、Python3.12，分别构建 Torch2.11.0 和 Torch2.13.0 的 wheel 并运行正确性测试。每个版本在 _build-test-wheel.yml 的同一个 build job 中顺序执行构建、正确性和性能测试；沿用同一环境和本地 wheel。不同版本可在 runner 资源充足时并行执行，性能测试也可能同时运行。ci-result 要求两组构建与两组性能均成功。DTK26.04 的构建与发布已移除。
+PR 到 main：已有 Quality Gate 并行检查；build2610 使用 DTK26.10、Python3.12，分别构建 Torch2.11.0 和 Torch2.13.0 的 wheel 并运行正确性测试。不同版本的构建和正确性测试并行；各自成功后，由 _build-test-wheel.yml 调用 _performance.yml 下载对应 wheel 并运行性能测试。只有性能 job 使用共享锁串行执行，一个版本失败不会阻止另一版本的性能测试。ci-result 要求两组构建与两组性能均成功。DTK26.04 的构建与发布已移除。
 
 push 到 main：只构建和修复 wheel，不再运行正确性或性能测试。DTK26.10 的 Torch2.11.0、2.13.0 两组均构建成功后统一发布。PR 阶段完成正确性与性能测试，合入后不重复测试。workflow_dispatch 运行构建、正确性与性能测试，仅验证、不发布。Actions 不执行 GitLab → GitHub 镜像任务。此次版本调整只修改 GitHub CI，旧 GitLab CI 仍需按正式切换步骤停用。
 
@@ -20,7 +20,7 @@ push 到 main：只构建和修复 wheel，不再运行正确性或性能测试�
 | .github/scripts/setup-env.sh | 安装 AICC、精确选择 Torch/Triton/TileLang/NumPy 并验证版本 |
 | .github/scripts/_build_hcu_wheel.sh | 统一检查环境并打包；CIUpload REPAIR 由复用工作流执行 |
 | .github/scripts/test-correctness.sh | 把 wheel 安装到临时目录，在该目录运行 test，避免误测源码 |
-| .github/scripts/test-performance.sh | 安装本 job 构建的 wheel，运行 optest，收集 JSON、日志、JUnit |
+| .github/scripts/test-performance.sh | 下载并安装对应版本构建的 wheel，运行 optest，收集 JSON、日志、JUnit |
 | .github/scripts/publish.sh | 收集 wheel 到发布目录，使用 CIUpload NIGHTLY 上传 |
 
 先写触发条件 on，再写矩阵和 container，然后给每个动作写一个 shell 脚本，最后用 needs 串起来。不要把 Actions 的 `${{ ... }}` 写进独立 shell 文件；先通过 env 传入，脚本只使用 `${VAR}`。
@@ -57,7 +57,7 @@ Settings → Actions → Runners：确保 BW1100 runner/runner group 允许 Bolt
 
 镜像需允许 Actions Node20 动作运行；若私有仓库要求认证，需要额外配置 container.credentials，当前参考 lightop 使用 runner 已有的镜像访问方式。
 
-build job 不设置共享 concurrency 锁，两个 Torch 版本可并行编译及测试。CIsmi 分配空闲 HCU，但不能隔离共享 CPU、内存和 I/O 的性能干扰。工作流级别仍会取消同一 PR 的旧运行。
+build job 不设置共享 concurrency 锁，两个 Torch 版本可并行编译及执行正确性测试。性能 job 使用 boltops-performance-BW1100 共享 concurrency group，cancel-in-progress=false，因此性能测试串行执行，顺序不保证；GitHub 默认最多保留一个 pending job，跨流水线提交可能替换等待任务。CIsmi 分配空闲 HCU，但不能隔离共享 CPU、内存和 I/O 的性能干扰。工作流级别仍会取消同一 PR 的旧运行。
 
 与 lightop 一样，同仓库 PR 和 fork PR 均可进入构建及 GPU 测试流程，不检查来源仓库是否相同。使用 pull_request 事件，不使用 pull_request_target。是否等待维护者批准由 GitHub 仓库/组织的 Actions fork 工作流审批设置决定；需管理员确认 BW1100 runner 对 BoltOPs 可用。PR 不进入发布任务，发布 Secret 只用于 main push 的发布任务。
 
@@ -97,7 +97,7 @@ PR 验证通过后，安排同一次切换窗口：
 ## 6. 本地验证
 
 ```bash
-actionlint -config-file .github/actionlint.yaml .github/workflows/ci.yml .github/workflows/_build-test-wheel.yml .github/workflows/_publish.yml
+actionlint -config-file .github/actionlint.yaml .github/workflows/ci.yml .github/workflows/_build-test-wheel.yml .github/workflows/_performance.yml .github/workflows/_publish.yml
 for f in .github/scripts/*.sh; do bash -n "$f"; done
 git diff --check
 ```

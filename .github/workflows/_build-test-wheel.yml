@@ -29,7 +29,7 @@ jobs:
     runs-on:
     - self-hosted
     - BW1100
-    timeout-minutes: 360
+    timeout-minutes: 180
     container:
       image: ${{ vars.DTK_IMAGE_REGISTRY || '10.16.1.152:5000/hcu/base/dtk' }}:${{ inputs.dtk_version }}-rockylinux8.6-py${{ inputs.py_version
         }}
@@ -78,20 +78,6 @@ jobs:
     - name: Run correctness tests
       if: ${{ inputs.run_tests }}
       run: bash .github/scripts/test-correctness.sh
-    - name: Run performance tests
-      if: ${{ inputs.run_tests }}
-      run: bash .github/scripts/test-performance.sh
-    - name: Upload performance reports and logs
-      if: ${{ always() && inputs.run_tests }}
-      uses: actions/upload-artifact@v4
-      with:
-        name: performance-reports-dtk${{ inputs.dtk_ver }}-py${{ inputs.py_version }}-torch${{ inputs.torch_version }}
-        path: |
-          scripts/*_boltops_output.xml
-          optest_artifacts/
-        include-hidden-files: true
-        if-no-files-found: warn
-        retention-days: 7
     - name: Upload wheels and test reports
       if: ${{ always() }}
       uses: actions/upload-artifact@v4
@@ -100,3 +86,14 @@ jobs:
         path: output/
         if-no-files-found: error
         retention-days: 7
+  performance:
+    if: ${{ inputs.run_tests }}
+    needs:
+    - build
+    uses: ./.github/workflows/_performance.yml
+    with:
+      dtk_version: ${{ inputs.dtk_version }}
+      dtk_ver: ${{ inputs.dtk_ver }}
+      py_version: ${{ inputs.py_version }}
+      numpy_version: ${{ inputs.numpy_version }}
+      torch_version: ${{ inputs.torch_version }}
