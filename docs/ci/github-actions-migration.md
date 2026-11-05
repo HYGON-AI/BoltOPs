@@ -39,7 +39,7 @@ GitHub BoltOPs → Settings → Secrets and variables → Actions → Variables�
 
 | Variable | 值/含义 |
 |---|---|
-| PYPI_URL | 通用 devpi 服务根地址（包含 http:// 与端口，无 /nightly 后缀）；构建及性能任务默认 http://10.16.1.201:9929，与 lightop 一样支持 fork PR 的变量缺失场景；发布任务仍读取组织/仓库 Variable |
+| PYPI_URL | 通用 devpi 服务根地址（包含 http:// 与端口，无 /nightly 后缀）；构建及性能任务默认 http://12.12.12.201:9929，与 lightop 一样支持 fork PR 的变量缺失场景；发布任务仍读取组织/仓库 Variable |
 | TRITON_PYPI_URL | Triton/DTK2610 镜像根地址；可与 PYPI_URL 相同，未设置时回退到 PYPI_URL |
 | AICC_INSTALLER_URL | 默认使用提供的 http://42.228.13.241:18000/ai_cc/Nightly/hcu_llvm_installer.sh；可配置覆盖 |
 | RESOURCE_SERVER_URL | 可选，准备脚本单独使用时用于拼接 AICC 地址的回退值 |

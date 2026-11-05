@@ -40,8 +40,8 @@ jobs:
         shell: bash
     env:
       # Fork PRs may not receive vars; match lightop's non-secret URL fallback.
-      PYPI_URL: ${{ vars.PYPI_URL || 'http://10.16.1.201:9929' }}
-      TRITON_PYPI_URL: ${{ vars.TRITON_PYPI_URL || vars.PYPI_URL || 'http://10.16.1.201:9929' }}
+      PYPI_URL: ${{ vars.PYPI_URL || 'http://12.12.12.201:9929' }}
+      TRITON_PYPI_URL: ${{ vars.TRITON_PYPI_URL || vars.PYPI_URL || 'http://12.12.12.201:9929' }}
       AICC_INSTALLER_URL: ${{ vars.AICC_INSTALLER_URL || 'http://42.228.13.241:18000/ai_cc/Nightly/hcu_llvm_installer.sh' }}
       RESOURCE_SERVER_URL: ${{ vars.RESOURCE_SERVER_URL }}
       MAX_JOBS: '32'
