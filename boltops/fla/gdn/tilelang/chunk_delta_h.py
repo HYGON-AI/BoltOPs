@@ -20,6 +20,26 @@ from .common import require_contiguous, require_first_version, tilelang_dtype
 _LOG2E = 1.4426950408889634
 _PRODUCER_THREADS = 256
 _TOTAL_THREADS = 512
+_TOTAL_WAVES = _TOTAL_THREADS // 64
+_WASP_CONSUMER_WAVES = (_TOTAL_THREADS - _PRODUCER_THREADS) // 64
+_WASP_PRODUCER_WAVES = _PRODUCER_THREADS // 64
+_WASP_U_FREE_PING = 0
+_WASP_U_READY_PING = 1
+_WASP_K_FREE_PING = 2
+_WASP_K_READY_PING = 3
+_WASP_W_FREE_PING = 4
+_WASP_W_READY_PING = 5
+_WASP_STATE_FREE_PING = 6
+_WASP_STATE_READY_PING = 7
+_WASP_V_NEW_FREE_PING = 8
+_WASP_V_NEW_READY_PING = 9
+_WASP_INIT_EBAR_ID = 0
+_WASP_CONSUMER_EBAR_ID = 1
+# The two four-wave WDRA branches must have a four-VGPR-aligned average:
+# (32 + 192) / 2 = 112.
+_WASP_PRODUCER_MAX_NREG = 32
+_WASP_CONSUMER_MAX_NREG = 192
+_WASP_VARLEN_CONSUMER_MAX_NREG = 208
 
 @tilelang.jit(
     out_idx=[],
@@ -313,7 +333,7 @@ def _build_chunk_h_copy_pipeline(
                     v_new_shared: v_new_shared_v8_phase_layout,
                 }
             )
-            T.use_swizzle(10)
+            # T.use_swizzle(10)
 
             state_idx = initial_state_indices[bid]
             for iv, ik in T.Parallel(block_v, dim_k):
@@ -756,7 +776,7 @@ def _build_chunk_h_copy_pipeline_varlen(
             T.ceildiv(dim_v, block_v), num_sequences * heads, threads=threads
         ) as (vid, bbh):
             # Apply the block remap before deriving sequence/head coordinates.
-            T.use_swizzle(10)
+            # T.use_swizzle(10)
             sequence_id, hid = bbh // heads, bbh % heads
             v_offset = vid * block_v
             data_bid = 0
@@ -1385,7 +1405,7 @@ def _build_chunk_h_wasp_4p4c(
                     v_new_shared: v_new_shared_v8_phase_layout,
                 }
             )
-            T.use_swizzle(10)
+            # T.use_swizzle(10)
 
             if tx < _PRODUCER_THREADS:
                 # Prologue: U_0 is the oldest group, K_0 remains outstanding.
@@ -1844,7 +1864,7 @@ def _build_chunk_h_wasp_4p4c(
             num_sequences * heads,
             threads=_TOTAL_THREADS,
         ) as (vid, bbh):
-            T.use_swizzle(10)
+            # T.use_swizzle(10)
             sequence_id, hid = bbh // heads, bbh % heads
             v_offset = vid * block_v
             tx = T.get_thread_binding()
@@ -2239,6 +2259,1178 @@ def _build_chunk_h_wasp_4p4c(
 
 
 
+@tilelang.jit(
+    out_idx=[],
+    pass_configs={
+        tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+        tilelang.PassConfigKey.TL_ENABLE_HCU_WDRA: True,
+        tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
+        tilelang.PassConfigKey.TL_DISABLE_SHARED_MEMORY_REUSE: True,
+        tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True,
+    },
+)
+def _build_chunk_h_wasp_4p4c_gfx946(
+    batch: int,
+    heads: int,
+    dim_k: int,
+    dim_v: int,
+    state_rows: int,
+    qkv_dtype: str,
+    gate_dtype: str,
+    chunk_size: int,
+    use_initial_state: bool,
+    store_final_state: bool,
+    inplace_final_state: bool,
+    save_new_value: bool,
+    transpose_state_layout: bool,
+    is_varlen: bool = False,
+    fixed_has_tail: bool = False,
+):
+    """Build the gfx946 ABarrier four-producer/four-consumer kernel."""
+    block_v = 32
+    seq_len = T.dynamic("seq_len")
+    full_chunks = seq_len // chunk_size
+    num_chunks = (
+        T.ceildiv(seq_len, chunk_size) if fixed_has_tail else full_chunks
+    )
+    state_shape = (
+        (heads, dim_v, dim_k)
+        if transpose_state_layout
+        else (heads, dim_k, dim_v)
+    )
+    chunk_state_shape = (
+        (batch, num_chunks, heads, dim_v, dim_k)
+        if transpose_state_layout
+        else (batch, num_chunks, heads, dim_k, dim_v)
+    )
+    state_shared_h_k_major_layout = T.Layout(
+        (block_v, dim_k),
+        lambda iv, ik: (
+            iv,
+            ((ik // 8) ^ (iv % 8)) * 8 + ik % 8,
+        ),
+    )
+    v_new_shared_v8_phase_layout = T.Layout(
+        (chunk_size, block_v),
+        lambda it, iv: (
+            it,
+            ((iv // 8) ^ (it % 4)) * 8 + iv % 8,
+        ),
+    )
+
+    @T.macro
+    def run_consumer_chunk(
+        cid,
+        w_current,
+        w_next,
+        prefetch_next,
+        has_following_chunk,
+        w,
+        g,
+        h,
+        v_new,
+        bid,
+        hid,
+        v_offset,
+        state_shared_h,
+        state_operand,
+        w_shared,
+        u_shared,
+        u_fragment,
+        v_new_fragment,
+        g_fragment,
+        k_shared,
+        g_shared,
+        k_fragment,
+        v_new_shared,
+        v_new_operand,
+        state_fragment,
+    ):
+        # U uses its own single-buffer handoff.  The producer-side READY
+        # arrival completes only after the bound global-to-LDS copy.
+        T.abarrier_try_wait(_WASP_U_READY_PING, cid & 1)
+        T.copy(u_shared, u_fragment)
+        # 2 u_fragment reads (outstanding)
+        T.s_waitcnt(2, "lgkmcnt")
+
+        T.sched_barrier()
+        T.gemm(
+            w_current,
+            state_operand,
+            v_new_fragment,
+            transpose_B=True,
+            policy=T.GemmWarpPolicy.FullRow,
+            clear_accum=True,
+            k_pack=2,
+        )
+        T.sched_barrier()
+
+        # Barrier 1: u_shared -> u_fragment for chunk cid is complete, so
+        # producers may overwrite u_shared.
+        T.s_waitcnt(0, "lgkmcnt")
+        T.abarrier_arrive(_WASP_U_FREE_PING)
+
+        for it, iv in T.Parallel(chunk_size, block_v):
+            v_new_fragment[it, iv] = (
+                T.cast(u_fragment[it, iv], "float32")
+                - v_new_fragment[it, iv]
+            )
+
+        # Publish the ungated value for producer-side global storage.  The
+        # producer releases v_new_shared after capturing it in VGPRs, while
+        # consumers continue with the elementwise gating work.
+        if save_new_value:
+            T.abarrier_try_wait(_WASP_V_NEW_FREE_PING, cid & 1)
+            T.abarrier_seq(_WASP_V_NEW_READY_PING)
+            T.copy(v_new_fragment, v_new_shared)
+            T.s_waitcnt(0, "lgkmcnt")
+            T.abarrier_arrive(_WASP_V_NEW_READY_PING)
+
+        # Barrier 2: wait for producer publication of k_shared for chunk cid.
+        T.abarrier_try_wait(_WASP_K_READY_PING, cid & 1)
+
+        # G shares K's single-buffer lifetime. Issue its LDS reads before the
+        # K reads so lgkmcnt(4) can make G ready while leaving the tail of the
+        # K prefetch outstanding during the elementwise gating work.
+        for it, iv in T.Parallel(chunk_size, block_v):
+            g_fragment[it, iv] = g_shared[it]
+        g_last_value = g_shared[chunk_size - 1]
+        T.copy(k_shared, k_fragment)
+        T.s_waitcnt(4, "lgkmcnt")
+
+        for it, iv in T.Parallel(chunk_size, block_v):
+            diff = g_last_value - g_fragment[it, iv]
+            v_new_fragment[it, iv] = T.if_then_else(
+                diff <= 0,
+                v_new_fragment[it, iv] * T.exp2(diff * _LOG2E),
+                T.float32(0.0),
+            )
+        g_last_scale = T.exp2(g_last_value * _LOG2E)
+        for iv, ik in T.Parallel(block_v, dim_k):
+            state_fragment[iv, ik] *= g_last_scale
+
+        if save_new_value:
+            T.abarrier_try_wait(_WASP_V_NEW_FREE_PING, (cid + 1) & 1)
+        T.copy(v_new_fragment, v_new_shared)
+        T.sched_barrier()
+
+        # Barrier 3: complete k_shared -> k_fragment and publish v_new_shared
+        # for chunk cid. Producers may then overwrite k_shared with data for
+        # chunk cid+1.
+        T.s_waitcnt(0, "lgkmcnt")
+        T.abarrier_arrive(_WASP_K_FREE_PING)
+        T.ebarrier_sync_cnt(
+            _WASP_CONSUMER_EBAR_ID, _WASP_CONSUMER_WAVES
+        )
+        T.copy(v_new_shared, v_new_operand)
+        if prefetch_next:
+            # Both fixed and varlen publish W_0 through the producer, so the
+            # following chunk always uses the next READY phase.
+            T.abarrier_try_wait(_WASP_W_READY_PING, (cid + 1) & 1)
+            T.copy(w_shared, w_next)
+
+        T.sched_barrier()
+        T.gemm(
+            v_new_operand,
+            k_fragment,
+            state_fragment,
+            transpose_A=True,
+            policy=T.GemmWarpPolicy.FullCol,
+            clear_accum=False,
+            k_pack=1,
+        )
+        T.sched_barrier()
+        T.abarrier_try_wait(_WASP_STATE_FREE_PING, (cid + 1) & 1)
+        T.abarrier_seq(_WASP_STATE_READY_PING)
+        T.copy(state_fragment, state_shared_h)
+
+        T.sched_barrier()
+
+        # Barrier 4
+        # state_shared_h ready
+        T.s_waitcnt(0, "lgkmcnt")
+        T.abarrier_arrive(_WASP_STATE_READY_PING)
+        if prefetch_next:
+            T.abarrier_arrive(_WASP_W_FREE_PING)
+        T.ebarrier_sync_cnt(
+            _WASP_CONSUMER_EBAR_ID, _WASP_CONSUMER_WAVES
+        )
+
+        if has_following_chunk:
+            T.copy(state_shared_h, state_operand)
+            T.sched_barrier()
+
+    @T.macro
+    def drain_producer_v_new(
+        cid,
+        v_new,
+        bid,
+        hid,
+        v_offset,
+        v_new_shared,
+        v_new_save_fragment,
+    ):
+        base = cid * chunk_size
+        if save_new_value:
+            T.abarrier_try_wait(_WASP_V_NEW_READY_PING, cid & 1)
+            T.copy(v_new_shared, v_new_save_fragment)
+            T.s_waitcnt(0, "lgkmcnt")
+            T.abarrier_arrive(_WASP_V_NEW_FREE_PING)
+            T.copy(
+                v_new_save_fragment,
+                v_new[
+                    bid,
+                    base : base + chunk_size,
+                    hid,
+                    v_offset : v_offset + block_v,
+                ],
+            )
+
+    @T.macro
+    def drain_producer_state(
+        cid,
+        h,
+        bid,
+        hid,
+        v_offset,
+        state_shared_h,
+        state_save_fragment,
+    ):
+        T.abarrier_try_wait(_WASP_STATE_READY_PING, cid & 1)
+        T.copy(state_shared_h, state_save_fragment)
+        T.s_waitcnt(0, "lgkmcnt")
+        T.abarrier_arrive(_WASP_STATE_FREE_PING)
+        if transpose_state_layout:
+            T.copy(
+                state_save_fragment,
+                h[
+                    bid,
+                    cid,
+                    hid,
+                    v_offset : v_offset + block_v,
+                    0:dim_k,
+                ],
+            )
+        else:
+            for iv, ik in T.Parallel(block_v, dim_k):
+                h[bid, cid, hid, ik, v_offset + iv] = state_save_fragment[iv, ik]
+
+    @T.prim_func
+    def chunk_gated_delta_rule_fwd_h_wasp_4p4c_gfx946_kernel(
+        k: T.Tensor([batch, seq_len, heads, dim_k], qkv_dtype),
+        w: T.Tensor([batch, seq_len, heads, dim_k], qkv_dtype),
+        u: T.Tensor([batch, seq_len, heads, dim_v], qkv_dtype),
+        g: T.Tensor([batch, seq_len, heads], gate_dtype),
+        initial_state: T.Tensor([state_rows, *state_shape], "float32"),
+        initial_state_indices: T.Tensor([batch], "int32"),
+        h: T.Tensor(chunk_state_shape, qkv_dtype),
+        v_new: T.Tensor([batch, seq_len, heads, dim_v], qkv_dtype),
+        final_state: T.Tensor(
+            [state_rows if inplace_final_state else batch, *state_shape],
+            "float32",
+        ),
+    ):
+        with T.Kernel(
+            T.ceildiv(dim_v, block_v), batch * heads, threads=_TOTAL_THREADS
+        ) as (vid, bbh):
+            bid, hid = bbh // heads, bbh % heads
+            v_offset = vid * block_v
+            tx = T.get_thread_binding()
+
+            # Consumer waves retain W in two VGPR fragments. Producer waves
+            # own the single-buffered U/K/W global-to-LDS path.
+            state_shared_h = T.alloc_shared((block_v, dim_k), qkv_dtype)
+            w_shared = T.alloc_shared((chunk_size, dim_k), qkv_dtype)
+            u_shared = T.alloc_shared((chunk_size, block_v), qkv_dtype)
+            k_shared = T.alloc_shared((chunk_size, dim_k), qkv_dtype)
+            g_shared = T.alloc_shared((chunk_size,), gate_dtype)
+            v_new_shared = T.alloc_shared((chunk_size, block_v), qkv_dtype)
+
+            T.annotate_layout(
+                {
+                    state_shared_h: state_shared_h_k_major_layout,
+                    v_new_shared: v_new_shared_v8_phase_layout,
+                }
+            )
+            # T.use_swizzle(10)
+
+            T.abarrier_init(_WASP_U_FREE_PING, _WASP_CONSUMER_WAVES)
+            T.abarrier_init(_WASP_U_READY_PING, _WASP_PRODUCER_WAVES)
+            T.abarrier_init(_WASP_K_FREE_PING, _WASP_CONSUMER_WAVES)
+            T.abarrier_init(_WASP_K_READY_PING, _WASP_PRODUCER_WAVES)
+            T.abarrier_init(_WASP_W_FREE_PING, _WASP_CONSUMER_WAVES)
+            T.abarrier_init(_WASP_W_READY_PING, _WASP_PRODUCER_WAVES)
+            T.abarrier_init(
+                _WASP_STATE_FREE_PING, _WASP_PRODUCER_WAVES
+            )
+            T.abarrier_init(
+                _WASP_STATE_READY_PING, _WASP_CONSUMER_WAVES
+            )
+            if save_new_value:
+                T.abarrier_init(
+                    _WASP_V_NEW_FREE_PING, _WASP_PRODUCER_WAVES
+                )
+                T.abarrier_init(
+                    _WASP_V_NEW_READY_PING, _WASP_CONSUMER_WAVES
+                )
+            T.ebarrier_sync_cnt(_WASP_INIT_EBAR_ID, _TOTAL_WAVES)
+
+            if tx < _PRODUCER_THREADS:
+                T.set_max_nreg(_WASP_PRODUCER_MAX_NREG, 0)
+                state_save_fragment = T.alloc_fragment(
+                    (block_v, dim_k), qkv_dtype
+                )
+                v_new_save_fragment = T.alloc_fragment(
+                    (chunk_size, block_v), qkv_dtype
+                )
+                # The initial state_shared_h slot is free for consumers.
+                T.abarrier_arrive(_WASP_STATE_FREE_PING)
+                if save_new_value:
+                    T.abarrier_arrive(_WASP_V_NEW_FREE_PING)
+
+                # Use one uniform producer iteration for every full chunk.
+                # Each iteration publishes the current W/U/K inputs and then
+                # drains the current consumer outputs.
+                for cid in T.serial(full_chunks):
+                    base = cid * chunk_size
+
+                    T.abarrier_try_wait(_WASP_W_FREE_PING, cid & 1)
+                    T.abarrier_seq(_WASP_W_READY_PING)
+                    T.async_copy(
+                        w[
+                            bid,
+                            base : base + chunk_size,
+                            hid,
+                            0:dim_k,
+                        ],
+                        w_shared,
+                    )
+                    T.abarrier_arrive(_WASP_W_READY_PING)
+
+                    T.abarrier_try_wait(_WASP_U_FREE_PING, cid & 1)
+                    T.abarrier_seq(_WASP_U_READY_PING)
+                    T.async_copy(
+                        u[
+                            bid,
+                            base : base + chunk_size,
+                            hid,
+                            v_offset : v_offset + block_v,
+                        ],
+                        u_shared,
+                    )
+                    T.abarrier_arrive(_WASP_U_READY_PING)
+
+                    T.abarrier_try_wait(_WASP_K_FREE_PING, cid & 1)
+                    T.abarrier_seq(_WASP_K_READY_PING)
+                    T.async_copy(
+                        k[
+                            bid,
+                            base : base + chunk_size,
+                            hid,
+                            0:dim_k,
+                        ],
+                        k_shared,
+                    )
+                    T.async_copy(
+                        g[bid, base : base + chunk_size, hid],
+                        g_shared,
+                    )
+                    T.abarrier_arrive(_WASP_K_READY_PING)
+
+                    drain_producer_v_new(
+                        cid,
+                        v_new,
+                        bid,
+                        hid,
+                        v_offset,
+                        v_new_shared,
+                        v_new_save_fragment,
+                    )
+                    drain_producer_state(
+                        cid,
+                        h,
+                        bid,
+                        hid,
+                        v_offset,
+                        state_shared_h,
+                        state_save_fragment,
+                    )
+
+            else:
+                T.set_max_nreg(
+                    _WASP_VARLEN_CONSUMER_MAX_NREG
+                    if fixed_has_tail
+                    else _WASP_CONSUMER_MAX_NREG,
+                    0,
+                )
+                # Initially all three single-buffered LDS regions are free.
+                T.abarrier_arrive(_WASP_U_FREE_PING)
+                T.abarrier_arrive(_WASP_K_FREE_PING)
+                T.abarrier_arrive(_WASP_W_FREE_PING)
+
+                state_fragment = T.alloc_fragment(
+                    (block_v, dim_k), "float32"
+                )
+                u_fragment = T.alloc_fragment(
+                    (chunk_size, block_v), qkv_dtype
+                )
+                v_new_fragment = T.alloc_fragment(
+                    (chunk_size, block_v), "float32"
+                )
+                v_new_operand = T.alloc_fragment(
+                    (chunk_size, block_v), qkv_dtype
+                )
+                k_fragment = T.alloc_fragment(
+                    (chunk_size, dim_k), qkv_dtype
+                )
+                g_fragment = T.alloc_fragment(
+                    (chunk_size, block_v), gate_dtype
+                )
+                w_operand_0 = T.alloc_fragment(
+                    (chunk_size, dim_k), qkv_dtype
+                )
+                w_operand_1 = T.alloc_fragment(
+                    (chunk_size, dim_k), qkv_dtype
+                )
+                state_operand = T.alloc_fragment(
+                    (block_v, dim_k), qkv_dtype
+                )
+                state_idx = T.alloc_var("int32")
+                if fixed_has_tail:
+                    tail_g_last = T.alloc_var("float32")
+
+                state_idx = initial_state_indices[bid]
+                for iv, ik in T.Parallel(block_v, dim_k):
+                    if (
+                        use_initial_state
+                        and state_idx >= 0
+                        and state_idx < state_rows
+                    ):
+                        if transpose_state_layout:
+                            state_fragment[iv, ik] = initial_state[
+                                state_idx, hid, v_offset + iv, ik
+                            ]
+                        else:
+                            state_fragment[iv, ik] = initial_state[
+                                state_idx, hid, ik, v_offset + iv
+                            ]
+                    else:
+                        state_fragment[iv, ik] = T.float32(0.0)
+                T.abarrier_try_wait(_WASP_STATE_FREE_PING, 0)
+                T.abarrier_seq(_WASP_STATE_READY_PING)
+                T.copy(state_fragment, state_shared_h)
+
+                # Publish the initial state among the four consumer waves.
+                # U_0 readiness is handled independently at the beginning of
+                # run_consumer_chunk.
+                T.s_waitcnt(0, "lgkmcnt")
+                T.abarrier_arrive(_WASP_STATE_READY_PING)
+                T.ebarrier_sync_cnt(
+                    _WASP_CONSUMER_EBAR_ID, _WASP_CONSUMER_WAVES
+                )
+                T.copy(state_shared_h, state_operand)
+                T.sched_barrier()
+
+                # Load each pair's even W at pair entry. The even chunk then
+                # prefetches the odd W while Gemm1 executes. This keeps every
+                # full pair uniform and leaves only an odd tail outside.
+                full_chunk_pairs = full_chunks // 2
+                for pair in T.serial(full_chunk_pairs):
+                    cid = pair * 2
+                    T.abarrier_try_wait(_WASP_W_READY_PING, cid & 1)
+                    T.copy(w_shared, w_operand_0)
+                    T.s_waitcnt(0, "lgkmcnt")
+                    T.abarrier_arrive(_WASP_W_FREE_PING)
+                    run_consumer_chunk(
+                        cid,
+                        w_operand_0,
+                        w_operand_1,
+                        True,
+                        True,
+                        w,
+                        g,
+                        h,
+                        v_new,
+                        bid,
+                        hid,
+                        v_offset,
+                        state_shared_h,
+                        state_operand,
+                        w_shared,
+                        u_shared,
+                        u_fragment,
+                        v_new_fragment,
+                        g_fragment,
+                        k_shared,
+                        g_shared,
+                        k_fragment,
+                        v_new_shared,
+                        v_new_operand,
+                        state_fragment,
+                    )
+                    run_consumer_chunk(
+                        cid + 1,
+                        w_operand_1,
+                        w_operand_0,
+                        False,
+                        True,
+                        w,
+                        g,
+                        h,
+                        v_new,
+                        bid,
+                        hid,
+                        v_offset,
+                        state_shared_h,
+                        state_operand,
+                        w_shared,
+                        u_shared,
+                        u_fragment,
+                        v_new_fragment,
+                        g_fragment,
+                        k_shared,
+                        g_shared,
+                        k_fragment,
+                        v_new_shared,
+                        v_new_operand,
+                        state_fragment,
+                    )
+
+                if full_chunks % 2 != 0:
+                    tail_cid = full_chunk_pairs * 2
+                    T.abarrier_try_wait(
+                        _WASP_W_READY_PING, tail_cid & 1
+                    )
+                    T.copy(w_shared, w_operand_0)
+                    T.s_waitcnt(0, "lgkmcnt")
+                    T.abarrier_arrive(_WASP_W_FREE_PING)
+                    run_consumer_chunk(
+                        tail_cid,
+                        w_operand_0,
+                        w_operand_1,
+                        False,
+                        True,
+                        w,
+                        g,
+                        h,
+                        v_new,
+                        bid,
+                        hid,
+                        v_offset,
+                        state_shared_h,
+                        state_operand,
+                        w_shared,
+                        u_shared,
+                        u_fragment,
+                        v_new_fragment,
+                        g_fragment,
+                        k_shared,
+                        g_shared,
+                        k_fragment,
+                        v_new_shared,
+                        v_new_operand,
+                        state_fragment,
+                    )
+
+                if fixed_has_tail:
+                    tail_size = seq_len % chunk_size
+                    tail_base = full_chunks * chunk_size
+                    for it, ik in T.Parallel(chunk_size, dim_k):
+                        if it < tail_size:
+                            w_operand_0[it, ik] = w[
+                                bid, tail_base + it, hid, ik
+                            ]
+                        else:
+                            w_operand_0[it, ik] = T.cast(0, qkv_dtype)
+                    for it, ik in T.Parallel(chunk_size, dim_k):
+                        if it < tail_size:
+                            k_fragment[it, ik] = k[
+                                bid, tail_base + it, hid, ik
+                            ]
+                        else:
+                            k_fragment[it, ik] = T.cast(0, qkv_dtype)
+                    for it, iv in T.Parallel(chunk_size, block_v):
+                        if it < tail_size:
+                            u_fragment[it, iv] = u[
+                                bid,
+                                tail_base + it,
+                                hid,
+                                v_offset + iv,
+                            ]
+                        else:
+                            u_fragment[it, iv] = T.cast(0, qkv_dtype)
+                    for it, iv in T.Parallel(chunk_size, block_v):
+                        if it < tail_size:
+                            g_fragment[it, iv] = g[
+                                bid, tail_base + it, hid
+                            ]
+                        else:
+                            g_fragment[it, iv] = T.float32(0.0)
+                    T.s_waitcnt(0, "vmcnt")
+
+                    if transpose_state_layout:
+                        T.copy(
+                            state_fragment,
+                            h[
+                                bid,
+                                full_chunks,
+                                hid,
+                                v_offset : v_offset + block_v,
+                                0:dim_k,
+                            ],
+                        )
+                    else:
+                        for iv, ik in T.Parallel(block_v, dim_k):
+                            h[
+                                bid,
+                                full_chunks,
+                                hid,
+                                ik,
+                                v_offset + iv,
+                            ] = state_fragment[iv, ik]
+
+                    T.sched_barrier()
+                    T.gemm(
+                        w_operand_0,
+                        state_operand,
+                        v_new_fragment,
+                        transpose_B=True,
+                        policy=T.GemmWarpPolicy.FullRow,
+                        clear_accum=True,
+                        k_pack=2,
+                    )
+                    T.sched_barrier()
+                    for it, iv in T.Parallel(chunk_size, block_v):
+                        if it < tail_size:
+                            v_new_fragment[it, iv] = (
+                                T.cast(u_fragment[it, iv], "float32")
+                                - v_new_fragment[it, iv]
+                            )
+                        else:
+                            v_new_fragment[it, iv] = T.float32(0.0)
+
+                    if save_new_value:
+                        for it, iv in T.Parallel(chunk_size, block_v):
+                            if it < tail_size:
+                                v_new[
+                                    bid,
+                                    tail_base + it,
+                                    hid,
+                                    v_offset + iv,
+                                ] = T.cast(v_new_fragment[it, iv], qkv_dtype)
+
+                    tail_g_last = g[bid, tail_base + tail_size - 1, hid]
+                    T.s_waitcnt(0, "vmcnt")
+                    for it, iv in T.Parallel(chunk_size, block_v):
+                        if it < tail_size:
+                            diff = tail_g_last - g_fragment[it, iv]
+                            v_new_fragment[it, iv] = T.if_then_else(
+                                diff <= 0,
+                                v_new_fragment[it, iv]
+                                * T.exp2(diff * _LOG2E),
+                                T.float32(0.0),
+                            )
+                    for iv, ik in T.Parallel(block_v, dim_k):
+                        state_fragment[iv, ik] *= T.exp2(
+                            tail_g_last * _LOG2E
+                        )
+
+                    T.copy(v_new_fragment, v_new_shared)
+                    T.sched_barrier()
+                    T.s_waitcnt(0, "lgkmcnt")
+                    T.ebarrier_sync_cnt(
+                        _WASP_CONSUMER_EBAR_ID, _WASP_CONSUMER_WAVES
+                    )
+                    T.copy(v_new_shared, v_new_operand)
+                    T.sched_barrier()
+                    T.gemm(
+                        v_new_operand,
+                        k_fragment,
+                        state_fragment,
+                        transpose_A=True,
+                        policy=T.GemmWarpPolicy.FullCol,
+                        clear_accum=False,
+                        k_pack=1,
+                    )
+
+                if store_final_state:
+                    if inplace_final_state:
+                        if state_idx >= 0 and state_idx < state_rows:
+                            for iv, ik in T.Parallel(block_v, dim_k):
+                                if transpose_state_layout:
+                                    final_state[
+                                        state_idx, hid, v_offset + iv, ik
+                                    ] = state_fragment[iv, ik]
+                                else:
+                                    final_state[
+                                        state_idx, hid, ik, v_offset + iv
+                                    ] = state_fragment[iv, ik]
+                    else:
+                        for iv, ik in T.Parallel(block_v, dim_k):
+                            if transpose_state_layout:
+                                final_state[
+                                    bid, hid, v_offset + iv, ik
+                                ] = state_fragment[iv, ik]
+                            else:
+                                final_state[
+                                    bid, hid, ik, v_offset + iv
+                                ] = state_fragment[iv, ik]
+
+    if not is_varlen:
+        return chunk_gated_delta_rule_fwd_h_wasp_4p4c_gfx946_kernel
+
+    num_sequences = T.dynamic("num_sequences")
+    total_num_chunks = T.dynamic("num_chunks")
+    cu_size = T.dynamic("cu_size")
+    chunk_offsets_size = T.dynamic("chunk_offsets_size")
+    varlen_chunk_state_shape = (
+        (batch, total_num_chunks, heads, dim_v, dim_k)
+        if transpose_state_layout
+        else (batch, total_num_chunks, heads, dim_k, dim_v)
+    )
+
+    @T.prim_func
+    def chunk_gated_delta_rule_fwd_h_wasp_4p4c_gfx946_varlen_kernel(
+        k: T.Tensor([batch, seq_len, heads, dim_k], qkv_dtype),
+        w: T.Tensor([batch, seq_len, heads, dim_k], qkv_dtype),
+        u: T.Tensor([batch, seq_len, heads, dim_v], qkv_dtype),
+        g: T.Tensor([batch, seq_len, heads], gate_dtype),
+        initial_state: T.Tensor([state_rows, *state_shape], "float32"),
+        initial_state_indices: T.Tensor([num_sequences], "int32"),
+        cu_seqlens: T.Tensor([cu_size], "int32"),
+        chunk_offsets: T.Tensor([chunk_offsets_size], "int32"),
+        h: T.Tensor(varlen_chunk_state_shape, qkv_dtype),
+        v_new: T.Tensor([batch, seq_len, heads, dim_v], qkv_dtype),
+        final_state: T.Tensor(
+            [
+                state_rows if inplace_final_state else num_sequences,
+                *state_shape,
+            ],
+            "float32",
+        ),
+    ):
+        with T.Kernel(
+            T.ceildiv(dim_v, block_v),
+            num_sequences * heads,
+            threads=_TOTAL_THREADS,
+        ) as (vid, bbh):
+            sequence_id, hid = bbh // heads, bbh % heads
+            v_offset = vid * block_v
+            tx = T.get_thread_binding()
+
+            state_shared_h = T.alloc_shared((block_v, dim_k), qkv_dtype)
+            w_shared = T.alloc_shared((chunk_size, dim_k), qkv_dtype)
+            u_shared = T.alloc_shared((chunk_size, block_v), qkv_dtype)
+            k_shared = T.alloc_shared((chunk_size, dim_k), qkv_dtype)
+            g_shared = T.alloc_shared((chunk_size,), gate_dtype)
+            v_new_shared = T.alloc_shared((chunk_size, block_v), qkv_dtype)
+
+            T.annotate_layout(
+                {
+                    state_shared_h: state_shared_h_k_major_layout,
+                    v_new_shared: v_new_shared_v8_phase_layout,
+                }
+            )
+
+            T.abarrier_init(_WASP_U_FREE_PING, _WASP_CONSUMER_WAVES)
+            T.abarrier_init(_WASP_U_READY_PING, _WASP_PRODUCER_WAVES)
+            T.abarrier_init(_WASP_K_FREE_PING, _WASP_CONSUMER_WAVES)
+            T.abarrier_init(_WASP_K_READY_PING, _WASP_PRODUCER_WAVES)
+            T.abarrier_init(_WASP_W_FREE_PING, _WASP_CONSUMER_WAVES)
+            T.abarrier_init(_WASP_W_READY_PING, _WASP_PRODUCER_WAVES)
+            T.abarrier_init(
+                _WASP_STATE_FREE_PING, _WASP_PRODUCER_WAVES
+            )
+            T.abarrier_init(
+                _WASP_STATE_READY_PING, _WASP_CONSUMER_WAVES
+            )
+            if save_new_value:
+                T.abarrier_init(
+                    _WASP_V_NEW_FREE_PING, _WASP_PRODUCER_WAVES
+                )
+                T.abarrier_init(
+                    _WASP_V_NEW_READY_PING, _WASP_CONSUMER_WAVES
+                )
+            T.ebarrier_sync_cnt(_WASP_INIT_EBAR_ID, _TOTAL_WAVES)
+
+            if tx < _PRODUCER_THREADS:
+                T.set_max_nreg(_WASP_PRODUCER_MAX_NREG, 0)
+                token_begin = cu_seqlens[sequence_id]
+                actual_seq_len = (
+                    cu_seqlens[sequence_id + 1] - token_begin
+                )
+                chunk_begin = chunk_offsets[sequence_id]
+                full_chunks = actual_seq_len // chunk_size
+                state_save_fragment = T.alloc_fragment(
+                    (block_v, dim_k), qkv_dtype
+                )
+                v_new_save_fragment = T.alloc_fragment(
+                    (chunk_size, block_v), qkv_dtype
+                )
+                T.abarrier_arrive(_WASP_STATE_FREE_PING)
+                if save_new_value:
+                    T.abarrier_arrive(_WASP_V_NEW_FREE_PING)
+
+                # Match the fixed kernel: publish this chunk's W/U/K/G, then
+                # capture its v_new and entering state before advancing.
+                for cid in T.serial(full_chunks):
+                    base = token_begin + cid * chunk_size
+
+                    T.abarrier_try_wait(_WASP_W_FREE_PING, cid & 1)
+                    T.abarrier_seq(_WASP_W_READY_PING)
+                    T.async_copy(
+                        w[0, base : base + chunk_size, hid, 0:dim_k],
+                        w_shared,
+                    )
+                    T.abarrier_arrive(_WASP_W_READY_PING)
+
+                    T.abarrier_try_wait(_WASP_U_FREE_PING, cid & 1)
+                    T.abarrier_seq(_WASP_U_READY_PING)
+                    T.async_copy(
+                        u[
+                            0,
+                            base : base + chunk_size,
+                            hid,
+                            v_offset : v_offset + block_v,
+                        ],
+                        u_shared,
+                    )
+                    T.abarrier_arrive(_WASP_U_READY_PING)
+
+                    T.abarrier_try_wait(_WASP_K_FREE_PING, cid & 1)
+                    T.abarrier_seq(_WASP_K_READY_PING)
+                    T.async_copy(
+                        k[
+                            0,
+                            base : base + chunk_size,
+                            hid,
+                            0:dim_k,
+                        ],
+                        k_shared,
+                    )
+                    T.async_copy(
+                        g[0, base : base + chunk_size, hid],
+                        g_shared,
+                    )
+                    T.abarrier_arrive(_WASP_K_READY_PING)
+
+                    if save_new_value:
+                        T.abarrier_try_wait(
+                            _WASP_V_NEW_READY_PING, cid & 1
+                        )
+                        T.copy(v_new_shared, v_new_save_fragment)
+                        T.s_waitcnt(0, "lgkmcnt")
+                        T.abarrier_arrive(_WASP_V_NEW_FREE_PING)
+                        T.copy(
+                            v_new_save_fragment,
+                            v_new[
+                                0,
+                                base : base + chunk_size,
+                                hid,
+                                v_offset : v_offset + block_v,
+                            ],
+                        )
+
+                    T.abarrier_try_wait(
+                        _WASP_STATE_READY_PING, cid & 1
+                    )
+                    T.copy(state_shared_h, state_save_fragment)
+                    T.s_waitcnt(0, "lgkmcnt")
+                    T.abarrier_arrive(_WASP_STATE_FREE_PING)
+                    if transpose_state_layout:
+                        T.copy(
+                            state_save_fragment,
+                            h[
+                                0,
+                                chunk_begin + cid,
+                                hid,
+                                v_offset : v_offset + block_v,
+                                0:dim_k,
+                            ],
+                        )
+                    else:
+                        for iv, ik in T.Parallel(block_v, dim_k):
+                            h[
+                                0,
+                                chunk_begin + cid,
+                                hid,
+                                ik,
+                                v_offset + iv,
+                            ] = state_save_fragment[iv, ik]
+
+            else:
+                T.set_max_nreg(_WASP_VARLEN_CONSUMER_MAX_NREG, 0)
+                token_begin = cu_seqlens[sequence_id]
+                actual_seq_len = (
+                    cu_seqlens[sequence_id + 1] - token_begin
+                )
+                chunk_begin = chunk_offsets[sequence_id]
+                full_chunks = actual_seq_len // chunk_size
+                tail_size = actual_seq_len % chunk_size
+                tail_base = token_begin + full_chunks * chunk_size
+                T.abarrier_arrive(_WASP_U_FREE_PING)
+                T.abarrier_arrive(_WASP_K_FREE_PING)
+                T.abarrier_arrive(_WASP_W_FREE_PING)
+
+                state_fragment = T.alloc_fragment(
+                    (block_v, dim_k), "float32"
+                )
+                u_fragment = T.alloc_fragment(
+                    (chunk_size, block_v), qkv_dtype
+                )
+                v_new_fragment = T.alloc_fragment(
+                    (chunk_size, block_v), "float32"
+                )
+                v_new_operand = T.alloc_fragment(
+                    (chunk_size, block_v), qkv_dtype
+                )
+                k_fragment = T.alloc_fragment(
+                    (chunk_size, dim_k), qkv_dtype
+                )
+                g_fragment = T.alloc_fragment(
+                    (chunk_size, block_v), gate_dtype
+                )
+                w_operand_0 = T.alloc_fragment(
+                    (chunk_size, dim_k), qkv_dtype
+                )
+                w_operand_1 = T.alloc_fragment(
+                    (chunk_size, dim_k), qkv_dtype
+                )
+                state_operand = T.alloc_fragment(
+                    (block_v, dim_k), qkv_dtype
+                )
+                state_idx = T.alloc_var("int32")
+                tail_g_last = T.alloc_var("float32")
+
+                state_idx = initial_state_indices[sequence_id]
+                for iv, ik in T.Parallel(block_v, dim_k):
+                    if (
+                        use_initial_state
+                        and state_idx >= 0
+                        and state_idx < state_rows
+                    ):
+                        if transpose_state_layout:
+                            state_fragment[iv, ik] = initial_state[
+                                state_idx, hid, v_offset + iv, ik
+                            ]
+                        else:
+                            state_fragment[iv, ik] = initial_state[
+                                state_idx, hid, ik, v_offset + iv
+                            ]
+                    else:
+                        state_fragment[iv, ik] = T.float32(0.0)
+
+                T.abarrier_try_wait(_WASP_STATE_FREE_PING, 0)
+                T.abarrier_seq(_WASP_STATE_READY_PING)
+                T.copy(state_fragment, state_shared_h)
+                T.s_waitcnt(0, "lgkmcnt")
+                T.abarrier_arrive(_WASP_STATE_READY_PING)
+                T.ebarrier_sync_cnt(
+                    _WASP_CONSUMER_EBAR_ID, _WASP_CONSUMER_WAVES
+                )
+                T.copy(state_shared_h, state_operand)
+                T.sched_barrier()
+
+                # As in fixed, even chunks prefetch odd W during Gemm1;
+                # each pair starts by acquiring its even W from the producer.
+                full_chunk_pairs = full_chunks // 2
+                for pair in T.serial(full_chunk_pairs):
+                    cid = pair * 2
+                    T.abarrier_try_wait(_WASP_W_READY_PING, cid & 1)
+                    T.copy(w_shared, w_operand_0)
+                    T.s_waitcnt(0, "lgkmcnt")
+                    T.abarrier_arrive(_WASP_W_FREE_PING)
+                    run_consumer_chunk(
+                        cid,
+                        w_operand_0,
+                        w_operand_1,
+                        True,
+                        True,
+                        w, g, h, v_new, 0, hid, v_offset,
+                        state_shared_h, state_operand, w_shared,
+                        u_shared, u_fragment,
+                        v_new_fragment, g_fragment, k_shared, g_shared,
+                        k_fragment,
+                        v_new_shared, v_new_operand, state_fragment,
+                    )
+                    run_consumer_chunk(
+                        cid + 1,
+                        w_operand_1,
+                        w_operand_0,
+                        False,
+                        True,
+                        w, g, h, v_new, 0, hid, v_offset,
+                        state_shared_h, state_operand, w_shared,
+                        u_shared, u_fragment,
+                        v_new_fragment, g_fragment, k_shared, g_shared,
+                        k_fragment,
+                        v_new_shared, v_new_operand, state_fragment,
+                    )
+
+                if full_chunks % 2 != 0:
+                    tail_cid = full_chunk_pairs * 2
+                    T.abarrier_try_wait(
+                        _WASP_W_READY_PING, tail_cid & 1
+                    )
+                    T.copy(w_shared, w_operand_0)
+                    T.s_waitcnt(0, "lgkmcnt")
+                    T.abarrier_arrive(_WASP_W_FREE_PING)
+                    run_consumer_chunk(
+                        tail_cid,
+                        w_operand_0,
+                        w_operand_1,
+                        False,
+                        True,
+                        w, g, h, v_new, 0, hid, v_offset,
+                        state_shared_h, state_operand, w_shared,
+                        u_shared, u_fragment,
+                        v_new_fragment, g_fragment, k_shared, g_shared,
+                        k_fragment,
+                        v_new_shared, v_new_operand, state_fragment,
+                    )
+
+                if tail_size > 0:
+                    for it, ik in T.Parallel(chunk_size, dim_k):
+                        if it < tail_size:
+                            w_operand_0[it, ik] = w[
+                                0, tail_base + it, hid, ik
+                            ]
+                        else:
+                            w_operand_0[it, ik] = T.cast(0, qkv_dtype)
+                    for it, ik in T.Parallel(chunk_size, dim_k):
+                        if it < tail_size:
+                            k_fragment[it, ik] = k[
+                                0, tail_base + it, hid, ik
+                            ]
+                        else:
+                            k_fragment[it, ik] = T.cast(0, qkv_dtype)
+                    for it, iv in T.Parallel(chunk_size, block_v):
+                        if it < tail_size:
+                            u_fragment[it, iv] = u[
+                                0, tail_base + it, hid, v_offset + iv
+                            ]
+                        else:
+                            u_fragment[it, iv] = T.cast(0, qkv_dtype)
+                    for it, iv in T.Parallel(chunk_size, block_v):
+                        if it < tail_size:
+                            g_fragment[it, iv] = g[
+                                0, tail_base + it, hid
+                            ]
+                        else:
+                            g_fragment[it, iv] = T.float32(0.0)
+                    T.s_waitcnt(0, "vmcnt")
+
+                    if transpose_state_layout:
+                        T.copy(
+                            state_fragment,
+                            h[
+                                0,
+                                chunk_begin + full_chunks,
+                                hid,
+                                v_offset : v_offset + block_v,
+                                0:dim_k,
+                            ],
+                        )
+                    else:
+                        for iv, ik in T.Parallel(block_v, dim_k):
+                            h[
+                                0,
+                                chunk_begin + full_chunks,
+                                hid,
+                                ik,
+                                v_offset + iv,
+                            ] = state_fragment[iv, ik]
+
+                    T.sched_barrier()
+                    T.gemm(
+                        w_operand_0,
+                        state_operand,
+                        v_new_fragment,
+                        transpose_B=True,
+                        policy=T.GemmWarpPolicy.FullRow,
+                        clear_accum=True,
+                        k_pack=2,
+                    )
+                    T.sched_barrier()
+                    for it, iv in T.Parallel(chunk_size, block_v):
+                        if it < tail_size:
+                            v_new_fragment[it, iv] = (
+                                T.cast(u_fragment[it, iv], "float32")
+                                - v_new_fragment[it, iv]
+                            )
+                        else:
+                            v_new_fragment[it, iv] = T.float32(0.0)
+
+                    if save_new_value:
+                        for it, iv in T.Parallel(chunk_size, block_v):
+                            if it < tail_size:
+                                v_new[
+                                    0,
+                                    tail_base + it,
+                                    hid,
+                                    v_offset + iv,
+                                ] = T.cast(v_new_fragment[it, iv], qkv_dtype)
+
+                    tail_g_last = g[0, tail_base + tail_size - 1, hid]
+                    T.s_waitcnt(0, "vmcnt")
+                    for it, iv in T.Parallel(chunk_size, block_v):
+                        if it < tail_size:
+                            diff = tail_g_last - g_fragment[it, iv]
+                            v_new_fragment[it, iv] = T.if_then_else(
+                                diff <= 0,
+                                v_new_fragment[it, iv]
+                                * T.exp2(diff * _LOG2E),
+                                T.float32(0.0),
+                            )
+                    for iv, ik in T.Parallel(block_v, dim_k):
+                        state_fragment[iv, ik] *= T.exp2(
+                            tail_g_last * _LOG2E
+                        )
+
+                    T.copy(v_new_fragment, v_new_shared)
+                    T.sched_barrier()
+                    T.s_waitcnt(0, "lgkmcnt")
+                    T.ebarrier_sync_cnt(
+                        _WASP_CONSUMER_EBAR_ID, _WASP_CONSUMER_WAVES
+                    )
+                    T.copy(v_new_shared, v_new_operand)
+                    T.sched_barrier()
+                    T.gemm(
+                        v_new_operand,
+                        k_fragment,
+                        state_fragment,
+                        transpose_A=True,
+                        policy=T.GemmWarpPolicy.FullCol,
+                        clear_accum=False,
+                        k_pack=1,
+                    )
+
+                if store_final_state:
+                    if inplace_final_state:
+                        if state_idx >= 0 and state_idx < state_rows:
+                            for iv, ik in T.Parallel(block_v, dim_k):
+                                if transpose_state_layout:
+                                    final_state[
+                                        state_idx, hid, v_offset + iv, ik
+                                    ] = state_fragment[iv, ik]
+                                else:
+                                    final_state[
+                                        state_idx, hid, ik, v_offset + iv
+                                    ] = state_fragment[iv, ik]
+                    else:
+                        for iv, ik in T.Parallel(block_v, dim_k):
+                            if transpose_state_layout:
+                                final_state[
+                                    sequence_id, hid, v_offset + iv, ik
+                                ] = state_fragment[iv, ik]
+                            else:
+                                final_state[
+                                    sequence_id, hid, ik, v_offset + iv
+                                ] = state_fragment[iv, ik]
+
+    return chunk_gated_delta_rule_fwd_h_wasp_4p4c_gfx946_varlen_kernel
+
+
 @functools.lru_cache(maxsize=128)
 def _get_copy_pipeline_kernel(*args):
     return _build_chunk_h_copy_pipeline(*args)
@@ -2252,6 +3444,11 @@ def _get_copy_pipeline_varlen_kernel(*args):
 @functools.lru_cache(maxsize=128)
 def _get_wasp_4p4c_kernel(*args):
     return _build_chunk_h_wasp_4p4c(*args)
+
+
+@functools.lru_cache(maxsize=128)
+def _get_wasp_4p4c_gfx946_kernel(*args):
+    return _build_chunk_h_wasp_4p4c_gfx946(*args)
 
 
 
@@ -2279,7 +3476,11 @@ def chunk_gated_delta_rule_fwd_h(
         if kernel_cfg is None
         else kernel_cfg.get("implementation")
     )
-    if implementation not in ("copy-pipeline", "wasp_4p4c"):
+    if implementation not in (
+        "copy-pipeline",
+        "wasp_4p4c",
+        "wasp_4p4c_gfx946",
+    ):
         raise NotImplementedError(
             f"unsupported TileLang implementation: {kernel_cfg}"
         )
@@ -2477,9 +3678,11 @@ def chunk_gated_delta_rule_fwd_h(
         raise NotImplementedError(
             "TileLang kernels require bf16 BT64/K128/V32 shapes, VK "
             "state layout, final_state and v_new enabled; fixed copy-pipeline "
-            "needs T >= 64, and fixed WASP requires T divisible by 64."
+            "needs T >= 64, and fixed wasp_4p4c requires T divisible by 64."
         )
-    if implementation == "wasp_4p4c":
+    if implementation == "wasp_4p4c_gfx946":
+        get_kernel = _get_wasp_4p4c_gfx946_kernel
+    elif implementation == "wasp_4p4c":
         get_kernel = _get_wasp_4p4c_kernel
     elif is_varlen:
         get_kernel = _get_copy_pipeline_varlen_kernel
@@ -2506,6 +3709,12 @@ def chunk_gated_delta_rule_fwd_h(
         kernel = get_kernel(*kernel_args, 32, 256)
     elif is_varlen:
         kernel = get_kernel(*kernel_args, True)
+    elif implementation == "wasp_4p4c_gfx946":
+        kernel = get_kernel(
+            *kernel_args,
+            False,
+            seq_len % chunk_size != 0,
+        )
     else:
         kernel = get_kernel(*kernel_args)
     if is_varlen:
