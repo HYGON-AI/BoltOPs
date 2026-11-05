@@ -57,7 +57,7 @@ Settings → Actions → Runners：确保 BW1100 runner/runner group 允许 Bolt
 
 镜像需允许 Actions Node20 动作运行；若私有仓库要求认证，需要额外配置 container.credentials，当前参考 lightop 使用 runner 已有的镜像访问方式。
 
-build job 不设置共享 concurrency 锁，两个 Torch 版本可并行编译及执行正确性测试。性能 job 使用 boltops-performance-BW1100 共享 concurrency group，cancel-in-progress=false，因此性能测试串行执行，顺序不保证；GitHub 默认最多保留一个 pending job，跨流水线提交可能替换等待任务。CIsmi 分配空闲 HCU，但不能隔离共享 CPU、内存和 I/O 的性能干扰。工作流级别仍会取消同一 PR 的旧运行。
+build job 不设置共享 concurrency 锁，两个 Torch 版本可并行编译及执行正确性测试。性能 job 使用 boltops-performance-BW1100 共享 concurrency group，配置 cancel-in-progress=false 和 queue=max：性能测试串行执行，最多保留 100 个等待任务，避免默认单等待槽导致的任务替换。超过队列上限的任务仍可能取消；排队以进入 concurrency group 的时间为准，不保证按流水线创建时间执行。CIsmi 分配空闲 HCU，但不能隔离共享 CPU、内存和 I/O 的性能干扰。工作流级别仍会取消同一 PR 的旧运行，这与性能任务的队列替换不同。
 
 与 lightop 一样，同仓库 PR 和 fork PR 均可进入构建及 GPU 测试流程，不检查来源仓库是否相同。使用 pull_request 事件，不使用 pull_request_target。是否等待维护者批准由 GitHub 仓库/组织的 Actions fork 工作流审批设置决定；需管理员确认 BW1100 runner 对 BoltOPs 可用。PR 不进入发布任务，发布 Secret 只用于 main push 的发布任务。
 
