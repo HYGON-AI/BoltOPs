@@ -162,7 +162,7 @@ if _GLUON_AVAILABLE:
         mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
             version=MFMA_VERSION,
             instr_shape=[16, 16, 32],
-            transposed=False,
+            mmac_layout=gl.amd.MmacLayout.LIT_LTS,
             warps_per_cta=[1, NumWarps],
             tiles_per_warp=[1, KV_TILES_N],
         )

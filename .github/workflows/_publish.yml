@@ -1,0 +1,55 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: MIT
+name: Publish nightly wheels
+on:
+  workflow_call:
+    inputs:
+      dtk_ver:
+        required: true
+        type: string
+      dtk_pkg_name:
+        required: true
+        type: string
+    secrets:
+      PYPI_PASSWORD:
+        required: true
+permissions:
+  contents: read
+jobs:
+  publish:
+    runs-on:
+    - self-hosted
+    - BW1100
+    timeout-minutes: 180
+    container:
+      image: ${{ vars.DTK_IMAGE_REGISTRY || '10.16.1.152:5000/hcu/base/dtk' }}:26.10-rockylinux8.6-py3.12
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYPI_URL: ${{ vars.PYPI_URL || 'http://12.12.12.201:9929' }}
+      PYPI_PASSWORD: ${{ secrets.PYPI_PASSWORD }}
+      DTK_VER: ${{ inputs.dtk_ver }}
+      DTK_PKG_NAME: ${{ inputs.dtk_pkg_name }}
+    steps:
+    - name: Checkout integrated source
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.sha }}
+        fetch-depth: 0
+        persist-credentials: false
+    - name: Download repaired wheels
+      uses: actions/download-artifact@v4
+      with:
+        pattern: wheel-dtk${{ inputs.dtk_ver }}-*
+        path: output
+        merge-multiple: true
+    - name: Verify and publish nightly wheels
+      run: bash .github/scripts/publish.sh
+    - name: Upload published wheels
+      uses: actions/upload-artifact@v4
+      with:
+        name: published-dtk${{ inputs.dtk_ver }}
+        path: publish_wheels/dtk${{ inputs.dtk_ver }}/*.whl
+        if-no-files-found: error
+        retention-days: 30

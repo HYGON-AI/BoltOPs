@@ -190,7 +190,14 @@ boltops-fused-moe-tune-cli nmz int8_channel \
   --top-k 8
 ```
 
-说明：默认训练模式会执行 Step1/2/3/4，其中 Step4 即 benchmark/correctness。
+说明：默认训练模式会执行 Step1/2/3/4，再生成实测性能 CSV。
+
+训练按 M 分进程；M>=2048 时进一步按原有 BM/布局组合分进程，避免大量 HIP 模块累积触及进程资源上限。
+候选空间和合法性裁剪保持不变，最终按相同 BM/布局的 GEMM1+GEMM2 总耗时选优。
+若出现 `named symbol not found`，该进程会失败，不会将剩余候选当作无限慢后发布不完整排名。
+正确性回放和 CSV 补测也按 M 分进程。CSV 单 M 进程默认超时 600 秒，超时后有限重试；已生成的 JSON 不会因补测失败而删除。
+CSV 补测会重置为单设备、单运行分组，不继承训练的多卡分组数。
+`--kill` 包含 CSV 进程；CSV 调度进程收到 SIGTERM 后清理自己的子进程组，先发送 SIGTERM，等待 5 秒仍未退出再发送 SIGKILL。
 
 ### 阶段B（可选）：benchmark-only 复核
 
@@ -269,7 +276,7 @@ boltops-fused-moe-tune-cli nmz int8_channel \
 - `--num-groups-compile`：compile-only 分组数
 - `--device-start-id`：手工指定起始设备
 - `--device-count`：手工指定连续设备数量
-- `--num-groups-run`：autotune 运行分组数；需充分利用多卡时可设为可用 GPU 数
+- `--num-groups-run`：autotune 运行分组数，不能超过 `--device-count`，避免多个分组同时测同一张卡
 - `--disable-auto-select-devices-by-hy-smi`：禁用自动选卡
 - `--hy-smi-max-vram-pct`：自动选卡阈值（VRAM/HCU 共用）
 - `--break-on-error [true|false]`：遇错是否立即退出
@@ -288,7 +295,7 @@ boltops-fused-moe-tune-cli nmz int8 --kill
 
 补充：
 
-- 正常训练模式（不带 `--benchmark`）会在启动时自动检测并清理已在运行的 MoE 进程，避免并发冲突。
+- 启动训练不会自动终止其他 MoE 任务；需要清理时显式执行 `--kill`。并发任务应选择不重叠的 GPU，并在不同工作目录保存日志。
 
 ---
 

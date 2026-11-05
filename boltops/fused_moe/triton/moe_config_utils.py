@@ -6,6 +6,7 @@
 import torch
 from typing import Any, Dict, Optional, List
 import json
+import re
 import functools
 from pathlib import Path
 import boltops.utility.arch_info as arch_info
@@ -28,23 +29,40 @@ def get_config_file_name(E: int,
                          block_shape: Optional[list[int]] = None,
                          is_bottom: bool = False,
                          K: Optional[int] = None,
-                         top_k: Optional[int] = None) -> str:
+                         top_k: Optional[int] = None,
+                         gemm_type: str = "dot",
+                         scale_recipe: Optional[str] = None) -> str:
     if (K is None) != (top_k is None):
         raise ValueError("K and top_k must be specified together")
+    gemm_selector = _gemm_type_selector(gemm_type, scale_recipe)
     arch = arch_info.get_arch()
     shape_selector = "" if K is None else f",K={K},topk={top_k}"
     dtype_selector = "" if not dtype else f",dtype={dtype}"
     is_bottom_selector = ("" if is_bottom == False else ",is_bottom=True")
     block_shape_selector = ("" if not block_shape or not all(block_shape) else
                             f",block_shape={block_shape}").replace(" ", "")
-    return f"E={E},N={N}{shape_selector},arch={arch}{dtype_selector}{is_bottom_selector}{block_shape_selector}.json"  # noqa: E501
+    return f"E={E},N={N}{shape_selector},arch={arch}{dtype_selector}{gemm_selector}{is_bottom_selector}{block_shape_selector}.json"  # noqa: E501
+
+
+def _gemm_type_selector(gemm_type: str, scale_recipe: Optional[str] = None) -> str:
+    if gemm_type not in ("dot", "dot_scaled"):
+        raise ValueError(f"Unsupported MoE gemm_type: {gemm_type}")
+    if scale_recipe is not None:
+        if gemm_type != "dot_scaled" or not re.fullmatch(r"[a-z0-9_-]+", scale_recipe):
+            raise ValueError("scale_recipe requires dot_scaled and a filename-safe recipe")
+    # Unmarked historical files belong exclusively to tl.dot.
+    return ("" if gemm_type == "dot" else ",gemm_type=dot_scaled") + (
+        "" if scale_recipe is None else f",scale_recipe={scale_recipe}")
 
 
 def _config_file_suffix(
     dtype: Optional[str],
     block_shape: Optional[list[int]],
     is_bottom: bool,
+    gemm_type: str = "dot",
+    scale_recipe: Optional[str] = None,
 ) -> str:
+    gemm_selector = _gemm_type_selector(gemm_type, scale_recipe)
     arch = arch_info.get_arch()
     dtype_selector = "" if not dtype else f",dtype={dtype}"
     is_bottom_selector = "" if not is_bottom else ",is_bottom=True"
@@ -53,7 +71,7 @@ def _config_file_suffix(
         if not block_shape or not all(block_shape)
         else f",block_shape={block_shape}"
     ).replace(" ", "")
-    return f",arch={arch}{dtype_selector}{is_bottom_selector}{block_shape_selector}.json"
+    return f",arch={arch}{dtype_selector}{gemm_selector}{is_bottom_selector}{block_shape_selector}.json"
 
 
 def _parse_selector_set(value: str) -> Optional[tuple[int, ...]]:
@@ -236,7 +254,7 @@ def get_default_config(
         # on ROCm, set it to 2 instead.
         config = {
             "BLOCK_SIZE_M": 64,
-            "BLOCK_SIZE_N": block_shape[0],
+            "BLOCK_SIZE_N": max(16, block_shape[0]),
             "BLOCK_SIZE_K": block_shape[1],
             "GROUP_SIZE_M": 32,
             "COMBINE_SCALE_LOAD": False,
@@ -326,6 +344,8 @@ def get_moe_configs(
     is_bottom: bool = False,
     K: Optional[int] = None,
     top_k: Optional[int] = None,
+    gemm_type: str = "dot",
+    scale_recipe: Optional[str] = None,
 ) -> Optional[dict[int, Any]]:
     """
     Return optimized configurations for the fused MoE kernel.
@@ -344,14 +364,15 @@ def get_moe_configs(
     # current Triton capability remains preferred over lower capabilities.
     block_shape = [block_n, block_k] if block_n and block_k else None
     legacy_json_file_name = get_config_file_name(
-        E, N, dtype, block_shape, is_bottom
+        E, N, dtype, block_shape, is_bottom, gemm_type=gemm_type, scale_recipe=scale_recipe
     )
     config_dirs = get_compatible_triton_config_dirs(
         _TRITON_CONFIGS_DIR, get_triton_capabilities()
     )
     requested_json_file_name = (
         get_config_file_name(
-            E, N, dtype, block_shape, is_bottom, K=K, top_k=top_k
+            E, N, dtype, block_shape, is_bottom, K=K, top_k=top_k,
+            gemm_type=gemm_type, scale_recipe=scale_recipe
         )
         if K is not None and top_k is not None
         else legacy_json_file_name
@@ -385,19 +406,17 @@ def get_moe_configs(
     ) -> Optional[dict[int, Any]]:
         prefix = f"E={candidate_e},N={N},{selector_fragment}"
         top_path = config_dir / (
-            prefix + _config_file_suffix(dtype, block_shape, False)
+            prefix + _config_file_suffix(dtype, block_shape, False, gemm_type, scale_recipe)
         )
         # New selector families are anchored by the Gemm1 file.  Ignoring a
         # bottom-only family prevents Gemm1/Gemm2 from selecting different
         # K/topk families and then violating their shared BLOCK_SIZE_M rule.
+        bottom_path = config_dir / (
+            prefix + _config_file_suffix(dtype, block_shape, True, gemm_type, scale_recipe)
+        )
         if not top_path.exists():
             return None
-        paths = [top_path]
-        if is_bottom:
-            bottom_path = config_dir / (
-                prefix + _config_file_suffix(dtype, block_shape, True)
-            )
-            paths = [bottom_path, top_path]
+        paths = [bottom_path, top_path] if is_bottom else [top_path]
         for candidate_path in paths:
             if not candidate_path.exists():
                 continue
@@ -412,7 +431,7 @@ def get_moe_configs(
         candidate_e: int,
     ) -> list[tuple[tuple[int, ...], str]]:
         prefix = f"E={candidate_e},N={N},"
-        suffix = _config_file_suffix(dtype, block_shape, False)
+        suffix = _config_file_suffix(dtype, block_shape, False, gemm_type, scale_recipe)
         matches: list[tuple[tuple[int, ...], str]] = []
         for candidate_path in config_dir.glob(f"E={candidate_e},N={N},*.json"):
             name = candidate_path.name
@@ -430,8 +449,7 @@ def get_moe_configs(
             if selector["K"][0] == "exact" and selector["topk"][0] == "exact":
                 continue
             matches.append((_selector_specificity(selector), fragment))
-        matches.sort(reverse=True)
-        return matches
+        return sorted(set(matches), reverse=True)
 
     # For EP mode, local experts may not match a config file. Try the nearest
     # supported power-of-two expert count after all exact-E choices.
@@ -472,12 +490,13 @@ def get_moe_configs(
         # that the original tune covered the caller's K or topk.
         legacy_names = [
             get_config_file_name(
-                candidate_e, N, dtype, block_shape, is_bottom
+                candidate_e, N, dtype, block_shape, is_bottom, gemm_type=gemm_type, scale_recipe=scale_recipe
             )
         ]
         if is_bottom:
             legacy_names.append(
-                get_config_file_name(candidate_e, N, dtype, block_shape)
+                get_config_file_name(candidate_e, N, dtype, block_shape,
+                                     gemm_type=gemm_type, scale_recipe=scale_recipe)
             )
         for config_dir in config_dirs:
             for candidate_name in legacy_names:
@@ -509,6 +528,8 @@ def try_get_optimal_moe_config(
     block_shape: Optional[list[int]] = None,
     is_bottom: bool = False,
     is_gated: bool = True,
+    gemm_type: str = "dot",
+    scale_recipe: Optional[str] = None,
 ):
 
     # First try to load optimal config from the file
@@ -545,6 +566,7 @@ def try_get_optimal_moe_config(
         is_bottom,
         K=config_k,
         top_k=top_k,
+        gemm_type=gemm_type, scale_recipe=scale_recipe,
     )
 
     if configs and dtype == "int4_w4a8" and block_k > 0:
@@ -609,3 +631,37 @@ def get_optimal_moe_config_func(
         is_bottom=is_bottom,
         is_gated=is_gated,
     )
+
+
+def get_native_mx_moe_config(num_tokens, *, is_bottom=False, E=None, N=None,
+                        K=None, top_k=None, dtype="mxfp4_w4a8", scale_recipe=None):
+    """Load native scaled-dot tiles through the shared JSON selector, with a safe default.
+
+    N is the model intermediate width and K its hidden width for both GEMMs;
+    packed storage dimensions never enter the configuration filename.
+    """
+    config = dict(
+        BLOCK_SIZE_M=16, BLOCK_SIZE_N=64, BLOCK_SIZE_K=128,
+        GROUP_SIZE_M=1, COMBINE_SCALE_LOAD=False,
+        num_warps=4, num_stages=1,
+    )
+    if E is not None:
+        configs = get_moe_configs(
+            E, N, dtype, is_bottom=is_bottom, K=K, top_k=top_k,
+            gemm_type="dot_scaled", scale_recipe=scale_recipe,
+        )
+        if configs:
+            selected = configs[min(configs, key=lambda m: abs(m - num_tokens))]
+            candidate = {**config, **selected}
+            fixed = {key: value for key, value in config.items()
+                     if key not in ("BLOCK_SIZE_M", "BLOCK_SIZE_N")}
+            layout_options = ("a_sorted", "bottom_a_use_mls_load", "USE_MLS_LOAD")
+            extra_options = set(candidate).difference(config, layout_options)
+            if (candidate["BLOCK_SIZE_M"] not in (16, 32, 64, 128)
+                    or candidate["BLOCK_SIZE_N"] not in (64, 128)
+                    or any(candidate[key] != value for key, value in fixed.items())
+                    or any(candidate.get(key, False) for key in layout_options)
+                    or extra_options):
+                raise ValueError("Unsupported native scaled-dot MoE tuned configuration")
+            config.update({key: candidate[key] for key in config})
+    return (config, config["BLOCK_SIZE_M"]) if is_bottom else config

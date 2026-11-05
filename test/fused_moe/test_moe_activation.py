@@ -116,7 +116,8 @@ def test_moe_activation_matches_torch(activation, is_gated):
 @GPU_REQUIRED
 def test_explicit_output_api_matches_aiter_call_shape():
     """Exercise the keyword contract used by moe_c/moe_asm/moe_triton."""
-    input = torch.randn((7, 130), device=DEVICE, dtype=torch.float16)
+    input_cpu = torch.randn((7, 130), dtype=torch.float16)
+    input = input_cpu.to(DEVICE)
     out = torch.empty((7, 65), device=DEVICE, dtype=torch.float16)
 
     returned = moe_activation(
@@ -130,9 +131,9 @@ def test_explicit_output_api_matches_aiter_call_shape():
         activation_situ_linear_beta=None,
     )
 
-    expected = _reference(input, "silu", True).to(input.dtype)
+    expected = _reference(input_cpu, "silu", True).to(input_cpu.dtype)
     assert returned is None
-    torch.testing.assert_close(out, expected, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(out.cpu(), expected, rtol=2e-2, atol=2e-2)
 
 
 @GPU_REQUIRED

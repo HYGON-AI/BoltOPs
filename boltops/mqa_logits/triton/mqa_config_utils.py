@@ -164,13 +164,31 @@ def get_fp8_mqa_shape_dispatch(
 ) -> dict[str, Any]:
     """Pick backend path for prefill FP8 MQA logits.
 
-    * ``gluon_available=True``: only ``row`` / ``gluon`` (BN replaced by Gluon
-      tiled + optional ``head_split_k`` on the former BN grey zone).
-    * ``gluon_available=False``: only ``row`` / ``bn``.
+    On **gfx946**, float8 auto always uses head-serial (prologue MLS /
+    ``force_grouped`` qg8 / ``chunk8_mls`` / Q_GROUP). Other arches:
 
-    Shape heuristics for common prefill grids.
-    Auto Gluon path uses the tiled head-loop kernel only.
+    * ``gluon_available=True``: ``row`` / ``gluon``
+    * ``gluon_available=False``: ``row`` / ``bn``
     """
+    try:
+        if arch_info.get_arch() == "gfx946":
+            from boltops.mqa_logits.triton.mqa_logits_wasp import (
+                recommend_fp8_head_serial_launch,
+            )
+
+            rec = recommend_fp8_head_serial_launch(
+                seq_len, seq_len_kv, num_heads
+            )
+            return {
+                "path": "head_serial",
+                "block_m_tile": int(rec["block_m"]),
+                "bn_tile": int(rec["block_n"]),
+                "n_tiles": int(rec["n_tiles"]),
+                "chunk8_mls": bool(rec["chunk8_mls"]),
+                "force_grouped": bool(rec.get("force_grouped", False)),
+            }
+    except Exception:
+        pass
     if gluon_available:
         return _dispatch_row_or_gluon(seq_len, seq_len_kv, num_heads)
     return _dispatch_row_or_bn(seq_len, seq_len_kv, num_heads)
@@ -661,15 +679,18 @@ def get_mqa_logits_half_row_launch_config(
 def get_half_mqa_shape_dispatch(
     seq_len: int, seq_len_kv: int, num_heads: int
 ) -> dict[str, Any]:
-    """Half auto path: ``row`` or ``bn`` from shipped GPU compare (both Triton versions).
+    """Half auto path: ``row``, ``wasp``, or ``bn``.
 
-    Reads ``mqa_logits_half_row_short_kv`` ``compare`` / ``dispatch`` tables written by
-    the short-KV (or all-sizes) row|BN retune. Prefer exact ``(M,N,H)``; optionally
-    a coarse ``by_region`` path pick. No match → ``bn`` (safe default).
+    On **gfx946**, auto always uses BN-WASP (``wasp``; ``Q_GROUP=1`` + MLS Q).
+    Other arches still
+    read ``mqa_logits_half_row_short_kv`` compare/dispatch tables (row vs bn).
 
     Gluon half remains opt-in via ``backend='gluon_bn_align'``.
     """
     arch = arch_info.get_arch()
+    if arch == "gfx946":
+        return {"path": "wasp"}
+
     row_data = _load_half_row_config_file(arch)
     use_row = False
     row_kw: dict[str, Any] = {}

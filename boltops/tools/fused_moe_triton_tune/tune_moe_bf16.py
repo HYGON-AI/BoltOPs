@@ -21,46 +21,18 @@ from typing import Optional, List  # Add this import at the top
 from boltops.tools.fused_moe_triton_tune.routing import fused_topk
 from boltops.utility import dtypes
 import boltops.fused_moe.triton as fused_moe_module
-try:
-    from boltops.tools.fused_moe_triton_tune.common import (
-        get_env_int,
-        parse_batch_sizes_from_env,
-        resolve_device_settings,
-        build_compile_group_ids,
-        build_run_group_ids,
-        resolve_moe_activation_and_gate,
-        resolve_situ_parameters,
-        apply_activation_ref,
-        resolve_patched_environment,
-        enforce_training_patch_contract,
-    )
-except ImportError:
-    try:
-        from boltops.tools.fused_moe_triton_tune.common import (
-            get_env_int,
-            parse_batch_sizes_from_env,
-            resolve_device_settings,
-            build_compile_group_ids,
-            build_run_group_ids,
-            resolve_moe_activation_and_gate,
-            resolve_situ_parameters,
-            apply_activation_ref,
-            resolve_patched_environment,
-            enforce_training_patch_contract,
-        )
-    except ImportError:
-        from boltops.tools.fused_moe_triton_tune.common import (
-            get_env_int,
-            parse_batch_sizes_from_env,
-            resolve_device_settings,
-            build_compile_group_ids,
-            build_run_group_ids,
-            resolve_moe_activation_and_gate,
-            resolve_situ_parameters,
-            apply_activation_ref,
-            resolve_patched_environment,
-            enforce_training_patch_contract,
-        )
+from boltops.tools.fused_moe_triton_tune.common import (
+    get_env_int,
+    parse_batch_sizes_from_env,
+    resolve_device_settings,
+    build_compile_group_ids,
+    build_run_group_ids,
+    resolve_moe_activation_and_gate,
+    resolve_situ_parameters,
+    apply_activation_ref,
+    resolve_patched_environment,
+    enforce_training_patch_contract,
+)
 
 from boltops.utility.perf_utils import checkAllclose, perftest,benchmark
 # os.environ["VLLM_ENABLE_MOE_ALIGN_BLOCK_SIZE_TRITON"] = "1"
@@ -75,6 +47,9 @@ compile_only  = int(os.environ.get("TRITON_COMPILE_ONLY", "0"))
 num_groups_compile = int(os.environ.get("NUM_GROUPS_COMPILE", "1"))
 ep_size = get_env_int("EP_SIZE", 1)
 training_mode = int(os.environ.get("TRAINING_MODE", "0"))
+USE_MXFP8 = os.environ.get("AUTOTUNE_TEST_TYPE") == "mxfp8"
+USE_MXFP4 = os.environ.get("AUTOTUNE_TEST_TYPE") == "mxfp4"
+USE_NATIVE_MX = USE_MXFP4 or USE_MXFP8
 benchmark_mode = int(os.environ.get("BENCHMARK_MODE", "0"))
 cur_group = int(os.environ.get("CUR_GROUP", "0"))
 patched_environment, patch_source, patch_is_noop, patch_import_errors = resolve_patched_environment()
@@ -132,14 +107,14 @@ NUM_SHARED_EXPERTS = [get_env_int("MOE_NUM_SHARED_EXPERTS", 0)]
 # FFN_HIDDEN_SIZES = [7168]
 
 ## glm4.5v model
-NUM_EXPERTS = [get_env_int("MOE_NUM_EXPERTS", 128)]
-HIDDEN_SIZES = [get_env_int("MOE_HIDDEN_SIZE", 352)]
-FFN_HIDDEN_SIZES = [get_env_int("MOE_FFN_HIDDEN_SIZE", 4096)]
+NUM_EXPERTS = [get_env_int("MOE_NUM_EXPERTS", 256 if USE_NATIVE_MX else 128)]
+HIDDEN_SIZES = [get_env_int("MOE_HIDDEN_SIZE", 384 if USE_NATIVE_MX else 352)]
+FFN_HIDDEN_SIZES = [get_env_int("MOE_FFN_HIDDEN_SIZE", 7168 if USE_NATIVE_MX else 4096)]
 
 EP_SIZE = [ep_size]
 TOP_KS = [get_env_int("MOE_TOP_K", 8)]
 DTYPES = [torch.bfloat16]
-INPLACE = [True]
+INPLACE = [False] if USE_NATIVE_MX else [True]
 BATCH_SIZES = FULL_BATCH_SIZES.copy()
 # BATCH_SIZES = [4]
 
@@ -365,6 +340,46 @@ def input_helper(
     # 返回的 score 应该是包含所有专家的，用于后续计算
     return a, w1, w2, score_all, e_map, topk_weights, topk_ids
 
+def _native_mx_inputs(m, n, k, e, topk, *, ep_size=1, dtype=torch.bfloat16, seed=20261029):
+    """Prepare the native MX MoE recipe outside kernel/graph timing."""
+    alignment = 32 if USE_MXFP8 else 128
+    if k % alignment or n % alignment or e % ep_size or topk > e:
+        raise ValueError(f"Native MX requires K/N divisible by {alignment}, E divisible by EP, topk <= E")
+    activation, gated = ACTIVATION_NAME, IS_GATED
+    beta, linear_beta = ACTIVATION_SITU_BETA, ACTIVATION_SITU_LINEAR_BETA
+    experts = e // ep_size
+    torch.manual_seed(seed)
+    x = (torch.randn(m, k) * .1).to(dtype)
+    n1 = n * (2 if gated else 1)
+    block = tuple(map(int, os.environ.get("MOE_BLOCK_SHAPE", "1,32").split(","))) if USE_MXFP8 else (1, 32)
+    if block != (1, 32):
+        raise ValueError("native MXFP8 requires weight block_shape=[1,32]")
+    bo, bk = block
+    if USE_MXFP8:
+        w1 = (torch.randn(experts, n1, k) * 2).to(torch.float8_e4m3fn)
+        w2 = (torch.randn(experts, k, n) * 2).to(torch.float8_e4m3fn)
+    else:
+        w1 = torch.randint(0, 256, (experts, n1, k // 2), dtype=torch.uint8)
+        w2 = torch.randint(0, 256, (experts, k, n // 2), dtype=torch.uint8)
+    s1 = torch.full((experts, triton.cdiv(n1, bo), triton.cdiv(k, bk)), 123, dtype=torch.uint8)
+    s2 = torch.full((experts, triton.cdiv(k, bo), triton.cdiv(n, bk)), 123, dtype=torch.uint8)
+    ids = torch.stack([torch.randperm(e)[:topk] for _ in range(m)]).int()
+    weights = torch.softmax(torch.randn(m, topk), dim=-1)
+    expert_map = None
+    if ep_size > 1:
+        expert_map = torch.full((e,), -1, dtype=torch.int32)
+        expert_map[:experts] = torch.arange(experts, dtype=torch.int32)
+        expert_map = expert_map.cuda()
+    device_args = tuple(t.cuda() for t in (x, w1, w2, weights, ids))
+    options = dict(
+        output_dtype=dtype, activation=activation,
+        activation_situ_beta=beta, activation_situ_linear_beta=linear_beta,
+        use_mxfp4_w4a8=not USE_MXFP8, use_mxfp8=USE_MXFP8, use_ue8m0=True,
+        w1_scale=s1.cuda(), w2_scale=s2.cuda(), block_shape=list(block),
+        global_num_experts=e, expert_map=expert_map)
+    return device_args, options
+
+
 @perftest(num_warmup=1, num_iters=11,testGraph=True)
 def fused_experts_impl_benchmark(hidden_states: torch.Tensor,
                        w1: torch.Tensor,
@@ -390,7 +405,10 @@ def fused_experts_impl_benchmark(hidden_states: torch.Tensor,
                        a2_scale: Optional[torch.Tensor] = None,
                        block_shape: Optional[List[int]] = None,
                        activation_situ_beta: Optional[float] = None,
-                       activation_situ_linear_beta: Optional[float] = None)-> torch.Tensor:
+                       activation_situ_linear_beta: Optional[float] = None,
+                       use_mxfp4_w4a8: bool = False,
+                       use_ue8m0: bool = False,
+                       use_mxfp8: bool = False)-> torch.Tensor:
 
     return fused_moe_module.fused_experts_impl(hidden_states,
                                 w1,
@@ -403,6 +421,19 @@ def fused_experts_impl_benchmark(hidden_states: torch.Tensor,
                                 inplace=inplace,
                                 activation=activation,
                                 is_gated=IS_GATED,
+                                use_mxfp4_w4a8=use_mxfp4_w4a8,
+                                use_ue8m0=use_ue8m0,
+                                use_mxfp8=use_mxfp8,
+                                use_fp8_w8a8=use_fp8_w8a8,
+                                use_int8_w8a8=use_int8_w8a8,
+                                use_int8_w8a16=use_int8_w8a16,
+                                use_int4_w4a16=use_int4_w4a16,
+                                use_int4_w4a8=use_int4_w4a8,
+                                per_channel_quant=per_channel_quant,
+                                w1_scale=w1_scale, w2_scale=w2_scale,
+                                w1_zp=w1_zp, w2_zp=w2_zp,
+                                a1_scale=a1_scale, a2_scale=a2_scale,
+                                block_shape=block_shape,
                                 activation_situ_beta=activation_situ_beta,
                                 activation_situ_linear_beta=activation_situ_linear_beta)
 
@@ -444,6 +475,21 @@ def test_fused_moe(
 
     # 获取当前设备
     device = "cuda"
+
+    if USE_NATIVE_MX:
+        if num_shared_experts:
+            raise ValueError("Native MX tuning does not support shared experts")
+        args, options = _native_mx_inputs(m, n, k, e, topk, ep_size=ep_size, dtype=dtype)
+        options["inplace"] = inplace
+        print(f"\nTest: m={m}, n={n}, k={k}, e={e}, topk={topk}")
+        with patched_environment():
+            result = fused_moe_module.fused_experts_impl(*args, **options)
+        if not compile_only:
+            assert torch.isfinite(result.cpu()).all()
+        if benchmark_mode:
+            _, microseconds = fused_experts_impl_benchmark(*args, **options)
+            print(f"MXFP4 fused_experts: {microseconds} us")
+        return
 
     ENABLE_TORCH_REF = False if m > 256 or training_config["training_mode"] == 1 else True
 
@@ -627,6 +673,16 @@ def bench_fused_moe_bf16(BATCH_SIZE, HIDDEN_SIZE, FFN_HIDDEN_SIZE, NUM_EXPERTS, 
 
     # 获取当前设备
     device = "cuda"
+
+    if USE_NATIVE_MX:
+        if NUM_SHARED_EXPERTS:
+            raise ValueError("Native MX tuning does not support shared experts")
+        args, options = _native_mx_inputs(
+            BATCH_SIZE, HIDDEN_SIZE, FFN_HIDDEN_SIZE, NUM_EXPERTS, TOP_K,
+            ep_size=EP_SIZE[0], dtype=dtype,
+        )
+        _, microseconds = fused_experts_impl_benchmark(*args, **options)
+        return microseconds / 1000
 
     # 打印当前测试用例
     global case_counter  # 添加全局声明

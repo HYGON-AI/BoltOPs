@@ -25,11 +25,13 @@ from __future__ import annotations
 
 import os
 import types
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Callable
 
 import pytest
 import torch
+from packaging.version import Version
 
 from boltops.utility.bench import (
     BACKEND_ENV,
@@ -142,6 +144,20 @@ def pytest_addoption(parser: pytest.Parser) -> None:
             "(default: benchmark-specific)"
         ),
     )
+
+
+def pytest_sessionstart(session: pytest.Session) -> None:
+    try:
+        triton_version = version("triton")
+    except PackageNotFoundError:
+        return
+    # Include prerelease/nightly builds of the unsupported release family.
+    if Version(triton_version).release >= (3, 7):
+        pytest.exit(
+            f"BoltOPs tests are temporarily paused for Triton >=3.7 "
+            f"(installed: {triton_version}); no tests were run.",
+            returncode=0,
+        )
 
 
 def pytest_configure(config: pytest.Config) -> None:

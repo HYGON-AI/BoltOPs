@@ -104,12 +104,12 @@ def triton_mqa_logits(
 
     ``backend`` selects the Triton kernel path:
 
-    * ``None`` / ``\"auto\"`` — float8: Gluon → ``row``|``gluon``, else
-      ``row``|``bn``; half: ``row``|``bn`` (row only on short-KV shapes where
-      tune beats BN; else full-size tuned BN).
-    * ``\"row\"`` / ``\"bn\"`` / ``\"gluon\"`` — float8 as named; half ``row``
-      uses per-row KV scan, half ``bn`` forces BN; half ``gluon`` unsupported
-      (use experimental ``gluon_bn_align``).
+    * ``None`` / ``\"auto\"`` — gfx946 float8: head-serial; gfx946 half:
+      BN-WASP. Other arches: float8 Gluon → ``row``|``gluon`` else
+      ``row``|``bn``; half ``row``|``bn``.
+    * ``\"row\"`` / ``\"bn\"`` / ``\"wasp\"`` / ``\"head_serial\"`` / ``\"gluon\"``
+      — force named path (float8 ``wasp`` → head-serial; half ``wasp`` →
+      BN-WASP).
     * ``\"gluon_bn_align\"`` / ``\"gluon-exp\"`` / ``\"gluon_exp\"`` —
       **experimental** BN-aligned Gluon (float8 or half); not selected by auto.
     * ``\"gluon_opt\"`` — **experimental** float8 alias of ship Gluon
@@ -195,9 +195,28 @@ def _triton_mqa_logits(
             return mqa_logits_half_row(
                 Q, KV, weights, cu_starts, cu_ends, D_out=D_out
             )
+        if backend_norm in ("wasp", "bn_wasp"):
+            from boltops.mqa_logits.triton.mqa_logits_wasp import (
+                try_mqa_logits_half_bn_wasp,
+            )
+
+            out = try_mqa_logits_half_bn_wasp(
+                Q,
+                KV,
+                weights,
+                cu_starts,
+                cu_ends,
+                D_out=D_out,
+            )
+            if out is None:
+                raise RuntimeError(
+                    "backend='wasp' requested but BN-WASP launch is unavailable "
+                    "(need gfx946)"
+                )
+            return out
         if backend_norm not in (None, "", "auto", "bn"):
             raise ValueError(
-                "backend must be None/'auto'/'row'/'bn'/'gluon'/"
+                "backend must be None/'auto'/'row'/'bn'/'wasp'/'gluon'/"
                 f"'gluon_bn_align', got {backend!r}"
             )
         if backend_norm in (None, "", "auto"):
@@ -227,6 +246,21 @@ def _triton_mqa_logits(
                 return mqa_logits_half_row(
                     Q, KV, weights, cu_starts, cu_ends, **row_kw
                 )
+            if disp.get("path") == "wasp":
+                from boltops.mqa_logits.triton.mqa_logits_wasp import (
+                    try_mqa_logits_half_bn_wasp,
+                )
+
+                out = try_mqa_logits_half_bn_wasp(
+                    Q,
+                    KV,
+                    weights,
+                    cu_starts,
+                    cu_ends,
+                    D_out=D_out,
+                )
+                if out is not None:
+                    return out
         from boltops.mqa_logits.triton.mqa_logits_half import mqa_logits_half
 
         return mqa_logits_half(
@@ -245,6 +279,14 @@ def _triton_mqa_logits(
         except ImportError:
             gluon_ok = False
 
+        disp = get_fp8_mqa_shape_dispatch(
+            seq_len, seq_len_kv, num_heads, gluon_available=gluon_ok
+        )
+        if disp.get("path") == "head_serial":
+            return _run_triton_prefill(
+                Q, KV, kv_scales, weights, cu_starts, cu_ends, D_out=D_out, disp=disp
+            )
+
         if gluon_ok:
             from boltops.mqa_logits.triton.fp8_mqa_logits_gluon import (
                 fp8_mqa_logits_gluon,
@@ -254,9 +296,6 @@ def _triton_mqa_logits(
                 Q, KV, kv_scales, weights, cu_starts, cu_ends, D_out=D_out
             )
 
-        disp = get_fp8_mqa_shape_dispatch(
-            seq_len, seq_len_kv, num_heads, gluon_available=False
-        )
         return _run_triton_prefill(
             Q, KV, kv_scales, weights, cu_starts, cu_ends, D_out=D_out, disp=disp
         )
@@ -343,8 +382,26 @@ def _triton_mqa_logits(
             Q, KV, kv_scales, weights, cu_starts, cu_ends, D_out=D_out, disp=disp
         )
 
+    if backend_norm in ("wasp", "bn_wasp", "head_serial"):
+        # Float8: ``wasp`` aliases head-serial (BN-WASP removed). Half keeps
+        # true BN-WASP under the same backend name above.
+        from boltops.mqa_logits.triton.mqa_logits_wasp import (
+            try_fp8_mqa_logits_head_serial,
+        )
+
+        out = try_fp8_mqa_logits_head_serial(
+            Q, KV, kv_scales, weights, cu_starts, cu_ends, D_out=D_out
+        )
+        if out is None:
+            raise RuntimeError(
+                "backend='wasp'/'head_serial' requested but FP8 head-serial "
+                "is unavailable (need gfx946)"
+            )
+        return out
+
     raise ValueError(
-        "backend must be None/'auto'/'row'/'bn'/'gluon'/'gluon_bn_align'/'gluon_opt', "
+        "backend must be None/'auto'/'row'/'bn'/'wasp'/'head_serial'/"
+        "'gluon'/'gluon_bn_align'/'gluon_opt', "
         f"got {backend!r}"
     )
 
@@ -360,9 +417,25 @@ def _run_triton_prefill(
     D_out,
     disp: dict,
 ):
+    path = disp.get("path")
+    if path == "head_serial":
+        from boltops.mqa_logits.triton.mqa_logits_wasp import (
+            fp8_mqa_logits_head_serial,
+        )
+
+        return fp8_mqa_logits_head_serial(
+            Q,
+            KV,
+            kv_scales,
+            weights,
+            cu_starts,
+            cu_ends,
+            out=D_out,
+        )
+
     from boltops.mqa_logits.triton.fp8_mqa_logits import fp8_mqa_logits as impl
 
-    if disp["path"] == "row":
+    if path == "row":
         row_kw = {
             "auto_bn_tile": False,
             "D_out": D_out,

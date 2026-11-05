@@ -1,15 +1,17 @@
 # Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # SPDX-License-Identifier: MIT
-"""Correctness and size-grid performance tests for prefill FP8 MQA logits.
+"""Correctness and performance tests for prefill FP8 MQA logits.
 
-Backends under test: ``row``, ``bn``, ``gluon`` (plus public ``auto``).
+Two **mutually exclusive** suites (runtime skip by arch):
 
-Size-grid benches reuse the prefill shape list from hipc / aiter lineage tests
-(Q×KV×H, D=128). ``pytest --bench`` times BoltOPs only. Hipc comparison is
-opt-in and is skipped by optest ``per``:
+* **non-gfx946** — legacy ``row`` / ``bn`` / ``gluon`` / ``auto`` correctness,
+  hipc size-grid + 50-slice prod benches (``--bench -k vs_hipc_*``).
+* **gfx946** — head-serial ``auto`` on the six dense production shapes
+  (DeepSeek V4 Flash/Pro + GLM prefill/decode); optest ``per`` collects the
+  ``gfx946_prod`` bench. Dispatch unit test is mocked and runs on any host.
 
-* ``--bench -k vs_hipc_size`` — synthetic size grid
-* ``--bench -k vs_hipc_prod`` — 50 production prefill slices (GLM / V4 CSA / PP_Stage0)
+``pytest --bench`` times BoltOPs only. Hipc comparison is opt-in and skipped
+by optest ``per``.
 """
 
 from __future__ import annotations
@@ -35,13 +37,13 @@ GPU_REQUIRED = pytest.mark.skipif(
 e4m3_type = get_fp8_e4m3_dtype()
 fp8_max = torch.finfo(e4m3_type).max
 
-# Prefill size grid from hipc / aiter lineage tests (cuda list).
+# Prefill size grid from hipc / aiter lineage tests (non-gfx946).
 _SIZE_GRID_Q = (16, 32, 64, 127)
 _SIZE_GRID_KV = (66, 4096, 8192, 16384, 32768, 65536, 131072)
 _SIZE_GRID_H = (8, 64)
 _SIZE_GRID_D = 128
 
-# Production prefill slices (50 shapes): GLM chunked / V4 CSA / V4 PP_Stage0.
+# Production prefill slices (50 shapes, non-gfx946 vs_hipc): GLM / V4 CSA / PP_Stage0.
 _PROD_SLICE_D = 128
 _PROD_SLICE_SHAPES: list[tuple[int, int, int, str]] = (
     [(6656, 6656 * (i + 1), 32, "glm") for i in range(10)]
@@ -56,12 +58,31 @@ _PROD_SLICE_SHAPES: list[tuple[int, int, int, str]] = (
     ]
 )
 
+# gfx946 head-serial: dense FP8 production shapes (indexer dump).
+_GFX946_PROD_D = 128
+_GFX946_PROD_SHAPES: list[tuple[str, int, int, int]] = [
+    ("ds_v4_flash_prefill", 6656, 1664, 64),
+    ("ds_v4_flash_decode", 288, 16512, 64),
+    ("ds_v4_pro_prefill", 6656, 3167, 64),
+    ("ds_v4_pro_decode", 96, 32896, 64),
+    ("glm_prefill", 6656, 6656, 32),
+    ("glm_decode", 24, 131584, 32),
+]
+
 
 def _prod_slice_params():
     for s_q, s_k, num_heads, family in _PROD_SLICE_SHAPES:
         yield pytest.param(
             s_q, s_k, num_heads, family,
             id=f"{family}-{s_q}x{s_k}-H{num_heads}",
+        )
+
+
+def _gfx946_prod_params():
+    for name, s_q, s_k, num_heads in _GFX946_PROD_SHAPES:
+        yield pytest.param(
+            s_q, s_k, num_heads, _GFX946_PROD_D, name,
+            id=f"{name}-{s_q}x{s_k}-H{num_heads}",
         )
 
 
@@ -97,20 +118,19 @@ def ref_fp8_mqa_logits(
     cu_seqlen_ks: torch.Tensor,
     cu_seqlen_ke: torch.Tensor,
 ) -> torch.Tensor:
-    seq_len_kv = kv.shape[0]
-    q_f = q.float()
-    k_f = kv.float()
+    """CPU reference for FP8 MQA logits (avoids GPU/simulator for golden)."""
+    q_f = q.detach().float().cpu()
+    k_f = kv.detach().float().cpu()
+    weights_f = weights.detach().float().cpu()
+    ks = cu_seqlen_ks.detach().cpu()
+    ke = cu_seqlen_ke.detach().cpu()
+    seq_len_kv = k_f.shape[0]
 
-    mask_lo = (
-        torch.arange(0, seq_len_kv, device=q.device)[None, :] >= cu_seqlen_ks[:, None]
-    )
-    mask_hi = (
-        torch.arange(0, seq_len_kv, device=q.device)[None, :] < cu_seqlen_ke[:, None]
-    )
-    mask = mask_lo & mask_hi
+    kv_idx = torch.arange(0, seq_len_kv, device="cpu")
+    mask = (kv_idx[None, :] >= ks[:, None]) & (kv_idx[None, :] < ke[:, None])
 
     score = torch.einsum("mhd,nd->hmn", q_f, k_f)
-    logits = (score.relu() * weights.unsqueeze(-1).transpose(0, 1)).sum(dim=0)
+    logits = (score.relu() * weights_f.unsqueeze(-1).transpose(0, 1)).sum(dim=0)
     return logits.masked_fill(~mask, float("-inf"))
 
 
@@ -150,6 +170,24 @@ def _gluon_available() -> bool:
         return bool(gluon_prefill_available())
     except ImportError:
         return False
+
+
+def _is_gfx946() -> bool:
+    from boltops.utility.arch_info import get_arch
+
+    return get_arch() == "gfx946"
+
+
+def _require_gfx946() -> None:
+    """gfx946 head-serial suite only."""
+    if not _is_gfx946():
+        pytest.skip("gfx946 head-serial suite only")
+
+
+def _skip_if_gfx946() -> None:
+    """Legacy row/bn/gluon suite; gfx946 uses the production head-serial suite."""
+    if _is_gfx946():
+        pytest.skip("legacy FP8 suite skipped on gfx946 (see gfx946_prod tests)")
 
 
 def _make_inputs(
@@ -197,21 +235,28 @@ def _assert_close_to_ref(
     *,
     atol_diff: float = 1e-3,
 ) -> None:
+    kv_f = kv_fp8.detach().float().cpu() * scales.detach().float().cpu()[:, None]
     ref_logits = ref_fp8_mqa_logits(
-        q=q_fp8.float(),
-        kv=(kv_fp8.float() * scales[:, None]),
+        q=q_fp8,
+        kv=kv_f,
         weights=weights,
         cu_seqlen_ks=ks,
         cu_seqlen_ke=ke,
     )
+    out = logits.detach().float().cpu()
     ref_neginf_mask = ref_logits == float("-inf")
-    neginf_mask = logits == float("-inf")
+    neginf_mask = out == float("-inf")
     assert torch.equal(neginf_mask, ref_neginf_mask)
 
     ref_cmp = ref_logits.masked_fill(ref_neginf_mask, 0)
-    out_cmp = logits.masked_fill(neginf_mask, 0)
+    out_cmp = out.masked_fill(neginf_mask, 0)
     diff = calc_diff(out_cmp, ref_cmp)
     assert diff < atol_diff, f"{diff=}"
+
+
+# ---------------------------------------------------------------------------
+# non-gfx946: legacy row / bn / gluon / auto
+# ---------------------------------------------------------------------------
 
 
 @GPU_REQUIRED
@@ -225,6 +270,7 @@ def test_triton_fp8_mqa_logits_backends(
     head_dim: int,
     backend: str,
 ) -> None:
+    _skip_if_gfx946()
     if backend == "gluon" and not _gluon_available():
         pytest.skip("Gluon unavailable")
 
@@ -257,6 +303,7 @@ def test_triton_fp8_mqa_logits_auto_grid(
     head_dim: int,
     disable_cp: bool,
 ) -> None:
+    _skip_if_gfx946()
     q_fp8, kv_fp8, scales, weights, ks, ke = _make_inputs(
         s_q, s_k, num_heads, head_dim, disable_cp=disable_cp
     )
@@ -267,6 +314,7 @@ def test_triton_fp8_mqa_logits_auto_grid(
 @GPU_REQUIRED
 @torch.inference_mode()
 def test_triton_fp8_mqa_logits_dout_inplace() -> None:
+    _skip_if_gfx946()
     q_fp8, kv_fp8, scales, weights, ks, ke = _make_inputs(32, 1024, 64, 128)
     d_out = torch.empty(32, 1024, device=DEVICE, dtype=torch.float32)
     out = triton_mqa_logits(
@@ -304,7 +352,8 @@ def test_bench_triton_fp8_mqa_logits_size_grid(
     bench_repeat: int,
     time_ms,
 ) -> None:
-    """Perf on the hipc / aiter prefill size grid (auto backend)."""
+    """Perf on the hipc / aiter prefill size grid (auto backend; non-gfx946)."""
+    _skip_if_gfx946()
     q_fp8, kv_fp8, scales, weights, ks, ke = _make_inputs(
         s_q, s_k, num_heads, head_dim, disable_cp=True
     )
@@ -346,6 +395,7 @@ def test_bench_triton_fp8_mqa_logits_vs_hipc_size_grid(
     time_ms,
 ) -> None:
     """Optional: same hipc size grid, BoltOPs auto vs hipc.mqa_logits."""
+    _skip_if_gfx946()
     hipc = _require_hipc()
     q_fp8, kv_fp8, scales, weights, ks, ke = _make_inputs(
         s_q, s_k, num_heads, head_dim, disable_cp=True
@@ -390,12 +440,13 @@ def test_bench_triton_fp8_mqa_logits_vs_hipc_prod_slices(
     bench_repeat: int,
     time_ms,
 ) -> None:
-    """50 production prefill slices: BoltOPs auto vs hipc.
+    """50 production prefill slices: BoltOPs auto vs hipc (non-gfx946).
 
     Run with::
 
         pytest -q test/mqa_logits/test_triton_fp8_mqa_logits.py --bench -s -k vs_hipc_prod
     """
+    _skip_if_gfx946()
     hipc = _require_hipc()
     from boltops.mqa_logits.triton.mqa_config_utils import get_fp8_mqa_shape_dispatch
 
@@ -444,6 +495,91 @@ def test_bench_triton_fp8_mqa_logits_vs_hipc_prod_slices(
     )
 
 
+# ---------------------------------------------------------------------------
+# gfx946: head-serial on dense production shapes
+# ---------------------------------------------------------------------------
+
+
+def test_fp8_gfx946_dispatch_always_head_serial(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """gfx946 auto must select head-serial (mocked arch; any host)."""
+    from boltops.mqa_logits.triton import mqa_config_utils as mcu
+
+    monkeypatch.setattr(mcu.arch_info, "get_arch", lambda *a, **k: "gfx946")
+    for s_q, s_k, h in ((16, 66, 8), (32, 128, 64), (64, 8192, 32)):
+        disp = mcu.get_fp8_mqa_shape_dispatch(
+            s_q, s_k, h, gluon_available=True
+        )
+        assert disp.get("path") == "head_serial", (s_q, s_k, h, disp)
+
+
+@GPU_REQUIRED
+@pytest.mark.parametrize(
+    "s_q,s_k,num_heads,head_dim,case",
+    list(_gfx946_prod_params()),
+)
+@torch.inference_mode()
+def test_triton_fp8_mqa_logits_gfx946_prod(
+    s_q: int,
+    s_k: int,
+    num_heads: int,
+    head_dim: int,
+    case: str,
+) -> None:
+    """gfx946 head-serial ``auto`` vs CPU ref on production dense shapes."""
+    _require_gfx946()
+    q_fp8, kv_fp8, scales, weights, ks, ke = _make_inputs(
+        s_q, s_k, num_heads, head_dim, disable_cp=True
+    )
+    d_out = torch.empty(s_q, s_k, device=DEVICE, dtype=torch.float32)
+    logits = triton_mqa_logits(
+        q_fp8, kv_fp8, scales, weights, ks, ke, D_out=d_out, backend="auto"
+    )
+    assert logits.data_ptr() == d_out.data_ptr()
+    # Large prod shapes: slightly looser than tiny correctness grid.
+    _assert_close_to_ref(
+        logits, q_fp8, kv_fp8, scales, weights, ks, ke, atol_diff=2e-2
+    )
+
+
+@GPU_REQUIRED
+@pytest.mark.bench
+@pytest.mark.parametrize(
+    "s_q,s_k,num_heads,head_dim,case",
+    list(_gfx946_prod_params()),
+)
+@torch.inference_mode()
+def test_bench_triton_fp8_mqa_logits_gfx946_prod(
+    s_q: int,
+    s_k: int,
+    num_heads: int,
+    head_dim: int,
+    case: str,
+    bench_warmup: int,
+    bench_repeat: int,
+    time_ms,
+) -> None:
+    """optest ``per``: gfx946 head-serial on production dense shapes."""
+    _require_gfx946()
+    q_fp8, kv_fp8, scales, weights, ks, ke = _make_inputs(
+        s_q, s_k, num_heads, head_dim, disable_cp=True
+    )
+    d_out = torch.empty(s_q, s_k, device=DEVICE, dtype=torch.float32)
+
+    def run():
+        triton_mqa_logits(
+            q_fp8, kv_fp8, scales, weights, ks, ke, D_out=d_out, backend="auto"
+        )
+
+    flops = useful_flops(ks, ke, num_heads, head_dim)
+    ms = time_ms(run, bench_warmup, bench_repeat, flops=flops)
+    print(
+        f"[bench gfx946_prod] {case} auto {s_q}x{s_k} H={num_heads} D={head_dim} "
+        f"-> {ms:.3f} ms, {flops / (ms * 1e-3) / 1e12:.2f} TFLOPS"
+    )
+
+
 def test_triton_mqa_logits_public_export():
     from boltops.mqa_logits import triton_mqa_logits
     import boltops.mqa_logits as pkg
@@ -451,4 +587,3 @@ def test_triton_mqa_logits_public_export():
     assert callable(triton_mqa_logits)
     assert not hasattr(pkg, "mqa_logits")
     assert not hasattr(pkg, "fp8_mqa_logits")
-

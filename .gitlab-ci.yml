@@ -1,17 +1,21 @@
 stages:
+  - quality-gate
   - prepare
   - build
   - performance
   - publish
+  - mirror
 
 variables:
   GIT_DEPTH: "0"
-  BASE_COMPILE_IMAGE_ROCKY_PY310: "${BASE_COMPILE_IMAGE_ROCKY_PY310}"
-  BASE_COMPILE_IMAGE_ROCKY_PY312: "${BASE_COMPILE_IMAGE_ROCKY_PY312}"
-  PIP_INDEX_URL: "${URL1}:9929/nightly/dtk2604/+simple/"
-  PIP_TRUSTED_HOST: "${URL1}"
-  TORCH_INDEX_URL: "${URL1}:9929/nightly/dtk2604/+simple/"
-  TRITON_INDEX_URL: "${URL1}:9929/das_nightly/dtk2604-rc4/+simple/"
+  # Set GITHUB_MIRROR_TOKEN as a masked, protected CI/CD variable (Contents: write).
+  GITHUB_MIRROR_REPO: "github.com/HYGON-AI/BoltOPs.git"
+  BASE_COMPILE_IMAGE_ROCKY_PY310: "image.sourcefind.cn:5000/dcu/admin/base/dev:rockylinux8.6-mpi5.0-gcc10.3-cmake3.29-py3.10-mkl2020.4.304"
+  BASE_COMPILE_IMAGE_ROCKY_PY312: "harbor.sourcefind.cn:5443/dcu/admin/base/dev:rockylinux8.6-mpi5.0-gcc10.3-cmake3.29-py3.12-mkl2020.4.304"
+  PIP_INDEX_URL: "http://12.12.12.201:9929/nightly/dtk2604/+simple/"
+  PIP_TRUSTED_HOST: "10.16.1.201"
+  TORCH_INDEX_URL: "http://12.12.12.201:9929/nightly/dtk2604/+simple/"
+  TRITON_INDEX_URL: "http://12.12.12.201:9929/das_nightly/dtk2604-rc4/+simple/"
   # Torch wheels are larger than 1 GB. Tolerate transient stalls and let pip
   # resume partial downloads instead of restarting the whole transfer.
   PIP_DEFAULT_TIMEOUT: "600"
@@ -19,8 +23,8 @@ variables:
   PIP_RESUME_RETRIES: "10"
   DTK_VER: "2604"
   DTK_PKG: "/ArchivedFile/dtk-pkg/dtk26.04/DTK-26.04-rc4-centos8-x86_64.tar.gz"
-  AICC_INSTALLER_URL: ${URL2}:18000/ai_cc/Nightly/hcu_llvm_installer.sh"
-  DEVPI_URL: "${URL1}:9929/"
+  AICC_INSTALLER_URL: "http://42.228.13.241:18000/ai_cc/Nightly/hcu_llvm_installer.sh"
+  DEVPI_URL: "http://12.12.12.201:9929/"
   CISMI_TIMEOUT: "3600"
   # These two must be set as protected CI/CD secret variables in GitLab project settings.
   devpi_nightly_user: ""
@@ -39,7 +43,7 @@ variables:
         2604) ;;
         2610)
           export DTK_PKG="/ArchivedFile/dtk-pkg/dtk26.10/DTK-26.10-Rocky8.6-x86_64.tar.gz"
-          export TORCH_INDEX_URL="${URL1}:9929/das_nightly/dtk2610/+simple/"
+          export TORCH_INDEX_URL="http://12.12.12.201:9929/das_nightly/dtk2610/+simple/"
           export TRITON_INDEX_URL="${TORCH_INDEX_URL}"
           ;;
         *)
@@ -103,6 +107,22 @@ variables:
       SCRIPT
     - chmod +x /tmp/git-askpass.sh
     - export GIT_ASKPASS=/tmp/git-askpass.sh GIT_TERMINAL_PROMPT=0 GIT_TOKEN="${CI_JOB_TOKEN}"
+
+quality-gate:
+  stage: quality-gate
+  allow_failure: true
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"'
+  tags:
+    - nmz
+  before_script:
+    - !reference [.git-auth, before_script]
+  script:
+    - python -m pip install 'hygon_quality_gate[scanners]'
+    - python -m hygon_pr_gate.install_tools
+    # Fetch the target branch for incremental scanning against the MR commit.
+    - git fetch origin "${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}"
+    - quality-pr-scan --base "origin/${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}" --head "${CI_COMMIT_SHA}"
 
 select:source:
   stage: prepare
@@ -212,7 +232,7 @@ select:source:
     - GIT_COMMIT=$(git rev-parse --short=6 HEAD)
     - export WHEEL_OUTPUT="${CI_PROJECT_DIR}/output/dtk${DTK_VER}/py${PYTHON_VERSION}/torch${TORCH_VERSION}"
     - mkdir -p "${WHEEL_OUTPUT}"
-    - python -m build --wheel --outdir "${CI_WORK_DIR}/dist"
+    - bash .github/scripts/_build_hcu_wheel.sh --out-dir "${CI_WORK_DIR}/dist"
     - CIUpload REPAIR --dtk_version ${DTK_VER} --torch_version ${TORCH_VERSION} --git_commit ${GIT_COMMIT} --outputdir "${WHEEL_OUTPUT}" -f "${CI_WORK_DIR}"/dist/*.whl
   artifacts:
     when: always
@@ -415,7 +435,7 @@ performance:optest:
       fi
 
       report_rc=0
-      python ci_script/optest_to_junit.py "${CI_PROJECT_DIR}" "${RUNNER_TAG}_dtk${DTK_VER}_py${PYTHON_VERSION}_torch${TORCH_VERSION}" \
+      python scripts/ci/optest_to_junit.py "${CI_PROJECT_DIR}" "${RUNNER_TAG}_dtk${DTK_VER}_py${PYTHON_VERSION}_torch${TORCH_VERSION}" \
         "${results_file}" || report_rc=$?
       echo "optest exit=${optest_rc}; report exit=${report_rc}" | tee -a "${artifact_dir}/collection.log"
       if [ "${optest_rc}" -ne 0 ] || [ "${report_rc}" -ne 0 ]; then
@@ -521,3 +541,42 @@ publish:dtk2610:
   needs:
     - job: build:wheel:dtk2610
       artifacts: true
+
+# Publish the complete main history after the push pipeline succeeds.
+mirror:github:
+  stage: mirror
+  timeout: 30m
+  resource_group: boltops-github-mirror
+  tags:
+    - nmz
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == "main"'
+  before_script: !reference [.git-auth, before_script]
+  script:
+    - |
+      set -eu
+      test -n "${GITHUB_MIRROR_TOKEN:-}" || { echo "Set GITHUB_MIRROR_TOKEN in CI/CD variables"; exit 1; }
+      git fetch origin "+refs/heads/main:refs/remotes/origin/main"
+      if [ "$(git rev-parse refs/remotes/origin/main)" != "$CI_COMMIT_SHA" ]; then
+        echo "Skipping outdated main pipeline"
+        exit 0
+      fi
+
+      github_askpass=$(mktemp)
+      trap 'rm -f "$github_askpass"' EXIT
+      cat > "$github_askpass" << 'SCRIPT'
+      #!/bin/sh
+      case "$1" in
+        *Username*) printf '%s\n' 'x-access-token' ;;
+        *Password*) printf '%s\n' "$GITHUB_MIRROR_TOKEN" ;;
+      esac
+      SCRIPT
+      chmod 700 "$github_askpass"
+      export GIT_ASKPASS="$github_askpass" GIT_TERMINAL_PROMPT=0
+      mirror_url="https://${GITHUB_MIRROR_REPO}"
+      remote_tip=$(git -c credential.helper= ls-remote "$mirror_url" refs/heads/main)
+      expected_sha=$(printf '%s' "$remote_tip" | cut -f1)
+      git -c credential.helper= push \
+        "--force-with-lease=refs/heads/main:${expected_sha}" \
+        "$mirror_url" "${CI_COMMIT_SHA}:refs/heads/main"
+      echo "Mirrored main@${CI_COMMIT_SHA} to ${GITHUB_MIRROR_REPO}"
