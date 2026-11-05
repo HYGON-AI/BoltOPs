@@ -15,6 +15,7 @@ triton = pytest.importorskip("triton")
 from triton.testing import do_bench as _do_bench_ref  # reference timing only, not collected
 
 import boltops.fla.gdn as gdn
+from boltops.utility.arch_info import get_arch
 from boltops.utility.backends import discover_backends
 from boltops.fla.gdn import chunk_gated_delta_rule_fwd_h
 from ._gdn_reference import naive_chunk_h, naive_chunk_o
@@ -43,7 +44,7 @@ def _chunk_h_correctness_params():
     params = []
     for backend_name in CHUNK_H_BACKENDS:
         implementations = (
-            ("copy-pipeline", "wasp_4p4c")
+            ("copy-pipeline", "wasp_4p4c", "wasp_4p4c_gfx946")
             if backend_name == "tilelang"
             else (None,)
         )
@@ -107,9 +108,10 @@ def _make_chunk_cumsum(
     cu_seqlens: torch.Tensor | None,
     *,
     use_exp2: bool,
+    device: str = DEVICE,
 ) -> torch.Tensor:
     pointwise = (
-        -torch.rand(batch, total, H, device=DEVICE, dtype=torch.float32)
+        -torch.rand(batch, total, H, device=device, dtype=torch.float32)
         * 0.04
     )
     result = torch.empty_like(pointwise)
@@ -153,41 +155,53 @@ def _check_chunk_h_matches_reference(
         first = T // 3
         second = (T - first) // 2
         lengths = [first, second, T - first - second]
-        cu = torch.tensor(
+        cu_cpu = torch.tensor(
             [0, lengths[0], lengths[0] + lengths[1], T],
-            device=DEVICE,
             dtype=torch.int32,
         )
-        chunk_indices = _chunk_indices(cu, chunk_size)
+        chunk_indices_cpu = _chunk_indices(cu_cpu, chunk_size)
         num_sequences = len(lengths)
-        state_indices = torch.tensor(
-            [2, -1, 0], device=DEVICE, dtype=torch.int32
-        )
+        state_indices_cpu = torch.tensor([2, -1, 0], dtype=torch.int32)
     else:
-        cu = None
-        chunk_indices = None
+        cu_cpu = None
+        chunk_indices_cpu = None
         num_sequences = B
-        state_indices = torch.tensor(
-            [1], device=DEVICE, dtype=torch.int32
-        )
+        state_indices_cpu = torch.tensor([1], dtype=torch.int32)
     state_rows = num_sequences + 1
 
-    k = torch.randn(B, T, Hg, K, device=DEVICE, dtype=dtype) * 0.05
-    w = torch.randn(B, T, H, K, device=DEVICE, dtype=dtype) * 0.05
-    u = torch.randn(B, T, H, V, device=DEVICE, dtype=dtype) * 0.05
-    g = _make_chunk_cumsum(B, T, H, chunk_size, cu, use_exp2=False)
-    state_before = (
-        torch.randn(
-            state_rows, H, V, K, device=DEVICE, dtype=torch.float32
-        )
-        * 0.01
+    # Generate inputs and run the reference entirely on CPU so PMD captures
+    # only the TileLang kernel under test, not PyTorch setup/reference kernels.
+    k_cpu = torch.randn(B, T, Hg, K, dtype=dtype) * 0.05
+    w_cpu = torch.randn(B, T, H, K, dtype=dtype) * 0.05
+    u_cpu = torch.randn(B, T, H, V, dtype=dtype) * 0.05
+    g_cpu = _make_chunk_cumsum(
+        B,
+        T,
+        H,
+        chunk_size,
+        cu_cpu,
+        use_exp2=False,
+        device="cpu",
     )
-    state_actual = state_before.clone()
-    # Keep the PyTorch reference on CPU.  HCU's rocBLAS installation does not
-    # provide a Tensile library for every supported architecture, while the
-    # reference's einsums do not need to run on the accelerator.
-    reference_state = state_before.cpu()
+    state_before_cpu = (
+        torch.randn(state_rows, H, V, K, dtype=torch.float32) * 0.01
+    )
+    reference_state = state_before_cpu.clone()
 
+    k = k_cpu.to(DEVICE)
+    w = w_cpu.to(DEVICE)
+    u = u_cpu.to(DEVICE)
+    g = g_cpu.to(DEVICE)
+    state_actual = state_before_cpu.to(DEVICE)
+    state_indices = state_indices_cpu.to(DEVICE)
+    cu = None if cu_cpu is None else cu_cpu.to(DEVICE)
+    chunk_indices = (
+        None
+        if chunk_indices_cpu is None
+        else chunk_indices_cpu.to(DEVICE)
+    )
+
+    torch.cuda.synchronize()
     actual_h, actual_v, actual_final = chunk_h(
         k,
         w,
@@ -205,32 +219,39 @@ def _check_chunk_h_matches_reference(
         transpose_state_layout=True,
         kernel_cfg=_kernel_cfg(backend_name, implementation),
     )
+    torch.cuda.synchronize()
     expected_h, expected_v, expected_final = naive_chunk_h(
-        k.cpu(),
-        w.cpu(),
-        u.cpu(),
-        g=g.cpu(),
+        k_cpu,
+        w_cpu,
+        u_cpu,
+        g=g_cpu,
         initial_state=reference_state,
-        initial_state_indices=state_indices.cpu(),
+        initial_state_indices=state_indices_cpu,
         output_final_state=True,
         inplace_final_state=inplace_final_state,
         chunk_size=chunk_size,
         save_new_value=True,
-        cu_seqlens=None if cu is None else cu.cpu(),
+        cu_seqlens=cu_cpu,
         use_exp2=False,
         transpose_state_layout=True,
     )
 
+    actual_h_cpu = actual_h.cpu()
     torch.testing.assert_close(
-        actual_h.cpu(), expected_h, atol=BF16_ATOL, rtol=BF16_RTOL
+        actual_h_cpu, expected_h, atol=BF16_ATOL, rtol=BF16_RTOL
     )
     assert actual_v is not None and expected_v is not None
+    actual_v_cpu = actual_v.cpu()
     torch.testing.assert_close(
-        actual_v.cpu(), expected_v, atol=BF16_ATOL, rtol=BF16_RTOL
+        actual_v_cpu, expected_v, atol=BF16_ATOL, rtol=BF16_RTOL
     )
     assert actual_final is not None and expected_final is not None
+    actual_final_cpu = actual_final.cpu()
     torch.testing.assert_close(
-        actual_final.cpu(), expected_final, atol=BF16_ATOL, rtol=BF16_RTOL
+        actual_final_cpu,
+        expected_final,
+        atol=BF16_ATOL,
+        rtol=BF16_RTOL,
     )
     if inplace_final_state:
         assert actual_final is state_actual
@@ -238,7 +259,7 @@ def _check_chunk_h_matches_reference(
         assert actual_final.shape[0] == state_rows
     else:
         assert actual_final is not state_actual
-        torch.testing.assert_close(state_actual, state_before)
+        torch.testing.assert_close(state_actual.cpu(), state_before_cpu)
         assert actual_final.shape[0] == num_sequences
 
 
@@ -259,6 +280,10 @@ def test_chunk_h_matches_reference(
     use_varlen: bool,
     inplace_final_state: bool,
 ) -> None:
+    if backend_name == "tilelang" and implementation == "wasp_4p4c_gfx946":
+        arch = get_arch()
+        if arch != "gfx946":
+            pytest.skip(f"wasp_4p4c_gfx946 requires gfx946, got {arch}")
     _check_chunk_h_matches_reference(
         (backend_name, CHUNK_H_BACKENDS[backend_name]),
         use_varlen,
