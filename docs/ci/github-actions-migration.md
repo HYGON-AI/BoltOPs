@@ -122,4 +122,21 @@ bash .github/scripts/_build_hcu_wheel.sh --out-dir dist
 
 仓库技能位于 `.agents/skills/build-hcu-wheel/SKILL.md`，记录环境前提、参数、编译方法、错误处理与 CI 对应关系。技能是给智能助手阅读的说明，不是 CI 执行程序。
 
+### 下载当前性能测试 CSV 和原始结果
+
+打开 GitHub Actions 对应运行的 Summary，在 Artifacts 中下载
+`performance-reports-dtk2610-py3.12-torch<版本>`。不同 Torch 版本分别归档，保留 7 天。
+
+- `optest_results/`：本次性能入口写出的各算子 CSV。
+- `optest_artifacts/BW1100/dtk2610/py3.12/torch<版本>/results/`：本 job 的
+  optest 输出目录，保留实际生成的 CSV、`.optest-results.json`、`raw/` 等文件。
+- 同级 `logs/`：benchmark 日志；`collection.log` 记录收集路径。
+- `scripts/*_boltops_output.xml`：JUnit 性能报告。
+
+工作流在测试之后使用独立的 `always()` 步骤收集文件，再上传 artifacts。
+即使测试失败或 JSON 未生成，也会保留已有输出；不改变测试的失败状态。
+收集只匹配当前 run、attempt、job、DTK、Python 和 Torch 的唯一目录前缀，
+多个结果目录分别保留。若环境安装失败而未开始测试，可能没有 CSV；
+任务超时、runner 异常等情况不保证收集和上传完成。
+
 目录规则见 [CI 目录与文件职责](README.md)。GitLab/GitHub 共用的报告转换工具统一放在 `scripts/ci/optest_to_junit.py`。
