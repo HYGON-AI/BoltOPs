@@ -11,7 +11,7 @@ import torch
 
 pytest.importorskip("triton")
 
-from boltops.gemm import awq_gemm_triton  # noqa: E402
+from boltops.gemm.triton.awq_gemm_triton import awq_gemm_triton  # noqa: E402
 from boltops.gemm.triton.awq_gemm_triton import awq_dequantize_triton  # noqa: E402
 
 DEVICE = "cuda"

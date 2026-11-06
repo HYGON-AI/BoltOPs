@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 triton = pytest.importorskip("triton")
 
-from boltops.gemm import batched_gemm_bf16  # noqa: E402
+from boltops.gemm.triton.batched_gemm_bf16 import batched_gemm_bf16  # noqa: E402
 
 DEVICE = "cuda"
 GPU_REQUIRED = pytest.mark.skipif(

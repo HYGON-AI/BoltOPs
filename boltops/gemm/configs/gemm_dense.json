@@ -1,0 +1,90 @@
+{
+  "schema_version": 3,
+  "interface": "gemm_dense",
+  "entries": [
+    {
+      "match": {
+        "arch": "gfx946",
+        "num_cus": 48,
+        "dtypes": [
+          "float16",
+          "float16",
+          "float16"
+        ],
+        "scales": [],
+        "b_layout": "n_contiguous",
+        "shape_contract": {
+          "m": 4096,
+          "n": 4608,
+          "k": 512
+        }
+      },
+      "config": {
+        "implementation": "triton.dense.fp16",
+        "block_size": [
+          256,
+          256,
+          64
+        ],
+        "source_config": "triton/configs/gemm_fp16/gfx946/M4096_N4608_K512_TT_wdra48_bcs_mls_mlf3_pp_mstore.json",
+        "backend": "triton"
+      }
+    },
+    {
+      "match": {
+        "arch": "gfx946",
+        "num_cus": 48,
+        "dtypes": [
+          "float16",
+          "float16",
+          "float16"
+        ],
+        "scales": [],
+        "b_layout": "n_contiguous",
+        "shape_contract": {
+          "m": 4096,
+          "n": 4608,
+          "k": 4096
+        }
+      },
+      "config": {
+        "implementation": "triton.dense.fp16",
+        "block_size": [
+          256,
+          256,
+          64
+        ],
+        "source_config": "triton/configs/gemm_fp16/gfx946/M4096_N4608_K4096_TT_wdra48_bcs_mls_mlf3_pp_mstore.json",
+        "backend": "triton"
+      }
+    },
+    {
+      "match": {
+        "arch": "gfx946",
+        "num_cus": 48,
+        "dtypes": [
+          "float16",
+          "float16",
+          "float16"
+        ],
+        "scales": [],
+        "b_layout": "n_contiguous",
+        "shape_contract": {
+          "m": 4096,
+          "n": 4608,
+          "k": 16384
+        }
+      },
+      "config": {
+        "implementation": "triton.dense.fp16",
+        "block_size": [
+          256,
+          256,
+          64
+        ],
+        "source_config": "triton/configs/gemm_fp16/gfx946/M4096_N4608_K16384_TT_wdra48_bcs_mls_mlf3_pp_mstore.json",
+        "backend": "triton"
+      }
+    }
+  ]
+}

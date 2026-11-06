@@ -9,7 +9,7 @@ import torch
 
 pytest.importorskip("triton")
 
-from boltops.gemm import gemm_a8w8_blockscale  # noqa: E402
+from boltops.gemm.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale  # noqa: E402
 
 DEVICE = "cuda"
 GPU_REQUIRED = pytest.mark.skipif(
