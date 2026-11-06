@@ -4,6 +4,7 @@
 """TileLang kernels for the GDN chunk state recurrence."""
 
 import functools
+import os
 from typing import Optional
 
 import tilelang
@@ -36,11 +37,11 @@ _WASP_V_NEW_READY_PING = 9
 _WASP_INIT_EBAR_ID = 0
 _WASP_CONSUMER_EBAR_ID = 1
 # The two four-wave WDRA branches must have a four-VGPR-aligned average:
-# (32 + 192) / 2 = 112.
-_WASP_PRODUCER_MAX_NREG = 32
+# Fixed: (48 + 192) / 2 = 120; varlen: (48 + 208) / 2 = 128.
+# Reserve enough producer registers for BV64 address setup and output saves.
+_WASP_PRODUCER_MAX_NREG = 48
 _WASP_CONSUMER_MAX_NREG = 192
-# Varlen swizzled-copy address setup needs more than 32 producer VGPRs.
-_WASP_VARLEN_PRODUCER_MAX_NREG = 40
+_WASP_VARLEN_PRODUCER_MAX_NREG = 48
 _WASP_VARLEN_CONSUMER_MAX_NREG = 208
 
 @tilelang.jit(
@@ -2288,13 +2289,14 @@ def _build_chunk_h_wasp_4p4c_gfx946(
     transpose_state_layout: bool,
     is_varlen: bool = False,
     fixed_has_tail: bool = False,
+    block_v: int = 32,
 ):
     """Build gfx946 fixed/varlen kernels with grouped K heads.
 
     Only K uses kv_heads: consecutive groups of heads // kv_heads value
     heads share one K head. W/U/G and all states remain indexed by heads.
     """
-    block_v = 32
+    assert block_v in (32, 64)
     seq_len = T.dynamic("seq_len")
     full_chunks = seq_len // chunk_size
     num_chunks = (
@@ -2347,12 +2349,18 @@ def _build_chunk_h_wasp_4p4c_gfx946(
         v_new_fragment,
         g_fragment,
         k_shared,
-        g_shared,
         k_fragment,
         v_new_shared,
         v_new_operand,
         state_fragment,
+        token_begin=0,
     ):
+        # Prefetch gates directly into consumer registers, overlapping Gemm0.
+        # Avoid a separate 256-byte LDS allocation so BV64 fits in 64 KiB.
+        for it, iv in T.Parallel(chunk_size, block_v):
+            g_fragment[it, iv] = g[bid, token_begin + cid * chunk_size + it, hid]
+        g_last_value = g[bid, token_begin + (cid + 1) * chunk_size - 1, hid]
+
         # U uses its own single-buffer handoff.  The producer-side READY
         # arrival completes only after the bound global-to-LDS copy.
         T.abarrier_try_wait(_WASP_U_READY_PING, cid & 1)
@@ -2396,12 +2404,6 @@ def _build_chunk_h_wasp_4p4c_gfx946(
         # Barrier 2: wait for producer publication of k_shared for chunk cid.
         T.abarrier_try_wait(_WASP_K_READY_PING, cid & 1)
 
-        # G shares K's single-buffer lifetime. Issue its LDS reads before the
-        # K reads so lgkmcnt(4) can make G ready while leaving the tail of the
-        # K prefetch outstanding during the elementwise gating work.
-        for it, iv in T.Parallel(chunk_size, block_v):
-            g_fragment[it, iv] = g_shared[it]
-        g_last_value = g_shared[chunk_size - 1]
         T.copy(k_shared, k_fragment)
         T.s_waitcnt(4, "lgkmcnt")
 
@@ -2550,7 +2552,6 @@ def _build_chunk_h_wasp_4p4c_gfx946(
             w_shared = T.alloc_shared((chunk_size, dim_k), qkv_dtype)
             u_shared = T.alloc_shared((chunk_size, block_v), qkv_dtype)
             k_shared = T.alloc_shared((chunk_size, dim_k), qkv_dtype)
-            g_shared = T.alloc_shared((chunk_size,), gate_dtype)
             v_new_shared = T.alloc_shared((chunk_size, block_v), qkv_dtype)
 
             T.annotate_layout(
@@ -2637,10 +2638,6 @@ def _build_chunk_h_wasp_4p4c_gfx946(
                             0:dim_k,
                         ],
                         k_shared,
-                    )
-                    T.async_copy(
-                        g[bid, base : base + chunk_size, hid],
-                        g_shared,
                     )
                     T.abarrier_arrive(_WASP_K_READY_PING)
 
@@ -2769,7 +2766,6 @@ def _build_chunk_h_wasp_4p4c_gfx946(
                         v_new_fragment,
                         g_fragment,
                         k_shared,
-                        g_shared,
                         k_fragment,
                         v_new_shared,
                         v_new_operand,
@@ -2796,7 +2792,6 @@ def _build_chunk_h_wasp_4p4c_gfx946(
                         v_new_fragment,
                         g_fragment,
                         k_shared,
-                        g_shared,
                         k_fragment,
                         v_new_shared,
                         v_new_operand,
@@ -2832,7 +2827,6 @@ def _build_chunk_h_wasp_4p4c_gfx946(
                         v_new_fragment,
                         g_fragment,
                         k_shared,
-                        g_shared,
                         k_fragment,
                         v_new_shared,
                         v_new_operand,
@@ -3029,7 +3023,6 @@ def _build_chunk_h_wasp_4p4c_gfx946(
             w_shared = T.alloc_shared((chunk_size, dim_k), qkv_dtype)
             u_shared = T.alloc_shared((chunk_size, block_v), qkv_dtype)
             k_shared = T.alloc_shared((chunk_size, dim_k), qkv_dtype)
-            g_shared = T.alloc_shared((chunk_size,), gate_dtype)
             v_new_shared = T.alloc_shared((chunk_size, block_v), qkv_dtype)
 
             T.annotate_layout(
@@ -3078,7 +3071,7 @@ def _build_chunk_h_wasp_4p4c_gfx946(
                 if save_new_value:
                     T.abarrier_arrive(_WASP_V_NEW_FREE_PING)
 
-                # Match the fixed kernel: publish this chunk's W/U/K/G, then
+                # Match the fixed kernel: publish this chunk's W/U/K, then
                 # capture its v_new and entering state before advancing.
                 for cid in T.serial(full_chunks):
                     base = token_begin + cid * chunk_size
@@ -3114,10 +3107,6 @@ def _build_chunk_h_wasp_4p4c_gfx946(
                             0:dim_k,
                         ],
                         k_shared,
-                    )
-                    T.async_copy(
-                        g[0, base : base + chunk_size, hid],
-                        g_shared,
                     )
                     T.abarrier_arrive(_WASP_K_READY_PING)
 
@@ -3256,9 +3245,10 @@ def _build_chunk_h_wasp_4p4c_gfx946(
                         w, g, h, v_new, 0, hid, v_offset,
                         state_shared_h, state_operand, w_shared,
                         u_shared, u_fragment,
-                        v_new_fragment, g_fragment, k_shared, g_shared,
+                        v_new_fragment, g_fragment, k_shared,
                         k_fragment,
                         v_new_shared, v_new_operand, state_fragment,
+                        token_begin,
                     )
                     run_consumer_chunk(
                         cid + 1,
@@ -3269,9 +3259,10 @@ def _build_chunk_h_wasp_4p4c_gfx946(
                         w, g, h, v_new, 0, hid, v_offset,
                         state_shared_h, state_operand, w_shared,
                         u_shared, u_fragment,
-                        v_new_fragment, g_fragment, k_shared, g_shared,
+                        v_new_fragment, g_fragment, k_shared,
                         k_fragment,
                         v_new_shared, v_new_operand, state_fragment,
+                        token_begin,
                     )
 
                 if full_chunks % 2 != 0:
@@ -3291,9 +3282,10 @@ def _build_chunk_h_wasp_4p4c_gfx946(
                         w, g, h, v_new, 0, hid, v_offset,
                         state_shared_h, state_operand, w_shared,
                         u_shared, u_fragment,
-                        v_new_fragment, g_fragment, k_shared, g_shared,
+                        v_new_fragment, g_fragment, k_shared,
                         k_fragment,
                         v_new_shared, v_new_operand, state_fragment,
+                        token_begin,
                     )
 
                 if tail_size > 0:
@@ -3458,6 +3450,13 @@ def _get_wasp_4p4c_gfx946_kernel(*args):
     return _build_chunk_h_wasp_4p4c_gfx946(*args)
 
 
+def _get_gfx946_block_v() -> int:
+    value = os.environ.get("TILELANG_FLA_FORCE_BV", "32")
+    if value not in ("32", "64"):
+        raise ValueError("TILELANG_FLA_FORCE_BV must be 32 or 64")
+    return int(value)
+
+
 
 def chunk_gated_delta_rule_fwd_h(
     k: torch.Tensor,
@@ -3491,6 +3490,7 @@ def chunk_gated_delta_rule_fwd_h(
         raise NotImplementedError(
             f"unsupported TileLang implementation: {kernel_cfg}"
         )
+    block_v = _get_gfx946_block_v() if implementation == "wasp_4p4c_gfx946" else 32
     if null_state_index not in (-1, 0):
         raise ValueError(
             "null_state_index must be 0 (vLLM ABI) or -1 (SGLang ABI)."
@@ -3665,7 +3665,7 @@ def chunk_gated_delta_rule_fwd_h(
     supported = (
         chunk_size == 64
         and dim_k == 128
-        and dim_v % 32 == 0
+        and dim_v % block_v == 0
         and k.dtype == torch.bfloat16
         and output_final_state
         and save_new_value
@@ -3686,7 +3686,8 @@ def chunk_gated_delta_rule_fwd_h(
         )
     ):
         raise NotImplementedError(
-            "TileLang kernels require bf16 BT64/K128/V32 shapes, VK "
+            "TileLang kernels require bf16 BT64/K128 shapes, V divisible by "
+            f"the selected BV={block_v}, VK "
             "state layout, final_state and v_new enabled; fixed copy-pipeline "
             "needs T >= 64, and fixed wasp_4p4c requires T divisible by 64."
         )
@@ -3715,18 +3716,18 @@ def chunk_gated_delta_rule_fwd_h(
     )
     if implementation == "wasp_4p4c_gfx946":
         kernel_args = (*kernel_args[:2], kv_heads, *kernel_args[2:])
-    if is_varlen and implementation == "copy-pipeline":
+    if implementation == "wasp_4p4c_gfx946":
+        # Include BV in the cache key; read the environment before lookup.
+        kernel = get_kernel(
+            *kernel_args, is_varlen,
+            not is_varlen and seq_len % chunk_size != 0, block_v,
+        )
+    elif is_varlen and implementation == "copy-pipeline":
         # Compile the fixed BV32 pipeline as a separate packed-varlen kernel.
         # The fixed builder and its generated code remain unchanged.
         kernel = get_kernel(*kernel_args, 32, 256)
     elif is_varlen:
         kernel = get_kernel(*kernel_args, True)
-    elif implementation == "wasp_4p4c_gfx946":
-        kernel = get_kernel(
-            *kernel_args,
-            False,
-            seq_len % chunk_size != 0,
-        )
     else:
         kernel = get_kernel(*kernel_args)
     if is_varlen:
