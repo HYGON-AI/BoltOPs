@@ -65,3 +65,11 @@ def _get_activation_from_str(activation: str):
         "relu6": _relu6,
     }
     return mapping[activation]
+
+
+@triton.jit
+def _apply_activation_kernel(out, n, activation: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+    """Apply the native epilogue to the bias-only result of an empty K reduction."""
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    value = tl.load(out + offsets, mask=offsets < n, other=0).to(tl.float32)
+    tl.store(out + offsets, activation(value), mask=offsets < n)

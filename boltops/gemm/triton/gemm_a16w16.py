@@ -1,166 +1,179 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
 # Modified by Hygon Information Technology Co., Ltd., 2026.
-# Upstream reference: https://github.com/ROCm/aiter/blob/bbef5a6f2d3733b293c80d2cee6a8d464e88bc01/aiter/ops/triton/gemm/basic/gemm_a16w16.py
-"""Vendored aiter Triton ``gemm_a16w16`` (FP16/BF16).
-
-Upstream: ROCm/aiter ``aiter.ops.triton.gemm.basic.gemm_a16w16``.
-vLLM call site: ``from aiter.ops.triton.gemm_a16w16 import gemm_a16w16`` then
-``gemm_a16w16(x, weight, bias)`` with ``weight`` shape ``[N, K]`` (computes
-``Y = X @ W^T``).
-
-Gluon backend and ``torch_compile_guard`` are not vendored; this wrapper always
-uses the Triton kernel path.
-"""
-
-from __future__ import annotations
-
-from typing import Optional
-
-import torch
+# Upstream reference: https://github.com/ROCm/aiter/blob/bbef5a6f2d3733b293c80d2cee6a8d464e88bc01/aiter/ops/triton/_triton_kernels/gemm/basic/gemm_a16w16.py
 import triton
+import triton.language as tl
 
-from boltops.gemm.triton.activation import (
-    _get_activation_from_str,
-)
-from boltops.gemm.triton.gemm_a16w16_op import (
-    _gemm_a16_w16_kernel,
-)
-from boltops.gemm.triton.gemm_a16w16_op import (
-    _get_config as _get_triton_config,
-)
-from boltops.gemm.triton.splitk_reduce import (
-    _gemm_splitk_reduce_kernel,
+from boltops.gemm.triton.kernel_repr import make_kernel_repr
+from boltops.gemm.triton.pid_preprocessing import pid_grid, remap_xcd
+
+_gemm_a16w16_repr = make_kernel_repr(
+    "_gemm_a16_w16_kernel",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "BLOCK_SIZE_K",
+        "GROUP_SIZE_M",
+        "NUM_KSPLIT",
+        "SPLITK_BLOCK_SIZE",
+        "EVEN_K",
+        "EVEN_MN",
+        "cache_modifier",
+        "activation",
+        "use_activation",
+        "ADD_BIAS",
+        "SKIP_REDUCE",
+    ],
 )
 
 
-def gemm_a16w16(
-    x: torch.Tensor,
-    w: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
-    dtype: Optional[torch.dtype] = None,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
-    activation: Optional[str] = None,
-    skip_reduce: bool = False,
-    kernel_type: str = "bandwidth_bound",
-    backend: Optional[str] = None,
-) -> torch.Tensor:
-    """16-bit matmul ``Y = X @ W^T`` (aiter / vLLM ROCm Triton path).
-
-    Args:
-        x: ``[M, K]`` FP16/BF16
-        w: ``[N, K]`` FP16/BF16 (internally transposed)
-        bias: optional ``[N]``
-        dtype: output dtype; defaults to ``x.dtype``
-        y: optional preallocated ``[M, N]``
-        config: optional launch config dict (else JSON table lookup)
-        activation: optional epilogue activation name
-        skip_reduce: if True and split-K, return partials ``[NUM_KSPLIT, M, N]``
-        kernel_type / backend: accepted for API compatibility; Triton-only here
+@triton.heuristics(
+    {
+        "EVEN_K": lambda args: (args["K"] % (args["SPLITK_BLOCK_SIZE"]) == 0)
+        and (args["SPLITK_BLOCK_SIZE"] % args["BLOCK_SIZE_K"] == 0),
+        "EVEN_MN": lambda args: (args["M"] % args["BLOCK_SIZE_M"] == 0)
+        and (args["N"] % args["BLOCK_SIZE_N"] == 0),
+    }
+)
+@triton.jit(
+    repr=_gemm_a16w16_repr,
+    do_not_specialize=["M", "N"],
+)
+def _gemm_a16_w16_kernel(
+    a_ptr,
+    b_ptr,
+    bias_ptr,
+    c_ptr,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_ck,
+    stride_cm,
+    stride_cn,
+    # Meta-parameters
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    NUM_KSPLIT: tl.constexpr,
+    SPLITK_BLOCK_SIZE: tl.constexpr,
+    EVEN_K: tl.constexpr,
+    EVEN_MN: tl.constexpr,
+    cache_modifier: tl.constexpr,
+    activation: tl.constexpr,
+    use_activation: tl.constexpr,
+    ADD_BIAS: tl.constexpr,
+    SKIP_REDUCE: tl.constexpr,
+):
+    """Kernel for computing the matmul C = A x B.
+    A has shape (M, K), B has shape (K, N) and C has shape (M, N)
     """
-    del kernel_type  # gluon-only upstream
-    if backend is not None and backend.lower() not in ("triton",):
-        raise ValueError(
-            f"boltops vendored gemm_a16w16 only supports backend='triton'; "
-            f"got {backend!r}"
-        )
 
-    if dtype is None or not isinstance(dtype, torch.dtype):
-        dtype = x.dtype
+    tl.assume(stride_am > 0)
+    tl.assume(stride_ak > 0)
+    tl.assume(stride_bk > 0)
+    tl.assume(stride_bn > 0)
+    tl.assume(stride_ck > 0)
+    tl.assume(stride_cm > 0)
+    tl.assume(stride_cn > 0)
 
-    assert x.dtype in (torch.float16, torch.bfloat16), (
-        f"Activations (x) must be fp16 or bf16, got {x.dtype}"
-    )
-    assert w.dtype in (torch.float16, torch.bfloat16), (
-        f"Weights (w) must be fp16 or bf16, got {w.dtype}"
-    )
-    assert x.shape[1] == w.shape[1], "Incompatible matrix shapes."
+    # -----------------------------------------------------------
+    # Map program ids `pid` to the block of C it should compute.
+    # This is done in a grouped ordering to promote L2 data reuse.
+    pid_unified = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    pid_unified = remap_xcd(pid_unified, num_pid_m * num_pid_n * NUM_KSPLIT, NUM_XCDS=8)
+    pid_k = pid_unified % NUM_KSPLIT
+    pid = pid_unified // NUM_KSPLIT
 
-    M, K = x.shape
-    N, _ = w.shape
-    w_t = w.T
-
-    if config is None:
-        config, _ = _get_triton_config(M, N, K)
+    if NUM_KSPLIT == 1:
+        pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
     else:
-        config = dict(config)
+        pid_m = pid // num_pid_n
+        pid_n = pid % num_pid_n
 
-    if y is None and (config["NUM_KSPLIT"] == 1 or not skip_reduce):
-        y = torch.empty((M, N), dtype=dtype, device=x.device)
+    tl.assume(pid_m >= 0)
+    tl.assume(pid_n >= 0)
+    tl.assume(pid_k >= 0)
 
-    if config["NUM_KSPLIT"] > 1:
-        y_pp = torch.empty(
-            (config["NUM_KSPLIT"], M, N),
-            dtype=torch.float32,
-            device=y.device if y is not None else x.device,
+    split_k_start = pid_k * SPLITK_BLOCK_SIZE
+    if split_k_start < K:
+        # Create pointers for first block of A and B input matrices
+        offs_k = tl.arange(0, BLOCK_SIZE_K)
+        offs_k_split = split_k_start + offs_k
+        if EVEN_MN:
+            offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+            offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        else:
+            offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+            offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+
+        a_ptrs = a_ptr + (
+            offs_am[:, None] * stride_am + offs_k_split[None, :] * stride_ak
         )
-    else:
-        y_pp = None
-
-    grid = lambda META: (
-        (
-            META["NUM_KSPLIT"]
-            * triton.cdiv(M, META["BLOCK_SIZE_M"])
-            * triton.cdiv(N, META["BLOCK_SIZE_N"])
-        ),
-    )
-    _gemm_a16_w16_kernel[grid](
-        x,
-        w_t,
-        bias,
-        y if config["NUM_KSPLIT"] == 1 else y_pp,
-        M,
-        N,
-        K,
-        x.stride(0),
-        x.stride(1),
-        w_t.stride(0),
-        w_t.stride(1),
-        0 if config["NUM_KSPLIT"] == 1 else y_pp.stride(0),
-        y.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp.stride(1),
-        y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
-        activation=_get_activation_from_str(activation) if activation else "",
-        use_activation=activation is not None,
-        ADD_BIAS=(bias is not None),
-        SKIP_REDUCE=skip_reduce,
-        **config,
-    )
-
-    if config["NUM_KSPLIT"] > 1:
-        if skip_reduce:
-            return y_pp
-
-        REDUCE_BLOCK_SIZE_M = 32
-        REDUCE_BLOCK_SIZE_N = 32
-        ACTUAL_KSPLIT = triton.cdiv(K, config["SPLITK_BLOCK_SIZE"])
-
-        grid_reduce = (
-            triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
-            triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
-        )
-        _gemm_splitk_reduce_kernel[grid_reduce](
-            y_pp,
-            y,
-            bias,
-            M,
-            N,
-            y_pp.stride(0),
-            y_pp.stride(1),
-            y_pp.stride(2),
-            y.stride(0),
-            y.stride(1),
-            REDUCE_BLOCK_SIZE_M,
-            REDUCE_BLOCK_SIZE_N,
-            ACTUAL_KSPLIT,
-            triton.next_power_of_2(config["NUM_KSPLIT"]),
-            ADD_BIAS=(bias is not None),
-            activation=_get_activation_from_str(activation) if activation else "",
-            use_activation=activation is not None,
-            KERNEL_NAME="_gemm_a16w16_reduce_kernel",
+        b_ptrs = b_ptr + (
+            offs_k_split[:, None] * stride_bk + offs_bn[None, :] * stride_bn
         )
 
-    return y
+        acc_dtype = tl.float32 if c_ptr.type.element_ty != tl.int8 else tl.int32
+        if ADD_BIAS:
+            if NUM_KSPLIT == 1 or (SKIP_REDUCE and pid_k == 0):
+                accumulator = tl.load(bias_ptr + offs_bn).to(dtype=acc_dtype)
+                accumulator = tl.broadcast_to(
+                    accumulator[None, :], (BLOCK_SIZE_M, BLOCK_SIZE_N)
+                )
+            else:
+                accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
+        else:
+            accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
 
+        split_k_end = tl.minimum(split_k_start + SPLITK_BLOCK_SIZE, K)
+        k_span = split_k_end - split_k_start
+        num_k_iter = tl.cdiv(k_span, BLOCK_SIZE_K)
 
-__all__ = ["gemm_a16w16"]
+        for k in range(num_k_iter):
+            # Load the next block of A and B, generate a mask by checking the K dimension.
+            # If it is out of bounds, set it to 0.
+            if EVEN_K:
+                a = tl.load(a_ptrs)
+                b = tl.load(b_ptrs, cache_modifier=cache_modifier)
+            else:
+                a = tl.load(
+                    a_ptrs, mask=offs_k[None, :] < k_span - k * BLOCK_SIZE_K, other=0.0
+                )
+                b = tl.load(
+                    b_ptrs,
+                    mask=offs_k[:, None] < k_span - k * BLOCK_SIZE_K,
+                    other=0.0,
+                    cache_modifier=cache_modifier,
+                )
+            accumulator = tl.dot(a, b, acc=accumulator)
+            # Advance the ptrs to the next K block.
+            a_ptrs += BLOCK_SIZE_K * stride_ak
+            b_ptrs += BLOCK_SIZE_K * stride_bk
+
+        if use_activation and NUM_KSPLIT == 1:
+            accumulator = activation(accumulator)
+
+        # Write back the block of the output matrix C with masks.
+        c = accumulator.to(c_ptr.type.element_ty)
+        offs_cm = pid_m.to(tl.int64) * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        offs_cn = pid_n.to(tl.int64) * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        c_ptrs = (
+            c_ptr
+            + stride_cm * offs_cm[:, None]
+            + stride_cn * offs_cn[None, :]
+            + pid_k * stride_ck
+        )
+        if EVEN_MN:
+            tl.store(c_ptrs, c)
+        else:
+            c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+            tl.store(c_ptrs, c, mask=c_mask)

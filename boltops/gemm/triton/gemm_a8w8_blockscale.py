@@ -1,382 +1,426 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import os
-
-import torch
 import triton
-from packaging.version import Version
+import triton.language as tl
 
-from boltops.gemm.triton.splitk_reduce import (
-    _gemm_splitk_reduce_kernel,
-)
-from boltops.gemm.triton.gemm_a8w8_blockscale_op import (
-    _gemm_a8w8_blockscale_kernel as triton_gemm_a8w8_blockscale_kernel,
-)
-from boltops.gemm.triton.gemm_a8w8_blockscale_op import (
-    _gemm_a8w8_blockscale_preshuffle_kernel as triton_gemm_a8w8_blockscale_preshuffle_kernel,
-)
-from boltops.gemm.triton.gemm_a8w8_blockscale_op import (
-    _get_config,
-)
-from boltops.utility.arch_info import get_arch
-from boltops.gemm.triton.gemm_config_utils import compute_splitk_params
+from boltops.gemm.triton.kernel_repr import make_kernel_repr
+from boltops.gemm.triton.pid_preprocessing import pid_grid, remap_xcd
 
-_FORCE_GFX1250_EX = os.environ.get("AITER_FORCE_GFX1250_EX", "0") == "1"
-_TRITON_VERSION = Version(triton.__version__)
+_gemm_a8w8_blockscale_repr = make_kernel_repr(
+    "_gemm_a8w8_blockscale_kernel",
+    [
+        "GROUP_K",
+        "GROUP_N",
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "BLOCK_SIZE_K",
+        "GROUP_SIZE_M",
+        "NUM_KSPLIT",
+        "SPLITK_BLOCK_SIZE",
+        "EVEN_K",
+        "GRID_MN",
+        "cache_modifier",
+    ],
+)
 
 
-def gemm_a8w8_blockscale(
-    x: torch.Tensor,
-    w: torch.Tensor,
-    x_scale: torch.Tensor,
-    w_scale: torch.Tensor,
-    dtype: float | None = torch.bfloat16,
-    y: torch.Tensor | None = None,
-    config: dict | None = None,
-    skip_reduce: bool | None = False,
-    kernel_type: str = "bandwidth_bound",
-    backend: str | None = None,
+@triton.heuristics(
+    {
+        "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
+        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
+        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
+    }
+)
+@triton.jit(repr=_gemm_a8w8_blockscale_repr)
+def _gemm_a8w8_blockscale_kernel(
+    # Pointers to matrices
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    a_scale_ptr,
+    b_scale_ptr,
+    # Matrix dimensions
+    M,
+    N,
+    K,
+    # The stride variables represent how much to increase the ptr by when
+    # moving by 1 element in a particular dimension. E.g. `stride_am` is
+    # how much to increase `a_ptr` by to get the element one row down
+    # (A has M rows).
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_ck,
+    stride_cm,
+    stride_cn,
+    stride_ascale_m,
+    stride_ascale_k,
+    stride_bscale_k,
+    stride_bscale_n,
+    # Meta-parameters
+    GROUP_K: tl.constexpr,
+    GROUP_N: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    NUM_KSPLIT: tl.constexpr,
+    SPLITK_BLOCK_SIZE: tl.constexpr,
+    EVEN_K: tl.constexpr,
+    GRID_MN: tl.constexpr,
+    cache_modifier: tl.constexpr,
+    num_stages: tl.constexpr,
 ):
     """
-    Computes 8 bit matrix multiplication Y = X @ W^T using block-wise quantization scales.
-    Each block along K and N dimensions has independent scale factors for fine-grained quantization.
+    Note: this is Triton jited function and not meant to be called directly. Call gemm_a8w8_blockscale function
+    below
 
-    Args:
-        x (torch.Tensor): INT8 input matrix with shape (M, K).
-        w (torch.Tensor): INT8 weight matrix with shape (N, K), internally transposed.
-        x_scale (torch.Tensor): Block-wise scale for x with shape (M, scale_k).
-            scale_k = ceil(K / scale_block_size_k).
-        w_scale (torch.Tensor): Block-wise scale for w with shape (scale_n, scale_k).
-            scale_n = ceil(N / scale_block_size_n).
-        dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
-        y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N).
-        config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
-            BLOCK_SIZE_K, GROUP_SIZE_M, NUM_KSPLIT).
+    Computes the 8 bit matmul C = A x B using the block-scale quantization approach.
 
-    Returns:
-        torch.Tensor: Output with shape (M, N).
+    Key parameters:
+    - A: Matrix A with shape (M, K).
+    - B: Matrix B with shape (K, N).
+    - C: Matrix C with shape (M, N).
+    - A_scale: Scale tensor for A with shape (M, *scale_k).
+    - B_scale: Scale tensor for B with shape (*scale_k, **scale_n).
+
+    *scale_k = (K + GROUP_K - 1) // GROUP_K
+    **scale_n = (N + GROUP_N - 1) // GROUP_N
+
+    For this kernel implementation, GROUP_K must equal BLOCK_K.
     """
 
-    M, K = x.shape
-    N, K = w.shape
+    tl.assume(stride_am > 0)
+    tl.assume(stride_ak > 0)
+    tl.assume(stride_bk > 0)
+    tl.assume(stride_bn > 0)
+    tl.assume(stride_ck > 0)
+    tl.assume(stride_cm > 0)
+    tl.assume(stride_cn > 0)
+    tl.assume(stride_ascale_m > 0)
+    tl.assume(stride_ascale_k > 0)
+    tl.assume(stride_bscale_k > 0)
+    tl.assume(stride_bscale_n > 0)
 
-    # Check constraints.
-    assert x.shape[1] == w.shape[1], "Incompatible dimensions!!!"
+    # -----------------------------------------------------------
+    # Map program ids `pid` to the block of C it should compute.
+    # This is done in a grouped ordering to promote L2 data reuse.
+    pid_unified = tl.program_id(axis=0)
+    pid_k = pid_unified % NUM_KSPLIT
+    pid = pid_unified // NUM_KSPLIT
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
-    # Transpose w and w_scale
-    w = w.T  # (K, N)
-    w_scale = w_scale.T  # (scale_k, scale_n)
+    if NUM_KSPLIT == 1:
+        remap_xcd(pid, GRID_MN)
 
-    # Resolve backend up-front so the config is loaded from the backend's
-    # config dir (gemm/<backend>/), falling back to the shared gemm/ dir.
-    if backend is None:
-        backend = "triton"
-    backend = backend.lower()
-    if backend != "triton":
-        raise ValueError(
-            f"boltops vendored gemm_a8w8_blockscale only supports backend='triton'; got {backend!r}"
-        )
-
-    if config is None:
-        config, _ = _get_config(M, N, K, backend=backend)
-
-    if y is None and (config["NUM_KSPLIT"] == 1 or not skip_reduce):
-        y = torch.empty((M, N), dtype=dtype, device=x.device)
-
-    config["SPLITK_BLOCK_SIZE"] = triton.cdiv(
-        K, config["NUM_KSPLIT"]
-    )  # How big each split_k partition is
-    if config["NUM_KSPLIT"] > 1:
-        y_pp = torch.empty(
-            (config["NUM_KSPLIT"], M, N),
-            dtype=torch.float32,
-            device=x.device,
-        )
+        pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
     else:
-        y_pp = None
+        pid_m = pid // num_pid_n
+        pid_n = pid % num_pid_n
 
-    compute_splitk_params(config, K)
+    tl.assume(pid_m >= 0)
+    tl.assume(pid_n >= 0)
+    tl.assume(pid_k >= 0)
 
-    # Scale block sizes
-    # TODO: need a better way to pass scale block sizes around
-    config["GROUP_K"] = triton.next_power_of_2(
-        triton.cdiv(K, w_scale.shape[0])
-    )  # scale_block_size_k
-    config["GROUP_N"] = triton.next_power_of_2(
-        triton.cdiv(N, w_scale.shape[1])
-    )  # scale_block_size_n
+    if (pid_k * SPLITK_BLOCK_SIZE) < K:
 
-    assert (
-        config["GROUP_K"] == config["BLOCK_SIZE_K"]
-    ), "GROUP_K must equal BLOCK_SIZE_K"
+        # SPLITK_BLOCK_SIZE = tl.cdiv(K, NUM_KSPLIT)
+        num_k_iter = tl.cdiv(SPLITK_BLOCK_SIZE, BLOCK_SIZE_K)
+        # ^ Number of K blocks within our split-K partition
 
-    # grid = (config["NUM_KSPLIT"], triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),)
-    grid = lambda META: (
-        (
-            META["NUM_KSPLIT"]
-            * triton.cdiv(M, META["BLOCK_SIZE_M"])
-            * triton.cdiv(N, META["BLOCK_SIZE_N"])
-        ),  # Effective launch grid dims: [NUM_KSPLIT, NUM_M_BLOCKS, NUM_N_BLOCKS]
-    )
-
-    if backend is None:
-        backend = "triton"
-    backend = backend.lower()
-    if backend != "triton":
-        raise ValueError(
-            f"boltops vendored gemm_a8w8_blockscale only supports backend='triton'; got {backend!r}"
+        # Create pointers for first block of A and B input matrices
+        offs_k = tl.arange(0, BLOCK_SIZE_K)
+        offs_k_split = pid_k * SPLITK_BLOCK_SIZE + offs_k
+        offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+        offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+        a_ptrs = a_ptr + (
+            offs_am[:, None] * stride_am + offs_k_split[None, :] * stride_ak
         )
-    del kernel_type  # gluon-only upstream
-    impl = triton_gemm_a8w8_blockscale_kernel
-    impl[grid](
-        x,
-        w,
-        y if config["NUM_KSPLIT"] == 1 else y_pp,
-        x_scale,
-        w_scale,
-        M,
-        N,
-        K,
-        x.stride(0),
-        x.stride(1),
-        w.stride(0),
-        w.stride(1),
-        0 if config["NUM_KSPLIT"] == 1 else y_pp.stride(0),
-        y.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp.stride(1),
-        y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
-        x_scale.stride(0),
-        x_scale.stride(1),
-        w_scale.stride(0),
-        w_scale.stride(1),
-        **config,
-    )
-
-    if config["NUM_KSPLIT"] > 1:
-        if skip_reduce:
-            return y_pp
-
-        REDUCE_BLOCK_SIZE_M = 32
-        REDUCE_BLOCK_SIZE_N = 32
-        ACTUAL_KSPLIT = triton.cdiv(K, config["SPLITK_BLOCK_SIZE"])
-
-        grid_reduce = (
-            triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
-            triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
-        )
-        _gemm_splitk_reduce_kernel[grid_reduce](
-            y_pp,
-            y,
-            None,
-            M,
-            N,
-            y_pp.stride(0),
-            y_pp.stride(1),
-            y_pp.stride(2),
-            y.stride(0),
-            y.stride(1),
-            REDUCE_BLOCK_SIZE_M,
-            REDUCE_BLOCK_SIZE_N,
-            ACTUAL_KSPLIT,
-            triton.next_power_of_2(config["NUM_KSPLIT"]),
-            ADD_BIAS=False,
-            activation="",
-            use_activation=False,
-            KERNEL_NAME="_gemm_a8w8_blockscale_reduce_kernel",
+        b_ptrs = b_ptr + (
+            offs_k_split[:, None] * stride_bk + offs_bn[None, :] * stride_bn
         )
 
-    return y
+        # Create pointers for the scales
+        offs_k_scale = (pid_k * SPLITK_BLOCK_SIZE) // GROUP_K
+        a_scale_ptrs = (
+            a_scale_ptr + offs_am * stride_ascale_m + offs_k_scale * stride_ascale_k
+        )
+        offs_b_scale_n = offs_bn // GROUP_N
+        b_scale_ptrs = (
+            b_scale_ptr
+            + offs_k_scale * stride_bscale_k
+            + offs_b_scale_n * stride_bscale_n
+        )
+        offs_ks_step = BLOCK_SIZE_K // GROUP_K
+
+        acc_dtype = tl.float32 if c_ptr.type.element_ty != tl.int8 else tl.int32
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
+
+        for k in tl.range(
+            pid_k * num_k_iter, (pid_k + 1) * num_k_iter, num_stages=num_stages
+        ):
+            # Load the next block of A and B, generate a mask by checking the K dimension.
+            # If it is out of bounds, set it to 0.
+            if EVEN_K:
+                a = tl.load(a_ptrs)
+                b = tl.load(b_ptrs, cache_modifier=cache_modifier)
+            else:
+                a = tl.load(
+                    a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0
+                )
+                b = tl.load(
+                    b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0
+                )
+
+            a_scale = tl.load(a_scale_ptrs)
+            b_scale = tl.load(b_scale_ptrs)
+
+            # Perform dot operation and apply scale
+            accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
+
+            # Advance the ptrs to the next K block.
+            a_ptrs += BLOCK_SIZE_K * stride_ak
+            b_ptrs += BLOCK_SIZE_K * stride_bk
+
+            a_scale_ptrs += offs_ks_step * stride_ascale_k
+            b_scale_ptrs += offs_ks_step * stride_bscale_k
+
+        c = accumulator.to(c_ptr.type.element_ty)
+
+        # Write back the block of the output matrix C with masks.
+        offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
+        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
+        c_ptrs = (
+            c_ptr
+            + stride_cm * offs_cm[:, None]
+            + stride_cn * offs_cn[None, :]
+            + pid_k * stride_ck
+        )
+        c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+        tl.store(c_ptrs, c, mask=c_mask)
 
 
-def gemm_a8w8_blockscale_preshuffle(
-    x: torch.Tensor,
-    w: torch.Tensor,
-    x_scale: torch.Tensor,
-    w_scale: torch.Tensor,
-    dtype: float | None = torch.bfloat16,
-    y: torch.Tensor | None = None,
-    config: dict | None = None,
-    skip_reduce: bool | None = False,
-    is_x_scale_tranposed: bool | None = True,
-    kernel_type: str = "bandwidth_bound",
-    backend: str | None = None,
+_gemm_a8w8_blockscale_preshuffle_repr = make_kernel_repr(
+    "_gemm_a8w8_blockscale_preshuffle_kernel",
+    [
+        "GROUP_K",
+        "GROUP_N",
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "BLOCK_SIZE_K",
+        "GROUP_SIZE_M",
+        "NUM_KSPLIT",
+        "SPLITK_BLOCK_SIZE",
+        "EVEN_K",
+        "GRID_MN",
+        "cache_modifier",
+    ],
+)
+
+
+@triton.heuristics(
+    {
+        "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
+        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
+        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
+    }
+)
+@triton.jit(repr=_gemm_a8w8_blockscale_preshuffle_repr)
+def _gemm_a8w8_blockscale_preshuffle_kernel(
+    # Pointers to matrices
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    a_scale_ptr,
+    b_scale_ptr,
+    # Matrix dimensions
+    M,
+    N,
+    K,
+    # The stride variables represent how much to increase the ptr by when
+    # moving by 1 element in a particular dimension. E.g. `stride_am` is
+    # how much to increase `a_ptr` by to get the element one row down
+    # (A has M rows).
+    stride_am,
+    stride_ak,
+    stride_bn,
+    stride_bk,
+    stride_ck,
+    stride_cm,
+    stride_cn,
+    stride_ascale_m,
+    stride_ascale_k,
+    stride_bscale_k,
+    stride_bscale_n,
+    # Meta-parameters
+    GROUP_K: tl.constexpr,
+    GROUP_N: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    NUM_KSPLIT: tl.constexpr,
+    SPLITK_BLOCK_SIZE: tl.constexpr,
+    EVEN_K: tl.constexpr,
+    GRID_MN: tl.constexpr,
+    cache_modifier: tl.constexpr,
 ):
     """
-    Computes 8 bit matrix multiplication Y = X @ W^T using block-wise quantization scales.
-    Each block along K and N dimensions has independent scale factors for fine-grained quantization.
+    Note: this is Triton jited function and not meant to be called directly. Call gemm_a8w8_blockscale function
+    below
 
-    Args:
-        x (torch.Tensor): INT8 input matrix with shape (M, K).
-        w (torch.Tensor): INT8 weight matrix with shape (N, K), internally transposed.
-        x_scale (torch.Tensor): Block-wise scale for x with shape (M, scale_k).
-            scale_k = ceil(K / scale_block_size_k).
-        w_scale (torch.Tensor): Block-wise scale for w with shape (scale_n, scale_k).
-            scale_n = ceil(N / scale_block_size_n).
-        dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
-        y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N).
-        config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
-            BLOCK_SIZE_K, GROUP_SIZE_M, NUM_KSPLIT).
+    Computes the 8 bit matmul C = A x B using the block-scale quantization approach.
 
-    Returns:
-        torch.Tensor: Output with shape (M, N).
+    Key parameters:
+    - A: Matrix A with shape (M, K).
+    - B: Matrix B with shape (K, N).
+    - C: Matrix C with shape (M, N).
+    - A_scale: Scale tensor for A with shape (M, *scale_k).
+    - B_scale: Scale tensor for B with shape (*scale_k, **scale_n).
+
+    *scale_k = (K + GROUP_K - 1) // GROUP_K
+    **scale_n = (N + GROUP_N - 1) // GROUP_N
+
+    For this kernel implementation, GROUP_K must equal BLOCK_K.
     """
 
-    M, K = x.shape
-    N, K = w.shape
-    N = N * 16
-    K = K // 16
+    tl.assume(stride_am > 0)
+    tl.assume(stride_ak > 0)
+    tl.assume(stride_bk > 0)
+    tl.assume(stride_bn > 0)
+    tl.assume(stride_ck > 0)
+    tl.assume(stride_cm > 0)
+    tl.assume(stride_cn > 0)
+    tl.assume(stride_ascale_m > 0)
+    tl.assume(stride_ascale_k > 0)
+    tl.assume(stride_bscale_k > 0)
+    tl.assume(stride_bscale_n > 0)
 
-    # Check constraints.
-    assert x.shape[1] == w.shape[1] // 16, "Incompatible dimensions!!!"
+    # -----------------------------------------------------------
+    # Map program ids `pid` to the block of C it should compute.
+    # This is done in a grouped ordering to promote L2 data reuse.
+    pid_unified = tl.program_id(axis=0)
+    pid_k = pid_unified % NUM_KSPLIT
+    pid = pid_unified // NUM_KSPLIT
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
-    # Transpose w and w_scale
-    # w = w.T  # (K, N)
-    w_scale = w_scale.T  # (scale_k, scale_n)
+    if NUM_KSPLIT == 1:
+        remap_xcd(pid, GRID_MN)
 
-    # Resolve backend up-front so the config is loaded from the backend's
-    # config dir (gemm/<backend>/), falling back to the shared gemm/ dir.
-    if backend is None:
-        backend = "triton"
-    backend = backend.lower()
-    if backend != "triton":
-        raise ValueError(
-            f"boltops vendored gemm_a8w8_blockscale only supports backend='triton'; got {backend!r}"
-        )
-
-    if config is None:
-        config, _ = _get_config(M, N, K, True, backend=backend)
-
-    # Triton 3.6 fails TritonAMDGPUConvertToBufferOps for gfx950 preshuffle
-    # configs with three pipeline stages. Keep the tuned tile and split-K.
-    if (
-        backend == "triton"
-        and get_arch() == "gfx950"
-        and _TRITON_VERSION < Version("3.7.0")
-        and config.get("num_stages", 1) > 2
-    ):
-        config["num_stages"] = 2
-
-    kernel_type_from_config = config.pop("kernel_type", None)
-    if kernel_type_from_config is not None:
-        kernel_type = kernel_type_from_config
-
-    if y is None and (config["NUM_KSPLIT"] == 1 or not skip_reduce):
-        y = torch.empty((M, N), dtype=dtype, device=x.device)
-
-    config["SPLITK_BLOCK_SIZE"] = triton.cdiv(
-        K, config["NUM_KSPLIT"]
-    )  # How big each split_k partition is
-    if config["NUM_KSPLIT"] > 1:
-        y_pp = torch.empty(
-            (config["NUM_KSPLIT"], M, N),
-            dtype=torch.float32,
-            device=x.device,
-        )
+        pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
     else:
-        y_pp = None
+        pid_m = pid // num_pid_n
+        pid_n = pid % num_pid_n
 
-    # If block size is greater than split k size, shrink the block size
-    if config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]:
-        config["BLOCK_SIZE_K"] = triton.next_power_of_2(config["SPLITK_BLOCK_SIZE"])
-        if config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]:
-            config["BLOCK_SIZE_K"] = config["BLOCK_SIZE_K"] // 4
-    config["BLOCK_SIZE_K"] = max(
-        config["BLOCK_SIZE_K"], 16
-    )  # minimum block size is 16 for perf
+    tl.assume(pid_m >= 0)
+    tl.assume(pid_n >= 0)
+    tl.assume(pid_k >= 0)
 
-    # Scale block sizes
-    # TODO: need a better way to pass scale block sizes around
-    config["GROUP_K"] = triton.next_power_of_2(
-        triton.cdiv(K, w_scale.shape[0])
-    )  # scale_block_size_k
-    config["GROUP_N"] = triton.next_power_of_2(
-        triton.cdiv(N, w_scale.shape[1])
-    )  # scale_block_size_n
+    if (pid_k * SPLITK_BLOCK_SIZE) < K:
 
-    assert (
-        config["GROUP_K"] == config["BLOCK_SIZE_K"]
-    ), "GROUP_K must equal BLOCK_SIZE_K"
+        # SPLITK_BLOCK_SIZE = tl.cdiv(K, NUM_KSPLIT)
+        num_k_iter = tl.cdiv(SPLITK_BLOCK_SIZE, BLOCK_SIZE_K)
+        # ^ Number of K blocks within our split-K partition
 
-    if _FORCE_GFX1250_EX:
-        config["BLOCK_SIZE_K"] = 64
+        # Create pointers for first block of A and B input matrices
+        offs_k = tl.arange(0, BLOCK_SIZE_K)
+        offs_k_shuffle_arr = tl.arange(0, BLOCK_SIZE_K * 16)
+        offs_k_split = pid_k * SPLITK_BLOCK_SIZE + offs_k
+        offs_k_shuffle = pid_k * SPLITK_BLOCK_SIZE * 16 + offs_k_shuffle_arr
 
-    # grid = (config["NUM_KSPLIT"], triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),)
-    grid = lambda META: (
-        (
-            META["NUM_KSPLIT"]
-            * triton.cdiv(M, META["BLOCK_SIZE_M"])
-            * triton.cdiv(N, META["BLOCK_SIZE_N"])
-        ),  # Effective launch grid dims: [NUM_KSPLIT, NUM_M_BLOCKS, NUM_N_BLOCKS]
-    )
-
-    del kernel_type  # gluon-only upstream
-    if backend is None:
-        backend = "triton"
-    backend = backend.lower()
-    if backend != "triton":
-        raise ValueError(
-            f"boltops vendored gemm_a8w8_blockscale only supports backend='triton'; got {backend!r}"
+        offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+        offs_bn = (pid_n * (BLOCK_SIZE_N // 16) + tl.arange(0, BLOCK_SIZE_N // 16)) % (
+            N // 16
         )
-    impl = triton_gemm_a8w8_blockscale_preshuffle_kernel
-
-    impl[grid](
-        x,
-        w,
-        y if config["NUM_KSPLIT"] == 1 else y_pp,
-        x_scale,
-        w_scale,
-        M,
-        N,
-        K,
-        x.stride(0),
-        x.stride(1),
-        w.stride(0),
-        w.stride(1),
-        0 if config["NUM_KSPLIT"] == 1 else y_pp.stride(0),
-        y.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp.stride(1),
-        y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
-        x_scale.stride(1) if is_x_scale_tranposed else x_scale.stride(0),
-        (
-            (x_scale.numel() // x_scale.stride(0))
-            if is_x_scale_tranposed
-            else x_scale.stride(1)
-        ),
-        w_scale.stride(0),
-        w_scale.stride(1),
-        **config,
-    )
-
-    if config["NUM_KSPLIT"] > 1:
-        if skip_reduce:
-            return y_pp
-
-        REDUCE_BLOCK_SIZE_M = 32
-        REDUCE_BLOCK_SIZE_N = 32
-        ACTUAL_KSPLIT = triton.cdiv(K, config["SPLITK_BLOCK_SIZE"])
-
-        grid_reduce = (
-            triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
-            triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
+        a_ptrs = a_ptr + (
+            offs_am[:, None] * stride_am + offs_k_split[None, :] * stride_ak
         )
-        _gemm_splitk_reduce_kernel[grid_reduce](
-            y_pp,
-            y,
-            None,
-            M,
-            N,
-            y_pp.stride(0),
-            y_pp.stride(1),
-            y_pp.stride(2),
-            y.stride(0),
-            y.stride(1),
-            REDUCE_BLOCK_SIZE_M,
-            REDUCE_BLOCK_SIZE_N,
-            ACTUAL_KSPLIT,
-            triton.next_power_of_2(config["NUM_KSPLIT"]),
-            ADD_BIAS=False,
-            activation="",
-            use_activation=False,
-            KERNEL_NAME="_gemm_a8w8_blockscale_reduce_kernel",
+        b_ptrs = b_ptr + (
+            offs_bn[:, None] * stride_bn + offs_k_shuffle[None, :] * stride_bk
         )
 
-    return y
+        # Create pointers for the scales
+        offs_bsn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+        offs_k_scale = (pid_k * SPLITK_BLOCK_SIZE) // GROUP_K
+        a_scale_ptrs = (
+            a_scale_ptr + offs_am * stride_ascale_m + offs_k_scale * stride_ascale_k
+        )
+        # When the scale block covers the whole tile (GROUP_N >= BLOCK_SIZE_N and
+        # GROUP_K >= BLOCK_SIZE_K) every element shares one scalar b_scale.
+        if GROUP_N >= BLOCK_SIZE_N and GROUP_K >= BLOCK_SIZE_K:
+            offs_b_scale_n = (pid_n * BLOCK_SIZE_N) // GROUP_N
+        else:
+            offs_b_scale_n = offs_bsn // GROUP_N
+        b_scale_ptrs = (
+            b_scale_ptr
+            + offs_k_scale * stride_bscale_k
+            + offs_b_scale_n * stride_bscale_n
+        )
+
+        acc_dtype = tl.float32 if c_ptr.type.element_ty != tl.int8 else tl.int32
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
+
+        for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
+            # Load the per-K-tile block scales up-front
+            a_scale = tl.load(a_scale_ptrs)
+            b_scale = tl.load(b_scale_ptrs)
+
+            # Load the next block of A and B, generate a mask by checking the K dimension.
+            # If it is out of bounds, set it to 0.
+            if EVEN_K:
+                a = tl.load(a_ptrs)
+                b = tl.load(b_ptrs, cache_modifier=cache_modifier)
+            else:
+                a = tl.load(
+                    a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0
+                )
+                b = tl.load(
+                    b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0
+                )
+
+            b = (
+                b.reshape(
+                    1,
+                    BLOCK_SIZE_N // 16,
+                    BLOCK_SIZE_K // 32,
+                    2,
+                    16,
+                    16,
+                )
+                .permute(0, 1, 4, 2, 3, 5)
+                .reshape(BLOCK_SIZE_N, BLOCK_SIZE_K)
+                .trans(1, 0)
+            )
+
+            if GROUP_N >= BLOCK_SIZE_N and GROUP_K >= BLOCK_SIZE_K:
+                accumulator += tl.dot(a, b) * (a_scale * b_scale)[:, None]
+            else:
+                accumulator += tl.dot(a, b) * (a_scale[:, None] * b_scale[None, :])
+
+            # Advance the ptrs to the next K block.
+            a_ptrs += BLOCK_SIZE_K * stride_ak
+            b_ptrs += BLOCK_SIZE_K * 16 * stride_bk
+
+            offs_ks_step = (
+                k + 1
+            ) * BLOCK_SIZE_K // GROUP_K - k * BLOCK_SIZE_K // GROUP_K
+            a_scale_ptrs += offs_ks_step * stride_ascale_k
+            b_scale_ptrs += offs_ks_step * stride_bscale_k
+
+        c = accumulator.to(c_ptr.type.element_ty)
+
+        # Write back the block of the output matrix C with masks.
+        offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
+        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
+        c_ptrs = (
+            c_ptr
+            + stride_cm * offs_cm[:, None]
+            + stride_cn * offs_cn[None, :]
+            + pid_k * stride_ck
+        )
+        c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+        tl.store(c_ptrs, c, mask=c_mask)

@@ -1,0 +1,22 @@
+{
+  "profiles": {
+    "DTYPE=float8_e4m3fn-AS=float32-BS=float32-OUT=bfloat16-RECIPE_A=1x128-RECIPE_B=128x128": {
+      "DEFAULT_FALLBACK": true,
+      "M_EQ_768": {
+        "BLOCK_SIZE_M": 128,
+        "BLOCK_SIZE_N": 256,
+        "BLOCK_SIZE_K": 128,
+        "num_warps": 4,
+        "num_stages": 2,
+        "wasp_partition_warps": [
+          4,
+          4,
+          4,
+          4
+        ],
+        "wasp_wdra": true,
+        "kernel": "_gemm_a8w8_blockscale_as_fp32_bs_fp32_recipe_a_1x128_recipe_b_128x128_bm128_bn256_bk128_kernel"
+      }
+    }
+  }
+}

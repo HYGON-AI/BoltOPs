@@ -9,18 +9,87 @@ import torch
 
 pytest.importorskip("triton")
 
-from boltops.gemm.triton.gemm_fp16 import (  # noqa: E402
+from boltops.gemm.triton.gemm_a16w16_wasp import (  # noqa: E402
     MODES,
     build_autotune_configs,
-    gemm_fp16,
+    _gemm_fp16_load_kernel,
+    _gemm_fp16_mls_kernel,
+    default_launch_config,
     mode_launch_kwargs,
     supports_wasp_wdra,
 )
-from boltops.tools.tune_gemm_wasp import (  # noqa: E402
-    SHAPES,
-    assert_fp16_gemm_close,
-    _make_ab,
-)
+
+GOLDEN_ATOL = 1e-3
+GOLDEN_RTOL = 1e-3
+
+
+def fp16_gemm_golden(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """FP32-accumulate reference, rounded to fp16 to match kernel store."""
+    return torch.matmul(a.detach().cpu().float(), b.detach().cpu().float()).to(
+        torch.float16
+    )
+
+
+def assert_fp16_gemm_close(
+    out: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    *,
+    atol: float = GOLDEN_ATOL,
+    rtol: float = GOLDEN_RTOL,
+) -> tuple[float, float]:
+    """``assert_close`` vs :func:`fp16_gemm_golden`. Returns ``(max_abs, max_rel)``."""
+    out_cpu = out.detach().cpu()
+    ref = fp16_gemm_golden(a, b)
+    torch.testing.assert_close(out_cpu, ref, atol=atol, rtol=rtol)
+    diff = (out_cpu.float() - ref.float()).abs()
+    rel = diff / ref.float().abs().clamp_min(1e-8)
+    return float(diff.max().item()), float(rel.max().item())
+
+
+def _make_ab(
+    M: int,
+    N: int,
+    K: int,
+    ab_layout: str,
+    *,
+    device: str,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build A ``[M,K]`` and B ``[K,N]`` for the given AB layout tag.
+
+    TT: contiguous A (K-major), contiguous B (N-major).
+    TN: contiguous A (K-major); B is a ``[N,K].T`` view (K-major, ``stride_bk=1``).
+    """
+    a = torch.randn((M, K), device=device, dtype=dtype)
+    if ab_layout == "TT":
+        b = torch.randn((K, N), device=device, dtype=dtype)
+    else:  # TN
+        b = torch.randn((N, K), device=device, dtype=dtype).T
+    return a, b
+
+
+def run_pipeline(a, b, *, use_mls=False, config=None):
+    import os
+    import triton
+
+    os.environ.setdefault("AMDGCN_USE_BUFFER_OPS", "1")
+    m, k = a.shape
+    n = b.shape[1]
+    out = torch.empty((m, n), dtype=a.dtype, device=a.device)
+    params = dict(config) if config is not None else default_launch_config()
+    params["HAS_BIAS"] = False
+    if use_mls:
+        params["USE_MATRIX_STORE"] = False
+    kernel = _gemm_fp16_mls_kernel if use_mls else _gemm_fp16_load_kernel
+    grid = lambda meta: (
+        triton.cdiv(m, meta["BLOCK_SIZE_M"]) * triton.cdiv(n, meta["BLOCK_SIZE_N"]),
+    )
+    kernel[grid](
+        a, b, out, b, m, n, k, *a.stride(), *b.stride(), *out.stride(), **params
+    )
+    return out
+
 
 DEVICE = "cuda"
 GPU_REQUIRED = pytest.mark.skipif(
@@ -71,80 +140,8 @@ def test_launch_options_match_current_hcu_backend(mode, waves, wdra):
         assert parsed.wasp_partition_warps == waves
 
 
-def test_removed_pingpong_sweep_rejected():
-    from boltops.tools.tune_gemm_wasp import main
-    with pytest.raises(SystemExit):
-        main(["--consumer-pingpong", "false"])
-
-
-
-@pytest.mark.parametrize("mode,quotas", [("wdra48", (16, 244, 244)), ("wdra88", (16, 224, 240))])
-def test_promote_emits_current_partition_options(tmp_path, monkeypatch, mode, quotas):
-    import csv
-    import json
-    from boltops.tools import tune_gemm_wasp as tune
-    monkeypatch.setattr(tune, "_CONFIG_DIR", tmp_path / "configs")
-    row = dict(mode=mode, M=256, N=256, K=4096, ab_layout="TT",
-               BLOCK_SIZE_M=256, BLOCK_SIZE_N=256, BLOCK_SIZE_K=64,
-               num_stages=2, empty_arrive_after_mmac=0, enable_v_mmac_cluster=0,
-               enable_consumer_pingpong=1, mmac_layout_force=3,
-               wasp_partition_warps="(4,4,4)",
-               wdra_num_load_regs=quotas[0], wdra_num_mma_regs_main=quotas[1],
-               wdra_num_mma_regs_tail=quotas[2], tops=7.4, cycles=159000)
-    source = tmp_path / "measurements.csv"
-    with source.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=row.keys())
-        writer.writeheader()
-        writer.writerow(row)
-    result = json.loads(tune._promote(source, "test").read_text())
-    producers = 2 if mode == "wdra88" else 1
-    assert result["wasp_partition_warps"] == [4] * (producers + 2)
-    assert result["wasp_partition_regs"] == [quotas[0]] * producers + list(quotas[1:])
-    assert "enable_consumer_pingpong" not in result
-    assert "wasp_enabled" not in result
-    assert "wdra_enabled" not in result
-    assert "wdra_num_load_regs" not in result
-
-
-def test_saved_configs_use_current_hcu_options():
-    import json
-    from pathlib import Path
-    from boltops.tools import tune_gemm_wasp as tune
-    from triton.backends.hcu.compiler import HIPBackend
-    from triton.backends.compiler import GPUTarget
-    backend = HIPBackend(GPUTarget("hip", "gfx946", 64))
-    from triton.backends.hcu import wasp
-    configs = list((Path(tune._CONFIG_DIR) / "gfx946").glob("*.json"))
-    assert configs, f"Missing packaged GEMM configs under {tune._CONFIG_DIR}/gfx946"
-    for path in configs:
-        cfg = json.loads(path.read_text())
-        assert not ({"wasp_enabled", "wdra_enabled", "wasp_num_load_warps", "wasp_num_mma_warps", "wdra_num_load_regs", "wdra_num_mma_regs_main", "wdra_num_mma_regs_tail", "enable_consumer_pingpong"} & cfg.keys()), path
-        options = {k: cfg[k] for k in tune._LAUNCH_KEYS if k in cfg and k not in {"GROUP_SIZE_M", "WARP_SPECIALIZE", "BLOCK_SIZE_M", "BLOCK_SIZE_N", "BLOCK_SIZE_K"}}
-        parsed = backend.parse_options(options)
-        assert set(options) <= set(parsed.__dataclass_fields__), path
-        if parsed.wasp_partition_regs is not None:
-            wasp.normalize_regs(parsed.wasp_partition_regs, "gfx946")
-
-
-def test_cycle_attribution_ignores_other_output_directories(tmp_path, monkeypatch):
-    from boltops.tools import tune_gemm_wasp as tune
-    current = tmp_path / "current/m5out/0/0/stats.txt"
-    foreign = tmp_path / "other/m5out/0/0/stats.txt"
-    monkeypatch.setattr(tune, "_iter_stats", lambda: [(current, 159360, 2.197802, 2)])
-    assert tune._best_stats_since({str(foreign): (1, 27041)})[1] == 159360
-    prior = current.parent.parent / "previous/stats.txt"
-    assert tune._best_stats_since({str(prior): (1, 10000)})[1] == 149360
-
-
-def test_tune_shapes_table():
-    assert SHAPES[0][0] == "512cube"
-    assert SHAPES[0][1:] == (512, 512, 512)
-
-
 def test_fp16_golden_helper_is_tighter_than_1e2():
     """Dropped K-tile must fail 1e-3; identical tensors pass."""
-    from boltops.tools.tune_gemm_wasp import GOLDEN_ATOL, GOLDEN_RTOL, fp16_gemm_golden
-
     assert (GOLDEN_ATOL, GOLDEN_RTOL) == (1e-3, 1e-3)
     torch.manual_seed(0)
     a, b = _make_ab(64, 64, 256, "TN", device="cpu", dtype=torch.float16)
@@ -187,12 +184,9 @@ def test_internal_gemm_fp16_nowasp(M: int, N: int, K: int, ab_layout: str):
          else b_storage[:K * N].view(N, K).T)
     a.copy_(a_cpu)
     b.copy_(b_cpu)
-    out = gemm_fp16(
+    out = run_pipeline(
         a,
         b,
-        wasp=False,
-        wdra=False,
-        autotune=False,
     )
     assert torch.isfinite(out.detach().cpu()).all(), "GEMM returned NaN/Inf with finite inputs"
     max_abs, max_rel = assert_fp16_gemm_close(out, a_cpu, b_cpu)
@@ -254,15 +248,10 @@ def test_internal_gemm_fp16_wdra48_mls_sizes(
         num_stages=2,
     )
     cfg.update(BLOCK_SIZE_M=bm, BLOCK_SIZE_N=bn, BLOCK_SIZE_K=bk)
-    out = gemm_fp16(
+    out = run_pipeline(
         a_cpu.to(DEVICE),
         b_cpu.to(DEVICE),
-        wasp=True,
-        wdra=True,
         use_mls=True,
-        wasp_num_load_warps=4,
-        wasp_num_mma_warps=8,
-        autotune=False,
         config=cfg,
     )
     torch.cuda.synchronize()
@@ -280,7 +269,7 @@ def test_bench_gemm_fp16_nowasp_skeleton(time_ms, bench_warmup: int, bench_repea
     M = N = K = 128
     a = torch.randn((M, K), device=DEVICE, dtype=torch.float16)
     b = torch.randn((K, N), device=DEVICE, dtype=torch.float16)
-    gemm_fp16(a, b, autotune=False)
+    run_pipeline(a, b)
     torch.cuda.synchronize()
-    ms = time_ms(lambda: gemm_fp16(a, b, autotune=False), bench_warmup, bench_repeat)
+    ms = time_ms(lambda: run_pipeline(a, b), bench_warmup, bench_repeat)
     print(f"[bench] gemm_fp16 nowasp {M}x{N}x{K}: {ms:.3f} ms")
