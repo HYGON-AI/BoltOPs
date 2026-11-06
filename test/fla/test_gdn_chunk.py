@@ -131,7 +131,7 @@ def _make_chunk_cumsum(
 def _kernel_cfg(
     backend_name: str,
     implementation: str | None = "wasp_4p4c",
-) -> dict[str, str] | None:
+) -> dict[str, str | int] | None:
     if backend_name == "tilelang":
         assert implementation is not None
         return {"implementation": implementation}
@@ -143,10 +143,11 @@ def _check_chunk_h_matches_reference(
     use_varlen: bool,
     inplace_final_state: bool,
     implementation: str | None = "wasp_4p4c",
+    heads: int = 16,
 ) -> None:
     backend_name, chunk_h = chunk_backend
     torch.manual_seed(120 if use_varlen else 123)
-    B, H, Hg, K, V, chunk_size = 1, 16, 16, 128, 128, 64
+    B, H, Hg, K, V, chunk_size = 1, heads, 16, 128, 128, 64
     minimum_T = 5 * chunk_size
     T = CORRECTNESS_SEQ_LEN
     assert T >= minimum_T
@@ -201,6 +202,8 @@ def _check_chunk_h_matches_reference(
         else chunk_indices_cpu.to(DEVICE)
     )
 
+    cfg = _kernel_cfg(backend_name, implementation)
+
     torch.cuda.synchronize()
     actual_h, actual_v, actual_final = chunk_h(
         k,
@@ -217,7 +220,7 @@ def _check_chunk_h_matches_reference(
         chunk_indices=chunk_indices,
         use_exp2=False,
         transpose_state_layout=True,
-        kernel_cfg=_kernel_cfg(backend_name, implementation),
+        kernel_cfg=cfg,
     )
     torch.cuda.synchronize()
     expected_h, expected_v, expected_final = naive_chunk_h(
@@ -274,11 +277,13 @@ def _check_chunk_h_matches_reference(
     (False, True),
     ids=("out-of-place", "in-place"),
 )
+@pytest.mark.parametrize("heads", (16, 32), ids=("Hg16-H16", "Hg16-H32"))
 def test_chunk_h_matches_reference(
     backend_name: str,
     implementation: str | None,
     use_varlen: bool,
     inplace_final_state: bool,
+    heads: int,
 ) -> None:
     if backend_name == "tilelang" and implementation == "wasp_4p4c_gfx946":
         arch = get_arch()
@@ -289,6 +294,7 @@ def test_chunk_h_matches_reference(
         use_varlen,
         inplace_final_state,
         implementation,
+        heads,
     )
 
 
@@ -421,9 +427,11 @@ def _benchmark_sequences(
 @pytest.mark.parametrize(
     "transpose_state", [True, False], ids=["vk", "kv"]
 )
+@pytest.mark.parametrize("heads", (16, 32), ids=("Hg16-H16", "Hg16-H32"))
 def test_bench_chunk_h_tflops(
     chunk_h_backend: tuple[str, Callable],
     use_varlen: bool,
+    heads: int,
     transpose_state: bool,
     time_ms,
     bench_warmup: int,
@@ -434,7 +442,7 @@ def test_bench_chunk_h_tflops(
     if backend_name == "tilelang" and not transpose_state:
         pytest.skip("TileLang benchmark supports VK state layout only")
     torch.manual_seed(122)
-    B, H, Hg, K, V, chunk_size = 1, 16, 16, 128, 128, 64
+    B, H, Hg, K, V, chunk_size = 1, heads, 16, 128, 128, 64
     default_T = 13312
     T = default_T if bench_seq_len is None else bench_seq_len
     if T <= 0:
@@ -467,7 +475,7 @@ def test_bench_chunk_h_tflops(
         return chunk_h(
             k, w, u, g=g, initial_state=state,
             initial_state_indices=state_indices,
-            output_final_state=True, inplace_final_state=False,
+            output_final_state=True, inplace_final_state=True,
             chunk_size=chunk_size, save_new_value=True,
             cu_seqlens=cu, chunk_indices=chunk_indices,
             transpose_state_layout=transpose_state,
@@ -481,8 +489,13 @@ def test_bench_chunk_h_tflops(
     assert torch.isfinite(final).all()
     actual_h = h
     actual_v_new = v_new
+    actual_final = final.clone()
 
-    h_ms = time_ms(run_h, bench_warmup, bench_repeat)
+    # Reset outside timing. Repeated in-place calls advance the state; resetting
+    # each iteration would include an extra GPU operation in the kernel timing.
+    state.zero_()
+    torch.cuda.synchronize()
+    h_ms = time_ms(run_h, bench_warmup, bench_repeat, use_graph=False)
     h_flops = _chunk_h_flops(lengths, H, K, V, chunk_size)
     label = f"{backend_name}, {mode}, {state_layout}"
     h_tflops = h_flops / (h_ms * 1e-3) / 1e12
@@ -502,10 +515,12 @@ def test_bench_chunk_h_tflops(
         print(f"AITER chunk-h reference is unavailable: {exc}")
         return
 
+    reference_state = torch.zeros_like(state)
+
     def run_aiter_h():
         return aiter_chunk_h(
             k, w, u, g=g, gk=None,
-            initial_state=state, initial_state_indices=state_indices,
+            initial_state=reference_state, initial_state_indices=state_indices,
             output_final_state=True, chunk_size=chunk_size,
             save_new_value=True, cu_seqlens=cu, chunk_indices=chunk_indices,
             chunk_offsets=None, use_exp2=False, transpose_state_layout=True,
@@ -516,7 +531,7 @@ def test_bench_chunk_h_tflops(
     assert (
         torch.isfinite(reference_h).all()
         and torch.isfinite(reference_v_new).all()
-        and torch.isfinite(state).all()
+        and torch.isfinite(reference_state).all()
     )
     torch.testing.assert_close(
         actual_h, reference_h, atol=BF16_ATOL, rtol=BF16_RTOL
@@ -528,8 +543,14 @@ def test_bench_chunk_h_tflops(
         rtol=BF16_RTOL,
     )
 
+    torch.testing.assert_close(
+        actual_final, reference_state, atol=BF16_ATOL, rtol=BF16_RTOL
+    )
+
+    reference_state.zero_()
+    torch.cuda.synchronize()
     aiter_h_ms = _do_bench_ref(
-        run_aiter_h, warmup=bench_warmup, rep=bench_repeat
+        run_aiter_h, warmup=bench_warmup, rep=bench_repeat, return_mode="median"
     )
     print(
         "GDN chunk h "
@@ -538,6 +559,7 @@ def test_bench_chunk_h_tflops(
         f"{h_flops / (aiter_h_ms * 1e-3) / 1e12:.2f} TFLOPS"
     )
 
+    print(f"TileLang/AITER speedup: {aiter_h_ms / h_ms:.3f}x (event median, state reset excluded)")
 
 @GPU_REQUIRED
 @pytest.mark.bench

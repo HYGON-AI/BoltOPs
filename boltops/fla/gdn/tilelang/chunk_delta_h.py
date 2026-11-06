@@ -39,6 +39,8 @@ _WASP_CONSUMER_EBAR_ID = 1
 # (32 + 192) / 2 = 112.
 _WASP_PRODUCER_MAX_NREG = 32
 _WASP_CONSUMER_MAX_NREG = 192
+# Varlen swizzled-copy address setup needs more than 32 producer VGPRs.
+_WASP_VARLEN_PRODUCER_MAX_NREG = 40
 _WASP_VARLEN_CONSUMER_MAX_NREG = 208
 
 @tilelang.jit(
@@ -2272,6 +2274,7 @@ def _build_chunk_h_wasp_4p4c(
 def _build_chunk_h_wasp_4p4c_gfx946(
     batch: int,
     heads: int,
+    kv_heads: int,
     dim_k: int,
     dim_v: int,
     state_rows: int,
@@ -2286,7 +2289,11 @@ def _build_chunk_h_wasp_4p4c_gfx946(
     is_varlen: bool = False,
     fixed_has_tail: bool = False,
 ):
-    """Build the gfx946 ABarrier four-producer/four-consumer kernel."""
+    """Build gfx946 fixed/varlen kernels with grouped K heads.
+
+    Only K uses kv_heads: consecutive groups of heads // kv_heads value
+    heads share one K head. W/U/G and all states remain indexed by heads.
+    """
     block_v = 32
     seq_len = T.dynamic("seq_len")
     full_chunks = seq_len // chunk_size
@@ -2517,7 +2524,7 @@ def _build_chunk_h_wasp_4p4c_gfx946(
 
     @T.prim_func
     def chunk_gated_delta_rule_fwd_h_wasp_4p4c_gfx946_kernel(
-        k: T.Tensor([batch, seq_len, heads, dim_k], qkv_dtype),
+        k: T.Tensor([batch, seq_len, kv_heads, dim_k], qkv_dtype),
         w: T.Tensor([batch, seq_len, heads, dim_k], qkv_dtype),
         u: T.Tensor([batch, seq_len, heads, dim_v], qkv_dtype),
         g: T.Tensor([batch, seq_len, heads], gate_dtype),
@@ -2626,7 +2633,7 @@ def _build_chunk_h_wasp_4p4c_gfx946(
                         k[
                             bid,
                             base : base + chunk_size,
-                            hid,
+                            hid // (heads // kv_heads),
                             0:dim_k,
                         ],
                         k_shared,
@@ -2845,7 +2852,7 @@ def _build_chunk_h_wasp_4p4c_gfx946(
                     for it, ik in T.Parallel(chunk_size, dim_k):
                         if it < tail_size:
                             k_fragment[it, ik] = k[
-                                bid, tail_base + it, hid, ik
+                                bid, tail_base + it, hid // (heads // kv_heads), ik
                             ]
                         else:
                             k_fragment[it, ik] = T.cast(0, qkv_dtype)
@@ -2991,7 +2998,7 @@ def _build_chunk_h_wasp_4p4c_gfx946(
 
     @T.prim_func
     def chunk_gated_delta_rule_fwd_h_wasp_4p4c_gfx946_varlen_kernel(
-        k: T.Tensor([batch, seq_len, heads, dim_k], qkv_dtype),
+        k: T.Tensor([batch, seq_len, kv_heads, dim_k], qkv_dtype),
         w: T.Tensor([batch, seq_len, heads, dim_k], qkv_dtype),
         u: T.Tensor([batch, seq_len, heads, dim_v], qkv_dtype),
         g: T.Tensor([batch, seq_len, heads], gate_dtype),
@@ -3054,7 +3061,7 @@ def _build_chunk_h_wasp_4p4c_gfx946(
             T.ebarrier_sync_cnt(_WASP_INIT_EBAR_ID, _TOTAL_WAVES)
 
             if tx < _PRODUCER_THREADS:
-                T.set_max_nreg(_WASP_PRODUCER_MAX_NREG, 0)
+                T.set_max_nreg(_WASP_VARLEN_PRODUCER_MAX_NREG, 0)
                 token_begin = cu_seqlens[sequence_id]
                 actual_seq_len = (
                     cu_seqlens[sequence_id + 1] - token_begin
@@ -3103,7 +3110,7 @@ def _build_chunk_h_wasp_4p4c_gfx946(
                         k[
                             0,
                             base : base + chunk_size,
-                            hid,
+                            hid // (heads // kv_heads),
                             0:dim_k,
                         ],
                         k_shared,
@@ -3300,7 +3307,7 @@ def _build_chunk_h_wasp_4p4c_gfx946(
                     for it, ik in T.Parallel(chunk_size, dim_k):
                         if it < tail_size:
                             k_fragment[it, ik] = k[
-                                0, tail_base + it, hid, ik
+                                0, tail_base + it, hid // (heads // kv_heads), ik
                             ]
                         else:
                             k_fragment[it, ik] = T.cast(0, qkv_dtype)
@@ -3547,7 +3554,10 @@ def chunk_gated_delta_rule_fwd_h(
         chunk_offsets_kernel = None
         num_sequences = batch
         num_chunks = (seq_len + chunk_size - 1) // chunk_size
-    if kv_heads != heads:
+    if implementation == "wasp_4p4c_gfx946":
+        if heads <= 0 or kv_heads <= 0 or heads % kv_heads != 0:
+            raise ValueError("H and Hg must be positive and H must be divisible by Hg.")
+    elif kv_heads != heads:
         raise NotImplementedError("the first TileLang version requires Hg == H.")
     if tuple(w.shape) != (batch, seq_len, heads, dim_k):
         raise ValueError("w must have shape [B, T, H, K].")
@@ -3703,6 +3713,8 @@ def chunk_gated_delta_rule_fwd_h(
         save_new_value,
         transpose_state_layout,
     )
+    if implementation == "wasp_4p4c_gfx946":
+        kernel_args = (*kernel_args[:2], kv_heads, *kernel_args[2:])
     if is_varlen and implementation == "copy-pipeline":
         # Compile the fixed BV32 pipeline as a separate packed-varlen kernel.
         # The fixed builder and its generated code remain unchanged.
