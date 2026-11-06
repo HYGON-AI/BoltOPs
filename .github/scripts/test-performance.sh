@@ -33,7 +33,6 @@ results_file="${artifact_dir}/missing-optest-results.json"
 if [ -n "${latest_results}" ]; then
   results_file="${latest_results}/.optest-results.json"
   echo "Selected results: ${results_file}" | tee -a "${artifact_dir}/collection.log"
-  cp -a "${latest_results}" "${artifact_dir}/results"
 else
   echo "ERROR: No current-job report matched ${result_pattern} after ${CI_WORK_DIR}/optest-start" \
     | tee -a "${artifact_dir}/collection.log"

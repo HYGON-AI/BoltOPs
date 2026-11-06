@@ -30,6 +30,7 @@ jobs:
     concurrency:
       group: boltops-performance-BW1100
       cancel-in-progress: false
+      queue: max
     container:
       image: ${{ vars.DTK_IMAGE_REGISTRY || '10.16.1.152:5000/hcu/base/dtk' }}:${{ inputs.dtk_version }}-rockylinux8.6-py${{ inputs.py_version }}
       options: --device=/dev/kfd --device=/dev/dri --group-add video -v /opt/hyhal/:/opt/hyhal/:ro --shm-size=80G --cap-add=SYS_PTRACE
@@ -68,6 +69,27 @@ jobs:
       run: bash .github/scripts/setup-env.sh
     - name: Run performance suite
       run: bash .github/scripts/test-performance.sh
+    - name: Collect performance output even after failure
+      if: ${{ always() }}
+      run: |
+        # Reconstruct common.sh's identity without loading DTK or dependencies.
+        run_branch="ci_performance_BW1100_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}_${GITHUB_JOB}_${DTK_VER}_${PYTHON_VERSION}_${TORCH_VERSION}"
+        artifact_dir="${GITHUB_WORKSPACE}/optest_artifacts/BW1100/dtk${DTK_VER}/py${PYTHON_VERSION}/torch${TORCH_VERSION}"
+        mkdir -p "${artifact_dir}"
+        for result_dir in /op_test_output/boltops/"${run_branch}"_*; do
+          if [ -d "${result_dir}" ]; then
+            mkdir -p "${artifact_dir}/results"
+            echo "Archiving results: ${result_dir}" | tee -a "${artifact_dir}/collection.log"
+            cp -a "${result_dir}" "${artifact_dir}/results/"
+          fi
+        done
+        for log_dir in /op_test_log/boltops/"${run_branch}"_*; do
+          if [ -d "${log_dir}" ]; then
+            mkdir -p "${artifact_dir}/logs"
+            echo "Archiving logs: ${log_dir}" | tee -a "${artifact_dir}/collection.log"
+            cp -a "${log_dir}" "${artifact_dir}/logs/"
+          fi
+        done
     - name: Upload performance reports and logs
       if: ${{ always() }}
       uses: actions/upload-artifact@v4
@@ -76,6 +98,7 @@ jobs:
         path: |
           scripts/*_boltops_output.xml
           optest_artifacts/
+          optest_results/
         include-hidden-files: true
         if-no-files-found: warn
         retention-days: 7

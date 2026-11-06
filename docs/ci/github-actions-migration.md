@@ -57,7 +57,7 @@ Settings → Actions → Runners：确保 BW1100 runner/runner group 允许 Bolt
 
 镜像需允许 Actions Node20 动作运行；若私有仓库要求认证，需要额外配置 container.credentials，当前参考 lightop 使用 runner 已有的镜像访问方式。
 
-build job 不设置共享 concurrency 锁，两个 Torch 版本可并行编译及执行正确性测试。性能 job 使用 boltops-performance-BW1100 共享 concurrency group，cancel-in-progress=false，因此性能测试串行执行，顺序不保证；GitHub 默认最多保留一个 pending job，跨流水线提交可能替换等待任务。CIsmi 分配空闲 HCU，但不能隔离共享 CPU、内存和 I/O 的性能干扰。工作流级别仍会取消同一 PR 的旧运行。
+build job 不设置共享 concurrency 锁，两个 Torch 版本可并行编译及执行正确性测试。性能 job 使用 boltops-performance-BW1100 共享 concurrency group，配置 cancel-in-progress=false 和 queue=max：性能测试串行执行，最多保留 100 个等待任务，避免默认单等待槽导致的任务替换。超过队列上限的任务仍可能取消；排队以进入 concurrency group 的时间为准，不保证按流水线创建时间执行。CIsmi 分配空闲 HCU，但不能隔离共享 CPU、内存和 I/O 的性能干扰。工作流级别仍会取消同一 PR 的旧运行，这与性能任务的队列替换不同。
 
 与 lightop 一样，同仓库 PR 和 fork PR 均可进入构建及 GPU 测试流程，不检查来源仓库是否相同。使用 pull_request 事件，不使用 pull_request_target。是否等待维护者批准由 GitHub 仓库/组织的 Actions fork 工作流审批设置决定；需管理员确认 BW1100 runner 对 BoltOPs 可用。PR 不进入发布任务，发布 Secret 只用于 main push 的发布任务。
 
@@ -121,5 +121,22 @@ bash .github/scripts/_build_hcu_wheel.sh --out-dir dist
 要求 Linux、Python >=3.9、DTK、HIP 版 Torch、AICC 和 Python build。脚本默认从 /opt/dtk/env.sh 加载环境；可用 DTK_ROOT、PYTHON、BOLT_OPS_AICC 指定路径。缺少工具会在打包前报错，不会自动安装或偷偷退回 CPU Torch。检查可导入 Torch，但不要求能访问 GPU；GPU 验证交由测试负责。
 
 仓库技能位于 `.agents/skills/build-hcu-wheel/SKILL.md`，记录环境前提、参数、编译方法、错误处理与 CI 对应关系。技能是给智能助手阅读的说明，不是 CI 执行程序。
+
+### 下载当前性能测试 CSV 和原始结果
+
+打开 GitHub Actions 对应运行的 Summary，在 Artifacts 中下载
+`performance-reports-dtk2610-py3.12-torch<版本>`。不同 Torch 版本分别归档，保留 7 天。
+
+- `optest_results/`：本次性能入口写出的各算子 CSV。
+- `optest_artifacts/BW1100/dtk2610/py3.12/torch<版本>/results/`：本 job 的
+  optest 输出目录，保留实际生成的 CSV、`.optest-results.json`、`raw/` 等文件。
+- 同级 `logs/`：benchmark 日志；`collection.log` 记录收集路径。
+- `scripts/*_boltops_output.xml`：JUnit 性能报告。
+
+工作流在测试之后使用独立的 `always()` 步骤收集文件，再上传 artifacts。
+即使测试失败或 JSON 未生成，也会保留已有输出；不改变测试的失败状态。
+收集只匹配当前 run、attempt、job、DTK、Python 和 Torch 的唯一目录前缀，
+多个结果目录分别保留。若环境安装失败而未开始测试，可能没有 CSV；
+任务超时、runner 异常等情况不保证收集和上传完成。
 
 目录规则见 [CI 目录与文件职责](README.md)。GitLab/GitHub 共用的报告转换工具统一放在 `scripts/ci/optest_to_junit.py`。
