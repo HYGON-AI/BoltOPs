@@ -9,7 +9,7 @@ import torch
 
 pytest.importorskip("triton")
 
-from boltops.gemm import triton_scaled_mm  # noqa: E402
+from boltops.gemm.triton.triton_scaled_mm import triton_scaled_mm  # noqa: E402
 
 DEVICE = "cuda"
 GPU_REQUIRED = pytest.mark.skipif(

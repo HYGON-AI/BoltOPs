@@ -1,42 +1,25 @@
 # Gemm 系列算子说明
 
-`boltops.gemm` 公开 Triton GEMM 族（布局对齐 vLLM / aiter / SGLang 调用侧）。
+Common interfaces and cross-backend registration: [GEMM dispatch](gemm-dispatch.md).
+
+`boltops.gemm` 按计算语义公开 GEMM 接口，Triton、Gluon、TileLang 独立注册后端。
 实现位于 `boltops/gemm/triton/`；维护人 Triton @xukang。
 
 调优与支持跟踪见 [GEMM 优化记录](../gemm/OPTIMIZATION.md)，历史 WASP/WDRA 性能见 [RESULTS](../gemm/RESULTS.md)，寄存器策略见 [VGPR](../gemm/VGPR.md)。
 
-## 当前支持一览
+## 公开接口
 
-| 公开 API | 精度 / 量化 | 布局要点 | 来源 | 备注 |
-| --- | --- | --- | --- | --- |
-| `matmul_persistent` | FP16 / BF16 / FP32 | `C = A @ B`（NN） | vLLM | LDS≤64KiB 自动降 tile |
-| `gemm_a16w16` | FP16 / BF16 | `Y = X @ W^T`，`W[N,K]` | aiter | 可选 epilogue activation |
-| `w8a8_triton_block_scaled_mm` | FP8 / INT8 block-scale | `B[N,K]`，`block_size=[bn,bk]` | vLLM | |
-| `triton_scaled_mm` | INT8 / FP8 + scale | `C = (A @ B) * sa * sb`（NN） | vLLM | per-tensor / per-channel scale |
-| `awq_gemm_triton` | W4A16（AWQ packed） | int4 `qweight` | vLLM | HCU JSON：`K100_AI` / `BW200` |
-| `gemm_a8w8_blockscale` | A8W8 block-scale | `Y = X @ W^T` | aiter | |
-| `gemm_afp4wfp4` | MXFP4 | `Y = X @ W^T` | aiter | 需 `is_fp4_avail()` |
-| `batched_gemm_a16wfp4` | A16WFP4 batched | `Y[i] = X[i] @ W[i]^T` | aiter | 需 FP4 |
-| `batched_gemm_bf16` | BF16 / FP16 batched | `Y[i] = X[i] @ W[i]^T`，`W[B,N,K]` | aiter | HCU JSON：`K100_AI` / `BW200` |
-| `w8a8_block_int8_matmul` | INT8 block-scale | `B[N,K]` | SGLang | HCU JSON：`BW200` / `gfx938` |
-
-未公开：`gemm_fp16`（内部 HCU WASP/WDRA 实验）。
+公开入口及旧接口迁移表见 [GEMM dispatch](gemm-dispatch.md)。
 
 ```python
 from boltops.gemm import (
-    matmul_persistent,
-    gemm_a16w16,
-    w8a8_triton_block_scaled_mm,
-    triton_scaled_mm,
-    awq_gemm_triton,
-    gemm_a8w8_blockscale,
-    gemm_afp4wfp4,
-    batched_gemm_a16wfp4,
-    batched_gemm_bf16,
-    w8a8_block_int8_matmul,
+    gemm_dense, gemm_scaled, gemm_batched, gemm_grouped,
+    gemm_batched_a16wfp4_online_quant,
 )
-# 或 from boltops.gemm import ...
 ```
+
+下文沿用原 kernel 名称的章节记录后端实现与历史测试；这些名字不再从
+`boltops.gemm` 公开导出。需要后端专用参数时直接从 `boltops.gemm.triton` 的具体模块导入。
 
 测试统一目录：
 

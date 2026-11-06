@@ -9,7 +9,7 @@ import torch
 
 pytest.importorskip("triton")
 
-from boltops.gemm import batched_gemm_a16wfp4  # noqa: E402
+from boltops.gemm.triton.batched_gemm_a16wfp4 import batched_gemm_a16wfp4  # noqa: E402
 from boltops.utility import arch_info  # noqa: E402
 
 DEVICE = "cuda"
