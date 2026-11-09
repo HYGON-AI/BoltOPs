@@ -39,6 +39,7 @@ def recompute_w_u_fwd_gdn_kernel(
     H: tl.constexpr, Hg: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
     BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    FULL_CHUNK: tl.constexpr = False,
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
@@ -62,9 +63,15 @@ def recompute_w_u_fwd_gdn_kernel(
         A + (bos * H + i_h) * BT, (T, BT), (H * BT, 1),
         (i_t * BT, 0), (BT, BT), (1, 0),
     )
-    b_beta = tl.load(p_beta, boundary_check=(0,))
-    b_A = tl.load(p_A, boundary_check=(0, 1))
-    b_g = tl.exp(tl.load(p_g, boundary_check=(0,)))
+    EXACT: tl.constexpr = FULL_CHUNK and K % BK == 0 and V % BV == 0
+    if EXACT:
+        b_beta = tl.load(p_beta)
+        b_Ab = (tl.load(p_A) * b_beta[None, :]).to(tl.bfloat16)
+        b_g = tl.exp(tl.load(p_g))
+    else:
+        b_beta = tl.load(p_beta, boundary_check=(0,))
+        b_A = tl.load(p_A, boundary_check=(0, 1))
+        b_g = tl.exp(tl.load(p_g, boundary_check=(0,)))
 
     for i_v in range(tl.cdiv(V, BV)):
         p_v = tl.make_block_ptr(
@@ -75,11 +82,15 @@ def recompute_w_u_fwd_gdn_kernel(
             u + (bos * H + i_h) * V, (T, V), (H * V, 1),
             (i_t * BT, i_v * BV), (BT, BV), (1, 0),
         )
-        b_v = tl.load(p_v, boundary_check=(0, 1))
-        b_vb = (b_v * b_beta[:, None]).to(b_v.dtype)
-        b_u = tl.dot(b_A, b_vb, allow_tf32=False)
-        tl.store(p_u, b_u.to(p_u.dtype.element_ty), boundary_check=(0, 1))
-
+        if EXACT:
+            b_v = tl.load(p_v)
+            b_u = tl.dot(b_Ab, b_v, allow_tf32=False)
+            tl.store(p_u, b_u.to(p_u.dtype.element_ty))
+        else:
+            b_v = tl.load(p_v, boundary_check=(0, 1))
+            b_vb = (b_v * b_beta[:, None]).to(b_v.dtype)
+            b_u = tl.dot(b_A, b_vb, allow_tf32=False)
+            tl.store(p_u, b_u.to(p_u.dtype.element_ty), boundary_check=(0, 1))
     for i_k in range(tl.cdiv(K, BK)):
         p_k = tl.make_block_ptr(
             k + (bos * Hg + i_h // (H // Hg)) * K, (T, K), (Hg * K, 1),
@@ -89,10 +100,16 @@ def recompute_w_u_fwd_gdn_kernel(
             w + (bos * H + i_h) * K, (T, K), (H * K, 1),
             (i_t * BT, i_k * BK), (BT, BK), (1, 0),
         )
-        b_k = tl.load(p_k, boundary_check=(0, 1))
-        b_kb = (b_k * b_beta[:, None] * b_g[:, None]).to(b_k.dtype)
-        b_w = tl.dot(b_A, b_kb)
-        tl.store(p_w, b_w.to(p_w.dtype.element_ty), boundary_check=(0, 1))
+        if EXACT:
+            b_k = tl.load(p_k)
+            b_kg = (b_k * b_g[:, None]).to(b_k.dtype)
+            b_w = tl.dot(b_Ab, b_kg)
+            tl.store(p_w, b_w.to(p_w.dtype.element_ty))
+        else:
+            b_k = tl.load(p_k, boundary_check=(0, 1))
+            b_kb = (b_k * b_beta[:, None] * b_g[:, None]).to(b_k.dtype)
+            b_w = tl.dot(b_A, b_kb)
+            tl.store(p_w, b_w.to(p_w.dtype.element_ty), boundary_check=(0, 1))
 
 
 @triton.jit(do_not_specialize=["T"])
@@ -100,6 +117,7 @@ def recompute_w_u_fwd_gdn_kernel_head_first(
     k, v, beta, w, u, A, g, cu_seqlens, chunk_indices, T,
     H: tl.constexpr, Hg: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
     BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr,
+    FULL_CHUNK: tl.constexpr = False,
 ):
     """Varlen bf16 fast path with head-first scheduling and beta factoring."""
     i_h, i_tc = tl.program_id(0), tl.program_id(1)
@@ -118,9 +136,15 @@ def recompute_w_u_fwd_gdn_kernel_head_first(
         A + (bos * H + i_h) * BT, (Tloc, BT), (H * BT, 1),
         (i_t * BT, 0), (BT, BT), (1, 0),
     )
-    b_beta = tl.load(p_beta, boundary_check=(0,))
-    b_g = tl.exp(tl.load(p_g, boundary_check=(0,)))
-    b_Ab = (tl.load(p_A, boundary_check=(0, 1)) * b_beta[None, :]).to(tl.bfloat16)
+    EXACT: tl.constexpr = FULL_CHUNK and K % BK == 0 and V % BV == 0
+    if EXACT:
+        b_beta = tl.load(p_beta)
+        b_g = tl.exp(tl.load(p_g))
+        b_Ab = (tl.load(p_A) * b_beta[None, :]).to(tl.bfloat16)
+    else:
+        b_beta = tl.load(p_beta, boundary_check=(0,))
+        b_g = tl.exp(tl.load(p_g, boundary_check=(0,)))
+        b_Ab = (tl.load(p_A, boundary_check=(0, 1)) * b_beta[None, :]).to(tl.bfloat16)
 
     p_v = tl.make_block_ptr(
         v + (bos * H + i_h) * V, (Tloc, V), (H * V, 1),
@@ -130,10 +154,14 @@ def recompute_w_u_fwd_gdn_kernel_head_first(
         u + (bos * H + i_h) * V, (Tloc, V), (H * V, 1),
         (i_t * BT, 0), (BT, BV), (1, 0),
     )
-    b_v = tl.load(p_v, boundary_check=(0, 1))
-    b_u = tl.dot(b_Ab, b_v, allow_tf32=False)
-    tl.store(p_u, b_u.to(p_u.dtype.element_ty), boundary_check=(0, 1))
-
+    if EXACT:
+        b_v = tl.load(p_v)
+        b_u = tl.dot(b_Ab, b_v, allow_tf32=False)
+        tl.store(p_u, b_u.to(p_u.dtype.element_ty))
+    else:
+        b_v = tl.load(p_v, boundary_check=(0, 1))
+        b_u = tl.dot(b_Ab, b_v, allow_tf32=False)
+        tl.store(p_u, b_u.to(p_u.dtype.element_ty), boundary_check=(0, 1))
     p_k = tl.make_block_ptr(
         k + (bos * Hg + i_h // (H // Hg)) * K, (Tloc, K), (Hg * K, 1),
         (i_t * BT, 0), (BT, BK), (1, 0),
@@ -142,11 +170,16 @@ def recompute_w_u_fwd_gdn_kernel_head_first(
         w + (bos * H + i_h) * K, (Tloc, K), (H * K, 1),
         (i_t * BT, 0), (BT, BK), (1, 0),
     )
-    b_k = tl.load(p_k, boundary_check=(0, 1))
-    b_kg = (b_k * b_g[:, None]).to(b_k.dtype)
-    b_w = tl.dot(b_Ab, b_kg)
-    tl.store(p_w, b_w.to(p_w.dtype.element_ty), boundary_check=(0, 1))
-
+    if EXACT:
+        b_k = tl.load(p_k)
+        b_kg = (b_k * b_g[:, None]).to(b_k.dtype)
+        b_w = tl.dot(b_Ab, b_kg)
+        tl.store(p_w, b_w.to(p_w.dtype.element_ty))
+    else:
+        b_k = tl.load(p_k, boundary_check=(0, 1))
+        b_kg = (b_k * b_g[:, None]).to(b_k.dtype)
+        b_w = tl.dot(b_Ab, b_kg)
+        tl.store(p_w, b_w.to(p_w.dtype.element_ty), boundary_check=(0, 1))
 
 def recompute_w_u_fwd_gdn(
     k: torch.Tensor,
@@ -156,8 +189,18 @@ def recompute_w_u_fwd_gdn(
     A: torch.Tensor,
     cu_seqlens: torch.LongTensor | None = None,
     chunk_indices: torch.LongTensor | None = None,
+    full_chunks: bool | None = None,
+    kernel_cfg: dict | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Recompute GDN WY tensors with the GDN-specialized kernel."""
+    """Recompute GDN WY tensors with the GDN-specialized kernel.
+
+    Args:
+        full_chunks: Caller promise that every chunk has exactly BT tokens
+            (fixed: T % BT == 0; varlen: every sequence length % BT == 0).
+            None auto-enables it for the fixed layout with T % BT == 0.
+        kernel_cfg: Optional config override/extra compile options
+            (e.g. ``enable_v_mmac_cluster``) merged over the selected config.
+    """
     B, T, Hg, K, V = *k.shape, v.shape[-1]
     H = v.shape[-2]
     BT = A.shape[-1]
@@ -167,7 +210,13 @@ def recompute_w_u_fwd_gdn(
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
-    config = _select_recompute_w_u_fwd_gdn_config(K, V)
+    config = dict(_select_recompute_w_u_fwd_gdn_config(K, V))
+    if kernel_cfg is not None:
+        config.update(kernel_cfg)
+    if full_chunks is None:
+        full_chunks = cu_seqlens is None and T % BT == 0
+    extra = {key: value for key, value in config.items()
+             if key not in ("BK", "BV", "num_warps", "num_stages", "desync")}
     u = torch.empty_like(v)
     w = k.new_empty(B, T, H, K)
     use_head_first = (
@@ -180,7 +229,8 @@ def recompute_w_u_fwd_gdn(
             k=k, v=v, beta=beta, w=w, u=u, A=A, g=g_cumsum,
             cu_seqlens=cu_seqlens, chunk_indices=chunk_indices, T=T, H=H,
             Hg=Hg, K=K, V=V, BT=BT, BK=config["BK"], BV=config["BV"],
-            num_warps=4, num_stages=1,
+            FULL_CHUNK=full_chunks,
+            num_warps=4, num_stages=1, **extra,
         )
     else:
         recompute_w_u_fwd_gdn_kernel[(NT, B * H)](
@@ -188,7 +238,7 @@ def recompute_w_u_fwd_gdn(
             cu_seqlens=cu_seqlens, chunk_indices=chunk_indices, T=T, H=H,
             Hg=Hg, K=K, V=V, BT=BT, BK=config["BK"], BV=config["BV"],
             IS_VARLEN=cu_seqlens is not None, num_warps=config["num_warps"],
-            num_stages=config["num_stages"],
+            num_stages=config["num_stages"], FULL_CHUNK=full_chunks, **extra,
         )
     return w, u
 

@@ -94,11 +94,14 @@ def launch_chunk_fwd_kernel_o(
     use_exp2: bool,
     transpose_state_layout: bool,
     kernel_cfg: dict | None,
+    full_chunks: bool = False,
 ):
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), NT, B * H)
 
     cfg = kernel_cfg if kernel_cfg is not None else _get_chunk_o_config(K, V, BT, transpose_state_layout)
+    extra = {key: value for key, value in cfg.items()
+             if key not in ("BK", "BV", "num_warps", "num_stages")}
 
     chunk_fwd_kernel_o[grid](
         q=q,
@@ -121,8 +124,10 @@ def launch_chunk_fwd_kernel_o(
         BV=cfg["BV"],
         USE_EXP2=use_exp2,
         TRANSPOSE_STATE=transpose_state_layout,
+        FULL_CHUNK=full_chunks,
         num_warps=cfg["num_warps"],
         num_stages=cfg["num_stages"],
+        **extra,
     )
 
 
@@ -155,6 +160,7 @@ def chunk_fwd_kernel_o(
     USE_G_GAMMA: tl.constexpr,
     USE_EXP2: tl.constexpr,
     TRANSPOSE_STATE: tl.constexpr,
+    FULL_CHUNK: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
     i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -180,6 +186,7 @@ def chunk_fwd_kernel_o(
 
     b_o = tl.zeros([BT, BV], dtype=tl.float32)
     b_A = tl.zeros([BT, BT], dtype=tl.float32)
+    EXACT: tl.constexpr = FULL_CHUNK and K % BK == 0
 
     for i_k in range(tl.cdiv(K, BK)):
         p_q = tl.make_block_ptr(q, (T, K), (Hg * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
@@ -189,9 +196,14 @@ def chunk_fwd_kernel_o(
         else:
             p_h = tl.make_block_ptr(h, (K, V), (V, 1), (i_k * BK, i_v * BV), (BK, BV), (1, 0))
 
-        b_q = tl.load(p_q, boundary_check=(0, 1))
-        b_k = tl.load(p_k, boundary_check=(0, 1))
-        b_h = tl.load(p_h, boundary_check=(0, 1))
+        if EXACT:
+            b_q = tl.load(p_q)
+            b_k = tl.load(p_k)
+            b_h = tl.load(p_h)
+        else:
+            b_q = tl.load(p_q, boundary_check=(0, 1))
+            b_k = tl.load(p_k, boundary_check=(0, 1))
+            b_h = tl.load(p_h, boundary_check=(0, 1))
         if TRANSPOSE_STATE:
             b_o += tl.dot(b_q, tl.trans(b_h))
         else:
@@ -201,7 +213,10 @@ def chunk_fwd_kernel_o(
     if USE_G:
         g += bos * H + i_h
         p_g = tl.make_block_ptr(g, (T,), (H,), (i_t * BT,), (BT,), (0,))
-        b_g = tl.load(p_g, boundary_check=(0,))
+        if EXACT:
+            b_g = tl.load(p_g)
+        else:
+            b_g = tl.load(p_g, boundary_check=(0,))
         if USE_EXP2:
             b_o = b_o * exp2(b_g)[:, None]
             b_A = b_A * safe_exp2(b_g[:, None] - b_g[None, :])
@@ -220,16 +235,25 @@ def chunk_fwd_kernel_o(
             b_A = b_A * safe_exp(b_g[:, None] - b_g[None, :])
 
     o_t = i_t * BT + tl.arange(0, BT)
-    m_t = o_t < T
-    m_A = (o_t[:, None] >= o_t[None, :]) & (m_t[:, None] & m_t)
+    if FULL_CHUNK:
+        m_A = o_t[:, None] >= o_t[None, :]
+    else:
+        m_t = o_t < T
+        m_A = (o_t[:, None] >= o_t[None, :]) & (m_t[:, None] & m_t)
     b_A = tl.where(m_A, b_A, 0)
 
     p_v = tl.make_block_ptr(v, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
     p_o = tl.make_block_ptr(o, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
 
-    b_v = tl.load(p_v, boundary_check=(0, 1))
-    b_o = b_o * scale + tl.dot(b_A.to(b_v.dtype), b_v) * scale
-    tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
+    if EXACT:
+        b_v = tl.load(p_v)
+    else:
+        b_v = tl.load(p_v, boundary_check=(0, 1))
+    b_o = (b_o + tl.dot(b_A.to(b_v.dtype), b_v)) * scale
+    if EXACT:
+        tl.store(p_o, b_o.to(p_o.dtype.element_ty))
+    else:
+        tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
 
 def chunk_fwd_o(
@@ -246,7 +270,18 @@ def chunk_fwd_o(
     use_exp2: bool = False,
     transpose_state_layout: bool = False,
     kernel_cfg: dict | None = None,
+    full_chunks: bool | None = None,
 ) -> torch.Tensor:
+    """Compute the fused chunk output o = scale * (q @ h + A_g @ v).
+
+    Args:
+        full_chunks: Caller promise that every chunk covered by this launch has
+            exactly BT tokens (fixed: T % BT == 0; varlen: every sequence
+            length % BT == 0). When true the kernel skips token-boundary
+            clamps and the trailing-token mask. None auto-enables it for the
+            fixed layout with T % BT == 0 and stays off for varlen unless the
+            caller passes True.
+    """
     B, T, Hg, K, V = *q.shape, v.shape[-1]
     H = v.shape[-2]
     BT = chunk_size
@@ -255,6 +290,8 @@ def chunk_fwd_o(
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     if scale is None:
         scale = k.shape[-1] ** -0.5
+    if full_chunks is None:
+        full_chunks = cu_seqlens is None and T % BT == 0
 
     o = torch.empty_like(v)
 
@@ -280,5 +317,6 @@ def chunk_fwd_o(
         use_exp2=use_exp2,
         transpose_state_layout=transpose_state_layout,
         kernel_cfg=kernel_cfg,
+        full_chunks=full_chunks,
     )
     return o
