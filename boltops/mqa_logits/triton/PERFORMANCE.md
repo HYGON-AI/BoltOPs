@@ -152,7 +152,7 @@ Public Triton entries (TileLang is documented in ``docs/ops/mqa_logits_tilelang.
 
 1. **`triton_fp8_paged_mqa_logits`** — full logits; four dispatch branches:
    - ``kv_block_size=1``: per-token SplitKV
-   - ``kv_block_size=64``: default **SplitKV block** (only path with ``fuse_output_init``)
+   - ``kv_block_size=64``: default **SplitKV block** (only path with ``fuse_output_init``). gfx938 and gfx946 load K with ``tl.matrix_load`` (``num_stages=1``) when the head count is a multiple of 16; other arches and smaller head counts keep masked ``tl.load``. ``use_mls_k=False`` forces the load kernel.
    - ``kv_block_size=64`` + ``use_bucket=True``: host-built schedule (eager / reference; not for hot path)
    - ``kv_block_size=64`` + ``bucket_schedule=``: device persistent bucket (skewed batches)
 2. **`triton_fp8_paged_mqa_logits_stage1`** — per-head scores (page size 1 / 64)

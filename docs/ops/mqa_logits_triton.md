@@ -126,6 +126,9 @@ triton_fp8_paged_mqa_logits(
     q, kv_cache, weights, out, context_lens, block_table, max_model_len,
     kv_block_size=64,
 )
+
+
+`kv_block_size=64` 在 **gfx938** 和 **gfx946** 上，head 数是 16 的倍数时默认走 K 的 `tl.matrix_load`（`num_stages=1`）。其它架构，以及 head 数为 1/2/4/8 时，仍是 masked `tl.load`。传 `use_mls_k=False` 强制回到 load。
 ```
 
 ### 输出契约（`fuse_output_init`）

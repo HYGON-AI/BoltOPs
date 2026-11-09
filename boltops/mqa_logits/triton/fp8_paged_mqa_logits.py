@@ -9,7 +9,9 @@ Public entries: ``triton_fp8_paged_mqa_logits`` and
 
 Vendored from hygon aiter ``aiter.ops.triton.attention.pa_mqa_logits``
 (JIT ``_deepgemm_fp8_paged_mqa_logits`` in ``_triton_kernels``). Formula matches
-DeepGEMM / vLLM paged decode path:
+DeepGEMM / vLLM paged decode path. gfx938 and gfx946 ``kv_block_size=64``
+load K with ``tl.matrix_load`` when the head count is a multiple of 16;
+other arches and smaller head counts keep ``tl.load``.
 
     logits[b*next_n+n, t] = sum_h ReLU(Q[b,n,h] · K[t] * scale[t]) * W[b*next_n+n,h]
     causal: t <= context_lens[b] - next_n + n; outside valid KV -> -inf
@@ -628,8 +630,12 @@ def _fp8_paged_mqa_logits_block64_kernel(
     SplitKV: tl.constexpr = 1,
     FillTail: tl.constexpr = 0,
     TailBlock: tl.constexpr = 4096,
+    USE_MLS_K: tl.constexpr = 0,
 ):
     """Paged decode, specialized for ``ChunkK == KVBlockSize`` (one page per tile).
+
+    ``USE_MLS_K`` selects the page load: ``tl.matrix_load`` or masked ``tl.load``.
+    The rest of the loop is shared. gfx938 and gfx946 block64 pass ``True``.
 
     Identical math to :func:`_fp8_paged_mqa_logits_block_kernel` -- bitwise so,
     see ``test/mqa_logits/bench_paged_elem_ab.py`` -- but with the page index
@@ -724,15 +730,13 @@ def _fp8_paged_mqa_logits_block64_kernel(
         nxt = tl.minimum(context_idx + ChunkK, _last)
         next_phys = tl.load(bt_row + nxt // KVBlockSize)
 
-        k = tl.load(
-            KV_buffer + phys_block * stride_k_page + k_off,
-            mask=mask_kv[:, None],
-            other=0.0,
-        )
-        k_scale_f = tl.load(
-            scale_buffer + phys_block * stride_scale_page + s_off,
-            mask=mask_kv,
-            other=0.0,
+        # Load lives in the helper so the constexpr branch does not hide ``k``
+        # from the dot. MLS issues the scale before matrix_load; the masked
+        # path keeps the original order.
+        k, k_scale_f = _load_block64_page_k(
+            KV_buffer, phys_block, stride_k_page, stride_k_token, k_off,
+            scale_buffer, stride_scale_page, s_off, mask_kv,
+            ChunkK, HiddenDim, USE_MLS_K,
         )
 
         # [ChunkK, ChunkQ]: KV positions on M, heads on N.
@@ -779,6 +783,52 @@ def _fp8_paged_mqa_logits_block64_kernel(
                 float("-inf"),
                 mask=tail_pos < max_model_len,
             )
+
+
+@triton.jit
+def _load_block64_page_k(
+    KV_buffer,
+    phys,
+    stride_k_page,
+    stride_k_token,
+    k_off,
+    scale_buffer,
+    stride_scale_page,
+    s_off,
+    mask_kv,
+    ChunkK: tl.constexpr,
+    HiddenDim: tl.constexpr,
+    USE_MLS_K: tl.constexpr,
+):
+    """One page of K and its per-token scale.
+
+    ``matrix_load`` has no mask, so the scale load is issued first: the
+    matrix copy ends in a full vmem wait and would otherwise serialize the
+    two HBM trips. Rows past ``context_length`` are replaced with ``-inf``
+    by the caller before the head reduction. The masked path keeps K then
+    scale, with ``other=0``.
+    """
+    if USE_MLS_K:
+        k_scale_f = tl.load(scale_buffer + phys * stride_scale_page + s_off)
+        k = tl.matrix_load(
+            KV_buffer + phys * stride_k_page,
+            shape=[ChunkK, HiddenDim],
+            strides=[stride_k_token, 1],
+            block_shape=[ChunkK, HiddenDim],
+            offsets=[0, 0],
+        )
+        return k, k_scale_f
+    k = tl.load(
+        KV_buffer + phys * stride_k_page + k_off,
+        mask=mask_kv[:, None],
+        other=0.0,
+    )
+    k_scale_f = tl.load(
+        scale_buffer + phys * stride_scale_page + s_off,
+        mask=mask_kv,
+        other=0.0,
+    )
+    return k, k_scale_f
 
 
 @triton.jit
@@ -1795,6 +1845,18 @@ def _prepare_paged_kv_views(
     return views
 
 
+def _resolve_paged_block64_use_mls_k(use_mls_k: Optional[bool]) -> bool:
+    """gfx938 and gfx946 block64 load K with matrix_load. Explicit False keeps tl.load."""
+    if use_mls_k is not None:
+        return bool(use_mls_k)
+    try:
+        from boltops.utility.arch_info import get_arch
+
+        return get_arch() in ("gfx938", "gfx946")
+    except Exception:
+        return False
+
+
 def _launch_fp8_paged_mqa_logits_block(
     q_fp8: torch.Tensor,
     kv_cache_fp8: torch.Tensor,
@@ -1813,17 +1875,42 @@ def _launch_fp8_paged_mqa_logits_block(
     num_warps: int,
     num_stages: int,
     fuse_output_init: bool = False,
+    use_mls_k: Optional[bool] = None,
 ) -> None:
     batch_size, next_n, heads, hidden_dim = q_fp8.size()
-    grid = (batch_size * next_n * split_kv, 1, 1)
+    grid_n = batch_size * next_n * split_kv
+    grid = (grid_n, 1, 1)
     hip_kwargs = _filter_hip_launch_kwargs({"waves_per_eu": waves_per_eu})
     # One page per tile lets the page index be a scalar (see the kernel doc:
     # -15.9% at avg_kv=72000, bitwise identical). Only applies when the tile
     # equals the page, i.e. chunk_k == 64 with the paged layout.
-    kernel = (_fp8_paged_mqa_logits_block64_kernel
-              if chunk_k == kv_block_size
-              else _fp8_paged_mqa_logits_block_kernel)
-    kernel[grid](
+    use_block64 = chunk_k == kv_block_size
+    # gfx938 and gfx946 block64 default to matrix_load K. Explicit
+    # use_mls_k=False keeps the masked tl.load kernel. The MMAC N tile
+    # is 16, so heads 1/2/4/8 have no legal MLS dot: the encoding pass
+    # asserts instead of falling back. Those counts stay on tl.load
+    # even when use_mls_k=True.
+    mls_k = (
+        use_block64
+        and heads % 16 == 0
+        and _resolve_paged_block64_use_mls_k(use_mls_k)
+    )
+    if use_block64:
+        kernel = _fp8_paged_mqa_logits_block64_kernel
+    else:
+        kernel = _fp8_paged_mqa_logits_block_kernel
+    launch_kwargs = dict(
+        num_warps=num_warps,
+        num_stages=num_stages,
+        ChunkQ=heads,
+        ChunkK=chunk_k,
+        HiddenDim=hidden_dim,
+        KVBlockSize=kv_block_size,
+        SplitKV=split_kv,
+        FillTail=1 if fuse_output_init else 0,
+        **hip_kwargs,
+    )
+    args: list = [
         batch_size,
         next_n,
         heads,
@@ -1843,18 +1930,11 @@ def _launch_fp8_paged_mqa_logits_block(
         weights.stride(0),
         out_logits,
         out_logits.stride(0),
-        max_model_len,
-        max_block_len,
-        num_warps=num_warps,
-        num_stages=num_stages,
-        ChunkQ=heads,
-        ChunkK=chunk_k,
-        HiddenDim=hidden_dim,
-        KVBlockSize=kv_block_size,
-        SplitKV=split_kv,
-        FillTail=1 if fuse_output_init else 0,
-        **hip_kwargs,
-    )
+    ]
+    if use_block64:
+        launch_kwargs["USE_MLS_K"] = mls_k
+    args.extend([max_model_len, max_block_len])
+    kernel[grid](*args, **launch_kwargs)
 
 
 def build_paged_bucket_schedule(
@@ -2180,6 +2260,7 @@ def triton_fp8_paged_mqa_logits(
     bucket_schedule: Optional[PagedBucketSchedule] = None,
     batch_info: Optional[PagedBatchInfo] = None,
     fuse_output_init: bool = False,
+    use_mls_k: Optional[bool] = None,
 ) -> torch.Tensor:
     """Compute FP8 paged MQA logits for decode.
 
@@ -2275,6 +2356,13 @@ def triton_fp8_paged_mqa_logits(
             block path (``kv_block_size=64``, row-major, no bucket scheduler);
             every other path raises ``NotImplementedError``
             rather than quietly leaving the tail unwritten.
+        use_mls_k: full pages via ``tl.matrix_load``. ``None`` (default) turns
+            it on for gfx938 and gfx946 ``kv_block_size=64`` when ``heads``
+            is a multiple of 16, and leaves every other arch on the masked
+            ``tl.load`` kernel. Head counts below 16 stay on that load
+            kernel too: the MMAC N tile is 16 and the compiler does not
+            fall back. Pass ``False`` to force the load kernel.
+            ``num_stages`` stays 1. Ignored for bucket / ``kv_block_size=1``.
         waves_per_eu / num_warps / num_stages: Triton launch options.
 
     Note:
@@ -2489,6 +2577,7 @@ def triton_fp8_paged_mqa_logits(
             num_warps=num_warps,
             num_stages=num_stages,
             fuse_output_init=fuse_output_init,
+            use_mls_k=use_mls_k,
         )
         return out_logits
 

@@ -25,7 +25,9 @@ Vendored Triton MQA logits sources:
 
 - `fp8_paged_mqa_logits.py` — hygon aiter ``pa_mqa_logits`` lineage;
   public ``triton_fp8_paged_mqa_logits`` / ``_stage1`` / ``_prepare`` /
-  ``_build_bucket_schedule`` (``kv_block_size∈{1,64}``).
+  ``_build_bucket_schedule`` (``kv_block_size∈{1,64}``). gfx938 and gfx946
+  block64 default to ``tl.matrix_load`` for K when the head count is a
+  multiple of 16; ``use_mls_k=False`` and smaller head counts keep ``tl.load``.
 
 Semantic lineage: DeepGEMM `fp8_mqa_logits` (sparse indexer scoring).
 Call sites: vLLM `rocm_fp8_mqa_logits`, SGLang DSA indexer (ROCm → aiter).
