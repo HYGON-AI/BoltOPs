@@ -1,0 +1,7 @@
+{
+  "any": {
+    "BLOCK_SIZE_M": 32,
+    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_K": 32
+  }
+}

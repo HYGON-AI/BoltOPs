@@ -52,7 +52,9 @@ def test_gemm_a8w8_blockscale_correctness():
     x = torch.randint(-8, 8, (M, K), dtype=torch.int8)
     w = torch.randint(-8, 8, (N, K), dtype=torch.int8)
     x_scale = torch.rand((M, K // block_k), dtype=torch.float32) * 0.05 + 0.01
-    w_scale = torch.rand((N // block_n, K // block_k), dtype=torch.float32) * 0.05 + 0.01
+    w_scale = (
+        torch.rand((N // block_n, K // block_k), dtype=torch.float32) * 0.05 + 0.01
+    )
     golden = _a8w8_blockscale_golden(x, w, x_scale, w_scale, block_k, block_n)
 
     config = {
@@ -60,12 +62,8 @@ def test_gemm_a8w8_blockscale_correctness():
         "BLOCK_SIZE_N": 32,
         "BLOCK_SIZE_K": 128,
         "GROUP_SIZE_M": 8,
-        "NUM_KSPLIT": 1,
         "num_warps": 4,
         "num_stages": 2,
-        "waves_per_eu": 0,
-        "matrix_instr_nonkdim": 16,
-        "cache_modifier": ".cg",
     }
     out = gemm_a8w8_blockscale(
         x.to(DEVICE),
