@@ -13,6 +13,7 @@ Terminology:
   same last-dimension size (typically [..., D] -> [..., D]).
 """
 
+import functools
 from enum import IntEnum
 from typing import NamedTuple, Optional, Tuple
 
@@ -1329,6 +1330,123 @@ def triton_activation_quant(
         APPLY_ROW_MULTIPLIER=row_multiplier is not None,
         **config,
     )
+    return q, scale
+
+
+# ---------------------------------------------------------------------------
+# Expert-parallel (EP) gated-SWIGLUSTEP activation + per-token FP8 quant
+# ---------------------------------------------------------------------------
+#
+# Moved here from the vllm-plugin-das Step5 EP fast path
+# (vllm_hcu/model_executor/layers/fused_moe/ep_fused_moe.py at
+# v0.28.1-dev a5dcba3) so the MoE activation kernel lives with the rest of the
+# MoE computation backend. The kernel body is unchanged.
+#
+# It is deliberately a separate kernel instead of another mode of
+# ``activation_quant_kernel`` because it needs three properties that the shared
+# kernel does not provide and that would complicate every existing mode:
+#
+#   * a device-side row bound (the ``nvalid`` scalar) read inside the kernel, so
+#     the launch stays valid under CUDA graph replay with a changing valid-row
+#     count and no host synchronization;
+#   * ``fdiv_fast`` for the SiLU divide (the IEEE divide is ~20% of this
+#     memory-bound kernel's runtime);
+#   * an explicit ``D == 3 * CH`` column split, because the Step5 width
+#     D = 1536 is not a power of two and a power-of-two BLOCK_D tile would mask
+#     a quarter of the lanes.
+#
+# The router weight is folded into the per-row scale (never into ``q``), which
+# is what GEMM2 consumes as its per-channel activation scale.
+
+
+_EP_SWIGLUSTEP_QUANT_CFG = {"BLOCK_M": 2, "num_warps": 1, "CTAS_PER_CU": 64}
+
+
+@functools.lru_cache(maxsize=None)
+def _ep_num_cus(device: torch.device) -> int:
+    """Return the CU count for the tensor's device, cached per device."""
+    return torch.cuda.get_device_properties(device).multi_processor_count
+
+
+@triton.jit
+def _ep_swiglu_chunk(in_ptr, offs, m2, LIMIT: tl.constexpr, D: tl.constexpr):
+    x = tl.load(in_ptr + offs, mask=m2, other=0.0)
+    up = tl.load(in_ptr + offs + D, mask=m2, other=0.0)
+    xf = x.to(tl.float32)
+    # fdiv_fast: the IEEE divide alone costs ~20% of this memory-bound kernel.
+    silu = tl.math.fdiv_fast(xf, 1.0 + tl.exp(-xf))
+    y = tl.minimum(silu, LIMIT) * tl.minimum(tl.maximum(up.to(tl.float32), -LIMIT), LIMIT)
+    return y.to(x.dtype)
+
+
+@triton.jit
+def _ep_swiglustep_quant_kernel(
+    q_ptr, scale_ptr, in_ptr, w_ptr, nvalid_ptr,
+    D: tl.constexpr, LIMIT: tl.constexpr, DTYPE_MAX: tl.constexpr,
+    BLOCK_M: tl.constexpr, CH: tl.constexpr,
+):
+    # Same math as boltops activation_quant_kernel(GATED_SWIGLU_STEP, row multiplier),
+    # but grid-strided over the device-side valid row count. D = 3*CH: a power-of-2
+    # BLOCK_D=2048 tile for D=1536 masks a quarter of the lanes and runs at ~0.6 TB/s.
+    tl.static_assert(D == 3 * CH)
+    n = tl.load(nvalid_ptr)
+    cols = tl.arange(0, CH)
+    step = tl.num_programs(0) * BLOCK_M
+    for start in range(tl.program_id(0) * BLOCK_M, n, step):
+        rows = start + tl.arange(0, BLOCK_M)
+        row_mask = rows < n
+        m2 = row_mask[:, None]
+        offs = rows[:, None].to(tl.int64) * (2 * D) + cols[None, :]
+        y0 = _ep_swiglu_chunk(in_ptr, offs, m2, LIMIT, D)
+        y1 = _ep_swiglu_chunk(in_ptr, offs + CH, m2, LIMIT, D)
+        y2 = _ep_swiglu_chunk(in_ptr, offs + 2 * CH, m2, LIMIT, D)
+        absmax = tl.maximum(tl.maximum(tl.max(tl.abs(y0), axis=-1), tl.max(tl.abs(y1), axis=-1)),
+                            tl.max(tl.abs(y2), axis=-1))
+        scale = tl.maximum(absmax.to(tl.float32), 1.0e-10) / DTYPE_MAX
+        inv = (1.0 / scale)[:, None]
+        w = tl.load(w_ptr + rows, mask=row_mask, other=0.0)
+        q_offs = rows[:, None].to(tl.int64) * D + cols[None, :]
+        tl.store(q_ptr + q_offs, (y0 * inv).to(q_ptr.dtype.element_ty), mask=m2, cache_modifier=".cs")
+        tl.store(q_ptr + q_offs + CH, (y1 * inv).to(q_ptr.dtype.element_ty), mask=m2, cache_modifier=".cs")
+        tl.store(q_ptr + q_offs + 2 * CH, (y2 * inv).to(q_ptr.dtype.element_ty), mask=m2, cache_modifier=".cs")
+        tl.store(scale_ptr + rows, scale * w, mask=row_mask)
+
+
+def ep_swiglustep_quant(
+    cache1: torch.Tensor,
+    sorted_weights: torch.Tensor,
+    nvalid: torch.Tensor,
+    rows: int,
+    limit: float = 7.0,
+    q: Optional[torch.Tensor] = None,
+):
+    """Gated SWIGLUSTEP + per-token FP8 quant over a bounded sorted layout.
+
+    ``cache1`` is the GEMM1 output in expert-sorted order, ``[rows, 2 * D]``;
+    ``sorted_weights`` are the route weights in the same order and ``nvalid``
+    is a device-side int32 scalar with the number of live rows. Only rows below
+    ``nvalid`` are read and written, so callers may size the buffers from a
+    static bound and stay CUDA-graph safe. ``nvalid`` is never read on the
+    host, so the caller must guarantee ``nvalid <= rows``; the sorted-layout
+    bound it comes from does.
+
+    Returns ``(q, scale)`` with ``q`` of shape ``[rows, D]`` (FP8 e4m3) and
+    ``scale`` of shape ``[rows, 1]`` (fp32). The router weight is folded into
+    ``scale``; ``q`` is independent of it.
+    """
+    D = cache1.shape[1] // 2
+    if q is None:
+        q = torch.empty((rows, D), dtype=torch.float8_e4m3fn, device=cache1.device)
+    scale = torch.empty((rows, 1), dtype=torch.float32, device=cache1.device)
+    bm = _EP_SWIGLUSTEP_QUANT_CFG["BLOCK_M"]
+    grid = (max(1, min(triton.cdiv(rows, bm),
+                       _ep_num_cus(cache1.device.index) * _EP_SWIGLUSTEP_QUANT_CFG["CTAS_PER_CU"])),)
+    assert D % 3 == 0 and triton.next_power_of_2(D // 3) == D // 3
+    _ep_swiglustep_quant_kernel[grid](
+        q, scale, cache1, sorted_weights, nvalid,
+        D=D, LIMIT=float(limit), DTYPE_MAX=torch.finfo(torch.float8_e4m3fn).max,
+        BLOCK_M=bm, CH=D // 3,
+        num_warps=_EP_SWIGLUSTEP_QUANT_CFG["num_warps"], num_stages=1)
     return q, scale
 
 
