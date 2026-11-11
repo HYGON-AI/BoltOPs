@@ -38,6 +38,50 @@ from boltops.generic.triton.causal_conv1d.core import (  # noqa: E402
 )
 
 
+def test_rowscan_groups_without_device_info_returns_default():
+    """num_cu <= 0 (non-CUDA tensor) skips the occupancy model: GROUPS=8."""
+    from boltops.generic.triton.causal_conv1d import kernels
+
+    groups = kernels._select_rowscan_groups(
+        [128], 8192, 1, rows=8, block_n=512, warps=1, num_cu=0
+    )
+    assert groups == 8
+
+
+def test_rowscan_groups_prefers_smaller_tile_for_short_sequences():
+    """Short sequences shrink the rowscan token tile; long ones keep it.
+
+    A short sequence produces few resident rowscan waves, so the occupancy
+    model drops GROUPS toward the smallest tile (and to vec8 below that) to
+    keep enough loads in flight, while a long sequence keeps the largest
+    tile. The short < long shrink is the regression this test locks in.
+    """
+    from boltops.generic.triton.causal_conv1d import kernels
+
+    def groups(seq_lens):
+        return kernels._select_rowscan_groups(
+            seq_lens, 8192, 2, rows=8, block_n=512, warps=1, num_cu=48
+        )
+
+    short_groups = groups([128])
+    long_groups = groups([6656])
+    assert short_groups == 1
+    assert long_groups == 8
+    assert short_groups < long_groups
+
+
+def test_rowscan_default_is_gated_to_calibrated_arch(monkeypatch):
+    from boltops.generic.triton.causal_conv1d import kernels
+
+    cuda = torch.device("cuda", 0)
+    cpu = torch.device("cpu")
+    monkeypatch.setattr(kernels, "get_arch", lambda device: "gfx946")
+    assert kernels._rowscan_default_enabled(cuda) is True
+    assert kernels._rowscan_default_enabled(cpu) is False
+    monkeypatch.setattr(kernels, "get_arch", lambda device: "gfx936")
+    assert kernels._rowscan_default_enabled(cuda) is False
+
+
 def test_causal_conv1d_package_has_compact_module_layout():
     """Routing helpers live in core; kernel variants live in kernels."""
     from boltops.generic.triton.causal_conv1d import kernels  # noqa: E402
@@ -79,7 +123,7 @@ def silu_if(x: torch.Tensor, activation: Union[str, bool, None]) -> torch.Tensor
     return F.silu(x) if activation in ("silu", "swish") else x
 
 
-def causal_conv1d_fn_torch(
+def _causal_conv1d_fn_torch_impl(
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: Optional[torch.Tensor],
@@ -129,7 +173,7 @@ def causal_conv1d_fn_torch(
     return out
 
 
-def causal_conv1d_update_torch(
+def _causal_conv1d_update_torch_impl(
     x: torch.Tensor,
     conv_state: torch.Tensor,
     weight: torch.Tensor,
@@ -159,6 +203,44 @@ def causal_conv1d_update_torch(
             F.conv1d(x_new.to(compute), w, b, groups=dim)[0], activation
         )
     return out
+
+
+def _to_cpu(obj):
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().cpu()
+    return obj
+
+
+# OneDNN depthwise conv1d degrades to ~12 s/call at the default ~192 host
+# threads (huge per-call sync overhead on these tiny [1, dim, 4] convs);
+# 8 threads run them in ~0.04 s. The oracle is correctness-only, cap it.
+_REF_CPU_THREADS = 8
+
+
+def _ref_on_cpu(fn, state_idx, *args, **kwargs):
+    """Run the oracle on CPU: gfx946 has no rocBLAS/Tensile library, so
+    F.conv1d on the device aborts the process. In-place state updates are
+    copied back so callers can compare device state against the oracle."""
+    cpu_args = [_to_cpu(a) for a in args]
+    cpu_kwargs = {k: _to_cpu(v) for k, v in kwargs.items()}
+    prev_threads = torch.get_num_threads()
+    torch.set_num_threads(min(prev_threads, _REF_CPU_THREADS))
+    try:
+        out = fn(*cpu_args, **cpu_kwargs)
+    finally:
+        torch.set_num_threads(prev_threads)
+    state = args[state_idx] if len(args) > state_idx else None
+    if isinstance(state, torch.Tensor) and state.is_cuda:
+        state.copy_(cpu_args[state_idx])
+    return out.to(args[0].device)
+
+
+def causal_conv1d_fn_torch(*args, **kwargs):
+    return _ref_on_cpu(_causal_conv1d_fn_torch_impl, 3, *args, **kwargs)
+
+
+def causal_conv1d_update_torch(*args, **kwargs):
+    return _ref_on_cpu(_causal_conv1d_update_torch_impl, 1, *args, **kwargs)
 
 
 def assert_close(
@@ -285,6 +367,10 @@ def _make_update_inputs(
     seqlen: int = 1,
     with_padding: bool = True,
 ):
+    assert batch <= num_slots, (
+        f"batch {batch} > num_slots {num_slots}: every sequence needs its own "
+        f"conv_state line; a shorter index tensor makes the kernels read OOB"
+    )
     torch.manual_seed(42)
     padding = 2 if with_padding else 0
     total = batch + padding
@@ -389,6 +475,26 @@ def _update_varlen_torch(
                  num_seqs=8, seqlen=2048, with_padding=False),
             id="k3-tp8-bf16x-fp32w-t16384",
         ),
+        # ---- shaobob0 network channel counts (BF16 x/weight, small T) ----
+        # Qwen3.5 35B-A3B (C=8192), 397B tp8 (C=12288) and tp8cp8 (C=1536).
+        pytest.param(
+            dict(dim=8192, width=4, x_dtype=torch.bfloat16,
+                 weight_dtype=torch.bfloat16, has_bias=False, activation="silu",
+                 num_seqs=2, seqlen=96, with_padding=False),
+            id="q35-c8192-bf16w-t192",
+        ),
+        pytest.param(
+            dict(dim=12288, width=4, x_dtype=torch.bfloat16,
+                 weight_dtype=torch.bfloat16, has_bias=False, activation="silu",
+                 num_seqs=2, seqlen=96, with_padding=False),
+            id="q397b-c12288-bf16w-t192",
+        ),
+        pytest.param(
+            dict(dim=1536, width=4, x_dtype=torch.bfloat16,
+                 weight_dtype=torch.bfloat16, has_bias=False, activation="silu",
+                 num_seqs=2, seqlen=96, with_padding=False),
+            id="q397b-cp8-c1536-bf16w-t192",
+        ),
         pytest.param(
             dict(dim=128, width=4, x_dtype=torch.float32,
                  weight_dtype=torch.float32, has_bias=True, activation="swish"),
@@ -431,6 +537,30 @@ def test_unified_fwd_matches_torch(case, backend):
     assert_close(conv_states[active], conv_states_ref[active], case["x_dtype"])
 
 
+@GPU_REQUIRED
+@pytest.mark.parametrize("has_init", [False, True], ids=["no-init", "init"])
+@pytest.mark.parametrize("rowscan", [True, False], ids=["rowscan", "vec8"])
+def test_short_sequences_state_writeback(has_init, rowscan):
+    """seq_len < 3: new state mixes the old state with the few new tokens."""
+    dim, lengths = 8192, [1, 2, 3, 5]
+    torch.manual_seed(7)
+    x = torch.randn(sum(lengths), dim, dtype=torch.bfloat16, device=DEVICE).t()
+    weight = torch.randn(dim, 4, dtype=torch.bfloat16, device=DEVICE)
+    pool = torch.randn(len(lengths), 3, dim, dtype=torch.bfloat16, device=DEVICE)
+    states = pool.transpose(-1, -2)
+    ref_states = states.clone()
+    qsl = torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()], dtype=torch.int32, device=DEVICE)
+    ci = torch.arange(len(lengths), dtype=torch.int32, device=DEVICE)
+    hi = torch.full((len(lengths),), has_init, dtype=torch.bool, device=DEVICE)
+    actual = causal_conv1d_fn(
+        x, weight, None, states, qsl, cache_indices=ci, has_initial_state=hi,
+        activation="silu", backend="sglang", seq_lens_cpu=lengths, rowscan=rowscan,
+    )
+    expected = causal_conv1d_fn_torch(x, weight, None, ref_states, qsl, ci, hi, "silu")
+    assert_close(actual, expected, torch.bfloat16)
+    assert_close(states, ref_states, torch.bfloat16)
+
+
 @pytest.mark.parametrize(
     "case",
     [
@@ -445,6 +575,19 @@ def test_unified_fwd_matches_torch(case, backend):
                  weight_dtype=torch.float32, has_bias=False, activation="silu",
                  batch=8, seqlen=5),
             id="k3-tp8-multi-token",
+        ),
+        # shaobob0 decode: q35 B=64/12 (C=8192); q397b 48 seqs x 4 MTP steps (C=6144).
+        pytest.param(
+            dict(dim=8192, width=4, x_dtype=torch.bfloat16,
+                 weight_dtype=torch.bfloat16, has_bias=False, activation="silu",
+                 batch=12, seqlen=1),
+            id="q35-decode-b12-c8192",
+        ),
+        pytest.param(
+            dict(dim=6144, width=4, x_dtype=torch.bfloat16,
+                 weight_dtype=torch.bfloat16, has_bias=False, activation="silu",
+                 batch=48, seqlen=4, num_slots=64),
+            id="q397b-mtp-b48x4-c6144",
         ),
         pytest.param(
             dict(dim=300, width=2, x_dtype=torch.float16,
@@ -767,11 +910,27 @@ BENCH_FWD_SHAPES = {
     "long-prefill": _BenchShape("long-prefill", DIM_PER_RANK, lengths=(4096,)),
     "full-model": _BenchShape("full-model", 12288, lengths=(4156,)),
 }
+# shaobob0 network shapes (gdn_conv1d_silu, BF16 x/weight). Prefill rows are
+# the Chunk/Remainder token counts; use -k to pick a subset
+# (the large ones are slow on the perf model).
+_NET = dict(weight_dtype=torch.bfloat16)
+BENCH_FWD_SHAPES.update({
+    "net-q35-c8192-t2048": _BenchShape("net-q35-c8192-t2048", 8192, lengths=(2048,), **_NET),
+    "net-q35-c8192-t2560": _BenchShape("net-q35-c8192-t2560", 8192, lengths=(2560,), **_NET),
+    "net-q35-c8192-t6656": _BenchShape("net-q35-c8192-t6656", 8192, lengths=(6656,), **_NET),
+    "net-q397b-c12288-t3584": _BenchShape("net-q397b-c12288-t3584", 12288, lengths=(3584,), **_NET),
+    "net-q397b-c12288-t6656": _BenchShape("net-q397b-c12288-t6656", 12288, lengths=(6656,), **_NET),
+    "net-q397b-cp8-c1536-t28672": _BenchShape("net-q397b-cp8-c1536-t28672", 1536, lengths=(28672,), **_NET),
+    "net-q397b-cp8-c1536-t53248": _BenchShape("net-q397b-cp8-c1536-t53248", 1536, lengths=(53248,), **_NET),
+})
 BENCH_UPDATE_SHAPES = {
     "decode-b1-measured": _BenchShape("decode-b1-measured", DIM_DECODE, batch=1, seqlen=1),
     "decode-b8": _BenchShape("decode-b8", DIM_DECODE, batch=8, seqlen=1),
     "decode-b32-max": _BenchShape("decode-b32-max", DIM_DECODE, batch=MAX_DECODE_BATCH, seqlen=1),
     "decode-multi-token": _BenchShape("decode-multi-token", DIM_DECODE, batch=8, seqlen=5),
+    "net-q35-decode-b12": _BenchShape("net-q35-decode-b12", 8192, batch=12, seqlen=1, **_NET),
+    "net-q35-decode-b64": _BenchShape("net-q35-decode-b64", 8192, batch=64, seqlen=1, **_NET),
+    "net-q397b-mtp-b48x4": _BenchShape("net-q397b-mtp-b48x4", 6144, batch=48, seqlen=4, **_NET),
 }
 
 

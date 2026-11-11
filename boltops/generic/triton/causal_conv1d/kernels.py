@@ -20,7 +20,30 @@ import torch
 import triton
 import triton.language as tl
 
+from boltops.utility.arch_info import get_arch, get_num_sms
+
 from .core import PAD_SLOT_ID, is_arch_support_pdl
+
+
+@triton.jit
+def _store_new_conv_state(
+    x_ptr, conv_states_base, sequence_start_index, seq_len,
+    idx_feats, mask_feats, use_init,
+    stride_x_token, stride_x_dim, stride_istate_token,
+):
+    """New state = last 3 rows of concat(initial state or zeros, x).
+
+    Rows before the sequence start (seq_len < 3) come from the old state when
+    ``use_init``; the read row (3 + t > j) is always ahead of the row j being
+    written, so the in-place update is safe.
+    """
+    for j in tl.static_range(3):
+        t = seq_len - 3 + j
+        src = tl.load(x_ptr + (sequence_start_index + t) * stride_x_token + idx_feats * stride_x_dim,
+                      mask=mask_feats & (t >= 0), other=0.0)
+        prev = tl.load(conv_states_base + (3 + t) * stride_istate_token,
+                       mask=mask_feats & (t < 0) & use_init, other=0.0)
+        tl.store(conv_states_base + j * stride_istate_token, tl.where(t >= 0, src, prev), mask=mask_feats)
 
 
 @triton.jit()
@@ -387,6 +410,71 @@ def _sglang_causal_conv1d_fwd_kernel(  # continuous batching
         tl.store(o_ptrs, acc, mask=mask_1d)
 
 
+# Static (gfx946 ISA) occupancy and max outstanding dwordx4 loads per wave,
+# from the compiled kernels: rowscan 135 VGPRs -> 3 waves/SIMD, 6 loads in
+# flight; vec8 (num_warps=4) 60-65 VGPRs -> 7-8 waves/SIMD, 3 loads in flight
+# with CHUNKS=1 and 4 with CHUNKS>=2.
+_ROWSCAN_WAVES_PER_SIMD, _ROWSCAN_LOADS_PER_WAVE = 3, 6
+_VEC8_WAVES_PER_SIMD, _VEC8_WARPS = 7, 4
+# Device-wide outstanding wave-loads per SIMD at which rowscan's 4x fewer L2
+# requests win: anchored on the one PMD point (T=6656, C=8192: rowscan with
+# 5 waves/SIMD x 1 load in flight already beat vec8 by 1.42x). Recalibrate on
+# silicon.
+_ROWSCAN_SATURATION_PER_SIMD = 5
+
+
+# The constants above are measured on gfx946; other architectures keep vec8
+# unless the caller passes ``rowscan=True`` explicitly.
+_ROWSCAN_DEFAULT_ARCHS = ("gfx946",)
+
+
+def _rowscan_default_enabled(device) -> bool:
+    return device.type == "cuda" and get_arch(device) in _ROWSCAN_DEFAULT_ARCHS
+
+
+def _flush_denorm_options(device) -> dict:
+    """Launch options that let the SiLU exp skip its denormal-range fixups.
+
+    conv1d is VALU-bound on gfx946 (vector unit ~85-94% busy in the model), and
+    the default exp lowering adds a compare+select+scale pair per element to
+    keep denormal results exact. Flushing them is numerically irrelevant here
+    (the denormal region of exp(-x) only multiplies values that already
+    underflow after the division) and removes ~29% of the loop's VALU work.
+    """
+    if device.type == "cuda" and get_arch(device) in _ROWSCAN_DEFAULT_ARCHS:
+        return {"allow_flush_denorm": True}
+    return {}
+
+
+def _select_rowscan_groups(seq_lens_cpu, dim, vec8_chunks, rows, block_n, warps, num_cu):
+    """Return the rowscan GROUPS (token tile = rows * GROUPS), or 0 for vec8.
+
+    Both kernels are latency-bound until enough loads are outstanding, so the
+    choice compares estimated device-wide loads in flight (resident waves x
+    loads per wave). rowscan is chosen once it saturates, or whenever it keeps
+    at least as many loads in flight as vec8.
+    """
+    if num_cu <= 0:
+        return 8
+    simds = 4 * num_cu
+    max_seq_len = max(seq_lens_cpu)
+    n_seq = len(seq_lens_cpu)
+
+    def in_flight(waves, waves_per_simd, loads):
+        return min(waves, simds * waves_per_simd) * loads
+
+    v8_waves = n_seq * triton.cdiv(triton.cdiv(max_seq_len, 8), vec8_chunks) * triton.cdiv(dim, 256) * _VEC8_WARPS
+    v8 = in_flight(v8_waves, _VEC8_WAVES_PER_SIMD, 4 if vec8_chunks >= 2 else 3)
+    target = min(v8, simds * _ROWSCAN_SATURATION_PER_SIMD)
+    # Prefer long token tiles (3-row halo = ~5% extra reads at GROUPS=8) and
+    # shrink them only while that raises parallelism enough to matter.
+    for groups in (8, 4, 2, 1):
+        waves = n_seq * triton.cdiv(max_seq_len, rows * groups) * triton.cdiv(dim, block_n) * warps
+        if in_flight(waves, _ROWSCAN_WAVES_PER_SIMD, _ROWSCAN_LOADS_PER_WAVE) >= target:
+            return groups
+    return 0
+
+
 def causal_conv1d_fn_sglang(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -543,7 +631,67 @@ def causal_conv1d_fn_sglang(
     # provides tl.fdiv_fast (HCU fork, commit 51c0a1d2b). Stock Triton lacks
     # it, so the knob falls back to the precise `/` division there.
     silu_fast = kwargs.get("silu_fast", hasattr(tl, "fdiv_fast"))
-    if use_vec8:
+    rs_warps = kwargs.get("rowscan_warps", 1)
+    rs_block_n = 8 * 64 * rs_warps  # one dwordx4 (8 x bf16) per lane
+    rs_rows = 8
+    rs_groups = kwargs.get("rowscan_groups", 0)
+    use_rowscan = (
+        use_vec8 and kwargs.get("rowscan", _rowscan_default_enabled(x.device))
+        and x.stride(0) == 1 and out.stride(-2) == 1
+    )
+    if use_rowscan and rs_groups == 0:
+        rs_groups = _select_rowscan_groups(
+            seq_lens_cpu, dim, chunks, rs_rows, rs_block_n, rs_warps,
+            get_num_sms(x.device) if x.is_cuda else 0,
+        )
+        use_rowscan = rs_groups > 0
+    if use_rowscan:
+        def rs_grid(META):
+            return (
+                len(seq_lens_cpu),
+                triton.cdiv(max(seq_lens_cpu), rs_rows * rs_groups),
+                triton.cdiv(dim, rs_block_n),
+            )
+
+        _sglang_causal_conv1d_fwd_kernel_rowscan[rs_grid](
+            x,
+            weight,
+            bias,
+            conv_states,
+            cache_indices,
+            has_initial_state,
+            query_start_loc,
+            out,
+            dim,
+            cu_seqlen,
+            num_cache_lines,
+            stride_x_seq,
+            stride_x_dim,
+            stride_x_token,
+            stride_w_dim,
+            stride_w_width,
+            stride_istate_seq,
+            stride_istate_dim,
+            stride_istate_token,
+            stride_o_seq,
+            stride_o_dim,
+            stride_o_token,
+            pad_slot_id,
+            HAS_BIAS=bias is not None,
+            KERNEL_WIDTH=width,
+            SILU_ACTIVATION=activation in ["silu", "swish"],
+            HAS_INITIAL_STATES=has_initial_state is not None,
+            HAS_CACHE=conv_states is not None,
+            IS_CONTINUOUS_BATCHING=cache_indices is not None,
+            USE_PAD_SLOT=pad_slot_id is not None,
+            BLOCK_N=rs_block_n,
+            ROWS=rs_rows,
+            GROUPS=rs_groups,
+            SILU_FAST=silu_fast,
+            num_warps=rs_warps,
+            **_flush_denorm_options(x.device),
+        )
+    elif use_vec8:
         # 8-token tile sibling: dwordx4 vectorized load/store (see above).
         _sglang_causal_conv1d_fwd_kernel_vec8[grid](
             x,
@@ -583,6 +731,7 @@ def causal_conv1d_fn_sglang(
             SILU_FAST=silu_fast,
             CHUNKS=chunks,
             num_warps=4,
+            **_flush_denorm_options(x.device),
         )
     else:
         _sglang_causal_conv1d_fwd_kernel[grid](
@@ -687,6 +836,10 @@ def _sglang_causal_conv1d_fwd_kernel_vec8(
     w_col2 = tl.load(w_ptr + idx_feats * stride_w_dim + 2 * stride_w_width, mask=mask_feats, other=0.0)
     w_col3 = tl.load(w_ptr + idx_feats * stride_w_dim + 3 * stride_w_width, mask=mask_feats, other=0.0)
 
+    load_init_state = False
+    if HAS_INITIAL_STATES:
+        load_init_state = tl.load(has_initial_states_ptr + idx_seq).to(tl.int1)
+
     feat_off = idx_feats[:, None] * stride_x_dim  # [BLOCK_N, 1]
     m_x = mask_feats[:, None]  # [BLOCK_N, 1]
 
@@ -701,9 +854,6 @@ def _sglang_causal_conv1d_fwd_kernel_vec8(
             tok_off = (base_tok + tt)[None, :]  # [1, BLOCK_T]
 
             if chunk_offset == 0:
-                load_init_state = False
-                if HAS_INITIAL_STATES:
-                    load_init_state = tl.load(has_initial_states_ptr + idx_seq).to(tl.int1)
                 s0 = tl.zeros((BLOCK_N,), dtype=x_ptr.dtype.element_ty)
                 s1 = tl.zeros((BLOCK_N,), dtype=x_ptr.dtype.element_ty)
                 s2 = tl.zeros((BLOCK_N,), dtype=x_ptr.dtype.element_ty)
@@ -760,15 +910,133 @@ def _sglang_causal_conv1d_fwd_kernel_vec8(
             )
 
             if chunk_offset == 0 and HAS_CACHE:
-                src0 = tl.load(x_ptr + (sequence_start_index + seq_len - 3) * stride_x_token + idx_feats * stride_x_dim,
-                               mask=mask_feats, other=0.0)
-                tl.store(conv_states_base + 0 * stride_istate_token, src0, mask=mask_feats)
-                src1 = tl.load(x_ptr + (sequence_start_index + seq_len - 2) * stride_x_token + idx_feats * stride_x_dim,
-                               mask=mask_feats, other=0.0)
-                tl.store(conv_states_base + 1 * stride_istate_token, src1, mask=mask_feats)
-                src2 = tl.load(x_ptr + (sequence_start_index + seq_len - 1) * stride_x_token + idx_feats * stride_x_dim,
-                               mask=mask_feats, other=0.0)
-                tl.store(conv_states_base + 2 * stride_istate_token, src2, mask=mask_feats)
+                _store_new_conv_state(
+                    x_ptr, conv_states_base, sequence_start_index, seq_len,
+                    idx_feats, mask_feats, load_init_state,
+                    stride_x_token, stride_x_dim, stride_istate_token,
+                )
+
+
+# ---------------------------------------------------------------------------
+# rowscan sibling: channel-last, width=4 load-once kernel.
+# vec8 issues 4 shifted [BLOCK_N, 8] tile loads per 8 output rows (4x L2
+# requests) and, on gfx946, round-trips the broadcast weight columns through
+# LDS in every chunk. Here every tensor is 1-D over features, so there is no
+# layout conversion, and each program walks T_TILE consecutive tokens keeping
+# the 3 previous rows as loop-carried registers: one dwordx4 load and one
+# dwordx4 store per output row, plus a 3-row halo per program.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit()
+def _sglang_causal_conv1d_fwd_kernel_rowscan(
+    x_ptr, w_ptr, bias_ptr, initial_states_ptr, cache_indices_ptr,
+    has_initial_states_ptr, query_start_loc_ptr, o_ptr,
+    dim: tl.constexpr, seqlen: tl.int32, num_cache_lines: tl.constexpr,
+    stride_x_seq: tl.constexpr, stride_x_dim: tl.constexpr, stride_x_token: tl.constexpr,
+    stride_w_dim: tl.constexpr, stride_w_width: tl.constexpr,
+    stride_istate_seq: tl.constexpr, stride_istate_dim: tl.constexpr, stride_istate_token: tl.constexpr,
+    stride_o_seq: tl.constexpr, stride_o_dim: tl.constexpr, stride_o_token: tl.constexpr,
+    pad_slot_id: tl.constexpr,
+    HAS_BIAS: tl.constexpr, KERNEL_WIDTH: tl.constexpr, SILU_ACTIVATION: tl.constexpr,
+    HAS_INITIAL_STATES: tl.constexpr, HAS_CACHE: tl.constexpr,
+    IS_CONTINUOUS_BATCHING: tl.constexpr, USE_PAD_SLOT: tl.constexpr,
+    BLOCK_N: tl.constexpr, ROWS: tl.constexpr, GROUPS: tl.constexpr,
+    SILU_FAST: tl.constexpr,
+):
+    T_TILE: tl.constexpr = ROWS * GROUPS
+    idx_seq = tl.program_id(0)
+    tile = tl.program_id(1)
+    idx_feats = tl.program_id(2) * BLOCK_N + tl.arange(0, BLOCK_N)  # [BLOCK_N]
+    mask_feats = idx_feats < dim
+
+    if idx_seq == pad_slot_id:
+        return
+    sequence_start_index = tl.load(query_start_loc_ptr + idx_seq)
+    sequence_end_index = tl.load(query_start_loc_ptr + idx_seq + 1)
+    seq_len = sequence_end_index - sequence_start_index
+    token_offset = tile * T_TILE
+    if token_offset >= seq_len:
+        return
+
+    if IS_CONTINUOUS_BATCHING:
+        conv_state_batch_coord = tl.load(cache_indices_ptr + idx_seq).to(tl.int64)
+    else:
+        conv_state_batch_coord = idx_seq
+    if USE_PAD_SLOT:
+        if conv_state_batch_coord == pad_slot_id:
+            return
+
+    conv_states_base = (
+        initial_states_ptr + conv_state_batch_coord * stride_istate_seq
+        + idx_feats * stride_istate_dim
+    )
+    # One [BLOCK_N, 4] tile load (a dwordx2 per channel when w is row-major)
+    # instead of four strided per-column scalar loads, split into columns.
+    w_tile = tl.load(
+        w_ptr + idx_feats[:, None] * stride_w_dim + tl.arange(0, 4)[None, :] * stride_w_width,
+        mask=mask_feats[:, None], other=0.0,
+    ).to(tl.float32)
+    w02, w13 = tl.split(tl.reshape(w_tile, (BLOCK_N, 2, 2)))
+    w0, w2 = tl.split(w02)
+    w1, w3 = tl.split(w13)
+    if HAS_BIAS:
+        bias = tl.load(bias_ptr + idx_feats, mask=mask_feats, other=0.0).to(tl.float32)
+    else:
+        bias = tl.zeros((BLOCK_N,), dtype=tl.float32)
+
+    x_base = x_ptr + idx_feats * stride_x_dim  # [BLOCK_N]
+    o_base = o_ptr + idx_feats * stride_o_dim
+    base_tok = sequence_start_index + token_offset
+
+    # h0/h1/h2 = x[t-3], x[t-2], x[t-1]; before the sequence they come from state.
+    if tile == 0:
+        h0 = tl.zeros((BLOCK_N,), dtype=tl.float32)
+        h1 = tl.zeros((BLOCK_N,), dtype=tl.float32)
+        h2 = tl.zeros((BLOCK_N,), dtype=tl.float32)
+        if HAS_INITIAL_STATES:
+            if tl.load(has_initial_states_ptr + idx_seq).to(tl.int1):
+                h0 = tl.load(conv_states_base + 0 * stride_istate_token, mask=mask_feats, other=0.0).to(tl.float32)
+                h1 = tl.load(conv_states_base + 1 * stride_istate_token, mask=mask_feats, other=0.0).to(tl.float32)
+                h2 = tl.load(conv_states_base + 2 * stride_istate_token, mask=mask_feats, other=0.0).to(tl.float32)
+    else:
+        h0 = tl.load(x_base + (base_tok - 3) * stride_x_token, mask=mask_feats, other=0.0).to(tl.float32)
+        h1 = tl.load(x_base + (base_tok - 2) * stride_x_token, mask=mask_feats, other=0.0).to(tl.float32)
+        h2 = tl.load(x_base + (base_tok - 1) * stride_x_token, mask=mask_feats, other=0.0).to(tl.float32)
+
+    for g in range(GROUPS):
+        # Issue all ROWS row loads before the first store: a store between two
+        # loads keeps the compiler from hoisting the later load (x and o may
+        # alias), which would leave one load in flight per wave.
+        rows = ()
+        for r in tl.static_range(ROWS):
+            tok = base_tok + g * ROWS + r
+            m = mask_feats & (tok < sequence_end_index)
+            rows = rows + (tl.load(x_base + tok * stride_x_token, mask=m, other=0.0),)
+        for r in tl.static_range(ROWS):
+            tok = base_tok + g * ROWS + r
+            m = mask_feats & (tok < sequence_end_index)
+            xr = rows[r].to(tl.float32)
+            acc = bias + h0 * w0 + h1 * w1 + h2 * w2 + xr * w3
+            if SILU_ACTIVATION:
+                if SILU_FAST:
+                    acc = tl.fdiv_fast(acc, 1 + tl.exp(-acc))
+                else:
+                    acc = acc / (1 + tl.exp(-acc))
+            tl.store(o_base + tok * stride_o_token, acc.to(o_ptr.dtype.element_ty), mask=m)
+            h0 = h1
+            h1 = h2
+            h2 = xr
+
+    if tile == 0 and HAS_CACHE:
+        use_init = False
+        if HAS_INITIAL_STATES:
+            use_init = tl.load(has_initial_states_ptr + idx_seq).to(tl.int1)
+        _store_new_conv_state(
+            x_ptr, conv_states_base, sequence_start_index, seq_len,
+            idx_feats, mask_feats, use_init,
+            stride_x_token, stride_x_dim, stride_istate_token,
+        )
 
 
 # HAS_EAGLE_TREE_CUSTOM_ATTN_MASK is added to support eagle tree attention mask
@@ -2383,6 +2651,7 @@ def causal_conv1d_fn_vllm(
             SILU_FAST=silu_fast,
             CHUNKS=chunks,
             num_warps=4,
+            **_flush_denorm_options(x.device),
         )
     else:
         _vllm_causal_conv1d_fwd_kernel[grid](
