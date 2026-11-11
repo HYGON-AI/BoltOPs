@@ -435,7 +435,7 @@ from boltops.fla.gdn import chunk_fwd_o
   `inplace_final_state=True`，此时必须提供 FP32 `initial_state`，并按
   `initial_state_indices` 原地写回和返回同一 tensor
 - 默认使用 WASP：无 `cu_seqlens`，或单段 `cu_seqlens=[0,T]`，走 fixed；多段走 varlen（空序列仍计为一段）
-- fixed 支持任意 `T>0`，默认 BV32，可选 BV64（要求 V 能被 BV 整除）
+- fixed 支持任意 `T>0`，统一使用 state 在寄存器内转换的新 WASP 实现，默认 BV64，可显式指定 BV32（要求 V 能被 BV 整除；V 仅能被 32 整除时需指定 BV32）
 - 多段 varlen 要求 packed B=1、V=128，默认 BV128，可选 BV32/BV64；支持短序列与 tail
 - varlen 始终使用 vector state I/O，不再接受 `state_io` 配置项
 - 单段 cu 转 fixed 会读取并验证 `[0,T]` 边界，产生一次主机同步；直接 fixed 调用无需传 cu
@@ -535,20 +535,22 @@ PYTHONPATH=.:${AITER_ROOT} TILELANG_CACHE_DIR=./cache pytest -q -s \
 
 ### Chunk-h fixed / varlen（gfx938，2026-11-11）
 
-`gfx938，B=1，K=V=128，BT64，BF16，WASP，AITER auto；7轮中位数，state重置不计时。`
+`gfx938，B=1，K=V=128，BT64，BF16，state 重置不计时。`
+
+fixed 为新 WASP BV64，5 轮中位数；AITER auto 为此前 7 轮参考值，本轮未重测。varlen 保留此前双方 7 轮中位数。
 
 | 路径 | T / lengths | H / Hg | BV | TileLang ms | AITER ms | 有效带宽 GB/s（TileLang / AITER） | TileLang 耗时降低 |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| fixed | 2048 | 32 / 16 | 32 | 0.14440 | 0.15448 | 669.88 / 626.17 | 6.52% |
-| fixed | 3560 | 32 / 16 | 32 | 0.24544 | 0.25584 | 674.07 / 646.66 | 4.07% |
-| fixed | 6656 | 32 / 16 | 32 | 0.41840 | 0.45712 | 728.82 / 667.09 | 8.47% |
-| fixed | 6656 | 32 / 16 | 64 | 0.39728 | 0.45712 | 767.57 / 667.09 | 13.09% |
-| fixed | 13312 | 32 / 16 | 32 | 0.80832 | 0.89560 | 749.31 / 676.29 | 9.75% |
+| fixed | 2048 | 32 / 16 | 64 | 0.12576 | 0.15448 | 769.17 / 626.17 | 18.59% |
+| fixed | 3560 | 32 / 16 | 64 | 0.21560 | 0.25584 | 767.36 / 646.66 | 15.73% |
+| fixed | 6656 | 32 / 16 | 64 | 0.37264 | 0.45712 | 818.32 / 667.09 | 18.48% |
+| fixed | 13312 | 32 / 16 | 64 | 0.73288 | 0.89560 | 826.44 / 676.29 | 18.17% |
 | varlen | [2048, 2048, 2560] | 32 / 16 | 128 | 0.32144 | 0.37120 | 974.76 / 844.09 | 13.41% |
 | varlen | [5461, 5461, 5462] | 32 / 16 | 128 | 0.74056 | 0.85008 | 1019.46 / 888.12 | 12.88% |
-| fixed | 13312 | 16 / 16 | 32 | 0.43632 | 0.62544 | 756.57 / 527.80 | 30.24% |
 
 有效带宽按算法输入/输出字节数 ÷ 耗时计算（GB/s，十进制）；包含 K/W/U/g、h/v_new、initial/final state，h 按各序列实际 chunk 数计，不计 state 清零。
+
+fixed 数据：`tilelang/perf/gdn/fixed_state_alt2_20261111_side/doc_complete_performance.json`（2048、6656）及 `fixed_unified_one_flag/performance.json`（3560、H32/13312）。
 
 ### `chunk_fwd_o`
 
