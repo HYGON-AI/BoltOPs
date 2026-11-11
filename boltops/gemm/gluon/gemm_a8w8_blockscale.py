@@ -16,12 +16,11 @@ from triton.experimental.gluon.language.amd.hcu import (
     matrix_load,
     matrix_store,
     MmacInterleave2Layout,
-    get_lds_slice_address,
     get_wave_id,
     set_priority,
     wait_lgkmcnt,
     abarrier_init,
-    abarrier_wait,
+    abarrier_try_wait,
     abarrier_seq,
     abarrier_arrive,
     ebarrier_arrive,
@@ -100,18 +99,18 @@ def _produce_ab_and_scales(
         slot = i % 2
         if GROUP == 0:
             if i >= 2:
-                abarrier_wait(slot * 2, ((i // 2) - 1) % 2)
+                abarrier_try_wait(slot * 2, ((i // 2) - 1) % 2)
             abarrier_seq(slot * 2 + 1)
             matrix_load(smA, A, (64, K), (K, 1), (0, i * 128), pred=wave % 4 == 0)
             abarrier_arrive(slot * 2 + 1)
             if i >= 2:
-                abarrier_wait(8 + slot * 4, ((i // 2) - 1) % 2)
+                abarrier_try_wait(8 + slot * 4, ((i // 2) - 1) % 2)
             abarrier_seq(9 + slot * 4)
             matrix_load(smB, B, (K, 256), (1, K), (i * 128, 0))
             abarrier_arrive(9 + slot * 4)
         else:
             if i >= 2:
-                abarrier_wait(6 + slot * 4, ((i // 2) - 1) % 2)
+                abarrier_try_wait(6 + slot * 4, ((i // 2) - 1) % 2)
             abarrier_seq(7 + slot * 4)
             matrix_load(
                 smA, A + 64 * K, (64, K), (K, 1), (0, i * 128), pred=wave % 4 == 0
@@ -121,7 +120,7 @@ def _produce_ab_and_scales(
             bi = gl.arange(0, 2, layout=SL)
             async_copy.buffer_load_to_shared(smBS.index(i), BS, bi * (K // 128) + i)
             abarrier_arrive(7 + slot * 4)
-            abarrier_wait(14, i % 2)
+            abarrier_try_wait(14, i % 2)
 
 
 @g.jit
@@ -133,20 +132,20 @@ def _wait_ab_reads_and_raise_priority():
 @g.jit
 def _wait_a_tile_ready(i, GROUP: gl.constexpr):
     if GROUP == 0:
-        abarrier_wait((i % 2) * 2 + 1, (i // 2) % 2)
+        abarrier_try_wait((i % 2) * 2 + 1, (i // 2) % 2)
     else:
-        abarrier_wait(7 + (i % 2) * 4, (i // 2) % 2)
+        abarrier_try_wait(7 + (i % 2) * 4, (i // 2) % 2)
 
 
 @g.jit
 def _wait_b_tile_ready(i):
-    abarrier_wait(9 + (i % 2) * 4, (i // 2) % 2)
+    abarrier_try_wait(9 + (i % 2) * 4, (i // 2) % 2)
 
 
 @g.jit
 def _ack_scale_tile_ready(i, GROUP: gl.constexpr):
     if GROUP == 0:
-        abarrier_wait(7 + (i % 2) * 4, (i // 2) % 2)
+        abarrier_try_wait(7 + (i % 2) * 4, (i // 2) % 2)
     # ACK means readiness observed, not completion of pending LDS reads.
     # Scale slices are immutable; the producer writes the following distinct slice.
     # TODO: use abarrier_arrive(14, 1) once LLVM supports this readiness-only
@@ -184,11 +183,11 @@ def _prefetch_scale_tile(
     GROUP: gl.constexpr,
     F: gl.constexpr,
 ):
-    base = get_lds_slice_address(smAS0.index(i)) + GROUP * 256
-    base = base + lane_m_byte
-    sa = gl.load(base.to(gl.uint64).to(gl.pointer_type(gl.float32, 3)) + (m // 4) * 4)
-    bp = get_lds_slice_address(smBS.index(i))
-    sb = gl.load(bp.to(gl.uint64).to(gl.pointer_type(gl.uint64, 3)))
+    # release/3.6.x exposes descriptor loads; the reference's raw LDS
+    # slice pointer API is not present in this release branch.
+    sa = smAS0.index(i).slice(GROUP * 64, 64).load(gl.SliceLayout(1, F))
+    bits = smBS.index(i)._reinterpret(gl.uint64, (1,), gl.SwizzledSharedLayout(1, 1, 1, [0]))
+    sb = bits.load(gl.BlockedLayout([1], [64], [4], [0])).reshape(())
     return sa, sb
 
 
