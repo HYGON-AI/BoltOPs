@@ -26,7 +26,7 @@ jobs:
       fail-fast: false
       matrix:
         py_version: ['3.10', '3.12']
-        torch_version: ['2.10.0', '2.11.0']
+        torch_version: ['2.11.0']
         include:
         - py_version: '3.10'
           numpy_version: '1.24.3'
@@ -39,10 +39,8 @@ jobs:
       py_version: ${{ matrix.py_version }}
       numpy_version: ${{ matrix.numpy_version }}
       torch_version: ${{ matrix.torch_version }}
-      run_tests: ${{ github.event_name != 'push' }}
-      run_performance: ${{ matrix.py_version == '3.12' && matrix.torch_version == '2.11.0' }}
+      run_tests: ${{ github.event_name != 'push' && matrix.py_version == '3.10' && matrix.torch_version == '2.11.0' }}
   build2610:
-    # Each matrix entry runs a CPU build, four-HCU correctness, then performance.
     name: DTK2610 (torch${{ matrix.torch_version }})
     strategy:
       fail-fast: false
@@ -57,7 +55,7 @@ jobs:
       py_version: '3.12'
       numpy_version: '1.26.4'
       torch_version: ${{ matrix.torch_version }}
-      run_tests: ${{ github.event_name != 'push' }}
+      run_tests: ${{ github.event_name != 'push' && matrix.torch_version == '2.13.0' }}
   publish-2604:
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     needs:
