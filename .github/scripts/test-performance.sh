@@ -7,18 +7,14 @@ wheels=("${WHEEL_OUTPUT}"/*.whl)
 test "${#wheels[@]}" -eq 1
 python -m pip install --force-reinstall --no-deps "${wheels[0]}"
 git checkout -B "${OPTEST_RUN_BRANCH}"
-HIP_VISIBLE_DEVICES=$(CIsmi need 1 --timeout "${CISMI_TIMEOUT}")
-test -n "${HIP_VISIBLE_DEVICES}"
-export HIP_VISIBLE_DEVICES
-echo "Allocated performance HCU: ${HIP_VISIBLE_DEVICES}"
 
 touch "${CI_WORK_DIR}/optest-start"
 # Performance only: the accuracy suite still has pre-existing
 # failures (see test/mqa_logits, test/qsa) that would gate every
 # MR, so acc is not run by this job. --gpus pins the run to the
-# HCU reserved by CIsmi above.
+# logical HCU allocated by ARC; the workflow sets BOLTOPS_TEST_GPU=0.
 optest_rc=0
-optest --op_name boltops --test_mode per --gpus "${HIP_VISIBLE_DEVICES}" \
+optest --op_name boltops --test_mode per --gpus "${BOLTOPS_TEST_GPU}" \
   --test_dir "${CI_PROJECT_DIR}" || optest_rc=$?
 
 artifact_dir="${CI_PROJECT_DIR}/optest_artifacts/${RUNNER_TAG}/dtk${DTK_VER}/py${PYTHON_VERSION}/torch${TORCH_VERSION}"
