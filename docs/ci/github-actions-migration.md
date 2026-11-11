@@ -4,9 +4,9 @@
 
 ## 1. 先理解整体流程
 
-PR 到 main 和手动运行时，`build2604` 的四组环境和 `build2610` 的两组环境都在 `hygon-build` 构建 wheel，再到 `hygon-bw1100-4card` 运行正确性测试。DTK26.04 的 Python3.12 + Torch2.11.0 组合与 DTK26.10 的两组组合在 `hygon-bw1100-1card` 下载 wheel 并运行性能测试。性能 job 通过共享 concurrency group 串行执行。`ci-result` 在 `hygon-cpu` 汇总两个 DTK 的构建和测试结果。
+PR 到 main 和手动运行时，`build2604` 和 `build2610` 各自的两组环境都在 `hygon-build` 构建 wheel，再到 `hygon-bw1100-4card` 运行正确性测试。DTK26.04 的 Python3.12 + Torch2.11.0 组合与 DTK26.10 的两组组合在 `hygon-bw1100-1card` 下载 wheel 并运行性能测试。性能 job 通过共享 concurrency group 串行执行。`ci-result` 在 `hygon-cpu` 汇总两个 DTK 的构建和测试结果。
 
-push 到 main 时构建并修复六组 wheel，各 DTK 的构建成功后，由 `publish-2604` 和 `publish-2610` 在 `hygon-build` 分别发布。正确性和性能测试在 PR 或手动运行时执行。
+push 到 main 时构建并修复四组 wheel，各 DTK 的构建成功后，由 `publish-2604` 和 `publish-2610` 在 `hygon-build` 分别发布。正确性和性能测试在 PR 或手动运行时执行。
 
 ## 2. 文件怎么写、怎么看
 
@@ -27,7 +27,7 @@ push 到 main 时构建并修复六组 wheel，各 DTK 的构建成功后，由 
 
 PR checkout 采用 github.sha（GitHub 生成的 PR 合并提交），所有矩阵与性能任务使用同一个 SHA，包含目标分支集成结果。push 则验证实际提交。无需像 GitLab 那样在每个 job 临时 merge main。
 
-DTK26.04 构建 Python3.10 / NumPy1.24.3 与 Python3.12 / NumPy1.26.4，分别搭配 Torch2.10.0 和 Torch2.11.0。DTK26.10 构建 Python3.12 / NumPy1.26.4，搭配 Torch2.11.0 和 Torch2.13.0。环境准备阶段校验 HCU Torch 版本以及 Triton、TileLang 的 DTK 和 Torch 标签。
+DTK26.04 构建 Python3.10 / NumPy1.24.3 与 Python3.12 / NumPy1.26.4，两组都搭配 Torch2.11.0。DTK26.10 构建 Python3.12 / NumPy1.26.4，搭配 Torch2.11.0 和 Torch2.13.0。环境准备阶段校验 HCU Torch 版本以及 Triton、TileLang 的 DTK 和 Torch 标签。
 
 统一入口为`.github/scripts/_build_hcu_wheel.sh`，旧 `build_wheel.sh` 转发到新入口；GitLab 与 GitHub CI 都调用同一脚本。环境需预先准备，入口不隐式安装工具。检查通过后输出 wheel，测试和发布使用同一构建路径。
 
