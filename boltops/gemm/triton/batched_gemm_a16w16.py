@@ -52,7 +52,7 @@ def _batched_gemm_a16w16_kernel(
     GROUP_SIZE_M: tl.constexpr,
     EVEN_K: tl.constexpr,
     GRID_MN: tl.constexpr,
-    BATCH_LAST_GRID: tl.constexpr,
+    BATCH_LAST_GRID: tl.constexpr = False,
 ):
     """Batched matmul ``C[i] = A[i] @ B[i]`` (+ optional bias). Not for direct use."""
 
