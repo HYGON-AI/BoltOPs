@@ -1,0 +1,15 @@
+{
+  "config": {
+    "default": {
+      "BV": 32,
+      "num_warps": 8,
+      "num_stages": 2
+    },
+    "K=128,V=128,BT=64,H=32": {
+      "BV": 32,
+      "BK": 128,
+      "num_warps": 4,
+      "num_stages": 1
+    }
+  }
+}
