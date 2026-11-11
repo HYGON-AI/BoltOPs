@@ -4,17 +4,17 @@
 
 ## 1. 先理解整体流程
 
-PR 到 main：已有 Quality Gate 并行检查；build2610 使用 DTK26.10、Python3.12，分别构建 Torch2.11.0 和 Torch2.13.0 的 wheel。每组先在 hygon-build 的 CPU Pod 构建，再传递 wheel 到 hygon-bw1100-4card 的正确性测试 Pod，通过后由同一工作流中的 performance job 在单卡池 hygon-bw1100-1card 的 Pod 中下载同一个 wheel 并运行性能测试。不同版本的链路独立，只有性能 job 使用共享 concurrency group 串行执行。ci-result 在 hygon-cpu 上要求两组链路均成功。DTK26.04 的构建与发布已移除。
+PR 到 main 和手动运行时，`build2604` 的四组环境和 `build2610` 的两组环境都在 `hygon-build` 构建 wheel，再到 `hygon-bw1100-4card` 运行正确性测试。DTK26.04 的 Python3.12 + Torch2.11.0 组合与 DTK26.10 的两组组合在 `hygon-bw1100-1card` 下载 wheel 并运行性能测试。性能 job 通过共享 concurrency group 串行执行。`ci-result` 在 `hygon-cpu` 汇总两个 DTK 的构建和测试结果。
 
-push 到 main：只构建和修复 wheel，不再运行正确性或性能测试。DTK26.10 的 Torch2.11.0、2.13.0 两组均构建成功后在 hygon-build 的 CPU 作业容器中统一发布。PR 阶段完成正确性与性能测试，合入后不重复测试。workflow_dispatch 运行构建、正确性与性能测试，仅验证、不发布。Actions 不执行 GitLab → GitHub 镜像任务。此次版本调整只修改 GitHub CI，旧 GitLab CI 仍需按正式切换步骤停用。
+push 到 main 时构建并修复六组 wheel，各 DTK 的构建成功后，由 `publish-2604` 和 `publish-2610` 在 `hygon-build` 分别发布。正确性和性能测试在 PR 或手动运行时执行。
 
 ## 2. 文件怎么写、怎么看
 
 | 文件 | 职责 |
 |---|---|
 | .github/workflows/ci.yml | 事件、矩阵、依赖 needs、制品传递、发布条件 |
-| .github/workflows/_build-test-wheel.yml | workflow_call 复用构建流程，供 Torch2.11.0、2.13.0 两组调用 |
-| .github/workflows/_publish.yml | workflow_call 接收 DTK 标识、包名及发布密码，统一下载、校验、发布 wheel |
+| .github/workflows/_build-test-wheel.yml | workflow_call 复用构建流程，供两套 DTK 的版本矩阵调用 |
+| .github/workflows/_publish.yml | workflow_call 接收 DTK 镜像版本、发布标识、包名及发布密码，统一下载、校验、发布 wheel |
 | .github/scripts/checkout-source.sh | 校验实际 checkout 的事件 SHA |
 | .github/scripts/common.sh | 每一步加载 DTK；设置索引、输出目录和唯一运行标识 |
 | .github/scripts/setup-env.sh | 安装 AICC、精确选择 Torch/Triton/TileLang/NumPy 并验证版本 |
@@ -27,7 +27,7 @@ push 到 main：只构建和修复 wheel，不再运行正确性或性能测试�
 
 PR checkout 采用 github.sha（GitHub 生成的 PR 合并提交），所有矩阵与性能任务使用同一个 SHA，包含目标分支集成结果。push 则验证实际提交。无需像 GitLab 那样在每个 job 临时 merge main。
 
-构建矩阵：DTK2610 × Python3.12 × Torch2.11.0/2.13.0；NumPy1.26.4。只有两组，不再构建 DTK2604 或 Torch2.10.0。启用前需要确认 DTK2610 包源提供相应 HCU Torch，以及兼容的 Triton/TileLang；版本号和构建标签仍会在环境准备阶段校验。
+DTK26.04 构建 Python3.10 / NumPy1.24.3 与 Python3.12 / NumPy1.26.4，分别搭配 Torch2.10.0 和 Torch2.11.0。DTK26.10 构建 Python3.12 / NumPy1.26.4，搭配 Torch2.11.0 和 Torch2.13.0。环境准备阶段校验 HCU Torch 版本以及 Triton、TileLang 的 DTK 和 Torch 标签。
 
 统一入口为`.github/scripts/_build_hcu_wheel.sh`，旧 `build_wheel.sh` 转发到新入口；GitLab 与 GitHub CI 都调用同一脚本。环境需预先准备，入口不隐式安装工具。检查通过后输出 wheel，测试和发布使用同一构建路径。
 
@@ -40,7 +40,7 @@ GitHub BoltOPs → Settings → Secrets and variables → Actions → Variables�
 | Variable | 值/含义 |
 |---|---|
 | PYPI_URL | 通用 devpi 服务根地址（包含 http:// 与端口，无 /nightly 后缀）；构建及性能任务默认 http://12.12.12.201:9929，与 lightop 一样支持 fork PR 的变量缺失场景；发布任务仍读取组织/仓库 Variable |
-| TRITON_PYPI_URL | Triton/DTK2610 镜像根地址；可与 PYPI_URL 相同，未设置时回退到 PYPI_URL |
+| TRITON_PYPI_URL | Triton 镜像根地址；可与 PYPI_URL 相同，未设置时回退到 PYPI_URL |
 | AICC_INSTALLER_URL | 默认使用提供的 http://42.228.13.241:18000/ai_cc/Nightly/hcu_llvm_installer.sh；可配置覆盖 |
 | RESOURCE_SERVER_URL | 可选，准备脚本单独使用时用于拼接 AICC 地址的回退值 |
 | DTK_IMAGE_REGISTRY | 可选；默认 10.16.1.152:5000/hcu/base/dtk |
@@ -53,6 +53,7 @@ Secret：PYPI_PASSWORD，使用现有 nightly 发布密码（不要把密码写�
 
 Settings → Actions → Runners：确保 ARC 的 `hygon-cpu`、`hygon-build` 、`hygon-bw1100-1card` 和 `hygon-bw1100-4card` pools 都授权给 BoltOPs。其他仓库可使用不代表 BoltOPs 自动有权使用。构建、正确性、性能和发布继续使用同一个基础镜像：
 
+- `${DTK_IMAGE_REGISTRY}:26.04-rockylinux8.6-py3.10` 或 `:26.04-rockylinux8.6-py3.12`
 - `${DTK_IMAGE_REGISTRY}:26.10-rockylinux8.6-py3.12`
 - 默认 registry 为 `10.16.1.152:5000/hcu/base/dtk`
 
@@ -62,7 +63,7 @@ AICC、Torch、Triton、TileLang、NumPy 和测试依赖继续在各自的临时
 
 正确性工作流校验可见 HCU 数量必须为 4，性能工作流校验必须为 1，不运行 `CIsmi need`，不重写平台提供的 `ROCR_VISIBLE_DEVICES` 或 `HIP_VISIBLE_DEVICES`。性能 job 在 env 中设置 `BOLTOPS_TEST_GPU: '0'`，optest 使用 Pod 内逻辑卡号 0，保留现有单卡基准语义；正确性测试可见逻辑卡 0～3，原有跨卡用例可以执行。没有额外的设备选择脚本。
 
-两个 Torch 版本的构建和正确性测试可独立调度。性能 job 保留 boltops-performance-BW1100 共享 concurrency group、cancel-in-progress=false 和 queue=max，避免多个性能任务同时运行及默认单等待槽替换。ARC 隔离设备分配，但不意味着 CPU、内存和 I/O 没有性能干扰；实际基准仍需在集群验收。工作流仍会取消同一 PR 的旧运行。
+各版本组合的构建和正确性测试可独立调度。性能 job 保留 boltops-performance-BW1100 共享 concurrency group、cancel-in-progress=false 和 queue=max，避免多个性能任务同时运行及默认单等待槽替换。ARC 隔离设备分配，但不意味着 CPU、内存和 I/O 没有性能干扰；实际基准仍需在集群验收。工作流仍会取消同一 PR 的旧运行。
 
 同仓库 PR 和 fork PR 均使用 pull_request 事件进入构建和 GPU 测试，不使用 pull_request_target。是否等待维护者批准取决于 GitHub 组织/仓库的 fork 工作流审批设置；个人 fork 还需要相应 pools 的使用权限。PR 不进入发布任务，发布 Secret 只用于 main push 的发布任务。
 
@@ -83,7 +84,7 @@ git commit -m 'ci: add GitHub Actions build test and nightly workflows'
 git push -u fork ci/github-actions-migration
 ```
 
-从原仓库分支或个人 fork 创建 PR 到 main；如页面要求，等待维护者批准工作流运行。检查 build2610 的 Torch2.11.0、2.13.0 两组中构建、正确性和性能三个作业、ci-result 及已有 Quality Gate。PR 不会发布，也不接触 PYPI_PASSWORD。下载 artifact 核对 wheel、JUnit 与性能报告。两组 DTK26.10 性能路径均需在 BW1100 上实际验证。
+从原仓库分支或个人 fork 创建 PR 到 main；如页面要求，等待维护者批准工作流运行。检查两套 DTK 的构建和正确性测试、三组性能作业、ci-result 及已有 Quality Gate。PR 不会发布，也不接触 PYPI_PASSWORD。下载 artifact 核对 wheel、JUnit 与性能报告。三组性能作业均需在 BW1100 上实际验证。
 
 由于需要真实内网 runner、编译器和 GPU，本地只能验证 YAML/Actions 表达式、Bash 语法、矩阵、设备选择分支和脚本迁移逻辑；未实际运行 GPU 构建、测试或上传。
 
@@ -130,10 +131,10 @@ bash .github/scripts/_build_hcu_wheel.sh --out-dir dist
 ### 下载当前性能测试 CSV 和原始结果
 
 打开 GitHub Actions 对应运行的 Summary，在 Artifacts 中下载
-`performance-reports-dtk2610-py3.12-torch<版本>`。不同 Torch 版本分别归档，保留 7 天。
+`performance-reports-dtk<DTK>-py3.12-torch<版本>`。不同 Torch 版本分别归档，保留 7 天。
 
 - `optest_results/`：本次性能入口写出的各算子 CSV。
-- `optest_artifacts/BW1100/dtk2610/py3.12/torch<版本>/results/`：本 job 的
+- `optest_artifacts/BW1100/dtk<DTK>/py3.12/torch<版本>/results/`：本 job 的
   optest 输出目录，保留实际生成的 CSV、`.optest-results.json`、`raw/` 等文件。
 - 同级 `logs/`：benchmark 日志；`collection.log` 记录收集路径。
 - `scripts/*_boltops_output.xml`：JUnit 性能报告。

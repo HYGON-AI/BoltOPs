@@ -4,6 +4,9 @@ name: Publish nightly wheels
 on:
   workflow_call:
     inputs:
+      dtk_version:
+        required: true
+        type: string
       dtk_ver:
         required: true
         type: string
@@ -20,7 +23,7 @@ jobs:
     runs-on: hygon-build
     timeout-minutes: 180
     container:
-      image: ${{ vars.DTK_IMAGE_REGISTRY || '10.16.1.152:5000/hcu/base/dtk' }}:26.10-rockylinux8.6-py3.12
+      image: ${{ vars.DTK_IMAGE_REGISTRY || '10.16.1.152:5000/hcu/base/dtk' }}:${{ inputs.dtk_version }}-rockylinux8.6-py3.12
     defaults:
       run:
         shell: bash

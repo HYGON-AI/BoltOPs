@@ -22,6 +22,10 @@ on:
       run_tests:
         required: true
         type: boolean
+      run_performance:
+        description: Run performance after correctness tests pass
+        type: boolean
+        default: true
 permissions:
   contents: read
 jobs:
@@ -139,7 +143,7 @@ jobs:
         if-no-files-found: warn
         retention-days: 7
   performance:
-    if: ${{ inputs.run_tests }}
+    if: ${{ inputs.run_tests && inputs.run_performance }}
     needs:
     - build
     - correctness
