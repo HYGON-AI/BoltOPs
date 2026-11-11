@@ -17,9 +17,7 @@ permissions:
   contents: read
 jobs:
   publish:
-    runs-on:
-    - self-hosted
-    - BW1100
+    runs-on: hygon-build
     timeout-minutes: 180
     container:
       image: ${{ vars.DTK_IMAGE_REGISTRY || '10.16.1.152:5000/hcu/base/dtk' }}:26.10-rockylinux8.6-py3.12

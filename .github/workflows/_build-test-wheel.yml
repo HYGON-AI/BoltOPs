@@ -26,15 +26,11 @@ permissions:
   contents: read
 jobs:
   build:
-    runs-on:
-    - self-hosted
-    - BW1100
+    runs-on: hygon-build
     timeout-minutes: 180
     container:
       image: ${{ vars.DTK_IMAGE_REGISTRY || '10.16.1.152:5000/hcu/base/dtk' }}:${{ inputs.dtk_version }}-rockylinux8.6-py${{ inputs.py_version
         }}
-      options: --device=/dev/kfd --device=/dev/dri --group-add video -v /opt/hyhal/:/opt/hyhal/:ro --shm-size=80G --cap-add=SYS_PTRACE
-        --security-opt seccomp=unconfined --privileged=true
     defaults:
       run:
         shell: bash
@@ -44,8 +40,6 @@ jobs:
       TRITON_PYPI_URL: ${{ vars.TRITON_PYPI_URL || vars.PYPI_URL || 'http://12.12.12.201:9929' }}
       AICC_INSTALLER_URL: ${{ vars.AICC_INSTALLER_URL || 'http://42.228.13.241:18000/ai_cc/Nightly/hcu_llvm_installer.sh' }}
       RESOURCE_SERVER_URL: ${{ vars.RESOURCE_SERVER_URL }}
-      MAX_JOBS: '32'
-      CISMI_TIMEOUT: '3600'
       PYTHONUNBUFFERED: '1'
       DTK_VER: ${{ inputs.dtk_ver }}
       PYTHON_VERSION: ${{ inputs.py_version }}
@@ -75,10 +69,7 @@ jobs:
           --git_commit "$(git rev-parse --short=6 HEAD)" \
           --outputdir "${WHEEL_OUTPUT}" \
           -f "${CI_WORK_DIR}"/dist/*.whl
-    - name: Run correctness tests
-      if: ${{ inputs.run_tests }}
-      run: bash .github/scripts/test-correctness.sh
-    - name: Upload wheels and test reports
+    - name: Upload built wheels
       if: ${{ always() }}
       uses: actions/upload-artifact@v4
       with:
@@ -86,14 +77,157 @@ jobs:
         path: output/
         if-no-files-found: error
         retention-days: 7
+  correctness:
+    if: ${{ inputs.run_tests }}
+    needs: build
+    runs-on: hygon-bw1100-4card
+    timeout-minutes: 180
+    container:
+      image: ${{ vars.DTK_IMAGE_REGISTRY || '10.16.1.152:5000/hcu/base/dtk' }}:${{ inputs.dtk_version }}-rockylinux8.6-py${{ inputs.py_version
+        }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      # Fork PRs may not receive vars; match lightop's non-secret URL fallback.
+      PYPI_URL: ${{ vars.PYPI_URL || 'http://12.12.12.201:9929' }}
+      TRITON_PYPI_URL: ${{ vars.TRITON_PYPI_URL || vars.PYPI_URL || 'http://12.12.12.201:9929' }}
+      AICC_INSTALLER_URL: ${{ vars.AICC_INSTALLER_URL || 'http://42.228.13.241:18000/ai_cc/Nightly/hcu_llvm_installer.sh' }}
+      RESOURCE_SERVER_URL: ${{ vars.RESOURCE_SERVER_URL }}
+      PYTHONUNBUFFERED: '1'
+      DTK_VER: ${{ inputs.dtk_ver }}
+      PYTHON_VERSION: ${{ inputs.py_version }}
+      NUMPY_VERSION: ${{ inputs.numpy_version }}
+      TORCH_VERSION: ${{ inputs.torch_version }}
+    steps:
+    - name: Checkout integrated source
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.sha }}
+        fetch-depth: 0
+        persist-credentials: false
+    - name: Verify source
+      run: bash .github/scripts/checkout-source.sh
+    - name: Download built wheel
+      uses: actions/download-artifact@v4
+      with:
+        name: wheel-dtk${{ inputs.dtk_ver }}-py${{ inputs.py_version }}-torch${{ inputs.torch_version }}
+        path: output
+    - name: Install compiler and dependencies
+      run: bash .github/scripts/setup-env.sh
+    - name: Verify allocated HCU
+      run: |
+        source .github/scripts/common.sh
+        python - <<'PY'
+        import torch
+
+        if not torch.version.hip:
+            raise SystemExit('Tests require an HCU/HIP Torch build')
+        count = torch.cuda.device_count()
+        if count != 4:
+            raise SystemExit(f'Expected exactly four ARC-allocated HCUs, found {count}')
+        print(f'Allocated HCUs: {count}; logical indices=0..{count - 1}; model={torch.cuda.get_device_name(0)}')
+        PY
+    - name: Run correctness tests on the allocated HCU
+      run: bash .github/scripts/test-correctness.sh
+    - name: Upload correctness reports
+      if: ${{ always() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: correctness-reports-dtk${{ inputs.dtk_ver }}-py${{ inputs.py_version }}-torch${{ inputs.torch_version }}
+        path: output/**/boltops_test.xml
+        if-no-files-found: warn
+        retention-days: 7
   performance:
     if: ${{ inputs.run_tests }}
     needs:
     - build
-    uses: ./.github/workflows/_performance.yml
-    with:
-      dtk_version: ${{ inputs.dtk_version }}
-      dtk_ver: ${{ inputs.dtk_ver }}
-      py_version: ${{ inputs.py_version }}
-      numpy_version: ${{ inputs.numpy_version }}
-      torch_version: ${{ inputs.torch_version }}
+    - correctness
+    runs-on: hygon-bw1100-1card
+    timeout-minutes: 180
+    concurrency:
+      group: boltops-performance-BW1100
+      cancel-in-progress: false
+      queue: max
+    container:
+      image: ${{ vars.DTK_IMAGE_REGISTRY || '10.16.1.152:5000/hcu/base/dtk' }}:${{ inputs.dtk_version }}-rockylinux8.6-py${{ inputs.py_version }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      # Fork PRs may not receive vars; match lightop's non-secret URL fallback.
+      PYPI_URL: ${{ vars.PYPI_URL || 'http://12.12.12.201:9929' }}
+      TRITON_PYPI_URL: ${{ vars.TRITON_PYPI_URL || vars.PYPI_URL || 'http://12.12.12.201:9929' }}
+      AICC_INSTALLER_URL: ${{ vars.AICC_INSTALLER_URL || 'http://42.228.13.241:18000/ai_cc/Nightly/hcu_llvm_installer.sh' }}
+      RESOURCE_SERVER_URL: ${{ vars.RESOURCE_SERVER_URL }}
+      PYTHONUNBUFFERED: '1'
+      # ARC allocates one HCU, exposed to optest as logical device 0.
+      BOLTOPS_TEST_GPU: '0'
+      DTK_VER: ${{ inputs.dtk_ver }}
+      PYTHON_VERSION: ${{ inputs.py_version }}
+      NUMPY_VERSION: ${{ inputs.numpy_version }}
+      TORCH_VERSION: ${{ inputs.torch_version }}
+    steps:
+    - name: Checkout integrated source
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.sha }}
+        fetch-depth: 0
+        persist-credentials: false
+    - name: Verify source
+      run: bash .github/scripts/checkout-source.sh
+    - name: Download tested wheel
+      uses: actions/download-artifact@v4
+      with:
+        name: wheel-dtk${{ inputs.dtk_ver }}-py${{ inputs.py_version }}-torch${{ inputs.torch_version }}
+        path: output
+    - name: Install compiler and dependencies
+      run: bash .github/scripts/setup-env.sh
+    - name: Verify allocated HCU
+      run: |
+        source .github/scripts/common.sh
+        python - <<'PY'
+        import torch
+
+        if not torch.version.hip:
+            raise SystemExit('Tests require an HCU/HIP Torch build')
+        count = torch.cuda.device_count()
+        if count != 1:
+            raise SystemExit(f'Expected exactly one ARC-allocated HCU, found {count}')
+        print(f'Allocated HCUs: {count}; logical indices=0..{count - 1}; model={torch.cuda.get_device_name(0)}')
+        PY
+    - name: Run performance suite
+      run: bash .github/scripts/test-performance.sh
+    - name: Collect performance output even after failure
+      if: ${{ always() }}
+      run: |
+        # Reconstruct common.sh's identity without loading DTK or dependencies.
+        run_branch="ci_performance_BW1100_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}_${GITHUB_JOB}_${DTK_VER}_${PYTHON_VERSION}_${TORCH_VERSION}"
+        artifact_dir="${GITHUB_WORKSPACE}/optest_artifacts/BW1100/dtk${DTK_VER}/py${PYTHON_VERSION}/torch${TORCH_VERSION}"
+        mkdir -p "${artifact_dir}"
+        for result_dir in /op_test_output/boltops/"${run_branch}"_*; do
+          if [ -d "${result_dir}" ]; then
+            mkdir -p "${artifact_dir}/results"
+            echo "Archiving results: ${result_dir}" | tee -a "${artifact_dir}/collection.log"
+            cp -a "${result_dir}" "${artifact_dir}/results/"
+          fi
+        done
+        for log_dir in /op_test_log/boltops/"${run_branch}"_*; do
+          if [ -d "${log_dir}" ]; then
+            mkdir -p "${artifact_dir}/logs"
+            echo "Archiving logs: ${log_dir}" | tee -a "${artifact_dir}/collection.log"
+            cp -a "${log_dir}" "${artifact_dir}/logs/"
+          fi
+        done
+    - name: Upload performance reports and logs
+      if: ${{ always() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: performance-reports-dtk${{ inputs.dtk_ver }}-py${{ inputs.py_version }}-torch${{ inputs.torch_version }}
+        path: |
+          scripts/*_boltops_output.xml
+          optest_artifacts/
+          optest_results/
+        include-hidden-files: true
+        if-no-files-found: warn
+        retention-days: 7

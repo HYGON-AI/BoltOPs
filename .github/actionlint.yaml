@@ -1,8 +1,11 @@
 self-hosted-runner:
   labels:
-    - BW1100
+    - hygon-cpu
+    - hygon-build
+    - hygon-bw1100-1card
+    - hygon-bw1100-4card
 paths:
-  .github/workflows/_performance.yml:
+  .github/workflows/_build-test-wheel.yml:
     ignore:
       # actionlint 1.7.12 predates GitHub's queue: max support (2026-05-07).
       # https://github.blog/changelog/2026-05-07-github-actions-concurrency-groups-now-allow-larger-queues/
