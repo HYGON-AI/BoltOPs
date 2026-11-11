@@ -428,25 +428,29 @@ from boltops.fla.gdn import chunk_fwd_o
 `chunk_gated_delta_rule_fwd_h` 当前支持范围：
 
 - gfx938、fixed-length/varlen、`chunk_size=64`、BF16
-- `K=128`、`V % 32 == 0`、`Hg == H`
+- `K=128`、fixed `V % 32 == 0` / 多段 varlen `V=128`、`H % Hg == 0`（`H/Hg` 个连续 value head 共享一个 K head）
 - FP32 scalar累计 gate `g`，不支持 `gk` 或 `use_exp2=True`
 - VK state布局，即 `transpose_state_layout=True`
 - 要求 `output_final_state=True`、`save_new_value=True`；支持
   `inplace_final_state=True`，此时必须提供 FP32 `initial_state`，并按
   `initial_state_indices` 原地写回和返回同一 tensor
-- copy-pipeline支持动态 `T` 和 varlen；varlen通过 `cu_seqlens` 提供每条
-  sequence边界，`chunk_indices=None` 时由 wrapper自动生成
-- fixed模式要求 `T >= 64`；varlen支持短于64的 sequence以及非完整尾 chunk
+- 默认使用 WASP：无 `cu_seqlens`，或单段 `cu_seqlens=[0,T]`，走 fixed；多段走 varlen（空序列仍计为一段）
+- fixed 支持任意 `T>0`，默认 BV32，可选 BV64（要求 V 能被 BV 整除）
+- 多段 varlen 要求 packed B=1、V=128，默认 BV128，可选 BV32/BV64；支持短序列与 tail
+- varlen 始终使用 vector state I/O，不再接受 `state_io` 配置项
+- 单段 cu 转 fixed 会读取并验证 `[0,T]` 边界，产生一次主机同步；直接 fixed 调用无需传 cu
 
-`kernel_cfg` 可选择两个 gfx938 kernel：
+`kernel_cfg=None` 或 `{}` 使用上述默认规则，也可以仅指定 BV：
 
 ```python
-# 默认；支持非对齐 T 和 varlen
-kernel_cfg = {"implementation": "copy-pipeline"}
-
-# 4 producer + 4 consumer WASP实现；fixed要求 T % 64 == 0
-kernel_cfg = {"implementation": "wasp_4p4c"}
+kernel_cfg = {"block_v": 64}
+# 等价的显式实现名：
+kernel_cfg = {"implementation": "wasp_4p4c", "block_v": 64}
 ```
+
+非 gfx946 公共入口只选择 fixed WASP 与 packed varlen WASP；旧 copy-pipeline
+和旧 varlen builder 不再参与分派。多段 V!=128、fixed BV128、旧 `state_io`
+配置会明确报错，不会静默回退。`wasp_4p4c_gfx946` 独立保留。
 
 TileLang backend当前只替换 `chunk_gated_delta_rule_fwd_h`；后续
 `chunk_fwd_o` 仍使用公开接口提供的 Triton实现。TileLang `chunk_h` 的序列长度是
@@ -494,48 +498,57 @@ pytest -q test/fla/test_gdn_sigmoid_gating.py
 # Chunk h/o
 pytest -q test/fla/test_gdn_chunk.py
 
-# TileLang WASP chunk h：fixed + varlen正确性
-PYTHONPATH=. TILELANG_CACHE_DIR=./cache pytest -q -s \
-  'test/fla/test_gdn_chunk.py::test_chunk_h_and_o_match_fla_torch_reference[tilelang-fixed]' \
-  'test/fla/test_gdn_chunk.py::test_chunk_h_and_o_match_fla_torch_reference[tilelang-varlen]'
+# TileLang WASP chunk h：Hg16/H32，定长正确性（非原地写回）
+PYTHONPATH=. TILELANG_CACHE_DIR=./cache pytest -q \
+  'test/fla/test_gdn_chunk.py::test_chunk_h_matches_reference[Hg16-H32-out-of-place-tilelang-wasp-4p4c-fixed]'
 
-# TileLang/AITER chunk h fixed性能对比
-PYTHONPATH=. TILELANG_CACHE_DIR=./cache pytest -q -s \
-  --bench --bench-warmup=5 --bench-repeat=20 --bench-t=13312 \
-  test/fla/test_gdn_chunk.py::test_bench_chunk_h_o_tflops[tilelang-vk-fixed]
+# TileLang WASP chunk h：Hg16/H32，变长正确性（非原地写回）
+PYTHONPATH=. TILELANG_CACHE_DIR=./cache pytest -q \
+  'test/fla/test_gdn_chunk.py::test_chunk_h_matches_reference[Hg16-H32-out-of-place-tilelang-wasp-4p4c-varlen]'
 
-# TileLang/AITER chunk h varlen性能对比
-PYTHONPATH=. TILELANG_CACHE_DIR=./cache pytest -q -s \
-  --bench --bench-warmup=5 --bench-repeat=20 --bench-t=13312 \
-  test/fla/test_gdn_chunk.py::test_bench_chunk_h_o_tflops[tilelang-vk-varlen]
+# AITER_ROOT 指向可导入且扩展与当前容器兼容的 AITER 源码目录。
+# 定长：B=1、T=13312，单条序列
+PYTHONPATH=.:${AITER_ROOT} TILELANG_CACHE_DIR=./cache pytest -q -s \
+  'test/fla/test_gdn_chunk.py::test_bench_chunk_h_tflops[tilelang-Hg16-H32-vk-fixed]' \
+  --bench --bench-warmup=25 --bench-repeat=100 --bench-t=13312
+
+# 变长：packed B=1、总 token 数 13312，lengths=[4437,4437,4438]
+PYTHONPATH=.:${AITER_ROOT} TILELANG_CACHE_DIR=./cache pytest -q -s \
+  'test/fla/test_gdn_chunk.py::test_bench_chunk_h_tflops[tilelang-Hg16-H32-vk-varlen]' \
+  --bench --bench-warmup=25 --bench-repeat=100 --bench-t=13312
 ```
+
+测试 ID 中 `Hg16-H32` 是 head 配置，`vk` 是 state 布局，`fixed` / `varlen`
+分别表示定长和变长；上述两条性能命令都会运行 TileLang WASP 与 AITER HIP 对比。
+`--bench-t` 在 fixed 中为单条序列长度，在 varlen 中为 packed 总 token 数。
 
 性能输出规则：
 
 - packed decode、普通 sigmoid、speculative verify 主要受 state/cache流量限制，报告
   latency和逻辑有效带宽 `GB/s`
 - chunk h、chunk o及二者端到端为矩阵计算密集型，报告 latency和 `TFLOPS`
-- chunk VK的 TileLang fixed/varlen case额外运行 AITER chunk-h作为性能参考
+- chunk-h 性能测试覆盖 `(Hg,H)=(16,16)` 和 `(16,32)`；TileLang VK fixed/varlen case额外运行 AITER HIP chunk-h作为性能参考
+- chunk-h 双方均使用 event median，warmup/repeat 为毫秒预算；计时包含每次调用前的 state 清零，双方使用独立 FP32 state pool 并原地写回。对比前检查 h、v_new 和 final state（BF16 atol/rtol 均为 0.08）
 - 性能测试不设置固定性能阈值
 
 ## 7. 性能数据
 
-下表为实测数据。带宽型接口使用 `GB/s`，计算密集型接口使用 `TFLOPS`。
-除表中单独标注的条目外，历史数据的默认计时参数为：
+### Chunk-h fixed / varlen（gfx938，2026-11-11）
 
-```text
-gfx936: HIP_VISIBLE_DEVICES=5
-gfx938: HIP_VISIBLE_DEVICES=7
-warmup=10
-repeat=50
-```
+`gfx938，B=1，K=V=128，BT64，BF16，WASP，AITER auto；7轮中位数，state重置不计时。`
 
-### `chunk_gated_delta_rule_fwd_h`
+| 路径 | T / lengths | H / Hg | BV | TileLang ms | AITER ms | 有效带宽 GB/s（TileLang / AITER） | TileLang 耗时降低 |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
+| fixed | 2048 | 32 / 16 | 32 | 0.14440 | 0.15448 | 669.88 / 626.17 | 6.52% |
+| fixed | 3560 | 32 / 16 | 32 | 0.24544 | 0.25584 | 674.07 / 646.66 | 4.07% |
+| fixed | 6656 | 32 / 16 | 32 | 0.41840 | 0.45712 | 728.82 / 667.09 | 8.47% |
+| fixed | 6656 | 32 / 16 | 64 | 0.39728 | 0.45712 | 767.57 / 667.09 | 13.09% |
+| fixed | 13312 | 32 / 16 | 32 | 0.80832 | 0.89560 | 749.31 / 676.29 | 9.75% |
+| varlen | [2048, 2048, 2560] | 32 / 16 | 128 | 0.32144 | 0.37120 | 974.76 / 844.09 | 13.41% |
+| varlen | [5461, 5461, 5462] | 32 / 16 | 128 | 0.74056 | 0.85008 | 1019.46 / 888.12 | 12.88% |
+| fixed | 13312 | 16 / 16 | 32 | 0.43632 | 0.62544 | 756.57 / 527.80 | 30.24% |
 
-| Shape | gfx936 | gfx938 |
-|---|---:|---:|
-| `B=1, T=13312, H=Hg=16, K=128, V=128, BT=64, BF16, fixed, VK (warmup=5, repeat=20)` | TileLang: 0.777 ms / 17.96 TFLOPS; AITER: 0.791 ms / 17.64 TFLOPS | TileLang WASP: 0.396 ms / 35.25 TFLOPS; AITER: 0.641 ms / 21.77 TFLOPS |
-| `B=1, lengths=[4437,4437,4438], H=Hg=16, K=128, V=128, BT=64, BF16, varlen, VK (warmup=5, repeat=20)` | TileLang: 0.852 ms / 16.39 TFLOPS; AITER: 0.642 ms / 21.73 TFLOPS | TileLang WASP: 0.435 ms / 32.11 TFLOPS; AITER: 0.411 ms / 33.96 TFLOPS |
+有效带宽按算法输入/输出字节数 ÷ 耗时计算（GB/s，十进制）；包含 K/W/U/g、h/v_new、initial/final state，h 按各序列实际 chunk 数计，不计 state 清零。
 
 ### `chunk_fwd_o`
 

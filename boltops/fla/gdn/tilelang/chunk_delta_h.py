@@ -1200,19 +1200,22 @@ def _build_chunk_h_wasp_4p4c(
     transpose_state_layout: bool,
     is_varlen: bool = False,
     block_v: int = 32,
+    fixed_has_tail: bool = False,
+    fixed_tail_only: bool = False,
 ):
     """Build the four-producer/four-consumer WASP kernel."""
     seq_len = T.dynamic("seq_len")
     num_chunks = seq_len // chunk_size
+    h_chunks = T.ceildiv(seq_len, chunk_size) if fixed_has_tail else num_chunks
     state_shape = (
         (heads, dim_v, dim_k)
         if transpose_state_layout
         else (heads, dim_k, dim_v)
     )
     chunk_state_shape = (
-        (batch, num_chunks, heads, dim_v, dim_k)
+        (batch, h_chunks, heads, dim_v, dim_k)
         if transpose_state_layout
-        else (batch, num_chunks, heads, dim_k, dim_v)
+        else (batch, h_chunks, heads, dim_k, dim_v)
     )
     state_shared_h_k_major_layout = T.Layout(
         (block_v, dim_k),
@@ -1414,94 +1417,100 @@ def _build_chunk_h_wasp_4p4c(
             # T.use_swizzle(10)
 
             if tx < _PRODUCER_THREADS:
-                # Prologue: U_0 is the oldest group, K_0 remains outstanding.
-                T.async_copy(
-                    u[
-                        bid,
-                        0:chunk_size,
-                        hid,
-                        v_offset : v_offset + block_v,
-                    ],
-                    u_shared,
-                )
-                T.async_copy(
-                    k[bid, 0:chunk_size, hid // (heads // kv_heads), 0:dim_k],
-                    k_shared,
-                )
-
-                # Barrier 0: state_shared_h/u_shared ready; k_shared outstanding.
-                T.ptx_wait_group(1)
-                T.sync_warp()
-
-                for cid in T.serial(num_chunks - 1):
-                    base = cid * chunk_size
-                    next_base = base + chunk_size
-
-                    # Produce W_i+1 while consumers execute Gemm0 for chunk i.
-                    T.async_copy(
-                        w[
-                            bid,
-                            next_base : next_base + chunk_size,
-                            hid,
-                            0:dim_k,
-                        ],
-                        w_shared,
-                    )
-
-                    # Barrier 1: consumers have captured u_shared for chunk
-                    # cid, so producers may overwrite it.
-                    T.sync_warp()
-
+                if not fixed_tail_only:
+                    # Prologue: U_0 is the oldest group, K_0 remains outstanding.
                     T.async_copy(
                         u[
                             bid,
-                            next_base : next_base + chunk_size,
+                            0:chunk_size,
                             hid,
                             v_offset : v_offset + block_v,
                         ],
                         u_shared,
                     )
-                    # Complete k_shared for chunk cid; retain W/U copies.
-                    T.ptx_wait_group(2)
-
-                    # Barrier 2: k_shared for chunk cid is ready; u_shared for
-                    # chunk cid+1 may remain outstanding.
-                    T.sync_warp()
-
-                    # Complete w_shared for chunk cid+1; retain its U copy.
-                    T.ptx_wait_group(1)
-
-                    # Barrier 3: consumers have captured k_shared for chunk
-                    # cid; v_new_shared and W for chunk cid+1 are ready.
-                    T.sync_warp()
-
                     T.async_copy(
-                        k[
-                            bid,
-                            next_base : next_base + chunk_size,
-                            hid // (heads // kv_heads),
-                            0:dim_k,
-                        ],
+                        k[bid, 0:chunk_size, hid // (heads // kv_heads), 0:dim_k],
                         k_shared,
                     )
-                    # Complete u_shared for chunk cid+1; retain its K copy.
-                    T.ptx_wait_group(1)
 
-                    # Barrier 4: next state_shared_h/u_shared ready.
+                    # Barrier 0: state_shared_h/u_shared ready; k_shared outstanding.
+                    T.ptx_wait_group(1)
                     T.sync_warp()
 
-                # Barrier 1: final U captured.
-                T.sync_warp()
-                T.ptx_wait_group(0)
+                    for cid in T.serial(num_chunks - 1):
+                        base = cid * chunk_size
+                        next_base = base + chunk_size
 
-                # Barrier 2: final k_shared ready.
-                T.sync_warp()
+                        # Produce W_i+1 while consumers execute Gemm0 for chunk i.
+                        T.async_copy(
+                            w[
+                                bid,
+                                next_base : next_base + chunk_size,
+                                hid,
+                                0:dim_k,
+                            ],
+                            w_shared,
+                        )
 
-                # Barrier 3: final K captured and v_new_shared published.
-                T.sync_warp()
+                        # Barrier 1: consumers have captured u_shared for chunk
+                        # cid, so producers may overwrite it.
+                        T.sync_warp()
 
-                # Barrier 4: close the producer/consumer protocol.
-                T.sync_warp()
+                        T.async_copy(
+                            u[
+                                bid,
+                                next_base : next_base + chunk_size,
+                                hid,
+                                v_offset : v_offset + block_v,
+                            ],
+                            u_shared,
+                        )
+                        # Complete k_shared for chunk cid; retain W/U copies.
+                        T.ptx_wait_group(2)
+
+                        # Barrier 2: k_shared for chunk cid is ready; u_shared for
+                        # chunk cid+1 may remain outstanding.
+                        T.sync_warp()
+
+                        # Complete w_shared for chunk cid+1; retain its U copy.
+                        T.ptx_wait_group(1)
+
+                        # Barrier 3: consumers have captured k_shared for chunk
+                        # cid; v_new_shared and W for chunk cid+1 are ready.
+                        T.sync_warp()
+
+                        T.async_copy(
+                            k[
+                                bid,
+                                next_base : next_base + chunk_size,
+                                hid // (heads // kv_heads),
+                                0:dim_k,
+                            ],
+                            k_shared,
+                        )
+                        # Complete u_shared for chunk cid+1; retain its K copy.
+                        T.ptx_wait_group(1)
+
+                        # Barrier 4: next state_shared_h/u_shared ready.
+                        T.sync_warp()
+
+                    # Barrier 1: final U captured.
+                    T.sync_warp()
+                    T.ptx_wait_group(0)
+
+                    # Barrier 2: final k_shared ready.
+                    T.sync_warp()
+
+                    # Barrier 3: final K captured and v_new_shared published.
+                    T.sync_warp()
+
+                    # Barrier 4: close the producer/consumer protocol.
+                    T.sync_warp()
+
+                if fixed_has_tail:
+                    # Tail state publication, then gated-V publication.
+                    T.sync_warp()
+                    T.sync_warp()
 
             else:
                 state_fragment = T.alloc_fragment(
@@ -1552,72 +1561,41 @@ def _build_chunk_h_wasp_4p4c(
                         state_fragment[iv, ik] = T.float32(0.0)
                 T.copy(state_fragment, state_shared_h)
 
-                # Keep W on consumer VGPRs. Each chunk prefetches W_i+1 into
-                # the alternate slot before consuming W_i.
-                T.copy(
-                    w[bid, 0:chunk_size, hid, 0:dim_k],
-                    w_operand_0,
-                )
-                for it, iv in T.Parallel(chunk_size, block_v):
-                    g_fragment[it, iv] = g[bid, it, hid]
-
-                # Barrier 0 (prologue): publish state_shared_h for chunk 0 and
-                # wait for producer publication of u_shared for chunk 0.
-                T.s_waitcnt(0, "lgkmcnt")
-                T.sync_warp()
-                T.copy(state_shared_h, state_operand)
-                T.sched_barrier()
-
-                if block_v == 64:
-                    # A single W fragment and a separate final chunk avoid
-                    # the BV64 register spills of the paired-chunk loop.
-                    # Keep the W/G prefetch overlap in the steady loop.
-                    for cid in T.Pipelined(num_chunks - 1, num_stages=0):
-                        run_consumer_chunk(
-                            cid, w_operand_0, w_operand_0,
-                            True, True,
-                            w, g, h, v_new, bid, hid, v_offset,
-                            state_shared_h, state_operand, w_shared,
-                            u_shared, u_fragment,
-                            v_new_fragment, g_fragment, k_shared, k_fragment,
-                            v_new_shared, v_new_operand, state_fragment,
-                        )
-
-                    run_consumer_chunk(
-                        num_chunks - 1, w_operand_0, w_operand_0,
-                        False, False,
-                        w, g, h, v_new, bid, hid, v_offset,
-                        state_shared_h, state_operand, w_shared,
-                        u_shared, u_fragment,
-                        v_new_fragment, g_fragment, k_shared, k_fragment,
-                        v_new_shared, v_new_operand, state_fragment,
+                if not fixed_tail_only:
+                    # Keep W on consumer VGPRs. Each chunk prefetches W_i+1 into
+                    # the alternate slot before consuming W_i.
+                    T.copy(
+                        w[bid, 0:chunk_size, hid, 0:dim_k],
+                        w_operand_0,
                     )
+                    for it, iv in T.Parallel(chunk_size, block_v):
+                        g_fragment[it, iv] = g[bid, it, hid]
 
-                else:
-                    # Expand two chunks per hot-loop iteration with statically
-                    # selected W operands. This avoids a cid-parity branch in the
-                    # consumer path.
-                    steady_pair_count = T.max((num_chunks - 2) // 2, 0)
-                    for pair in T.Pipelined(steady_pair_count, num_stages=0):
-                        cid = pair * 2
+                    # Barrier 0 (prologue): publish state_shared_h for chunk 0 and
+                    # wait for producer publication of u_shared for chunk 0.
+                    T.s_waitcnt(0, "lgkmcnt")
+                    T.sync_warp()
+                    T.copy(state_shared_h, state_operand)
+                    T.sched_barrier()
+
+                    if block_v == 64:
+                        # A single W fragment and a separate final chunk avoid
+                        # the BV64 register spills of the paired-chunk loop.
+                        # Keep the W/G prefetch overlap in the steady loop.
+                        for cid in T.Pipelined(num_chunks - 1, num_stages=0):
+                            run_consumer_chunk(
+                                cid, w_operand_0, w_operand_0,
+                                True, True,
+                                w, g, h, v_new, bid, hid, v_offset,
+                                state_shared_h, state_operand, w_shared,
+                                u_shared, u_fragment,
+                                v_new_fragment, g_fragment, k_shared, k_fragment,
+                                v_new_shared, v_new_operand, state_fragment,
+                            )
+
                         run_consumer_chunk(
-                            cid,
-                            w_operand_0,
-                            w_operand_1,
-                            True,
-                            True,
-                            w, g, h, v_new, bid, hid, v_offset,
-                            state_shared_h, state_operand, w_shared,
-                            u_shared, u_fragment,
-                            v_new_fragment, g_fragment, k_shared, k_fragment,
-                            v_new_shared, v_new_operand, state_fragment,
-                        )
-                        run_consumer_chunk(
-                            cid + 1,
-                            w_operand_1,
-                            w_operand_0,
-                            True,
-                            True,
+                            num_chunks - 1, w_operand_0, w_operand_0,
+                            False, False,
                             w, g, h, v_new, bid, hid, v_offset,
                             state_shared_h, state_operand, w_shared,
                             u_shared, u_fragment,
@@ -1625,86 +1603,242 @@ def _build_chunk_h_wasp_4p4c(
                             v_new_shared, v_new_operand, state_fragment,
                         )
 
-                    # Handle the final one, two, or three chunks outside the hot
-                    # pair loop. Any odd/even selection is therefore paid once,
-                    # rather than once per chunk.
-                    tail_cid = steady_pair_count * 2
-                    if num_chunks == 1:
-                        run_consumer_chunk(
-                            tail_cid,
-                            w_operand_0,
-                            w_operand_1,
-                            False,
-                            False,
-                            w, g, h, v_new, bid, hid, v_offset,
-                            state_shared_h, state_operand, w_shared,
-                            u_shared, u_fragment,
-                            v_new_fragment, g_fragment, k_shared, k_fragment,
-                            v_new_shared, v_new_operand, state_fragment,
-                        )
-                    elif num_chunks % 2 != 0:
-                        run_consumer_chunk(
-                            tail_cid,
-                            w_operand_0,
-                            w_operand_1,
-                            True,
-                            True,
-                            w, g, h, v_new, bid, hid, v_offset,
-                            state_shared_h, state_operand, w_shared,
-                            u_shared, u_fragment,
-                            v_new_fragment, g_fragment, k_shared, k_fragment,
-                            v_new_shared, v_new_operand, state_fragment,
-                        )
-                        run_consumer_chunk(
-                            tail_cid + 1,
-                            w_operand_1,
-                            w_operand_0,
-                            True,
-                            True,
-                            w, g, h, v_new, bid, hid, v_offset,
-                            state_shared_h, state_operand, w_shared,
-                            u_shared, u_fragment,
-                            v_new_fragment, g_fragment, k_shared, k_fragment,
-                            v_new_shared, v_new_operand, state_fragment,
-                        )
-                        run_consumer_chunk(
-                            tail_cid + 2,
-                            w_operand_0,
-                            w_operand_1,
-                            False,
-                            False,
-                            w, g, h, v_new, bid, hid, v_offset,
-                            state_shared_h, state_operand, w_shared,
-                            u_shared, u_fragment,
-                            v_new_fragment, g_fragment, k_shared, k_fragment,
-                            v_new_shared, v_new_operand, state_fragment,
+                    else:
+                        # Expand two chunks per hot-loop iteration with statically
+                        # selected W operands. This avoids a cid-parity branch in the
+                        # consumer path.
+                        steady_pair_count = T.max((num_chunks - 2) // 2, 0)
+                        for pair in T.Pipelined(steady_pair_count, num_stages=0):
+                            cid = pair * 2
+                            run_consumer_chunk(
+                                cid,
+                                w_operand_0,
+                                w_operand_1,
+                                True,
+                                True,
+                                w, g, h, v_new, bid, hid, v_offset,
+                                state_shared_h, state_operand, w_shared,
+                                u_shared, u_fragment,
+                                v_new_fragment, g_fragment, k_shared, k_fragment,
+                                v_new_shared, v_new_operand, state_fragment,
+                            )
+                            run_consumer_chunk(
+                                cid + 1,
+                                w_operand_1,
+                                w_operand_0,
+                                True,
+                                True,
+                                w, g, h, v_new, bid, hid, v_offset,
+                                state_shared_h, state_operand, w_shared,
+                                u_shared, u_fragment,
+                                v_new_fragment, g_fragment, k_shared, k_fragment,
+                                v_new_shared, v_new_operand, state_fragment,
+                            )
+
+                        # Handle the final one, two, or three chunks outside the hot
+                        # pair loop. Any odd/even selection is therefore paid once,
+                        # rather than once per chunk.
+                        tail_cid = steady_pair_count * 2
+                        if num_chunks == 1:
+                            run_consumer_chunk(
+                                tail_cid,
+                                w_operand_0,
+                                w_operand_1,
+                                False,
+                                False,
+                                w, g, h, v_new, bid, hid, v_offset,
+                                state_shared_h, state_operand, w_shared,
+                                u_shared, u_fragment,
+                                v_new_fragment, g_fragment, k_shared, k_fragment,
+                                v_new_shared, v_new_operand, state_fragment,
+                            )
+                        elif num_chunks % 2 != 0:
+                            run_consumer_chunk(
+                                tail_cid,
+                                w_operand_0,
+                                w_operand_1,
+                                True,
+                                True,
+                                w, g, h, v_new, bid, hid, v_offset,
+                                state_shared_h, state_operand, w_shared,
+                                u_shared, u_fragment,
+                                v_new_fragment, g_fragment, k_shared, k_fragment,
+                                v_new_shared, v_new_operand, state_fragment,
+                            )
+                            run_consumer_chunk(
+                                tail_cid + 1,
+                                w_operand_1,
+                                w_operand_0,
+                                True,
+                                True,
+                                w, g, h, v_new, bid, hid, v_offset,
+                                state_shared_h, state_operand, w_shared,
+                                u_shared, u_fragment,
+                                v_new_fragment, g_fragment, k_shared, k_fragment,
+                                v_new_shared, v_new_operand, state_fragment,
+                            )
+                            run_consumer_chunk(
+                                tail_cid + 2,
+                                w_operand_0,
+                                w_operand_1,
+                                False,
+                                False,
+                                w, g, h, v_new, bid, hid, v_offset,
+                                state_shared_h, state_operand, w_shared,
+                                u_shared, u_fragment,
+                                v_new_fragment, g_fragment, k_shared, k_fragment,
+                                v_new_shared, v_new_operand, state_fragment,
+                            )
+                        else:
+                            run_consumer_chunk(
+                                tail_cid,
+                                w_operand_0,
+                                w_operand_1,
+                                True,
+                                True,
+                                w, g, h, v_new, bid, hid, v_offset,
+                                state_shared_h, state_operand, w_shared,
+                                u_shared, u_fragment,
+                                v_new_fragment, g_fragment, k_shared, k_fragment,
+                                v_new_shared, v_new_operand, state_fragment,
+                            )
+                            run_consumer_chunk(
+                                tail_cid + 1,
+                                w_operand_1,
+                                w_operand_0,
+                                False,
+                                False,
+                                w, g, h, v_new, bid, hid, v_offset,
+                                state_shared_h, state_operand, w_shared,
+                                u_shared, u_fragment,
+                                v_new_fragment, g_fragment, k_shared, k_fragment,
+                                v_new_shared, v_new_operand, state_fragment,
+                            )
+
+
+                if fixed_has_tail:
+                    # The last full chunk leaves the new state in LDS but
+                    # deliberately skips reloading the next GEMM0 operand.
+                    T.s_waitcnt(0, "lgkmcnt")
+                    T.sync_warp()
+                    T.copy(state_shared_h, state_operand)
+                    tail_size = seq_len % chunk_size
+                    tail_base = num_chunks * chunk_size
+                    for it, ik in T.Parallel(chunk_size, dim_k):
+                        if it < tail_size:
+                            w_operand_0[it, ik] = w[
+                                bid, tail_base + it, hid, ik
+                            ]
+                        else:
+                            w_operand_0[it, ik] = T.cast(0, qkv_dtype)
+                    for it, ik in T.Parallel(chunk_size, dim_k):
+                        if it < tail_size:
+                            k_fragment[it, ik] = k[
+                                bid, tail_base + it, hid // (heads // kv_heads), ik
+                            ]
+                        else:
+                            k_fragment[it, ik] = T.cast(0, qkv_dtype)
+                    for it, iv in T.Parallel(chunk_size, block_v):
+                        if it < tail_size:
+                            u_fragment[it, iv] = u[
+                                bid,
+                                tail_base + it,
+                                hid,
+                                v_offset + iv,
+                            ]
+                        else:
+                            u_fragment[it, iv] = T.cast(0, qkv_dtype)
+                    for it, iv in T.Parallel(chunk_size, block_v):
+                        if it < tail_size:
+                            g_fragment[it, iv] = g[
+                                bid, tail_base + it, hid
+                            ]
+                        else:
+                            g_fragment[it, iv] = T.float32(0.0)
+                    T.s_waitcnt(0, "vmcnt")
+
+                    if transpose_state_layout:
+                        T.copy(
+                            state_fragment,
+                            h[
+                                bid,
+                                num_chunks,
+                                hid,
+                                v_offset : v_offset + block_v,
+                                0:dim_k,
+                            ],
                         )
                     else:
-                        run_consumer_chunk(
-                            tail_cid,
-                            w_operand_0,
-                            w_operand_1,
-                            True,
-                            True,
-                            w, g, h, v_new, bid, hid, v_offset,
-                            state_shared_h, state_operand, w_shared,
-                            u_shared, u_fragment,
-                            v_new_fragment, g_fragment, k_shared, k_fragment,
-                            v_new_shared, v_new_operand, state_fragment,
-                        )
-                        run_consumer_chunk(
-                            tail_cid + 1,
-                            w_operand_1,
-                            w_operand_0,
-                            False,
-                            False,
-                            w, g, h, v_new, bid, hid, v_offset,
-                            state_shared_h, state_operand, w_shared,
-                            u_shared, u_fragment,
-                            v_new_fragment, g_fragment, k_shared, k_fragment,
-                            v_new_shared, v_new_operand, state_fragment,
+                        for iv, ik in T.Parallel(block_v, dim_k):
+                            h[
+                                bid,
+                                num_chunks,
+                                hid,
+                                ik,
+                                v_offset + iv,
+                            ] = state_fragment[iv, ik]
+
+                    T.sched_barrier()
+                    T.gemm(
+                        w_operand_0,
+                        state_operand,
+                        v_new_fragment,
+                        transpose_B=True,
+                        policy=T.GemmWarpPolicy.FullRow,
+                        clear_accum=True,
+                        k_pack=2,
+                    )
+                    T.sched_barrier()
+                    for it, iv in T.Parallel(chunk_size, block_v):
+                        if it < tail_size:
+                            v_new_fragment[it, iv] = (
+                                T.cast(u_fragment[it, iv], "float32")
+                                - v_new_fragment[it, iv]
+                            )
+                        else:
+                            v_new_fragment[it, iv] = T.float32(0.0)
+
+                    if save_new_value:
+                        for it, iv in T.Parallel(chunk_size, block_v):
+                            if it < tail_size:
+                                v_new[
+                                    bid,
+                                    tail_base + it,
+                                    hid,
+                                    v_offset + iv,
+                                ] = T.cast(v_new_fragment[it, iv], qkv_dtype)
+
+                    tail_g_last = g[bid, tail_base + tail_size - 1, hid]
+                    T.s_waitcnt(0, "vmcnt")
+                    for it, iv in T.Parallel(chunk_size, block_v):
+                        if it < tail_size:
+                            diff = tail_g_last - g_fragment[it, iv]
+                            v_new_fragment[it, iv] = T.if_then_else(
+                                diff <= 0,
+                                v_new_fragment[it, iv]
+                                * T.exp2(diff * _LOG2E),
+                                T.float32(0.0),
+                            )
+                    for iv, ik in T.Parallel(block_v, dim_k):
+                        state_fragment[iv, ik] *= T.exp2(
+                            tail_g_last * _LOG2E
                         )
 
+                    T.copy(v_new_fragment, v_new_shared)
+                    T.sched_barrier()
+                    T.s_waitcnt(0, "lgkmcnt")
+                    T.sync_warp()
+                    T.copy(v_new_shared, v_new_operand)
+                    T.sched_barrier()
+                    T.gemm(
+                        v_new_operand,
+                        k_fragment,
+                        state_fragment,
+                        transpose_A=True,
+                        policy=T.GemmWarpPolicy.FullCol,
+                        clear_accum=False,
+                        k_pack=1,
+                    )
 
                 if store_final_state:
                     if inplace_final_state:
@@ -3460,261 +3594,409 @@ def _build_chunk_h_wasp_4p4c_gfx946(
     return chunk_gated_delta_rule_fwd_h_wasp_4p4c_gfx946_varlen_kernel
 
 
-@tilelang.jit(out_idx=[], pass_configs={
-    tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
-    tilelang.PassConfigKey.TL_DISABLE_SHARED_MEMORY_REUSE: True,
-    tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
-})
-def _build_chunk_h_wasp_4p4c_varlen_bv128(batch, heads, kv_heads, dim_k, dim_v, state_rows,
-        qkv_dtype, gate_dtype, chunk_size, use_initial_state, store_final_state,
-        inplace_final_state, save_new_value, transpose_state_layout,
-        is_varlen=True, block_v=128, vector_state_io=True):
+@tilelang.jit(
+    out_idx=[],
+    pass_configs={
+        tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+        tilelang.PassConfigKey.TL_DISABLE_SHARED_MEMORY_REUSE: True,
+        tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
+    },
+)
+def _build_chunk_h_wasp_4p4c_varlen(
+    batch,
+    heads,
+    kv_heads,
+    dim_k,
+    dim_v,
+    state_rows,
+    qkv_dtype,
+    gate_dtype,
+    chunk_size,
+    use_initial_state,
+    store_final_state,
+    inplace_final_state,
+    save_new_value,
+    transpose_state_layout,
+    is_varlen=True,
+    block_v=128,
+):
     # Dedicated packed-varlen path; fixed BV64 remains in the original builder.
-    assert batch==1 and dim_k==128 and dim_v==128 and block_v==128 and chunk_size==64
+    assert (
+        batch == 1
+        and dim_k == 128
+        and dim_v == 128
+        and block_v in (32, 64, 128)
+        and chunk_size == 64
+    )
     assert is_varlen and transpose_state_layout
-    total=T.dynamic('seq_len');n=T.dynamic('num_sequences');nc=T.dynamic('num_chunks');cs=T.dynamic('cu_size');co=T.dynamic('chunk_offsets_size')
+    # Each consumer wave owns V32; smaller BV uses fewer consumer waves.
+    BT = chunk_size
+    BK = dim_k
+    BV = block_v
+    UV_WIDTH = max(BK, BV)
+    # Instruction/warp geometry, not arbitrary shape parameters.
+    K_STEP = 32
+    T_STEP = 32
+    GATE_ROWS = 16
+    PRODUCER_THREADS = 256
+    NUM_THREADS = PRODUCER_THREADS + (BV // 32) * 64
+    total = T.dynamic("seq_len")
+    n = T.dynamic("num_sequences")
+    nc = T.dynamic("num_chunks")
+    cs = T.dynamic("cu_size")
+    co = T.dynamic("chunk_offsets_size")
+
     def make_storage(use_xor):
-        def address(t,c):
-            group=(c//8)^((t//2)%4) if use_xor else c//8
-            return 8*(256*(t//16)+64*(t%4)+(16*((t%16)//4)+group+4*(t%2))%64)+c%8
-        def inverse(r,c):
-            flat=r*128+c
-            point=flat//8
-            row_low=(point%256)//64
-            packed=(point%64-4*(row_low%2))%64
-            row=16*(point//256)+4*(packed//16)+row_low
-            group=(packed%16)^((row//2)%4) if use_xor else packed%16
-            return row,group*8+flat%8
-        x=T.Layout((64,128),lambda t,c:(address(t,c)//128,address(t,c)%128))
-        return x.with_inverse(T.Layout((64,128),inverse))
-    uv_layout=make_storage(True)
+        def address(t, c):
+            group = (c // 8) ^ ((t // 2) % 4) if use_xor else c // 8
+            return 8 * (
+                256 * (t // 16)
+                + 64 * (t % 4)
+                + (16 * ((t % 16) // 4) + group + 4 * (t % 2)) % 64
+            ) + c % 8
+
+        def inverse(r, c):
+            flat = r * UV_WIDTH + c
+            point = flat // 8
+            row_low = (point % 256) // 64
+            packed = (point % 64 - 4 * (row_low % 2)) % 64
+            row = 16 * (point // 256) + 4 * (packed // 16) + row_low
+            group = (packed % 16) ^ ((row // 2) % 4) if use_xor else packed % 16
+            return row, group * 8 + flat % 8
+
+        x = T.Layout(
+            (BT, UV_WIDTH),
+            lambda t, c: (address(t, c) // UV_WIDTH, address(t, c) % UV_WIDTH),
+        )
+        return x.with_inverse(T.Layout((BT, UV_WIDTH), inverse))
+
+    uv_layout = make_storage(True)
+
     @T.prim_func
-    def chunk_gated_delta_rule_fwd_h_wasp_4p4c_varlen_bv128_kernel(k:T.Tensor((1,total,kv_heads,128),qkv_dtype),
-             w:T.Tensor((1,total,heads,128),qkv_dtype),
-             u:T.Tensor((1,total,heads,128),qkv_dtype),
-             g:T.Tensor((1,total,heads),gate_dtype),
-             initial:T.Tensor((state_rows,heads,128,128),'float32'),
-             indices:T.Tensor((n,),'int32'),cu:T.Tensor((cs,),'int32'),offsets:T.Tensor((co,),'int32'),
-             h:T.Tensor((1,nc,heads,128,128),qkv_dtype),
-             vn:T.Tensor((1,total,heads,128),qkv_dtype),
-             final:T.Tensor((state_rows if inplace_final_state else n,heads,128,128),'float32')):
-        with T.Kernel(1,n*heads,threads=512) as (vid,nh):
-            seq=nh//heads;hid=nh%heads
-            bos=cu[seq];length=cu[seq+1]-bos;start=offsets[seq];slot=indices[seq]
+    def chunk_gated_delta_rule_fwd_h_wasp_4p4c_varlen_kernel(
+        k: T.Tensor((batch, total, kv_heads, dim_k), qkv_dtype),
+        w: T.Tensor((batch, total, heads, dim_k), qkv_dtype),
+        u: T.Tensor((batch, total, heads, dim_v), qkv_dtype),
+        g: T.Tensor((batch, total, heads), gate_dtype),
+        initial: T.Tensor((state_rows, heads, dim_v, dim_k), "float32"),
+        indices: T.Tensor((n,), 'int32'),
+        cu: T.Tensor((cs,), 'int32'),
+        offsets: T.Tensor((co,), 'int32'),
+        h: T.Tensor((batch, nc, heads, dim_v, dim_k), qkv_dtype),
+        vn: T.Tensor((batch, total, heads, dim_v), qkv_dtype),
+        final: T.Tensor(
+            (state_rows if inplace_final_state else n, heads, dim_v, dim_k),
+            "float32",
+        ),
+    ):
+        with T.Kernel(T.ceildiv(dim_v, BV), n * heads, threads=NUM_THREADS) as (vid, nh):
+            v_start = vid * BV
+            seq = nh // heads
+            hid = nh % heads
+            bos = cu[seq]
+            length = cu[seq + 1] - bos
+            start = offsets[seq]
+            slot = indices[seq]
             # Contracts of well-formed packed sequence/chunk metadata.
             # Do not assume slot is valid: -1 retains the zero-initial behavior.
             T.assume(bos >= 0)
             T.assume(length >= 0)
             T.assume(bos + length <= total)
             T.assume(start >= 0)
-            T.assume(start + T.ceildiv(length, 64) <= nc)
-            uv=T.alloc_shared((64,128),qkv_dtype)
-            ks=T.alloc_shared((64,128),qkv_dtype)
-            T.annotate_layout({uv:uv_layout})
-            tx=T.get_thread_binding()
-            if tx<256:
-                up=T.alloc_fragment((64,128),qkv_dtype)
-                if length>0:
-                    T.async_copy(w[0,bos:bos+64,hid,:],uv,coalesced_width=8)
-                for cid in T.serial(length//64):
-                    base=bos+cid*64
-                    T.async_copy(k[0,base:base+64,hid//(heads//kv_heads),:],ks,coalesced_width=8)
-                    T.ptx_wait_group(1) # W prefix complete; newest K group may remain
-                    T.sync_threads() # B0: W ready; K may still be in flight
-                    T.copy(u[0,base:base+64,hid,:],up)
-                    T.sync_threads() # B1: W consumed
-                    T.copy(up,uv)
+            T.assume(start + T.ceildiv(length, BT) <= nc)
+            uv = T.alloc_shared((BT, UV_WIDTH), qkv_dtype)
+            ks = T.alloc_shared((BT, BK), qkv_dtype)
+            T.annotate_layout({ uv: uv_layout})
+            tx = T.get_thread_binding()
+            if tx < PRODUCER_THREADS:
+                up = T.alloc_fragment((BT, UV_WIDTH), qkv_dtype)
+                if length > 0:
+                    T.async_copy(w[0, bos: bos + BT, hid, :], uv, coalesced_width=8)
+                for cid in T.serial(length // BT):
+                    base = bos + cid * BT
+                    T.async_copy(
+                        k[0, base: base + BT, hid // (heads // kv_heads), :],
+                        ks,
+                        coalesced_width=8,
+                    )
+                    T.ptx_wait_group(1)  # W prefix complete; newest K group may remain
+                    T.sync_threads()  # B0: W ready; K may still be in flight
+                    T.copy(u[0, base: base + BT, hid, v_start: v_start + BV], up[:, 0:BV])
+                    T.sync_threads()  # B1: W consumed
+                    T.copy(up[:, 0:BV], uv[:, 0:BV])
                     T.ptx_wait_group(0)
-                    T.sync_threads() # B2: U/K ready
-                    if cid+1<T.ceildiv(length,64):
-                        T.copy(w[0,base+64:base+128,hid,:],up)
-                    T.sync_threads() # B4: second operands read; UV free
-                    if cid+1<T.ceildiv(length,64):
-                        T.copy(up,uv)
-                if length%64>0:
-                    base=bos+(length//64)*64
+                    T.sync_threads()  # B2: U/K ready
+                    if cid + 1 < T.ceildiv(length, BT):
+                        T.copy(w[0, base + BT: base + 2 * BT, hid, :], up)
+                    T.sync_threads()  # B4: second operands read; UV free
+                    if cid + 1 < T.ceildiv(length, BT):
+                        T.copy(up, uv)
+                if length % BT > 0:
+                    base = bos + (length // BT) * BT
                     T.ptx_wait_group(0)
-                    T.sync_threads() # tail W ready
-                    T.sync_threads() # tail W masking complete
-                    T.async_copy(k[0,base:base+64,hid//(heads//kv_heads),:],ks,coalesced_width=8)
-                    T.sync_threads() # tail W consumed
-                    T.async_copy(u[0,base:base+64,hid,:],uv,coalesced_width=8)
-                    T.ptx_wait_group(0)
-                    T.sync_threads() # tail U/K ready
-                    T.sync_threads() # tail U/K masking complete
-                    T.sync_threads() # tail gated V published
-                    T.sync_threads() # tail first operands read
-                    T.sync_threads() # tail second operands read
-                    T.sync_threads() # tail finished
-            else:
-                state=T.alloc_fragment((128,128),'float32')
-                sop=T.alloc_fragment((128,32),qkv_dtype)
-                hf=T.alloc_fragment((128,32),qkv_dtype)
-                state_io_tile=T.alloc_fragment((128,32),'float32')
-                factor = T.alloc_var("float32")
-                gate_prefetch = T.alloc_local((4,), gate_dtype)
-                wo=T.alloc_fragment((64,32),qkv_dtype)
-                uf=T.alloc_fragment((64,128),qkv_dtype)
-                val=T.alloc_fragment((64,128),'float32')
-                vo=T.alloc_fragment((32,128),qkv_dtype)
-                ko=T.alloc_fragment((32,128),qkv_dtype)
-                gl=T.alloc_var('float32')
-                if vector_state_io:
-                    if use_initial_state and slot>=0 and slot<state_rows:
-                        for bk in T.unroll(4):
-                            T.copy(initial[slot,hid,:,bk*32:(bk+1)*32],state_io_tile)
-                            for v,kk in T.Parallel(128,32):
-                                state[v,bk*32+kk]=state_io_tile[v,kk]
+                    T.sync_threads()  # tail W ready
+                    T.sync_threads()  # tail W masking complete
+                    T.async_copy(
+                        k[0, base: base + BT, hid // (heads // kv_heads), :],
+                        ks,
+                        coalesced_width=8,
+                    )
+                    T.sync_threads()  # tail W consumed
+                    if BV == 128:
+                        T.async_copy(u[0, base: base + BT, hid, :], uv, coalesced_width=8)
                     else:
-                        for v,kk in T.Parallel(128,128):
-                            state[v,kk]=T.float32(0)
+                        # Swizzled LDS async copies require a full matrix.
+                        # Reuse the existing producer registers for smaller V tiles.
+                        T.copy(u[0, base: base + BT, hid, v_start: v_start + BV], up[:, 0:BV])
+                        T.copy(up[:, 0:BV], uv[:, 0:BV])
+                    T.ptx_wait_group(0)
+                    T.sync_threads()  # tail U/K ready
+                    T.sync_threads()  # tail U/K masking complete
+                    T.sync_threads()  # tail gated V published
+                    T.sync_threads()  # tail first operands read
+                    T.sync_threads()  # tail second operands read
+                    T.sync_threads()  # tail finished
+            else:
+                state = T.alloc_fragment((BV, BK), "float32")
+                sop = T.alloc_fragment((BV, K_STEP), qkv_dtype)
+                hf = T.alloc_fragment((BV, K_STEP), qkv_dtype)
+                state_io_tile = T.alloc_fragment((BV, K_STEP), "float32")
+                factor = T.alloc_var("float32")
+                gate_prefetch = T.alloc_local((BT // GATE_ROWS,), gate_dtype)
+                wo = T.alloc_fragment((BT, K_STEP), qkv_dtype)
+                uf = T.alloc_fragment((BT, BV), qkv_dtype)
+                val = T.alloc_fragment((BT, BV), "float32")
+                vo = T.alloc_fragment((T_STEP, BV), qkv_dtype)
+                ko = T.alloc_fragment((T_STEP, BK), qkv_dtype)
+                gl = T.alloc_var("float32")
+                if use_initial_state and slot >= 0 and slot < state_rows:
+                    for bk in T.unroll(BK // K_STEP):
+                        T.copy(
+                            initial[slot, hid, v_start: v_start + BV, bk * K_STEP: (bk + 1) * K_STEP],
+                            state_io_tile,
+                        )
+                        for v, kk in T.Parallel(BV, K_STEP):
+                            state[v, bk * K_STEP + kk] = state_io_tile[v, kk]
                 else:
-                    for v,kk in T.Parallel(128,128):
-                        if use_initial_state and slot>=0 and slot<state_rows:
-                            state[v,kk]=initial[slot,hid,v,kk]
-                        else:
-                            state[v,kk]=0
-                for cid in T.serial(length//64):
-                    base=bos+cid*64
-                    valid=64
-                    gl=g[0,base+valid-1,hid]
+                    for v, kk in T.Parallel(BV, BK):
+                        state[v, kk] = T.float32(0)
+                for cid in T.serial(length // BT):
+                    base = bos + cid * BT
+                    valid = BT
+                    gl = g[0, base + valid - 1, hid]
                     T.sync_threads()
-                    if valid<64:
-                        for t,kk in T.Parallel(64,128):
-                            if t>=valid:
-                                uv[t,kk]=T.cast(0,qkv_dtype)
+                    if valid < BT:
+                        for t, kk in T.Parallel(BT, BK):
+                            if t >= valid:
+                                uv[t, kk] = T.cast(0, qkv_dtype)
                         T.sync_threads()
-                    for kb in T.unroll(4):
+                    for kb in T.unroll(BK // K_STEP):
                         # Cast and coordinate conversion are elementwise; let
                         # the TileOp express ownership instead of scalar tx reads.
-                        T.copy(state[:,kb*32:(kb+1)*32],hf)
-                        for v,kk in T.Parallel(128,32):
-                            sop[v,kk] = hf[(v//32)*32+2*(v%16)+(v%32)//16,kk]
-                        T.copy(hf,h[0,start+cid,hid,:,kb*32:(kb+1)*32])
-                        T.copy(uv[0:64,kb*32:(kb+1)*32],wo)
-                        T.gemm(wo,sop,val,transpose_B=True,policy=T.GemmWarpPolicy.FullCol,clear_accum=(kb==0),k_pack=2)
+                        T.copy(state[:, kb * K_STEP: (kb + 1) * K_STEP], hf)
+                        for v, kk in T.Parallel(BV, K_STEP):
+                            sop[v, kk] = hf[(v // 32) * 32 + 2 * (v % 16) + (v % 32) // 16, kk]
+                        T.copy(
+                            hf,
+                            h[0, start + cid, hid, v_start: v_start + BV, kb * K_STEP: (kb + 1) * K_STEP],
+                        )
+                        T.copy(uv[0:BT, kb * K_STEP: (kb + 1) * K_STEP], wo)
+                        T.gemm(
+                            wo,
+                            sop,
+                            val,
+                            transpose_B=True,
+                            policy=T.GemmWarpPolicy.FullCol,
+                            clear_accum=(kb == 0),
+                            k_pack=2,
+                        )
                     T.sync_threads()
                     T.sync_threads()
                     # Issue gate reads once U/K publication has completed.
-                    for ts in T.unroll(4):
-                        gate_prefetch[ts] = g[0,base+T.min(ts*16+tx%16,valid-1),hid]
+                    for ts in T.unroll(BT // GATE_ROWS):
+                        gate_prefetch[ts] = g[
+                            0,
+                            base + T.min(ts * GATE_ROWS + tx % GATE_ROWS, valid - 1),
+                            hid,
+                        ]
                     T.sched_barrier(0x64F)  # Allow ALU/MMAC, VMEM stores, DS writes, transcendentals.
-                    if valid<64:
-                        for t,kk in T.Parallel(64,128):
-                            if t>=valid:
-                                uv[t,kk]=T.cast(0,qkv_dtype)
-                                ks[t,kk]=T.cast(0,qkv_dtype)
+                    if valid < BT:
+                        for t, kk in T.Parallel(BT, BK):
+                            if t >= valid:
+                                uv[t, kk] = T.cast(0, qkv_dtype)
+                                ks[t, kk] = T.cast(0, qkv_dtype)
                         T.sync_threads()
-                    T.copy(uv,uf)
-                    for t,v in T.Parallel(64,128):
-                        val[t,v]=T.if_then_else(t<valid,T.cast(uf[t,(v//32)*32+2*(v%16)+(v%32)//16],'float32')-val[t,v],T.float32(0))
+                    T.copy(uv[:, 0:BV], uf)
+                    for t, v in T.Parallel(BT, BV):
+                        val[t, v] = T.if_then_else(
+                            t < valid,
+                            T.cast(
+                                uf[t, (v // 32) * 32 + 2 * (v % 16) + (v % 32) // 16],
+                                "float32",
+                            ) - val[t, v],
+                            T.float32(0),
+                        )
                     if save_new_value:
-                        for t,v in T.Parallel(64,128):
-                            uf[t,(v//32)*32+2*(v%16)+(v%32)//16]=T.cast(val[t,v],qkv_dtype)
-                        T.copy(uf,vn[0,base:base+64,hid,:])
-                    for ts in T.unroll(4):
-                        factor = gl-gate_prefetch[ts]
-                        factor = T.if_then_else(factor<=0, T.exp2(factor*1.4426950408889634), T.float32(0))
-                        for t,v in T.Parallel(16,128):
-                            if ts*16+t < valid:
-                                val[ts*16+t,v] *= factor
-                    for v,kk in T.Parallel(128,128):
-                        state[v,kk]*=T.exp2(gl*1.4426950408889634)
-                    for t,v in T.Parallel(64,128):
-                        uf[t,(v//32)*32+2*(v%16)+(v%32)//16]=T.cast(val[t,v],qkv_dtype)
-                    T.copy(uf,uv)
-                    T.s_waitcnt(0,"lgkmcnt") # V is owned by the same consumer wave
-                    for tp in T.unroll(2):
-                        T.ds_read_vector(uv[tp*32:(tp+1)*32,:],vo,alt=2)
-                        T.ds_read_vector(ks[tp*32:(tp+1)*32,:],ko,alt=2)
-                        T.s_waitcnt(0,"lgkmcnt")
-                        if tp==1:
+                        for t, v in T.Parallel(BT, BV):
+                            uf[t, (v // 32) * 32 + 2 * (v % 16) + (v % 32) // 16] = T.cast(
+                                val[t, v], qkv_dtype
+                            )
+                        T.copy(uf, vn[0, base: base + BT, hid, v_start: v_start + BV])
+                    for ts in T.unroll(BT // GATE_ROWS):
+                        factor = gl - gate_prefetch[ts]
+                        factor = T.if_then_else(
+                            factor <= 0,
+                            T.exp2(factor * 1.4426950408889634),
+                            T.float32(0),
+                        )
+                        for t, v in T.Parallel(GATE_ROWS, BV):
+                            if ts * GATE_ROWS + t < valid:
+                                val[ts * GATE_ROWS + t, v] *= factor
+                    for v, kk in T.Parallel(BV, BK):
+                        state[v, kk] *= T.exp2(gl * 1.4426950408889634)
+                    for t, v in T.Parallel(BT, BV):
+                        uf[t, (v // 32) * 32 + 2 * (v % 16) + (v % 32) // 16] = T.cast(
+                            val[t, v], qkv_dtype
+                        )
+                    T.copy(uf, uv[:, 0:BV])
+                    T.s_waitcnt(0, "lgkmcnt")  # V is owned by the same consumer wave
+                    for tp in T.unroll(BT // T_STEP):
+                        T.ds_read_vector(uv[tp * T_STEP: (tp + 1) * T_STEP, 0:BV], vo, alt=2)
+                        T.ds_read_vector(ks[tp * T_STEP: (tp + 1) * T_STEP, :], ko, alt=2)
+                        T.s_waitcnt(0, "lgkmcnt")
+                        if tp == BT // T_STEP - 1:
                             T.sync_threads()
-                        T.gemm(vo,ko,state,transpose_A=True,policy=T.GemmWarpPolicy.FullRow,clear_accum=False,k_pack=1)
-                if length%64>0:
-                    tailcid=length//64
-                    base=bos+tailcid*64
-                    valid=length%64
-                    gl=g[0,base+valid-1,hid]
+                        T.gemm(
+                            vo,
+                            ko,
+                            state,
+                            transpose_A=True,
+                            policy=T.GemmWarpPolicy.FullRow,
+                            clear_accum=False,
+                            k_pack=1,
+                        )
+                if length % BT > 0:
+                    tailcid = length // BT
+                    base = bos + tailcid * BT
+                    valid = length % BT
+                    gl = g[0, base + valid - 1, hid]
                     T.sync_threads()
-                    if valid<64:
-                        for t,kk in T.Parallel(64,128):
-                            if t>=valid:
-                                uv[t,kk]=T.cast(0,qkv_dtype)
+                    if valid < BT:
+                        for t, kk in T.Parallel(BT, BK):
+                            if t >= valid:
+                                uv[t, kk] = T.cast(0, qkv_dtype)
                         T.sync_threads()
-                    for kb in T.unroll(4):
+                    for kb in T.unroll(BK // K_STEP):
                         # Cast and coordinate conversion are elementwise; let
                         # the TileOp express ownership instead of scalar tx reads.
-                        T.copy(state[:,kb*32:(kb+1)*32],hf)
-                        for v,kk in T.Parallel(128,32):
-                            sop[v,kk] = hf[(v//32)*32+2*(v%16)+(v%32)//16,kk]
-                        T.copy(hf,h[0,start+tailcid,hid,:,kb*32:(kb+1)*32])
-                        T.copy(uv[0:64,kb*32:(kb+1)*32],wo)
-                        T.gemm(wo,sop,val,transpose_B=True,policy=T.GemmWarpPolicy.FullCol,clear_accum=(kb==0),k_pack=2)
+                        T.copy(state[:, kb * K_STEP: (kb + 1) * K_STEP], hf)
+                        for v, kk in T.Parallel(BV, K_STEP):
+                            sop[v, kk] = hf[(v // 32) * 32 + 2 * (v % 16) + (v % 32) // 16, kk]
+                        T.copy(
+                            hf,
+                            h[0, start + tailcid, hid, v_start: v_start + BV, kb * K_STEP: (kb + 1) * K_STEP],
+                        )
+                        T.copy(uv[0:BT, kb * K_STEP: (kb + 1) * K_STEP], wo)
+                        T.gemm(
+                            wo,
+                            sop,
+                            val,
+                            transpose_B=True,
+                            policy=T.GemmWarpPolicy.FullCol,
+                            clear_accum=(kb == 0),
+                            k_pack=2,
+                        )
                     T.sync_threads()
                     T.sync_threads()
                     # Issue gate reads once U/K publication has completed.
-                    for ts in T.unroll(4):
-                        gate_prefetch[ts] = g[0,base+T.min(ts*16+tx%16,valid-1),hid]
+                    for ts in T.unroll(BT // GATE_ROWS):
+                        gate_prefetch[ts] = g[
+                            0,
+                            base + T.min(ts * GATE_ROWS + tx % GATE_ROWS, valid - 1),
+                            hid,
+                        ]
                     T.sched_barrier(0x64F)  # Allow ALU/MMAC, VMEM stores, DS writes, transcendentals.
-                    if valid<64:
-                        for t,kk in T.Parallel(64,128):
-                            if t>=valid:
-                                uv[t,kk]=T.cast(0,qkv_dtype)
-                                ks[t,kk]=T.cast(0,qkv_dtype)
+                    if valid < BT:
+                        for t, kk in T.Parallel(BT, BK):
+                            if t >= valid:
+                                uv[t, kk] = T.cast(0, qkv_dtype)
+                                ks[t, kk] = T.cast(0, qkv_dtype)
                         T.sync_threads()
-                    T.copy(uv,uf)
-                    for t,v in T.Parallel(64,128):
-                        val[t,v]=T.if_then_else(t<valid,T.cast(uf[t,(v//32)*32+2*(v%16)+(v%32)//16],'float32')-val[t,v],T.float32(0))
+                    T.copy(uv[:, 0:BV], uf)
+                    for t, v in T.Parallel(BT, BV):
+                        val[t, v] = T.if_then_else(
+                            t < valid,
+                            T.cast(
+                                uf[t, (v // 32) * 32 + 2 * (v % 16) + (v % 32) // 16],
+                                "float32",
+                            ) - val[t, v],
+                            T.float32(0),
+                        )
                     if save_new_value:
-                        for t,v in T.Parallel(64,128):
-                            uf[t,(v//32)*32+2*(v%16)+(v%32)//16]=T.cast(val[t,v],qkv_dtype)
-                        T.copy(uf[0:valid,:],vn[0,base:base+valid,hid,:])
-                    for ts in T.unroll(4):
-                        factor = gl-gate_prefetch[ts]
-                        factor = T.if_then_else(factor<=0, T.exp2(factor*1.4426950408889634), T.float32(0))
-                        for t,v in T.Parallel(16,128):
-                            if ts*16+t < valid:
-                                val[ts*16+t,v] *= factor
-                    for v,kk in T.Parallel(128,128):
-                        state[v,kk]*=T.exp2(gl*1.4426950408889634)
-                    for t,v in T.Parallel(64,128):
-                        uf[t,(v//32)*32+2*(v%16)+(v%32)//16]=T.cast(val[t,v],qkv_dtype)
-                    T.copy(uf,uv)
+                        for t, v in T.Parallel(BT, BV):
+                            uf[t, (v // 32) * 32 + 2 * (v % 16) + (v % 32) // 16] = T.cast(
+                                val[t, v], qkv_dtype
+                            )
+                        T.copy(
+                            uf[0: valid, :],
+                            vn[0, base: base + valid, hid, v_start: v_start + BV],
+                        )
+                    for ts in T.unroll(BT // GATE_ROWS):
+                        factor = gl - gate_prefetch[ts]
+                        factor = T.if_then_else(
+                            factor <= 0,
+                            T.exp2(factor * 1.4426950408889634),
+                            T.float32(0),
+                        )
+                        for t, v in T.Parallel(GATE_ROWS, BV):
+                            if ts * GATE_ROWS + t < valid:
+                                val[ts * GATE_ROWS + t, v] *= factor
+                    for v, kk in T.Parallel(BV, BK):
+                        state[v, kk] *= T.exp2(gl * 1.4426950408889634)
+                    for t, v in T.Parallel(BT, BV):
+                        uf[t, (v // 32) * 32 + 2 * (v % 16) + (v % 32) // 16] = T.cast(
+                            val[t, v], qkv_dtype
+                        )
+                    T.copy(uf, uv[:, 0:BV])
                     T.sync_threads()
-                    for tp in T.unroll(2):
-                        T.ds_read_vector(uv[tp*32:(tp+1)*32,:],vo,alt=2)
-                        T.ds_read_vector(ks[tp*32:(tp+1)*32,:],ko,alt=2)
-                        T.s_waitcnt(0,"lgkmcnt")
+                    for tp in T.unroll(BT // T_STEP):
+                        T.ds_read_vector(uv[tp * T_STEP: (tp + 1) * T_STEP, 0:BV], vo, alt=2)
+                        T.ds_read_vector(ks[tp * T_STEP: (tp + 1) * T_STEP, :], ko, alt=2)
+                        T.s_waitcnt(0, "lgkmcnt")
                         T.sync_threads()
-                        T.gemm(vo,ko,state,transpose_A=True,policy=T.GemmWarpPolicy.FullRow,clear_accum=False,k_pack=1)
+                        T.gemm(
+                            vo,
+                            ko,
+                            state,
+                            transpose_A=True,
+                            policy=T.GemmWarpPolicy.FullRow,
+                            clear_accum=False,
+                            k_pack=1,
+                        )
                     T.sync_threads()
                 if store_final_state:
                     if inplace_final_state:
-                        if slot>=0 and slot<state_rows:
-                            if vector_state_io:
-                                for bk in T.unroll(4):
-                                    for v,kk in T.Parallel(128,32):
-                                        state_io_tile[v,kk]=state[v,bk*32+kk]
-                                    T.copy(state_io_tile,final[slot,hid,:,bk*32:(bk+1)*32])
-                            else:
-                                for v,kk in T.Parallel(128,128):
-                                    final[slot,hid,v,kk]=state[v,kk]
+                        if slot >= 0 and slot < state_rows:
+                            for bk in T.unroll(BK // K_STEP):
+                                for v, kk in T.Parallel(BV, K_STEP):
+                                    state_io_tile[v, kk] = state[v, bk * K_STEP + kk]
+                                T.copy(
+                                    state_io_tile,
+                                    final[slot, hid, v_start: v_start + BV, bk * K_STEP: (bk + 1) * K_STEP],
+                                )
                     else:
-                        if vector_state_io:
-                            for bk in T.unroll(4):
-                                for v,kk in T.Parallel(128,32):
-                                    state_io_tile[v,kk]=state[v,bk*32+kk]
-                                T.copy(state_io_tile,final[seq,hid,:,bk*32:(bk+1)*32])
-                        else:
-                            for v,kk in T.Parallel(128,128):
-                                final[seq,hid,v,kk]=state[v,kk]
-    return chunk_gated_delta_rule_fwd_h_wasp_4p4c_varlen_bv128_kernel
-
+                        for bk in T.unroll(BK // K_STEP):
+                            for v, kk in T.Parallel(BV, K_STEP):
+                                state_io_tile[v, kk] = state[v, bk * K_STEP + kk]
+                            T.copy(
+                                state_io_tile,
+                                final[seq, hid, v_start: v_start + BV, bk * K_STEP: (bk + 1) * K_STEP],
+                            )
+    return chunk_gated_delta_rule_fwd_h_wasp_4p4c_varlen_kernel
 
 @functools.lru_cache(None)
-def _get_wasp_4p4c_varlen_bv128_kernel(*args):
-    return _build_chunk_h_wasp_4p4c_varlen_bv128(*args)
+def _get_wasp_4p4c_varlen_kernel(*args):
+    return _build_chunk_h_wasp_4p4c_varlen(*args)
 
 
 @functools.lru_cache(maxsize=128)
@@ -3765,12 +4047,15 @@ def chunk_gated_delta_rule_fwd_h(
     kernel_cfg: Optional[dict] = None,
 ):
     implementation = (
-        "copy-pipeline"
+        "wasp_4p4c"
         if kernel_cfg is None
-        else kernel_cfg.get("implementation")
+        else kernel_cfg.get("implementation", "wasp_4p4c")
     )
+    if kernel_cfg is not None:
+        unknown = set(kernel_cfg) - {"implementation", "block_v"}
+        if unknown:
+            raise ValueError(f"unsupported kernel_cfg keys: {sorted(unknown)}")
     if implementation not in (
-        "copy-pipeline",
         "wasp_4p4c",
         "wasp_4p4c_gfx946",
     ):
@@ -3818,10 +4103,7 @@ def chunk_gated_delta_rule_fwd_h(
             raise TypeError("cu_seqlens must have int32 or int64 dtype.")
         if cu_seqlens.device != k.device:
             raise ValueError("cu_seqlens and k must be on the same device.")
-        cu_seqlens_kernel = cu_seqlens.to(dtype=torch.int32)
-        if chunk_indices is None:
-            chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
-        elif (
+        if chunk_indices is not None and (
             chunk_indices.ndim != 2
             or chunk_indices.shape[1] != 2
             or chunk_indices.dtype not in (torch.int32, torch.int64)
@@ -3831,6 +4113,21 @@ def chunk_gated_delta_rule_fwd_h(
                 "chunk_indices must have shape [NT, 2], int32/int64 dtype, "
                 "and reside on the input device."
             )
+        if implementation == "wasp_4p4c" and cu_seqlens.numel() == 2:
+            # Validate before discarding packed metadata. This host read is
+            # confined to the single-sequence normalization path.
+            if cu_seqlens.tolist() != [0, seq_len]:
+                raise ValueError("single-sequence cu_seqlens must be [0, T].")
+            if chunk_indices is not None and chunk_indices.shape[0] != (
+                seq_len + chunk_size - 1
+            ) // chunk_size:
+                raise ValueError("single-sequence chunk_indices has the wrong chunk count.")
+            is_varlen = False
+
+    if is_varlen:
+        cu_seqlens_kernel = cu_seqlens.to(dtype=torch.int32)
+        if chunk_indices is None:
+            chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
         chunk_offsets_kernel = prepare_chunk_offsets(
             cu_seqlens, chunk_size
         )[:-1].to(dtype=torch.int32)
@@ -3954,58 +4251,29 @@ def chunk_gated_delta_rule_fwd_h(
         and output_final_state
         and save_new_value
     )
-    if (
-        not supported
-        or not transpose_state_layout
-        or num_chunks < 1
-        or (
-            implementation == "copy-pipeline"
-            and not is_varlen
-            and seq_len < chunk_size
-        )
-        or (
-            implementation == "wasp_4p4c"
-            and not is_varlen
-            and seq_len % chunk_size != 0
-        )
-    ):
+    if not supported or not transpose_state_layout or num_chunks < 1:
         raise NotImplementedError(
-            "TileLang kernels require bf16 BT64/K128 shapes, V divisible by "
-            f"the selected BV={block_v}, VK "
-            "state layout, final_state and v_new enabled; fixed copy-pipeline "
-            "needs T >= 64, and fixed wasp_4p4c requires T divisible by 64."
+            "TileLang kernels require bf16 BT64/K128/V32 shapes, VK "
+            "state layout, final_state and v_new enabled."
         )
-    # BV128 is specific to packed varlen V128. Preserve fixed and other paths.
-    default_bv = 128 if implementation == "wasp_4p4c" and is_varlen and dim_v == 128 else 32
+    if implementation == "wasp_4p4c" and is_varlen and dim_v != 128:
+        raise NotImplementedError("packed-varlen wasp_4p4c requires V=128.")
+
+    default_bv = 128 if implementation == "wasp_4p4c" and is_varlen else 32
     block_v = (
         _get_gfx946_block_v()
         if implementation == "wasp_4p4c_gfx946"
         else default_bv if kernel_cfg is None else kernel_cfg.get("block_v", default_bv)
     )
-    if block_v not in (32, 64, 128):
-        raise ValueError("TileLang chunk-h block_v must be 32, 64 or 128.")
-    varlen_bv128 = implementation == "wasp_4p4c" and is_varlen and dim_v == 128 and block_v == 128
-    if block_v == 128 and not varlen_bv128:
-        raise ValueError("block_v=128 requires packed-varlen wasp_4p4c with V=128.")
-    state_io = "vector" if kernel_cfg is None else kernel_cfg.get("state_io", "vector")
-    if state_io not in ("vector", "scalar"):
-        raise ValueError("state_io must be 'vector' or 'scalar'.")
-    if kernel_cfg is not None and "state_io" in kernel_cfg and not varlen_bv128:
-        raise ValueError("state_io is only supported by varlen wasp_4p4c BV128.")
-    if block_v == 64 and implementation != "wasp_4p4c_gfx946" and (
-        implementation != "wasp_4p4c" or is_varlen or dim_v % 64 != 0
-    ):
-        raise ValueError(
-            "block_v=64 requires fixed wasp_4p4c and V divisible by 64."
-        )
     if implementation == "wasp_4p4c_gfx946":
-        get_kernel = _get_wasp_4p4c_gfx946_kernel
-    elif implementation == "wasp_4p4c":
-        get_kernel = _get_wasp_4p4c_kernel
+        if dim_v % block_v:
+            raise ValueError("gfx946 requires V divisible by the selected BV.")
     elif is_varlen:
-        get_kernel = _get_copy_pipeline_varlen_kernel
-    else:
-        get_kernel = _get_copy_pipeline_kernel
+        if block_v not in (32, 64, 128):
+            raise ValueError("packed-varlen block_v must be 32, 64 or 128.")
+    elif block_v not in (32, 64) or dim_v % block_v:
+        raise ValueError("fixed block_v must be 32 or 64 and divide V.")
+
     kernel_args = (
         batch,
         heads,
@@ -4023,25 +4291,17 @@ def chunk_gated_delta_rule_fwd_h(
         transpose_state_layout,
     )
     if implementation == "wasp_4p4c_gfx946":
-        # Include BV in the cache key; read the environment before lookup.
-        kernel = get_kernel(
+        kernel = _get_wasp_4p4c_gfx946_kernel(
             *kernel_args, is_varlen,
-            not is_varlen and seq_len % chunk_size != 0, block_v,
-        )
-    elif is_varlen and implementation == "copy-pipeline":
-        # Compile the fixed BV32 pipeline as a separate packed-varlen kernel.
-        # The fixed builder and its generated code remain unchanged.
-        kernel = get_kernel(*kernel_args, 32, 256)
-    elif varlen_bv128:
-        kernel = _get_wasp_4p4c_varlen_bv128_kernel(
-            *kernel_args, True, 128, state_io == "vector"
+            False if is_varlen else seq_len % chunk_size != 0, block_v,
         )
     elif is_varlen:
-        kernel = get_kernel(*kernel_args, True)
-    elif implementation == "wasp_4p4c" and block_v == 64:
-        kernel = get_kernel(*kernel_args, False, 64)
+        kernel = _get_wasp_4p4c_varlen_kernel(*kernel_args, True, block_v)
     else:
-        kernel = get_kernel(*kernel_args)
+        kernel = _get_wasp_4p4c_kernel(
+            *kernel_args, False, block_v,
+            seq_len % chunk_size != 0, seq_len < chunk_size,
+        )
     if is_varlen:
         kernel(
             k,

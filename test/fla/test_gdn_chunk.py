@@ -44,7 +44,7 @@ def _chunk_h_correctness_params():
     params = []
     for backend_name in CHUNK_H_BACKENDS:
         implementations = (
-            ("copy-pipeline", "wasp_4p4c", "wasp_4p4c_gfx946")
+            ("wasp_4p4c", "wasp_4p4c_gfx946")
             if backend_name == "tilelang"
             else (None,)
         )
@@ -144,13 +144,19 @@ def _check_chunk_h_matches_reference(
     inplace_final_state: bool,
     implementation: str | None = "wasp_4p4c",
     heads: int = 16,
+    seq_len: int | None = None,
+    block_v: int | None = None,
+    state_index: int = 1,
 ) -> None:
     backend_name, chunk_h = chunk_backend
     torch.manual_seed(120 if use_varlen else 123)
     B, H, Hg, K, V, chunk_size = 1, heads, 16, 128, 128, 64
     minimum_T = 5 * chunk_size
-    T = CORRECTNESS_SEQ_LEN
-    assert T >= minimum_T
+    T = CORRECTNESS_SEQ_LEN if seq_len is None else seq_len
+    if seq_len is None:
+        assert T >= minimum_T
+    else:
+        assert not use_varlen and T >= chunk_size and T % chunk_size == 0
     dtype = torch.bfloat16
     if use_varlen:
         first = T // 3
@@ -167,7 +173,7 @@ def _check_chunk_h_matches_reference(
         cu_cpu = None
         chunk_indices_cpu = None
         num_sequences = B
-        state_indices_cpu = torch.tensor([1], dtype=torch.int32)
+        state_indices_cpu = torch.tensor([state_index], dtype=torch.int32)
     state_rows = num_sequences + 1
 
     # Generate inputs and run the reference entirely on CPU so PMD captures
@@ -203,6 +209,9 @@ def _check_chunk_h_matches_reference(
     )
 
     cfg = _kernel_cfg(backend_name, implementation)
+    if block_v is not None:
+        assert cfg is not None
+        cfg["block_v"] = block_v
 
     torch.cuda.synchronize()
     actual_h, actual_v, actual_final = chunk_h(
@@ -264,6 +273,26 @@ def _check_chunk_h_matches_reference(
         assert actual_final is not state_actual
         torch.testing.assert_close(state_actual.cpu(), state_before_cpu)
         assert actual_final.shape[0] == num_sequences
+
+
+@GPU_REQUIRED
+@pytest.mark.parametrize("seq_len", [64, 128, 192, 320])
+@pytest.mark.parametrize("state_index", [1, -1], ids=["state", "null-state"])
+@pytest.mark.parametrize("inplace", [False, True], ids=["out-of-place", "inplace"])
+def test_chunk_h_bv64_fixed_matches_reference(
+    seq_len: int, state_index: int, inplace: bool,
+) -> None:
+    if "tilelang" not in CHUNK_H_BACKENDS:
+        pytest.skip("TileLang backend is unavailable")
+    _check_chunk_h_matches_reference(
+        ("tilelang", CHUNK_H_BACKENDS["tilelang"]),
+        use_varlen=False,
+        inplace_final_state=inplace,
+        heads=32,
+        seq_len=seq_len,
+        block_v=64,
+        state_index=state_index,
+    )
 
 
 @GPU_REQUIRED
@@ -560,6 +589,29 @@ def test_bench_chunk_h_tflops(
     )
 
     print(f"TileLang/AITER speedup: {aiter_h_ms / h_ms:.3f}x (event median, state reset excluded)")
+
+@GPU_REQUIRED
+@pytest.mark.bench
+def test_bench_chunk_h_bv64_fixed(
+    time_ms, bench_warmup, bench_repeat, bench_seq_len,
+):
+    if "tilelang" not in CHUNK_H_BACKENDS:
+        pytest.skip("TileLang backend is unavailable")
+    chunk_h = CHUNK_H_BACKENDS["tilelang"]
+
+    def run_bv64(*args, **kwargs):
+        cfg = dict(kwargs.pop("kernel_cfg") or {})
+        cfg["block_v"] = 64
+        return chunk_h(*args, **kwargs, kernel_cfg=cfg)
+
+    print("GDN fixed BV64 benchmark: H=32, Hg=16")
+    test_bench_chunk_h_tflops(
+        chunk_h_backend=("tilelang", run_bv64),
+        use_varlen=False, heads=32, transpose_state=True,
+        time_ms=time_ms, bench_warmup=bench_warmup,
+        bench_repeat=bench_repeat, bench_seq_len=bench_seq_len,
+    )
+
 
 @GPU_REQUIRED
 @pytest.mark.bench
