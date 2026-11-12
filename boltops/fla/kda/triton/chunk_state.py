@@ -220,7 +220,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         b_h4 = tl.zeros([BV, 64], dtype=tl.float32)
 
     # calculate offset
-    h += ((boh * H + i_h) * V * K).to(tl.int64)
+    h += (boh.to(tl.int64) * H + i_h) * V * K
     v += ((bos * H + i_h) * V).to(tl.int64)
     k += ((bos * Hg + i_h // (H // Hg)) * K).to(tl.int64)
     w += ((bos * H + i_h) * K).to(tl.int64)
@@ -367,7 +367,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         if USE_GK:
             o_k1 = tl.arange(0, 64)
             b_gk_last1 = tl.load(
-                gk + (bos + last_idx) * H * K + i_h * K + o_k1,
+                gk + (bos + last_idx).to(tl.int64) * H * K + i_h * K + o_k1,
                 mask=(o_k1 < K),
                 other=0.0,
             )
@@ -378,7 +378,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             if K > 64:
                 o_k2 = 64 + o_k1
                 b_gk_last2 = tl.load(
-                    gk + (bos + last_idx) * H * K + i_h * K + o_k2,
+                    gk + (bos + last_idx).to(tl.int64) * H * K + i_h * K + o_k2,
                     mask=(o_k2 < K),
                     other=0.0,
                 )
@@ -389,7 +389,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             if K > 128:
                 o_k3 = 128 + o_k1
                 b_gk_last3 = tl.load(
-                    gk + (bos + last_idx) * H * K + i_h * K + o_k3,
+                    gk + (bos + last_idx).to(tl.int64) * H * K + i_h * K + o_k3,
                     mask=(o_k3 < K),
                     other=0.0,
                 )
@@ -400,7 +400,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             if K > 192:
                 o_k4 = 192 + o_k1
                 b_gk_last4 = tl.load(
-                    gk + (bos + last_idx) * H * K + i_h * K + o_k4,
+                    gk + (bos + last_idx).to(tl.int64) * H * K + i_h * K + o_k4,
                     mask=(o_k4 < K),
                     other=0.0,
                 )
@@ -605,7 +605,7 @@ def chunk_kda_fwd_kernel_state_output_fused(
         last_idx = min((i_t.to(tl.int64) + 1) * BT, T) - 1
         o_k = tl.arange(0, 64)
         b_g_last1 = tl.load(
-            g + (bos + last_idx) * H * K + i_h * K + o_k,
+            g + (bos + last_idx).to(tl.int64) * H * K + i_h * K + o_k,
             mask=o_k < K,
             other=0.0,
         )
@@ -613,7 +613,7 @@ def chunk_kda_fwd_kernel_state_output_fused(
         if K > 64:
             o_k2 = 64 + o_k
             b_g_last2 = tl.load(
-                g + (bos + last_idx) * H * K + i_h * K + o_k2,
+                g + (bos + last_idx).to(tl.int64) * H * K + i_h * K + o_k2,
                 mask=o_k2 < K,
                 other=0.0,
             )
@@ -621,7 +621,7 @@ def chunk_kda_fwd_kernel_state_output_fused(
         if K > 128:
             o_k3 = 128 + o_k
             b_g_last3 = tl.load(
-                g + (bos + last_idx) * H * K + i_h * K + o_k3,
+                g + (bos + last_idx).to(tl.int64) * H * K + i_h * K + o_k3,
                 mask=o_k3 < K,
                 other=0.0,
             )
@@ -629,7 +629,7 @@ def chunk_kda_fwd_kernel_state_output_fused(
         if K > 192:
             o_k4 = 192 + o_k
             b_g_last4 = tl.load(
-                g + (bos + last_idx) * H * K + i_h * K + o_k4,
+                g + (bos + last_idx).to(tl.int64) * H * K + i_h * K + o_k4,
                 mask=o_k4 < K,
                 other=0.0,
             )

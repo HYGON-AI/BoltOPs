@@ -393,7 +393,7 @@ def recompute_w_u_fwd_kernel(
             o_k = i_k * BK + tl.arange(0, BK)
             m_k = o_k < K
             b_gn = tl.load(
-                gk + ((bos + last_idx) * H + i_h) * K + o_k, mask=m_k, other=0.0
+                gk + ((bos + last_idx).to(tl.int64) * H + i_h) * K + o_k, mask=m_k, other=0.0
             )
             b_kg = b_k * exp2(b_gn - b_gk)
 
@@ -564,7 +564,7 @@ def recompute_w_u_fwd_kernel_beta_factored_head_first(
             o_k = i_k * BK + tl.arange(0, BK)
             m_k = o_k < K
             b_gn = tl.load(
-                gk + ((bos + last_idx) * H + i_h) * K + o_k,
+                gk + ((bos + last_idx).to(tl.int64) * H + i_h) * K + o_k,
                 mask=m_k,
                 other=0.0,
             ).to(tl.float32)
@@ -715,7 +715,7 @@ def chunk_gla_fwd_kernel_o(
             (1, 0),
         )
         p_h = tl.make_block_ptr(
-            h + (i_tg * H + i_h) * K * V,
+            h + (i_tg * H + i_h).to(tl.int64) * K * V,
             (V, K),
             (K, 1),
             (i_v * BV, i_k * BK),
@@ -843,7 +843,7 @@ def chunk_gla_fwd_kernel_o_local_first(
             (1, 0),
         )
         p_h = tl.make_block_ptr(
-            h + (i_tg * H + i_h) * K * V,
+            h + (i_tg * H + i_h).to(tl.int64) * K * V,
             (V, K),
             (K, 1),
             (i_v * BV, i_k * BK),
@@ -965,7 +965,7 @@ def chunk_gla_fwd_kernel_o_local_tri32(
             (1, 0),
         )
         p_h = tl.make_block_ptr(
-            h + (i_tg * H + i_h) * K * V,
+            h + (i_tg * H + i_h).to(tl.int64) * K * V,
             (V, K),
             (K, 1),
             (i_v * BV, i_k * BK),

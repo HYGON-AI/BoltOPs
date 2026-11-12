@@ -163,7 +163,7 @@ def _diag_block_products(
     log2 over 16 tokens against a 2^128 ceiling, so the halving is load
     bearing, not a micro-optimization.
     """
-    b_gn = tl.load(g + i_row * HV * K + o_k, mask=m_k, other=0.0).to(tl.float32)
+    b_gn = tl.load(g + i_row.to(tl.int64) * HV * K + o_k, mask=m_k, other=0.0).to(tl.float32)
     b_gm = (b_g - b_gn[None, :]).to(tl.float32)
     b_gq = tl.where(m_row[:, None], exp2(b_gm), 0.0)
     b_gk = tl.where(m_row[:, None], exp2(-b_gm), 0.0)
@@ -368,7 +368,7 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
                 b_Adq1 += b_dq
                 b_Adk1 += b_dk
 
-            b_gn1 = tl.load(g + i_tc1 * HV * K + o_k, mask=m_k, other=0).to(tl.float32)
+            b_gn1 = tl.load(g + i_tc1.to(tl.int64) * HV * K + o_k, mask=m_k, other=0).to(tl.float32)
             # [BC, BK]
             b_gqn = tl.where(m_tc1[:, None], exp2(b_g1 - b_gn1[None, :]), 0)
             # [BK, BC]
@@ -401,7 +401,7 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
                     b_Adq2 += b_dq
                     b_Adk2 += b_dk
 
-                b_gn2 = tl.load(g + i_tc2 * HV * K + o_k, mask=m_k, other=0).to(
+                b_gn2 = tl.load(g + i_tc2.to(tl.int64) * HV * K + o_k, mask=m_k, other=0).to(
                     tl.float32
                 )
                 # [BC, BK]
@@ -442,7 +442,7 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
                         b_Adq3 += b_dq
                         b_Adk3 += b_dk
 
-                    b_gn3 = tl.load(g + i_tc3 * HV * K + o_k, mask=m_k, other=0).to(
+                    b_gn3 = tl.load(g + i_tc3.to(tl.int64) * HV * K + o_k, mask=m_k, other=0).to(
                         tl.float32
                     )
                     # [BC, BK]
@@ -845,7 +845,7 @@ def chunk_kda_fwd_kernel_intra_sub_chunk(
         )
     else:
         # caculate offset
-        p_gn = g + (i_ti + min(BC // 2, T - i_ti - 1)) * HV * K + tl.arange(0, BK)
+        p_gn = g + (i_ti + min(BC // 2, T - i_ti - 1)).to(tl.int64) * HV * K + tl.arange(0, BK)
         b_gn = tl.load(p_gn, mask=tl.arange(0, BK) < K, other=0.0)
         b_gn = b_gn[None, :]
 
@@ -965,7 +965,7 @@ def chunk_kda_fwd_kernel_intra_sub_chunk_poly_solve_optimized(
     o_k = tl.arange(0, BK)
     center = min(BC // 2, T - i_ti - 1)
     b_gn = tl.load(
-        g + (i_ti + center) * HV * K + o_k, mask=o_k < K, other=0.0
+        g + (i_ti + center).to(tl.int64) * HV * K + o_k, mask=o_k < K, other=0.0
     )[None, :]
     b_gm = (b_g - b_gn).to(tl.float32)
     b_gq = tl.where(m_c[:, None], exp2(b_gm), 0.0)
