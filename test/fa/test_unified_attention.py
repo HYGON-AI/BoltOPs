@@ -9,10 +9,12 @@ import inspect
 import json
 import logging
 import math
+import os
 import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
+from typing import NamedTuple
 
 import pytest
 import torch
@@ -650,6 +652,34 @@ def test_general_path_matches_reference(feature: str) -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires an HCU/CUDA Triton device")
+def test_general_path_noncausal_d72_matches_reference() -> None:
+    # ViT bi-attention family (shaobob0 manifest unified_attention-141):
+    # non-power-of-2 head size 72 (padded to 128) with non-causal masking,
+    # routed to the general backend. The reference is computed on CPU copies
+    # because GPU-side rocBLAS has no gfx946 TensileLibrary on the PMD build
+    # (see docs/ops/gfx946_gdn_unified_attention.md); kernel inputs stay on
+    # device.
+    torch.manual_seed(1)
+    device, page, hq, hkv, dim, kv_len = "cuda", 16, 4, 4, 72, 15
+    q_cpu = torch.randn(1, hq, dim, dtype=torch.bfloat16)
+    k_cpu = torch.randn(1, page, hkv, dim, dtype=torch.bfloat16)
+    v_cpu = torch.randn_like(k_cpu)
+    q, k, v = q_cpu.to(device), k_cpu.to(device), v_cpu.to(device)
+    out = torch.empty_like(q)
+    unified_attention(
+        q, k, v, out, torch.tensor([0, 1], device=device, dtype=torch.int32), 1,
+        torch.tensor([kv_len], device=device, dtype=torch.int64), page,
+        dim ** -0.5, False, (-1, -1),
+        torch.tensor([[0]], device=device, dtype=torch.int32), 0.0, None, None, None,
+    )
+    reference = _reference_single_masked(
+        q_cpu, k_cpu, v_cpu, kv_len, dim ** -0.5,
+        lambda qpos, keys: torch.ones_like(keys, dtype=torch.bool)
+    )
+    torch.testing.assert_close(out.cpu(), reference, atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires an HCU/CUDA Triton device")
 @pytest.mark.parametrize("mode", [KVQuantMode.FP8_PER_TENSOR, KVQuantMode.FP8_PER_TOKEN_HEAD])
 def test_fp8_kv_cache_modes_match_dequantized_reference(mode: KVQuantMode) -> None:
     torch.manual_seed(5)
@@ -1123,3 +1153,379 @@ def test_all_packaged_aiter_cases_hit_runtime_configs(
         pytest.skip(f"no packaged configs for {info.arch}_cu{info.cu_count}")
     for case in UNIFIED_ATTENTION_BENCHMARK_CASES:
         assert _lookup_tuned_config(case) is not None, case.name
+
+
+def test_gfx946_fp8_prefill_fallback_uses_wide_tile(monkeypatch) -> None:
+    backend = importlib.import_module(
+        "boltops.fa.unified_attention.triton.unified_attention"
+    )
+    monkeypatch.setattr(backend, "get_arch", lambda device=None: "gfx946")
+
+    fp8_dtypes = [torch.float8_e4m3fn]
+    if hasattr(torch, "float8_e4m3fnuz"):
+        fp8_dtypes.append(torch.float8_e4m3fnuz)
+    for dtype in fp8_dtypes:
+        for head_size, queries_per_kv in ((256, 8), (256, 16), (128, 8)):
+            result = backend._default_2d_config(
+                "cuda",
+                16,
+                32,
+                cache_block_size=16,
+                head_size=head_size,
+                num_seqs=1,
+                num_queries_per_kv=queries_per_kv,
+                max_seqlen_q=256,
+                max_seqlen_k=4096,
+                kv_dtype=dtype,
+                plain_attention=True,
+            )
+
+            assert result == {
+                "BLOCK_M": 64,
+                "TILE_SIZE": 64,
+                "num_warps": 4,
+                "num_stages": 1,
+            }
+
+
+def test_gfx946_fp8_fallback_does_not_change_featured_attention(monkeypatch) -> None:
+    backend = importlib.import_module(
+        "boltops.fa.unified_attention.triton.unified_attention"
+    )
+    monkeypatch.setattr(backend, "get_arch", lambda device=None: "gfx946")
+
+    result = backend._default_2d_config(
+        "cuda",
+        16,
+        32,
+        cache_block_size=16,
+        head_size=256,
+        num_seqs=1,
+        num_queries_per_kv=8,
+        max_seqlen_q=256,
+        max_seqlen_k=4096,
+        kv_dtype=torch.float8_e4m3fn,
+        plain_attention=False,
+    )
+
+    assert result == {
+        "BLOCK_M": 16,
+        "TILE_SIZE": 32,
+        "num_warps": 4,
+        "num_stages": 2,
+    }
+
+
+# ---------------------------------------------------------------------------
+# shaobob0_1102 workload shape coverage.
+#
+# _GFX946_UA_CASES holds all 95 ready unified_attention shapes of the
+# shaobob0_1102 manifest, inlined so the suite has no generated-manifest
+# dependency.  Fields:
+#   (case_id, batch, query_heads, kv_heads, query_length, kv_length,
+#    head_size, value_head_size, fp8_kv)
+#
+# Shapes are tiered by size so the default run stays cheap on any arch
+# (including the PMD perf model, whose GPU rocBLAS has no gfx946
+# TensileLibrary and therefore cannot compute an on-device reference):
+#   * small  (score_count <= 2e8): always run; reference on CPU
+#   * large  : run with BOLTOPS_UA_RUN_LARGE=1; reference on device
+#   * huge   (paged-cache footprint > 96GB, the B32 Kimi prefill shapes
+#     that need ~140-190GB of HBM): additionally BOLTOPS_UA_RUN_HUGE=1
+# The kernel itself is arch-agnostic Triton, so every tier runs on gfx938
+# CI and gfx946 alike; only the reference location differs.
+# ---------------------------------------------------------------------------
+
+
+class _UaWorkloadShape(NamedTuple):
+    case_id: str
+    batch: int
+    query_heads: int
+    kv_heads: int
+    query_length: int
+    kv_length: int
+    head_size: int
+    value_head_size: int
+    fp8_kv: bool
+
+    @property
+    def score_count(self) -> int:
+        return self.query_heads * self.query_length * self.kv_length
+
+    @property
+    def cache_bytes(self) -> int:
+        kv_bytes = 1 if self.fp8_kv else 2
+        head_bytes = self.head_size + self.value_head_size
+        return (
+            self.batch * self.kv_length * self.kv_heads * head_bytes * kv_bytes
+            + self.batch * self.query_length * self.query_heads * head_bytes * 2
+        )
+
+
+_GFX946_UA_CASES = [
+    _UaWorkloadShape("unified_attention-012", 1, 16, 2, 2560, 4096, 256, 256, True),
+    _UaWorkloadShape("unified_attention-017", 64, 16, 2, 1, 4608, 256, 256, True),
+    _UaWorkloadShape("unified_attention-018", 1, 16, 2, 6656, 6656, 256, 256, True),
+    _UaWorkloadShape("unified_attention-019", 1, 16, 2, 6656, 13312, 256, 256, True),
+    _UaWorkloadShape("unified_attention-020", 1, 16, 2, 6656, 19968, 256, 256, True),
+    _UaWorkloadShape("unified_attention-021", 1, 16, 2, 6656, 26624, 256, 256, True),
+    _UaWorkloadShape("unified_attention-022", 1, 16, 2, 6656, 33280, 256, 256, True),
+    _UaWorkloadShape("unified_attention-023", 1, 16, 2, 6656, 39936, 256, 256, True),
+    _UaWorkloadShape("unified_attention-024", 1, 16, 2, 6656, 46592, 256, 256, True),
+    _UaWorkloadShape("unified_attention-025", 1, 16, 2, 6656, 53248, 256, 256, True),
+    _UaWorkloadShape("unified_attention-026", 1, 16, 2, 6656, 59904, 256, 256, True),
+    _UaWorkloadShape("unified_attention-027", 1, 16, 2, 6656, 66560, 256, 256, True),
+    _UaWorkloadShape("unified_attention-028", 1, 16, 2, 6656, 73216, 256, 256, True),
+    _UaWorkloadShape("unified_attention-029", 1, 16, 2, 6656, 79872, 256, 256, True),
+    _UaWorkloadShape("unified_attention-030", 1, 16, 2, 6656, 86528, 256, 256, True),
+    _UaWorkloadShape("unified_attention-031", 1, 16, 2, 6656, 93184, 256, 256, True),
+    _UaWorkloadShape("unified_attention-032", 1, 16, 2, 6656, 99840, 256, 256, True),
+    _UaWorkloadShape("unified_attention-033", 1, 16, 2, 6656, 106496, 256, 256, True),
+    _UaWorkloadShape("unified_attention-034", 1, 16, 2, 6656, 113152, 256, 256, True),
+    _UaWorkloadShape("unified_attention-035", 1, 16, 2, 6656, 119808, 256, 256, True),
+    _UaWorkloadShape("unified_attention-036", 1, 16, 2, 6656, 126464, 256, 256, True),
+    _UaWorkloadShape("unified_attention-037", 1, 16, 2, 6656, 131072, 256, 256, True),
+    _UaWorkloadShape("unified_attention-043", 1, 16, 2, 2048, 131072, 256, 256, True),
+    _UaWorkloadShape("unified_attention-048", 12, 16, 2, 1, 131584, 256, 256, True),
+    _UaWorkloadShape("unified_attention-049", 4, 64, 64, 6656, 6656, 192, 128, False),
+    _UaWorkloadShape("unified_attention-050", 4, 64, 64, 6656, 13312, 192, 128, False),
+    _UaWorkloadShape("unified_attention-051", 4, 64, 64, 6656, 19968, 192, 128, False),
+    _UaWorkloadShape("unified_attention-052", 4, 64, 64, 6656, 26624, 192, 128, False),
+    _UaWorkloadShape("unified_attention-053", 4, 64, 64, 6656, 33280, 192, 128, False),
+    _UaWorkloadShape("unified_attention-054", 4, 64, 64, 6656, 39936, 192, 128, False),
+    _UaWorkloadShape("unified_attention-055", 4, 64, 64, 6656, 46592, 192, 128, False),
+    _UaWorkloadShape("unified_attention-056", 4, 64, 64, 6656, 53248, 192, 128, False),
+    _UaWorkloadShape("unified_attention-057", 4, 64, 64, 6656, 59904, 192, 128, False),
+    _UaWorkloadShape("unified_attention-058", 4, 64, 64, 6656, 66560, 192, 128, False),
+    _UaWorkloadShape("unified_attention-059", 4, 64, 64, 6656, 73216, 192, 128, False),
+    _UaWorkloadShape("unified_attention-060", 4, 64, 64, 6656, 79872, 192, 128, False),
+    _UaWorkloadShape("unified_attention-061", 4, 64, 64, 6656, 86528, 192, 128, False),
+    _UaWorkloadShape("unified_attention-062", 4, 64, 64, 6656, 93184, 192, 128, False),
+    _UaWorkloadShape("unified_attention-063", 4, 64, 64, 6656, 99840, 192, 128, False),
+    _UaWorkloadShape("unified_attention-064", 4, 64, 64, 6656, 106496, 192, 128, False),
+    _UaWorkloadShape("unified_attention-065", 4, 64, 64, 6656, 113152, 192, 128, False),
+    _UaWorkloadShape("unified_attention-066", 4, 64, 64, 6656, 119808, 192, 128, False),
+    _UaWorkloadShape("unified_attention-067", 4, 64, 64, 6656, 126464, 192, 128, False),
+    _UaWorkloadShape("unified_attention-068", 4, 64, 64, 4608, 131072, 192, 128, False),
+    _UaWorkloadShape("unified_attention-069", 32, 64, 64, 6656, 53248, 192, 128, False),
+    _UaWorkloadShape("unified_attention-070", 32, 64, 64, 6656, 106496, 192, 128, False),
+    _UaWorkloadShape("unified_attention-071", 32, 64, 64, 3072, 131072, 192, 128, False),
+    _UaWorkloadShape("unified_attention-072", 4, 64, 64, 1, 131072, 128, 128, True),
+    _UaWorkloadShape("unified_attention-073", 1, 64, 8, 6656, 6656, 128, 128, True),
+    _UaWorkloadShape("unified_attention-074", 1, 64, 8, 6656, 13312, 128, 128, True),
+    _UaWorkloadShape("unified_attention-075", 1, 64, 8, 6656, 19968, 128, 128, True),
+    _UaWorkloadShape("unified_attention-076", 1, 64, 8, 6656, 26624, 128, 128, True),
+    _UaWorkloadShape("unified_attention-077", 1, 64, 8, 6656, 33280, 128, 128, True),
+    _UaWorkloadShape("unified_attention-078", 1, 64, 8, 6656, 39936, 128, 128, True),
+    _UaWorkloadShape("unified_attention-079", 1, 64, 8, 6656, 46592, 128, 128, True),
+    _UaWorkloadShape("unified_attention-080", 1, 64, 8, 6656, 53248, 128, 128, True),
+    _UaWorkloadShape("unified_attention-081", 1, 64, 8, 6656, 59904, 128, 128, True),
+    _UaWorkloadShape("unified_attention-082", 1, 64, 8, 6656, 66560, 128, 128, True),
+    _UaWorkloadShape("unified_attention-083", 1, 64, 8, 6656, 73216, 128, 128, True),
+    _UaWorkloadShape("unified_attention-084", 1, 64, 8, 6656, 79872, 128, 128, True),
+    _UaWorkloadShape("unified_attention-085", 1, 64, 8, 6656, 86528, 128, 128, True),
+    _UaWorkloadShape("unified_attention-086", 1, 64, 8, 6656, 93184, 128, 128, True),
+    _UaWorkloadShape("unified_attention-087", 1, 64, 8, 6656, 99840, 128, 128, True),
+    _UaWorkloadShape("unified_attention-088", 1, 64, 8, 6656, 106496, 128, 128, True),
+    _UaWorkloadShape("unified_attention-089", 1, 64, 8, 6656, 113152, 128, 128, True),
+    _UaWorkloadShape("unified_attention-090", 1, 64, 8, 6656, 119808, 128, 128, True),
+    _UaWorkloadShape("unified_attention-091", 1, 64, 8, 6656, 126464, 128, 128, True),
+    _UaWorkloadShape("unified_attention-092", 1, 64, 8, 6656, 131072, 128, 128, True),
+    _UaWorkloadShape("unified_attention-093", 1, 64, 8, 512, 131072, 128, 128, True),
+    _UaWorkloadShape("unified_attention-094", 4, 64, 8, 4, 131584, 128, 128, True),
+    _UaWorkloadShape("unified_attention-095", 4, 64, 8, 1, 131584, 128, 128, True),
+    _UaWorkloadShape("unified_attention-101", 1, 32, 2, 6656, 6656, 256, 256, True),
+    _UaWorkloadShape("unified_attention-102", 1, 32, 2, 6656, 13312, 256, 256, True),
+    _UaWorkloadShape("unified_attention-103", 1, 32, 2, 6656, 19968, 256, 256, True),
+    _UaWorkloadShape("unified_attention-104", 1, 32, 2, 6656, 26624, 256, 256, True),
+    _UaWorkloadShape("unified_attention-105", 1, 32, 2, 6656, 33280, 256, 256, True),
+    _UaWorkloadShape("unified_attention-106", 1, 32, 2, 6656, 39936, 256, 256, True),
+    _UaWorkloadShape("unified_attention-107", 1, 32, 2, 6656, 46592, 256, 256, True),
+    _UaWorkloadShape("unified_attention-108", 1, 32, 2, 6656, 53248, 256, 256, True),
+    _UaWorkloadShape("unified_attention-109", 1, 32, 2, 6656, 59904, 256, 256, True),
+    _UaWorkloadShape("unified_attention-110", 1, 32, 2, 6656, 66560, 256, 256, True),
+    _UaWorkloadShape("unified_attention-111", 1, 32, 2, 6656, 73216, 256, 256, True),
+    _UaWorkloadShape("unified_attention-112", 1, 32, 2, 6656, 79872, 256, 256, True),
+    _UaWorkloadShape("unified_attention-113", 1, 32, 2, 6656, 86528, 256, 256, True),
+    _UaWorkloadShape("unified_attention-114", 1, 32, 2, 6656, 93184, 256, 256, True),
+    _UaWorkloadShape("unified_attention-115", 1, 32, 2, 6656, 99840, 256, 256, True),
+    _UaWorkloadShape("unified_attention-116", 1, 32, 2, 6656, 106496, 256, 256, True),
+    _UaWorkloadShape("unified_attention-117", 1, 32, 2, 6656, 113152, 256, 256, True),
+    _UaWorkloadShape("unified_attention-118", 1, 32, 2, 6656, 119808, 256, 256, True),
+    _UaWorkloadShape("unified_attention-119", 1, 32, 2, 6656, 126464, 256, 256, True),
+    _UaWorkloadShape("unified_attention-120", 1, 32, 2, 6656, 131072, 256, 256, True),
+    _UaWorkloadShape("unified_attention-126", 1, 32, 2, 3584, 131072, 256, 256, True),
+    _UaWorkloadShape("unified_attention-139", 48, 16, 1, 4, 131584, 256, 256, True),
+    _UaWorkloadShape("unified_attention-140", 48, 16, 1, 1, 131584, 256, 256, True),
+    _UaWorkloadShape("unified_attention-144", 512, 32, 8, 1, 376, 128, 128, True),
+]
+
+
+@pytest.mark.parametrize("case", _GFX946_UA_CASES, ids=lambda case: case.case_id)
+def test_gfx946_workload_fallback_dispatch(case: _UaWorkloadShape, monkeypatch) -> None:
+    backend = importlib.import_module(
+        "boltops.fa.unified_attention.triton.unified_attention"
+    )
+    monkeypatch.setattr(backend, "get_arch", lambda device=None: "gfx946")
+    result = backend._default_2d_config(
+        "cuda", 16, 32,
+        cache_block_size=16,
+        head_size=case.head_size,
+        num_seqs=case.batch,
+        num_queries_per_kv=case.query_heads // case.kv_heads,
+        max_seqlen_q=case.query_length,
+        max_seqlen_k=case.kv_length,
+        kv_dtype=torch.float8_e4m3fn,
+        plain_attention=True,
+    )
+    expected_wide_ids = {
+        f"unified_attention-{index:03d}"
+        for index in (
+            [12] + list(range(18, 38)) + [43] + list(range(73, 94))
+            + list(range(101, 121)) + [126]
+        )
+    }
+    expected = (
+        dict(BLOCK_M=64, TILE_SIZE=64, num_warps=4, num_stages=1)
+        if case.case_id in expected_wide_ids
+        else dict(BLOCK_M=16, TILE_SIZE=32, num_warps=4, num_stages=2)
+    )
+    assert result == expected
+
+
+_SMALL_UA_SHAPE_SCORES = 2 * 10**8
+_HUGE_UA_SHAPE_BYTES = 96 * 1024**3
+_UA_LARGE_ENABLED = os.environ.get("BOLTOPS_UA_RUN_LARGE", "") not in ("", "0")
+_UA_HUGE_ENABLED = os.environ.get("BOLTOPS_UA_RUN_HUGE", "") not in ("", "0")
+_ON_PMD = bool(os.environ.get("PMD_PATH"))
+
+
+def _reference_paged_online(
+    q, k_cache, v_cache, q_lens, kv_lens, table, scale, *, tile=512,
+):
+    """Chunked online-softmax paged attention reference.
+
+    Runs on the device of the inputs (CPU for small shapes, GPU for the
+    large ones); the KV dimension is processed in ``tile`` chunks so the
+    score matrix is never fully materialized.  Caches must already be
+    dequantized (fp8 is not gatherable by aten, so callers pass the
+    float-dequantized values).
+    """
+    total_q, num_q_heads = q.shape[0], q.shape[1]
+    v_head = v_cache.shape[-1]
+    out = torch.empty(total_q, num_q_heads, v_head, dtype=q.dtype, device=q.device)
+    block_size = k_cache.shape[1]
+    floor = torch.finfo(torch.float32).min
+    cursor = 0
+    for seq, (q_len, kv_len) in enumerate(zip(q_lens, kv_lens)):
+        blocks = table[seq, : math.ceil(kv_len / block_size)].long()
+        k = k_cache[blocks].reshape(-1, k_cache.shape[2], k_cache.shape[3])[:kv_len]
+        v = v_cache[blocks].reshape(-1, v_cache.shape[2], v_cache.shape[3])[:kv_len]
+        q_seq = q[cursor : cursor + q_len].float()
+        group = num_q_heads // k.shape[1]
+        k = k.repeat_interleave(group, dim=1)
+        v = v.repeat_interleave(group, dim=1)
+        m = torch.full((num_q_heads, q_len), floor, device=q.device, dtype=torch.float32)
+        l = torch.zeros((num_q_heads, q_len), device=q.device, dtype=torch.float32)
+        acc = torch.zeros(num_q_heads, q_len, v_head, device=q.device, dtype=torch.float32)
+        q_pos = torch.arange(kv_len - q_len, kv_len, device=q.device, dtype=torch.int64)
+        for start in range(0, kv_len, tile):
+            stop = min(start + tile, kv_len)
+            keys = torch.arange(start, stop, device=q.device, dtype=torch.int64)
+            k_tile = k[start:stop].float()
+            v_tile = v[start:stop].float()
+            s = torch.einsum("qhd,khd->hqk", q_seq, k_tile) * scale
+            # Clamp (instead of -inf) so fully masked tiles cannot produce
+            # NaN; the garbage they accumulate is zeroed by alpha once the
+            # row's real tile arrives.
+            s = s.masked_fill(keys[None, None, :] > q_pos[None, :, None], floor)
+            m_new = torch.maximum(m, s.amax(dim=-1))
+            alpha = torch.exp(m - m_new)
+            p = torch.exp(s - m_new[:, :, None])
+            l = l * alpha + p.sum(dim=-1)
+            acc = acc * alpha[:, :, None] + torch.einsum("hqk,khd->hqd", p, v_tile)
+            m = m_new
+        out[cursor : cursor + q_len] = (acc / l[:, :, None]).transpose(0, 1).to(q.dtype)
+        cursor += q_len
+    return out
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires an HCU/CUDA Triton device")
+@pytest.mark.parametrize("case", _GFX946_UA_CASES, ids=lambda case: case.case_id)
+def test_workload_shape_matches_reference(case: _UaWorkloadShape) -> None:
+    """Every ready workload shape, causal, matches a chunked reference."""
+    if case.cache_bytes > _HUGE_UA_SHAPE_BYTES and not _UA_HUGE_ENABLED:
+        pytest.skip(
+            f"paged-cache footprint {case.cache_bytes / 1024**3:.0f}GB > 96GB; "
+            "set BOLTOPS_UA_RUN_HUGE=1 to run"
+        )
+    if case.score_count > _SMALL_UA_SHAPE_SCORES and not _UA_LARGE_ENABLED:
+        pytest.skip("large shape; set BOLTOPS_UA_RUN_LARGE=1 to run")
+    if case.score_count > _SMALL_UA_SHAPE_SCORES and _ON_PMD:
+        pytest.skip("perf model cannot compute the on-device reference")
+
+    torch.manual_seed(1)
+    device = "cuda"
+    q_len, kv_len = case.query_length, case.kv_length
+    page = 16
+    pages_per_seq = math.ceil(kv_len / page)
+    total_pages = case.batch * pages_per_seq
+    total_q = case.batch * q_len
+    scale = case.head_size ** -0.5
+
+    q = torch.randn(total_q, case.query_heads, case.head_size,
+                    device=device, dtype=torch.bfloat16)
+    k = torch.randn(total_pages, page, case.kv_heads, case.head_size,
+                    device=device, dtype=torch.bfloat16)
+    v = torch.randn(total_pages, page, case.kv_heads, case.value_head_size,
+                    device=device, dtype=torch.bfloat16)
+
+    k_descale = v_descale = None
+    kwargs = {}
+    if case.fp8_kv:
+        k_descale = torch.tensor(448.0 / k.abs().max().item(), device=device)
+        v_descale = torch.tensor(448.0 / v.abs().max().item(), device=device)
+        k = (k.float() / k_descale).to(torch.float8_e4m3fn)
+        v = (v.float() / v_descale).to(torch.float8_e4m3fn)
+        kwargs["kv_quant_mode"] = KVQuantMode.FP8_PER_TENSOR
+
+    out = torch.empty(total_q, case.query_heads, case.value_head_size,
+                      device=device, dtype=torch.bfloat16)
+    table = torch.arange(total_pages, dtype=torch.int32).reshape(case.batch, pages_per_seq)
+    unified_attention(
+        q, k, v, out,
+        torch.arange(0, total_q + 1, q_len, device=device, dtype=torch.int32),
+        q_len,
+        torch.full((case.batch,), kv_len, device=device, dtype=torch.int64),
+        kv_len,
+        scale, True, (-1, -1),
+        table, 0.0, None, k_descale, v_descale, **kwargs,
+    )
+
+    on_device = case.score_count > _SMALL_UA_SHAPE_SCORES
+    q_lens = [q_len] * case.batch
+    kv_lens = [kv_len] * case.batch
+    if on_device:
+        # fp8 caches are not gatherable by aten, so the reference consumes
+        # the float-dequantized cache; bf16 stays bf16 (cast per tile).
+        k_ref = k.float() * k_descale if k_descale is not None else k
+        v_ref = v.float() * v_descale if v_descale is not None else v
+        reference = _reference_paged_online(
+            q, k_ref, v_ref, q_lens, kv_lens, table, scale,
+        ).cpu()
+    else:
+        # Small shapes: reference on CPU copies (works on any arch, incl. the
+        # PMD perf model whose GPU rocBLAS has no gfx946 TensileLibrary).
+        # Dequantize on device first so the CPU reference sees the exact
+        # values the kernel consumes.
+        k_ref = k.float().cpu()
+        v_ref = v.float().cpu()
+        if k_descale is not None:
+            k_ref = k_ref * k_descale.cpu()
+            v_ref = v_ref * v_descale.cpu()
+        reference = _reference_paged_online(
+            q.float().cpu(), k_ref, v_ref, q_lens, kv_lens,
+            table.cpu(), scale,
+        )
+    tolerance = 8e-2 if case.fp8_kv else 3e-2
+    torch.testing.assert_close(out.cpu(), reference, atol=tolerance, rtol=tolerance)

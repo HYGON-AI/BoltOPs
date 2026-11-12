@@ -47,3 +47,6 @@ temp/
 
 # optest perf artifacts (collected into optest result dirs)
 optest_results/
+
+# PMD perf-model run artifacts
+m5out/
