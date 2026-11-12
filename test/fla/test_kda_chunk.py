@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import math
+
 import pytest
 import torch
 
@@ -303,6 +305,71 @@ def test_prefill_optimized_path_matches_recurrent_reference() -> None:
         )
         torch.testing.assert_close(actual, expected, atol=8e-2, rtol=6e-2)
         torch.testing.assert_close(actual_state, expected_state, atol=8e-2, rtol=6e-2)
+
+
+@GPU_REQUIRED
+def test_prefill_int32_h_offset_overflow_scale() -> None:
+    """The opbench first-crash scale (B=1, T=175360, H=48, K=V=128) has
+    ``(ceil(T/64) * H - 1) * K * V = 2,154,807,296 >= 2**31``: the chunked
+    state block offset ``(i_tg * H + i_h) * K * V`` used to wrap in signed
+    32-bit arithmetic and fault (or silently read the wrong h block).
+
+    Runs the split state/output path end to end and checks the output
+    against a per-chunk bmm reference; the chunk loop keeps every
+    reference op on small tensors, and the per-token recurrent reference
+    is too slow at this scale.
+    """
+    torch.manual_seed(4500)
+    b, t, heads, k, v, bt = 1, 175360, 48, 128, 128, 64
+    nt = t // bt
+    assert (nt * heads - 1) * k * v >= 2**31, "scale must exceed the int32 limit"
+
+    def maker(shape, dtype):
+        return torch.randn(*shape, dtype=torch.float32).to(DEVICE).to(dtype)
+
+    q = torch.nn.functional.normalize(
+        maker((b, t, heads, k), torch.bfloat16).float(), dim=-1
+    ).to(torch.bfloat16)
+    kk = torch.nn.functional.normalize(
+        maker((b, t, heads, k), torch.bfloat16).float(), dim=-1
+    ).to(torch.bfloat16)
+    vv = maker((b, t, heads, v), torch.bfloat16)
+    g = -torch.nn.functional.softplus(maker((b, t, heads, k), torch.float32))
+    for start in range(0, t, bt):
+        g[:, start:start + bt] = g[:, start:start + bt].cumsum(1) * (1.0 / math.log(2))
+    beta = maker((b, t, heads), torch.float32).sigmoid_()
+
+    scale = k ** -0.5
+    aqk, a = chunk_kda_fwd_intra(q, kk, gk=g, beta=beta, scale=scale, chunk_size=bt)
+    w, u, _, kg = recompute_w_u_fwd(kk, vv, beta, a, gk=g)
+    h, v_new, _ = chunk_gated_delta_rule_fwd_h(
+        kg, w, u, gk=g, output_final_state=True, chunk_size=bt, use_exp2=True,
+    )
+    assert h.numel() >= 2**31
+    o = torch.empty_like(vv)
+    chunk_gla_fwd_o_gk(q, v_new, g, aqk, h, o, scale, chunk_size=bt)
+    torch.cuda.synchronize()
+
+    mask = torch.tril(torch.ones(bt, bt, dtype=torch.bool, device=DEVICE))
+    for c in range(nt):
+        sl = slice(c * bt, (c + 1) * bt)
+        qg = (q[:, sl].float() * scale) * torch.exp2(g[:, sl].float())
+        e_state = torch.bmm(
+            qg.view(b, bt, heads, k).permute(0, 2, 1, 3).reshape(b * heads, bt, k),
+            h[:, c].float().reshape(b * heads, v, k).transpose(-1, -2).contiguous(),
+        ).view(b, heads, bt, v)
+        a_c = aqk[:, sl].view(b, bt, heads, bt).permute(0, 2, 1, 3).reshape(
+            b * heads, bt, bt
+        ).float()
+        a_c = torch.where(mask, a_c, torch.zeros((), device=DEVICE))
+        e_local = torch.bmm(
+            a_c,
+            v_new[:, sl].view(b, bt, heads, v).permute(0, 2, 1, 3).reshape(
+                b * heads, bt, v
+            ).float(),
+        ).view(b, heads, bt, v)
+        expected = (e_state + e_local).permute(0, 2, 1, 3).to(q.dtype)
+        torch.testing.assert_close(o[:, sl], expected, atol=5e-2, rtol=5e-2)
 
 
 def test_intra_rejects_chunk_sizes_it_is_not_unrolled_for() -> None:
