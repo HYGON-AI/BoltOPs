@@ -24,7 +24,7 @@
     → correctness（hygon-bw1100-4card，按事件决定）
       → 下载对应 wheel、setup-env.sh、流水线内校验四卡
       → .github/scripts/test-correctness.sh
-    → performance（hygon-bw1100-1card，PR/手动运行，串行）
+    → performance（hygon-bw1100-1card，PR/手动运行，可并行）
       → .github/scripts/setup-env.sh
       → .github/scripts/test-performance.sh
         → scripts/ci/optest_to_junit.py
@@ -48,7 +48,7 @@
 
 `ci.yml` 定义四组构建环境。DTK26.04 搭配 Python3.10/3.12 和 Torch2.11.0，共两组，NumPy 分别为 1.24.3/1.26.4。DTK26.10 搭配 Python3.12、NumPy1.26.4 和 Torch2.11.0/2.13.0，共两组。
 
-PR 和手动运行时，四组都构建 wheel。DTK26.04 / Python3.10 / Torch2.11.0，以及 DTK26.10 / Python3.12 下的 Torch2.11.0 和 Torch2.13.0 运行正确性测试，并在通过后运行性能测试。性能 job 使用共享 concurrency group 串行执行。main push 构建四组 wheel，各 DTK 的构建成功后由 `publish-2604` 和 `publish-2610` 分别发布。`ci-result` 检查两个 DTK 的构建和测试结果。为兼容组织质量门禁的 Workflow 解析器，当前使用显式值，不使用 YAML 锚点和别名；版本矩阵在 ci.yml 维护。
+PR 和手动运行时，四组都构建 wheel。DTK26.04 / Python3.10 / Torch2.11.0，以及 DTK26.10 / Python3.12 下的 Torch2.11.0 和 Torch2.13.0 运行正确性测试，并在通过后运行性能测试。性能任务各用一张 HCU，按 runner 容量并行调度。main push 构建四组 wheel，各 DTK 的构建成功后由 `publish-2604` 和 `publish-2610` 分别发布。`ci-result` 检查两个 DTK 的构建和测试结果。为兼容组织质量门禁的 Workflow 解析器，当前使用显式值，不使用 YAML 锚点和别名；版本矩阵在 ci.yml 维护。
 
 升级版本时，检查对应的 DTK/Python 容器及 HCU Torch/Triton/TileLang 包是否可用。不同 DTK 若需要不同版本，应拆开配置，不能只为减少重复而强行共用。发布任务的 Python3.12 容器只用于上传 wheel，不决定 wheel 的目标 Python 版本。
 

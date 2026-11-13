@@ -4,7 +4,7 @@
 
 ## 1. 先理解整体流程
 
-PR 到 main 和手动运行时，`build2604` 和 `build2610` 各自的两组环境都在 `hygon-build` 构建 wheel。DTK26.04 / Python3.10 / Torch2.11.0，以及 DTK26.10 / Python3.12 下的 Torch2.11.0 和 Torch2.13.0 在 `hygon-bw1100-4card` 运行正确性测试，通过后在 `hygon-bw1100-1card` 下载 wheel 并运行性能测试。性能 job 通过共享 concurrency group 串行执行。`ci-result` 在 `hygon-cpu` 汇总两个 DTK 的构建和测试结果。
+PR 到 main 和手动运行时，`build2604` 和 `build2610` 各自的两组环境都在 `hygon-build` 构建 wheel。DTK26.04 / Python3.10 / Torch2.11.0，以及 DTK26.10 / Python3.12 下的 Torch2.11.0 和 Torch2.13.0 在 `hygon-bw1100-4card` 运行正确性测试，通过后在 `hygon-bw1100-1card` 下载 wheel 并运行性能测试。`ci-result` 在 `hygon-cpu` 汇总两个 DTK 的构建和测试结果。
 
 push 到 main 时构建并修复四组 wheel，各 DTK 的构建成功后，由 `publish-2604` 和 `publish-2610` 在 `hygon-build` 分别发布。正确性和性能测试在 PR 或手动运行时执行。
 
@@ -63,7 +63,7 @@ AICC、Torch、Triton、TileLang、NumPy 和测试依赖继续在各自的临时
 
 正确性工作流校验可见 HCU 数量必须为 4，性能工作流校验必须为 1，不运行 `CIsmi need`，不重写平台提供的 `ROCR_VISIBLE_DEVICES` 或 `HIP_VISIBLE_DEVICES`。性能 job 在 env 中设置 `BOLTOPS_TEST_GPU: '0'`，optest 使用 Pod 内逻辑卡号 0，保留现有单卡基准语义；正确性测试可见逻辑卡 0～3，原有跨卡用例可以执行。没有额外的设备选择脚本。
 
-各版本组合的构建和正确性测试可独立调度。性能 job 保留 boltops-performance-BW1100 共享 concurrency group、cancel-in-progress=false 和 queue=max，避免多个性能任务同时运行及默认单等待槽替换。ARC 隔离设备分配，但不意味着 CPU、内存和 I/O 没有性能干扰；实际基准仍需在集群验收。工作流仍会取消同一 PR 的旧运行。
+各版本组合的构建、正确性测试和性能测试可独立调度。性能任务各用一张 HCU，按单卡 runner 池的容量并行运行。同一节点上的任务仍可能共享 CPU、内存和 I/O。工作流仍会取消同一 PR 的旧运行。
 
 同仓库 PR 和 fork PR 均使用 pull_request 事件进入构建和 GPU 测试，不使用 pull_request_target。是否等待维护者批准取决于 GitHub 组织/仓库的 fork 工作流审批设置；个人 fork 还需要相应 pools 的使用权限。PR 不进入发布任务，发布 Secret 只用于 main push 的发布任务。
 
