@@ -127,9 +127,10 @@ def _consume(values, gates, initial, states, residuals, final, indices, shared, 
              WEIGHTED_K_MAJOR: gl.constexpr):
     state_waves: gl.constexpr = [1,4] if STATE_VK else [4,1]
     mma: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=3, instr_shape=[16, 16, 16], transposed=True, warps_per_cta=state_waves, tiles_per_warp=[1,2])
+        version=3, instr_shape=[16, 16, 16], mmac_layout=gl.amd.MmacLayout.LIT,
+        warps_per_cta=state_waves, tiles_per_warp=[1,2])
     prediction_mma: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=3, instr_shape=[16,16,16],transposed=True,warps_per_cta=[4,1])
+        version=3, instr_shape=[16,16,16], mmac_layout=gl.amd.MmacLayout.LIT, warps_per_cta=[4,1])
     prediction_a: gl.constexpr = gl.DotOperandLayout(0,prediction_mma,PREDICTION_KWIDTH)
     prediction_b: gl.constexpr = gl.DotOperandLayout(1,prediction_mma,PREDICTION_KWIDTH)
     dot_a: gl.constexpr = gl.DotOperandLayout(0, mma, 4)
@@ -231,7 +232,8 @@ def chunk_wasp_async_kernel(keys, weights, values, gates, initial, states, resid
                       IS_VARLEN: gl.constexpr,
                       STATE_VK: gl.constexpr = False, SMALL: gl.constexpr = False,
                       PREDICTION_KWIDTH: gl.constexpr = 4,
-                      WEIGHTED_K_MAJOR: gl.constexpr = False):
+                      WEIGHTED_K_MAJOR: gl.constexpr = False,
+                      PARTITION_REGS: gl.constexpr = (64, 192)):
     layout: gl.constexpr = gl.SwizzledSharedLayout(8, 1, 16, [1, 0])
     shared = gl.allocate_shared_memory(gl.bfloat16, (64, 128), layout)
     matrix_layout: gl.constexpr = gl.SwizzledSharedLayout(8,2,2,[1,0])
@@ -253,7 +255,7 @@ def chunk_wasp_async_kernel(keys, weights, values, gates, initial, states, resid
             (_produce, (keys, weights, values, states, residuals, shared, key_shared, h_shared, u_shared, v_shared, T, cu_seqlens, chunk_offsets, H, HG, BV, SAVE_VALUE, IS_VARLEN, SMALL)),
             (_consume, (values, gates, initial, states, residuals, final, indices, shared, key_shared, h_shared, u_shared, v_shared,
                         T, cu_seqlens, H, BV, USE_INITIAL, HAS_INDICES, STATE_ROWS, IS_VARLEN, USE_EXP2, SAVE_VALUE, SAVE_FINAL, STATE_VK, SMALL, PREDICTION_KWIDTH, WEIGHTED_K_MAJOR)),
-        ], [4, 4], [40, 104])
+        ], [4, 4], PARTITION_REGS)
 
 
 def _supports_async_wasp(options):
@@ -376,5 +378,6 @@ def chunk_gated_delta_rule_fwd_h_wasp_async(k, w, u, **kwargs):
         SAVE_FINAL=final is not None, USE_EXP2=options['use_exp2'],
         STATE_VK=True, SMALL=False, PREDICTION_KWIDTH=config.get('prediction_kwidth', 4),
         WEIGHTED_K_MAJOR=config.get('weighted_k_major', False),
+        PARTITION_REGS=compiler_options['wasp_partition_regs'],
         **compiler_options)
     return states, residuals, final
