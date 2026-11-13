@@ -20,6 +20,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional, Union
 
+import importlib
+import json
+from functools import partial
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -1050,3 +1054,83 @@ def _report(kind: str, name: str, results: dict[str, float], flops: int) -> None
         f"vllm {ms_vllm:.4f} ms ({flops / (ms_vllm * 1e9):.3f} TFLOPS) | "
         f"vllm/sglang {ms_vllm / ms_sgl:.2f}x"
     )
+
+
+_BENCH_1102_DTYPES = {'BF16': torch.bfloat16, 'FP16': torch.float16,
+                      'FP32': torch.float32, 'FP8E4M3': torch.float8_e4m3fn}
+
+
+_BENCH_1102_SHAPES = [
+    {'id': 's001', 'op': 'gdn_conv1d_silu', 'type': 'gdn_conv1d_silu', 'stage': 'Prefill_Chunk', 'inputs': [[6656, 8192], [8192, 4]], 'dtypes': ['BF16', 'BF16'], 'outputs': [[6656, 8192]], 'output_dtypes': ['BF16'], 'locations': [{'file': 'shape_07_q35_fp8_4k_s150.xlsx', 'sheet': 'prefill_shape', 'row': 12}, {'file': 'shape_08_q35_mxfp4_128k_s150.xlsx', 'sheet': 'prefill_shape', 'row': 11}]},
+    {'id': 's007', 'op': 'gdn_conv1d_silu', 'type': 'gdn_conv1d_silu', 'stage': 'Prefill_Remainder', 'inputs': [[2560, 8192], [8192, 4]], 'dtypes': ['BF16', 'BF16'], 'outputs': [[2560, 8192]], 'output_dtypes': ['BF16'], 'locations': [{'file': 'shape_07_q35_fp8_4k_s150.xlsx', 'sheet': 'prefill_shape', 'row': 74}]},
+    {'id': 's013', 'op': 'gdn_conv1d_silu', 'type': 'gdn_conv1d_silu', 'stage': 'Decode', 'inputs': [[64, 8192], [8192, 4], [64, 8192, 3]], 'dtypes': ['BF16', 'BF16', 'BF16'], 'outputs': [[64, 8192], [64, 8192, 3]], 'output_dtypes': ['BF16', 'BF16'], 'locations': [{'file': 'shape_07_q35_fp8_4k_s150.xlsx', 'sheet': 'decode_shape', 'row': 12}]},
+    {'id': 's038', 'op': 'gdn_conv1d_silu', 'type': 'gdn_conv1d_silu', 'stage': 'Prefill_Remainder', 'inputs': [[2048, 8192], [8192, 4]], 'dtypes': ['BF16', 'BF16'], 'outputs': [[2048, 8192]], 'output_dtypes': ['BF16'], 'locations': [{'file': 'shape_08_q35_mxfp4_128k_s150.xlsx', 'sheet': 'prefill_shape', 'row': 86}]},
+    {'id': 's044', 'op': 'gdn_conv1d_silu', 'type': 'gdn_conv1d_silu', 'stage': 'Decode', 'inputs': [[12, 8192], [8192, 4], [12, 8192, 3]], 'dtypes': ['BF16', 'BF16', 'BF16'], 'outputs': [[12, 8192], [12, 8192, 3]], 'output_dtypes': ['BF16', 'BF16'], 'locations': [{'file': 'shape_08_q35_mxfp4_128k_s150.xlsx', 'sheet': 'decode_shape', 'row': 11}]},
+    {'id': 's099', 'op': 'gdn_conv1d_silu', 'type': 'gdn_conv1d_silu', 'stage': 'Prefill_Chunk', 'inputs': [[6656, 12288], [12288, 4]], 'dtypes': ['BF16', 'BF16'], 'outputs': [[6656, 12288]], 'output_dtypes': ['BF16'], 'locations': [{'file': 'shape_11_q397b_128k_s2000.xlsx', 'sheet': 'prefill_shape', 'row': 12}]},
+    {'id': 's124', 'op': 'gdn_conv1d_silu', 'type': 'gdn_conv1d_silu', 'stage': 'Prefill_Remainder', 'inputs': [[3584, 12288], [12288, 4]], 'dtypes': ['BF16', 'BF16'], 'outputs': [[3584, 12288]], 'output_dtypes': ['BF16'], 'locations': [{'file': 'shape_11_q397b_128k_s2000.xlsx', 'sheet': 'prefill_shape', 'row': 99}]},
+    {'id': 's130', 'op': 'gdn_conv1d_silu', 'type': 'gdn_conv1d_silu', 'stage': 'Prefill_Chunk', 'inputs': [[53248, 1536], [1536, 4]], 'dtypes': ['BF16', 'BF16'], 'outputs': [[53248, 1536]], 'output_dtypes': ['BF16'], 'locations': [{'file': 'shape_11_q397b_128k_s2000.xlsx', 'sheet': 'prefill_shape_cp8', 'row': 13}]},
+    {'id': 's137', 'op': 'gdn_conv1d_silu', 'type': 'gdn_conv1d_silu', 'stage': 'Prefill_Remainder', 'inputs': [[28672, 1536], [1536, 4]], 'dtypes': ['BF16', 'BF16'], 'outputs': [[28672, 1536]], 'output_dtypes': ['BF16'], 'locations': [{'file': 'shape_11_q397b_128k_s2000.xlsx', 'sheet': 'prefill_shape_cp8', 'row': 86}]},
+    {'id': 's141', 'op': 'gdn_conv1d_silu', 'type': 'gdn_conv1d_silu', 'stage': 'Decode', 'inputs': [[192, 6144], [6144, 4], [48, 6144, 3]], 'dtypes': ['BF16', 'BF16', 'BF16'], 'outputs': [[192, 6144], [48, 6144, 3]], 'output_dtypes': ['BF16', 'BF16'], 'locations': [{'file': 'shape_11_q397b_128k_s2000.xlsx', 'sheet': 'decode_shape', 'row': 12}]},
+]
+
+
+def _bench_1102_cases():
+    cases = []
+    for shape in _BENCH_1102_SHAPES:
+        routes = ('prefill', 'update')
+        routes = ('prefill' if len(shape['inputs']) == 2 else 'update',)
+        for route in routes:
+            cases.append({
+                'shape_id': shape['id'], 'source_op': shape['op'], 'route': route,
+                'measurement': 'component' if shape['op'] == 'gdn_chunk_delta' else 'operator',
+                'input_shapes': json.dumps(shape['inputs'], separators=(',', ':')),
+                'input_dtypes': ','.join(shape['dtypes']),
+                'output_shapes': json.dumps(shape['outputs'], separators=(',', ':')),
+                'output_dtypes': ','.join(shape['output_dtypes']),
+                'sources': json.dumps(shape['locations'], separators=(',', ':')),
+                'shape': shape,
+            })
+    return cases
+
+
+def _bench_1102_case_id(case):
+    return f"{case['source_op']}-{case['route']}-{case['shape_id']}"
+
+
+def _build_bench_1102_runner(case, device='cuda'):
+    """Allocate inputs once; return an operator/component invocation for timing."""
+    shape = case['shape']
+    inputs = shape['inputs']
+    dtypes = [_BENCH_1102_DTYPES[name] for name in shape['dtypes']]
+    route = case['route']
+
+    def tensor(*dims, dtype=torch.bfloat16, value=None):
+        tensor = torch.empty(dims, dtype=dtype, device=device)
+        if tensor.device.type != 'meta':
+            if value is not None:
+                tensor.fill_(value)
+            elif dtype == torch.float8_e4m3fn:
+                tensor.view(torch.uint8).random_(24, 40)
+            else:
+                tensor.uniform_(-0.02, 0.02)
+        return tensor
+
+    def indices(count):
+        return torch.arange(count, dtype=torch.int32, device=device)
+    target = importlib.import_module('boltops.generic.triton.causal_conv1d.core')
+    (total, channels) = inputs[0]
+    weight = tensor(*inputs[1], dtype=dtypes[1])
+    if route == 'prefill':
+        return partial(target.causal_conv1d_fn, tensor(total, channels).T, weight, conv_states=tensor(1, channels, inputs[1][-1] - 1, value=0), query_start_loc=indices(2) * total, seq_lens_cpu=[total], activation='silu', backend='sglang')
+    batch = inputs[2][0]
+    return partial(target.causal_conv1d_update, tensor(batch, total // batch, channels).transpose(1, 2), tensor(*inputs[2], dtype=dtypes[2], value=0), weight, activation='silu', backend='sglang')
+
+
+@GPU_REQUIRED
+@pytest.mark.bench
+@pytest.mark.parametrize('case', _bench_1102_cases(), ids=_bench_1102_case_id)
+def test_bench_1102_conv1d_triton(case, bench_warmup, bench_repeat, time_ms):
+    run = _build_bench_1102_runner(case)
+    run()
+    latency = time_ms(run, bench_warmup, bench_repeat, dtype=case['input_dtypes'])
+    print(f'{_bench_1102_case_id(case)} ({case["measurement"]}): {latency * 1000:.3f} us')

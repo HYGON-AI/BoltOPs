@@ -8,6 +8,10 @@ import inspect
 import math
 from collections.abc import Callable
 
+import importlib
+import json
+from functools import partial
+
 import pytest
 import torch
 
@@ -585,3 +589,92 @@ def test_bench_chunk_o_tflops(
     o_tflops = o_flops / (o_ms * 1e-3) / 1e12
     label = f"{backend_name}, {mode}, {state_layout}"
     print(f"GDN chunk o ({label}): {o_ms:.3f} ms, {o_tflops:.2f} TFLOPS")
+
+
+_BENCH_1102_DTYPES = {'BF16': torch.bfloat16, 'FP16': torch.float16,
+                      'FP32': torch.float32, 'FP8E4M3': torch.float8_e4m3fn}
+
+
+_BENCH_1102_SHAPES = [
+    {'id': 's003', 'op': 'gdn_chunk_delta', 'type': 'gdn_chunk_delta', 'stage': 'Prefill_Chunk', 'inputs': [[6656, 16, 128], [6656, 16, 128], [6656, 32, 128], [6656, 32], [6656, 32], [1, 32, 128, 128]], 'dtypes': ['BF16', 'BF16', 'BF16', 'FP32', 'FP32', 'FP32'], 'outputs': [[6656, 32, 128], [1, 32, 128, 128]], 'output_dtypes': ['BF16', 'FP32'], 'locations': [{'file': 'shape_07_q35_fp8_4k_s150.xlsx', 'sheet': 'prefill_shape', 'row': 14}, {'file': 'shape_08_q35_mxfp4_128k_s150.xlsx', 'sheet': 'prefill_shape', 'row': 13}]},
+    {'id': 's009', 'op': 'gdn_chunk_delta', 'type': 'gdn_chunk_delta', 'stage': 'Prefill_Remainder', 'inputs': [[2560, 16, 128], [2560, 16, 128], [2560, 32, 128], [2560, 32], [2560, 32], [1, 32, 128, 128]], 'dtypes': ['BF16', 'BF16', 'BF16', 'FP32', 'FP32', 'FP32'], 'outputs': [[2560, 32, 128], [1, 32, 128, 128]], 'output_dtypes': ['BF16', 'FP32'], 'locations': [{'file': 'shape_07_q35_fp8_4k_s150.xlsx', 'sheet': 'prefill_shape', 'row': 76}]},
+    {'id': 's040', 'op': 'gdn_chunk_delta', 'type': 'gdn_chunk_delta', 'stage': 'Prefill_Remainder', 'inputs': [[2048, 16, 128], [2048, 16, 128], [2048, 32, 128], [2048, 32], [2048, 32], [1, 32, 128, 128]], 'dtypes': ['BF16', 'BF16', 'BF16', 'FP32', 'FP32', 'FP32'], 'outputs': [[2048, 32, 128], [1, 32, 128, 128]], 'output_dtypes': ['BF16', 'FP32'], 'locations': [{'file': 'shape_08_q35_mxfp4_128k_s150.xlsx', 'sheet': 'prefill_shape', 'row': 88}]},
+    {'id': 's101', 'op': 'gdn_chunk_delta', 'type': 'gdn_chunk_delta', 'stage': 'Prefill_Chunk', 'inputs': [[6656, 16, 128], [6656, 16, 128], [6656, 64, 128], [6656, 64], [6656, 64], [1, 64, 128, 128]], 'dtypes': ['BF16', 'BF16', 'BF16', 'FP32', 'FP32', 'FP32'], 'outputs': [[6656, 64, 128], [1, 64, 128, 128]], 'output_dtypes': ['BF16', 'FP32'], 'locations': [{'file': 'shape_11_q397b_128k_s2000.xlsx', 'sheet': 'prefill_shape', 'row': 14}]},
+    {'id': 's126', 'op': 'gdn_chunk_delta', 'type': 'gdn_chunk_delta', 'stage': 'Prefill_Remainder', 'inputs': [[3584, 16, 128], [3584, 16, 128], [3584, 64, 128], [3584, 64], [3584, 64], [1, 64, 128, 128]], 'dtypes': ['BF16', 'BF16', 'BF16', 'FP32', 'FP32', 'FP32'], 'outputs': [[3584, 64, 128], [1, 64, 128, 128]], 'output_dtypes': ['BF16', 'FP32'], 'locations': [{'file': 'shape_11_q397b_128k_s2000.xlsx', 'sheet': 'prefill_shape', 'row': 101}]},
+    {'id': 's132', 'op': 'gdn_chunk_delta', 'type': 'gdn_chunk_delta', 'stage': 'Prefill_Chunk', 'inputs': [[53248, 2, 128], [53248, 2, 128], [53248, 8, 128], [53248, 8], [53248, 8], [1, 8, 128, 128]], 'dtypes': ['BF16', 'BF16', 'BF16', 'FP32', 'FP32', 'FP32'], 'outputs': [[53248, 8, 128], [1, 8, 128, 128]], 'output_dtypes': ['BF16', 'FP32'], 'locations': [{'file': 'shape_11_q397b_128k_s2000.xlsx', 'sheet': 'prefill_shape_cp8', 'row': 15}]},
+    {'id': 's139', 'op': 'gdn_chunk_delta', 'type': 'gdn_chunk_delta', 'stage': 'Prefill_Remainder', 'inputs': [[28672, 2, 128], [28672, 2, 128], [28672, 8, 128], [28672, 8], [28672, 8], [1, 8, 128, 128]], 'dtypes': ['BF16', 'BF16', 'BF16', 'FP32', 'FP32', 'FP32'], 'outputs': [[28672, 8, 128], [1, 8, 128, 128]], 'output_dtypes': ['BF16', 'FP32'], 'locations': [{'file': 'shape_11_q397b_128k_s2000.xlsx', 'sheet': 'prefill_shape_cp8', 'row': 88}]},
+]
+
+
+def _bench_1102_cases():
+    cases = []
+    for shape in _BENCH_1102_SHAPES:
+        routes = ('h', 'o', 'cumsum', 'l2norm')
+        for route in routes:
+            cases.append({
+                'shape_id': shape['id'], 'source_op': shape['op'], 'route': route,
+                'measurement': 'component' if shape['op'] == 'gdn_chunk_delta' else 'operator',
+                'input_shapes': json.dumps(shape['inputs'], separators=(',', ':')),
+                'input_dtypes': ','.join(shape['dtypes']),
+                'output_shapes': json.dumps(shape['outputs'], separators=(',', ':')),
+                'output_dtypes': ','.join(shape['output_dtypes']),
+                'sources': json.dumps(shape['locations'], separators=(',', ':')),
+                'shape': shape,
+            })
+    return cases
+
+
+def _bench_1102_case_id(case):
+    return f"{case['source_op']}-{case['route']}-{case['shape_id']}"
+
+
+def _build_bench_1102_runner(case, device='cuda'):
+    """Allocate inputs once; return an operator/component invocation for timing."""
+    shape = case['shape']
+    inputs = shape['inputs']
+    dtypes = [_BENCH_1102_DTYPES[name] for name in shape['dtypes']]
+    route = case['route']
+
+    def tensor(*dims, dtype=torch.bfloat16, value=None):
+        tensor = torch.empty(dims, dtype=dtype, device=device)
+        if tensor.device.type != 'meta':
+            if value is not None:
+                tensor.fill_(value)
+            elif dtype == torch.float8_e4m3fn:
+                tensor.view(torch.uint8).random_(24, 40)
+            else:
+                tensor.uniform_(-0.02, 0.02)
+        return tensor
+
+    def indices(count):
+        return torch.arange(count, dtype=torch.int32, device=device)
+    (total, heads, width) = inputs[0]
+    (value_heads, value_width) = inputs[2][1:]
+    if route == 'l2norm':
+        target = importlib.import_module('boltops.fla.common.triton.l2norm')
+        return partial(target.l2norm_fwd, tensor(1, total, heads, width))
+    gates = tensor(1, total, value_heads, dtype=torch.float32, value=-0.01)
+    if route == 'cumsum':
+        target = importlib.import_module('boltops.fla.common.triton.cumsum')
+        return partial(target.chunk_local_cumsum_scalar, gates, 64)
+    keys = tensor(1, total, heads, width)
+    values = tensor(1, total, value_heads, value_width)
+    if route == 'o':
+        target = importlib.import_module('boltops.fla.gdn.triton.chunk_o')
+        return partial(target.chunk_fwd_o, tensor(1, total, heads, width), keys, values, tensor(1, total // 64, value_heads, value_width, width), g=gates, transpose_state_layout=True)
+    weights = tensor(1, total, value_heads, width)
+    initial = tensor(*inputs[-1], dtype=torch.float32, value=0)
+    if route == 'h':
+        target = importlib.import_module('boltops.fla.gdn.triton.chunk_delta_h')
+        return partial(target.chunk_gated_delta_rule_fwd_h, keys, weights, values, g=gates, initial_state=initial, kernel_cfg={})
+    raise ValueError(f'Unknown benchmark route: {route}')
+
+
+@GPU_REQUIRED
+@pytest.mark.bench
+@pytest.mark.parametrize('case', _bench_1102_cases(), ids=_bench_1102_case_id)
+def test_bench_1102_gdn_chunk_components_triton(case, bench_warmup, bench_repeat, time_ms):
+    run = _build_bench_1102_runner(case)
+    run()
+    latency = time_ms(run, bench_warmup, bench_repeat, dtype=case['input_dtypes'])
+    print(f'{_bench_1102_case_id(case)} ({case["measurement"]}): {latency * 1000:.3f} us')
