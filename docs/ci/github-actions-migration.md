@@ -4,7 +4,7 @@
 
 ## 1. 先理解整体流程
 
-PR 到 main 和手动运行时，`build2604` 和 `build2610` 各自的两组环境都在 `hygon-build` 构建 wheel。仅 DTK26.04 / Python3.10 / Torch2.11.0 和 DTK26.10 / Python3.12 / Torch2.13.0 在 `hygon-bw1100-4card` 运行正确性测试，通过后在 `hygon-bw1100-1card` 下载 wheel 并运行性能测试。性能 job 通过共享 concurrency group 串行执行。`ci-result` 在 `hygon-cpu` 汇总两个 DTK 的构建和测试结果。
+PR 到 main 和手动运行时，`build2604` 和 `build2610` 各自的两组环境都在 `hygon-build` 构建 wheel。DTK26.04 / Python3.10 / Torch2.11.0，以及 DTK26.10 / Python3.12 下的 Torch2.11.0 和 Torch2.13.0 在 `hygon-bw1100-4card` 运行正确性测试，通过后在 `hygon-bw1100-1card` 下载 wheel 并运行性能测试。性能 job 通过共享 concurrency group 串行执行。`ci-result` 在 `hygon-cpu` 汇总两个 DTK 的构建和测试结果。
 
 push 到 main 时构建并修复四组 wheel，各 DTK 的构建成功后，由 `publish-2604` 和 `publish-2610` 在 `hygon-build` 分别发布。正确性和性能测试在 PR 或手动运行时执行。
 
@@ -84,7 +84,7 @@ git commit -m 'ci: add GitHub Actions build test and nightly workflows'
 git push -u fork ci/github-actions-migration
 ```
 
-从原仓库分支或个人 fork 创建 PR 到 main；如页面要求，等待维护者批准工作流运行。检查四组构建、两组正确性及性能作业、ci-result 和已有 Quality Gate。PR 不会发布，也不接触 PYPI_PASSWORD。下载 artifact 核对 wheel、JUnit 与性能报告。两组性能作业均需在 BW1100 上实际验证。
+从原仓库分支或个人 fork 创建 PR 到 main；如页面要求，等待维护者批准工作流运行。检查四组构建、三组正确性及性能作业、ci-result 和已有 Quality Gate。PR 不会发布，也不接触 PYPI_PASSWORD。下载 artifact 核对 wheel、JUnit 与性能报告。三组性能作业均需在 BW1100 上实际验证。
 
 由于需要真实内网 runner、编译器和 GPU，本地只能验证 YAML/Actions 表达式、Bash 语法、矩阵、设备选择分支和脚本迁移逻辑；未实际运行 GPU 构建、测试或上传。
 

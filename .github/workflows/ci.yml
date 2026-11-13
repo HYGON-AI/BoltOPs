@@ -55,7 +55,7 @@ jobs:
       py_version: '3.12'
       numpy_version: '1.26.4'
       torch_version: ${{ matrix.torch_version }}
-      run_tests: ${{ github.event_name != 'push' && matrix.torch_version == '2.13.0' }}
+      run_tests: ${{ github.event_name != 'push' }}
   publish-2604:
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     needs:
