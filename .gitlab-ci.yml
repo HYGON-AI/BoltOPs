@@ -197,7 +197,7 @@ select:source:
     # Match TileLang CI: apache-tvm-ffi comes from Aliyun, while the constraint
     # makes pip choose the TileLang wheel compatible with this Torch matrix job.
     - python -m pip install --constraint "${CI_WORK_DIR}/constraints.txt" "apache-tvm-ffi==0.1.11" -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
-    - python -m pip install --constraint "${CI_WORK_DIR}/constraints.txt" --index-url "${TRITON_INDEX_URL}" --trusted-host "${PIP_TRUSTED_HOST}" "tilelang==0.1.12" --extra-index-url https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
+    - python -m pip install --constraint "${CI_WORK_DIR}/constraints.txt" --index-url "${TRITON_INDEX_URL}" --trusted-host "${PIP_TRUSTED_HOST}" "tilelang==0.1.15" --extra-index-url https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
     - python -m pip check
     - python -m pip show torch triton tilelang apache-tvm-ffi numpy
     - |
@@ -347,7 +347,7 @@ performance:optest:
     # Keep performance on the same newest Torch-compatible Triton 3.6 build.
     - python -m pip install --constraint "${CI_WORK_DIR}/constraints.txt" --index-url "${TRITON_INDEX_URL}" --trusted-host "${PIP_TRUSTED_HOST}" "triton==3.6.0"
     - python -m pip install --constraint "${CI_WORK_DIR}/constraints.txt" "apache-tvm-ffi==0.1.11" -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
-    - python -m pip install --constraint "${CI_WORK_DIR}/constraints.txt" --index-url "${TRITON_INDEX_URL}" --trusted-host "${PIP_TRUSTED_HOST}" "tilelang==0.1.12" --extra-index-url https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
+    - python -m pip install --constraint "${CI_WORK_DIR}/constraints.txt" --index-url "${TRITON_INDEX_URL}" --trusted-host "${PIP_TRUSTED_HOST}" "tilelang==0.1.15" --extra-index-url https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
     - python -m pip check
     # Install the exact repaired wheel produced and validated by build:test-wheel.
     - |
@@ -418,7 +418,6 @@ performance:optest:
       if [ -n "${latest_results}" ]; then
         results_file="${latest_results}/.optest-results.json"
         echo "Selected results: ${results_file}" | tee -a "${artifact_dir}/collection.log"
-        cp -a "${latest_results}" "${artifact_dir}/results"
       else
         echo "ERROR: No current-job report matched ${result_pattern} after ${CI_WORK_DIR}/optest-start" \
           | tee -a "${artifact_dir}/collection.log"
@@ -460,11 +459,33 @@ performance:optest:
       if [ "${optest_rc}" -ne 0 ]; then
         exit "${optest_rc}"
       fi
+  after_script:
+    - |
+      # after_script uses a fresh shell: reconstruct the current job's branch.
+      # Archive partial output even when optest or JUnit conversion failed.
+      run_branch="ci_performance_${RUNNER_TAG}_dtk${DTK_VER}_py${PYTHON_VERSION}_torch${TORCH_VERSION}_${CI_JOB_ID}"
+      artifact_dir="${CI_PROJECT_DIR}/optest_artifacts/${RUNNER_TAG}/dtk${DTK_VER}/py${PYTHON_VERSION}/torch${TORCH_VERSION}"
+      mkdir -p "${artifact_dir}"
+      for result_dir in /op_test_output/boltops/"${run_branch}"_*; do
+        if [ -d "${result_dir}" ]; then
+          mkdir -p "${artifact_dir}/results"
+          echo "Archiving results: ${result_dir}" | tee -a "${artifact_dir}/collection.log"
+          cp -a "${result_dir}" "${artifact_dir}/results/"
+        fi
+      done
+      for log_dir in /op_test_log/boltops/"${run_branch}"_*; do
+        if [ -d "${log_dir}" ]; then
+          mkdir -p "${artifact_dir}/logs"
+          echo "Archiving logs: ${log_dir}" | tee -a "${artifact_dir}/collection.log"
+          cp -a "${log_dir}" "${artifact_dir}/logs/"
+        fi
+      done
   artifacts:
     when: always
     paths:
       - scripts/${RUNNER_TAG}_dtk${DTK_VER}_py${PYTHON_VERSION}_torch${TORCH_VERSION}_boltops_output.xml
       - optest_artifacts/${RUNNER_TAG}/dtk${DTK_VER}/py${PYTHON_VERSION}/torch${TORCH_VERSION}/
+      - optest_results/
     reports:
       junit: scripts/${RUNNER_TAG}_dtk${DTK_VER}_py${PYTHON_VERSION}_torch${TORCH_VERSION}_boltops_output.xml
     expire_in: 7 days

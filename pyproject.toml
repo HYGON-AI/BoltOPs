@@ -18,8 +18,8 @@ dependencies = [
 
 [project.optional-dependencies]
 triton = ["triton"]
-tilelang = ["tilelang"]
-all = ["triton", "tilelang"]
+tilelang = ["tilelang==0.1.15"]
+all = ["triton", "tilelang==0.1.15"]
 tune = [
     "triton",
     "pytest",

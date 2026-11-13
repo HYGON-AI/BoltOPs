@@ -15,6 +15,7 @@ triton = pytest.importorskip("triton")
 from triton.testing import do_bench as _do_bench_ref  # reference timing only, not collected
 
 import boltops.fla.gdn as gdn
+from boltops.utility.arch_info import get_arch
 from boltops.utility.backends import discover_backends
 from boltops.fla.gdn import chunk_gated_delta_rule_fwd_h
 from ._gdn_reference import naive_chunk_h, naive_chunk_o
@@ -43,7 +44,7 @@ def _chunk_h_correctness_params():
     params = []
     for backend_name in CHUNK_H_BACKENDS:
         implementations = (
-            ("copy-pipeline", "wasp_4p4c")
+            ("wasp_4p4c", "wasp_4p4c_gfx946")
             if backend_name == "tilelang"
             else (None,)
         )
@@ -107,9 +108,10 @@ def _make_chunk_cumsum(
     cu_seqlens: torch.Tensor | None,
     *,
     use_exp2: bool,
+    device: str = DEVICE,
 ) -> torch.Tensor:
     pointwise = (
-        -torch.rand(batch, total, H, device=DEVICE, dtype=torch.float32)
+        -torch.rand(batch, total, H, device=device, dtype=torch.float32)
         * 0.04
     )
     result = torch.empty_like(pointwise)
@@ -129,7 +131,7 @@ def _make_chunk_cumsum(
 def _kernel_cfg(
     backend_name: str,
     implementation: str | None = "wasp_4p4c",
-) -> dict[str, str] | None:
+) -> dict[str, str | int] | None:
     if backend_name == "tilelang":
         assert implementation is not None
         return {"implementation": implementation}
@@ -141,53 +143,77 @@ def _check_chunk_h_matches_reference(
     use_varlen: bool,
     inplace_final_state: bool,
     implementation: str | None = "wasp_4p4c",
+    heads: int = 16,
+    seq_len: int | None = None,
+    block_v: int | None = None,
+    state_index: int = 1,
 ) -> None:
     backend_name, chunk_h = chunk_backend
     torch.manual_seed(120 if use_varlen else 123)
-    B, H, Hg, K, V, chunk_size = 1, 16, 16, 128, 128, 64
+    B, H, Hg, K, V, chunk_size = 1, heads, 16, 128, 128, 64
     minimum_T = 5 * chunk_size
-    T = CORRECTNESS_SEQ_LEN
-    assert T >= minimum_T
+    T = CORRECTNESS_SEQ_LEN if seq_len is None else seq_len
+    if seq_len is None:
+        assert T >= minimum_T
+    else:
+        assert not use_varlen and T >= chunk_size and T % chunk_size == 0
     dtype = torch.bfloat16
     if use_varlen:
         first = T // 3
         second = (T - first) // 2
         lengths = [first, second, T - first - second]
-        cu = torch.tensor(
+        cu_cpu = torch.tensor(
             [0, lengths[0], lengths[0] + lengths[1], T],
-            device=DEVICE,
             dtype=torch.int32,
         )
-        chunk_indices = _chunk_indices(cu, chunk_size)
+        chunk_indices_cpu = _chunk_indices(cu_cpu, chunk_size)
         num_sequences = len(lengths)
-        state_indices = torch.tensor(
-            [2, -1, 0], device=DEVICE, dtype=torch.int32
-        )
+        state_indices_cpu = torch.tensor([2, -1, 0], dtype=torch.int32)
     else:
-        cu = None
-        chunk_indices = None
+        cu_cpu = None
+        chunk_indices_cpu = None
         num_sequences = B
-        state_indices = torch.tensor(
-            [1], device=DEVICE, dtype=torch.int32
-        )
+        state_indices_cpu = torch.tensor([state_index], dtype=torch.int32)
     state_rows = num_sequences + 1
 
-    k = torch.randn(B, T, Hg, K, device=DEVICE, dtype=dtype) * 0.05
-    w = torch.randn(B, T, H, K, device=DEVICE, dtype=dtype) * 0.05
-    u = torch.randn(B, T, H, V, device=DEVICE, dtype=dtype) * 0.05
-    g = _make_chunk_cumsum(B, T, H, chunk_size, cu, use_exp2=False)
-    state_before = (
-        torch.randn(
-            state_rows, H, V, K, device=DEVICE, dtype=torch.float32
-        )
-        * 0.01
+    # Generate inputs and run the reference entirely on CPU so PMD captures
+    # only the TileLang kernel under test, not PyTorch setup/reference kernels.
+    k_cpu = torch.randn(B, T, Hg, K, dtype=dtype) * 0.05
+    w_cpu = torch.randn(B, T, H, K, dtype=dtype) * 0.05
+    u_cpu = torch.randn(B, T, H, V, dtype=dtype) * 0.05
+    g_cpu = _make_chunk_cumsum(
+        B,
+        T,
+        H,
+        chunk_size,
+        cu_cpu,
+        use_exp2=False,
+        device="cpu",
     )
-    state_actual = state_before.clone()
-    # Keep the PyTorch reference on CPU.  HCU's rocBLAS installation does not
-    # provide a Tensile library for every supported architecture, while the
-    # reference's einsums do not need to run on the accelerator.
-    reference_state = state_before.cpu()
+    state_before_cpu = (
+        torch.randn(state_rows, H, V, K, dtype=torch.float32) * 0.01
+    )
+    reference_state = state_before_cpu.clone()
 
+    k = k_cpu.to(DEVICE)
+    w = w_cpu.to(DEVICE)
+    u = u_cpu.to(DEVICE)
+    g = g_cpu.to(DEVICE)
+    state_actual = state_before_cpu.to(DEVICE)
+    state_indices = state_indices_cpu.to(DEVICE)
+    cu = None if cu_cpu is None else cu_cpu.to(DEVICE)
+    chunk_indices = (
+        None
+        if chunk_indices_cpu is None
+        else chunk_indices_cpu.to(DEVICE)
+    )
+
+    cfg = _kernel_cfg(backend_name, implementation)
+    if block_v is not None:
+        assert cfg is not None
+        cfg["block_v"] = block_v
+
+    torch.cuda.synchronize()
     actual_h, actual_v, actual_final = chunk_h(
         k,
         w,
@@ -203,34 +229,41 @@ def _check_chunk_h_matches_reference(
         chunk_indices=chunk_indices,
         use_exp2=False,
         transpose_state_layout=True,
-        kernel_cfg=_kernel_cfg(backend_name, implementation),
+        kernel_cfg=cfg,
     )
+    torch.cuda.synchronize()
     expected_h, expected_v, expected_final = naive_chunk_h(
-        k.cpu(),
-        w.cpu(),
-        u.cpu(),
-        g=g.cpu(),
+        k_cpu,
+        w_cpu,
+        u_cpu,
+        g=g_cpu,
         initial_state=reference_state,
-        initial_state_indices=state_indices.cpu(),
+        initial_state_indices=state_indices_cpu,
         output_final_state=True,
         inplace_final_state=inplace_final_state,
         chunk_size=chunk_size,
         save_new_value=True,
-        cu_seqlens=None if cu is None else cu.cpu(),
+        cu_seqlens=cu_cpu,
         use_exp2=False,
         transpose_state_layout=True,
     )
 
+    actual_h_cpu = actual_h.cpu()
     torch.testing.assert_close(
-        actual_h.cpu(), expected_h, atol=BF16_ATOL, rtol=BF16_RTOL
+        actual_h_cpu, expected_h, atol=BF16_ATOL, rtol=BF16_RTOL
     )
     assert actual_v is not None and expected_v is not None
+    actual_v_cpu = actual_v.cpu()
     torch.testing.assert_close(
-        actual_v.cpu(), expected_v, atol=BF16_ATOL, rtol=BF16_RTOL
+        actual_v_cpu, expected_v, atol=BF16_ATOL, rtol=BF16_RTOL
     )
     assert actual_final is not None and expected_final is not None
+    actual_final_cpu = actual_final.cpu()
     torch.testing.assert_close(
-        actual_final.cpu(), expected_final, atol=BF16_ATOL, rtol=BF16_RTOL
+        actual_final_cpu,
+        expected_final,
+        atol=BF16_ATOL,
+        rtol=BF16_RTOL,
     )
     if inplace_final_state:
         assert actual_final is state_actual
@@ -238,8 +271,28 @@ def _check_chunk_h_matches_reference(
         assert actual_final.shape[0] == state_rows
     else:
         assert actual_final is not state_actual
-        torch.testing.assert_close(state_actual, state_before)
+        torch.testing.assert_close(state_actual.cpu(), state_before_cpu)
         assert actual_final.shape[0] == num_sequences
+
+
+@GPU_REQUIRED
+@pytest.mark.parametrize("seq_len", [64, 128, 192, 320])
+@pytest.mark.parametrize("state_index", [1, -1], ids=["state", "null-state"])
+@pytest.mark.parametrize("inplace", [False, True], ids=["out-of-place", "inplace"])
+def test_chunk_h_bv64_fixed_matches_reference(
+    seq_len: int, state_index: int, inplace: bool,
+) -> None:
+    if "tilelang" not in CHUNK_H_BACKENDS:
+        pytest.skip("TileLang backend is unavailable")
+    _check_chunk_h_matches_reference(
+        ("tilelang", CHUNK_H_BACKENDS["tilelang"]),
+        use_varlen=False,
+        inplace_final_state=inplace,
+        heads=32,
+        seq_len=seq_len,
+        block_v=64,
+        state_index=state_index,
+    )
 
 
 @GPU_REQUIRED
@@ -253,17 +306,24 @@ def _check_chunk_h_matches_reference(
     (False, True),
     ids=("out-of-place", "in-place"),
 )
+@pytest.mark.parametrize("heads", (16, 32), ids=("Hg16-H16", "Hg16-H32"))
 def test_chunk_h_matches_reference(
     backend_name: str,
     implementation: str | None,
     use_varlen: bool,
     inplace_final_state: bool,
+    heads: int,
 ) -> None:
+    if backend_name == "tilelang" and implementation == "wasp_4p4c_gfx946":
+        arch = get_arch()
+        if arch != "gfx946":
+            pytest.skip(f"wasp_4p4c_gfx946 requires gfx946, got {arch}")
     _check_chunk_h_matches_reference(
         (backend_name, CHUNK_H_BACKENDS[backend_name]),
         use_varlen,
         inplace_final_state,
         implementation,
+        heads,
     )
 
 
@@ -396,9 +456,11 @@ def _benchmark_sequences(
 @pytest.mark.parametrize(
     "transpose_state", [True, False], ids=["vk", "kv"]
 )
+@pytest.mark.parametrize("heads", (16, 32), ids=("Hg16-H16", "Hg16-H32"))
 def test_bench_chunk_h_tflops(
     chunk_h_backend: tuple[str, Callable],
     use_varlen: bool,
+    heads: int,
     transpose_state: bool,
     time_ms,
     bench_warmup: int,
@@ -409,7 +471,7 @@ def test_bench_chunk_h_tflops(
     if backend_name == "tilelang" and not transpose_state:
         pytest.skip("TileLang benchmark supports VK state layout only")
     torch.manual_seed(122)
-    B, H, Hg, K, V, chunk_size = 1, 16, 16, 128, 128, 64
+    B, H, Hg, K, V, chunk_size = 1, heads, 16, 128, 128, 64
     default_T = 13312
     T = default_T if bench_seq_len is None else bench_seq_len
     if T <= 0:
@@ -442,7 +504,7 @@ def test_bench_chunk_h_tflops(
         return chunk_h(
             k, w, u, g=g, initial_state=state,
             initial_state_indices=state_indices,
-            output_final_state=True, inplace_final_state=False,
+            output_final_state=True, inplace_final_state=True,
             chunk_size=chunk_size, save_new_value=True,
             cu_seqlens=cu, chunk_indices=chunk_indices,
             transpose_state_layout=transpose_state,
@@ -456,8 +518,13 @@ def test_bench_chunk_h_tflops(
     assert torch.isfinite(final).all()
     actual_h = h
     actual_v_new = v_new
+    actual_final = final.clone()
 
-    h_ms = time_ms(run_h, bench_warmup, bench_repeat)
+    # Reset outside timing. Repeated in-place calls advance the state; resetting
+    # each iteration would include an extra GPU operation in the kernel timing.
+    state.zero_()
+    torch.cuda.synchronize()
+    h_ms = time_ms(run_h, bench_warmup, bench_repeat, use_graph=False)
     h_flops = _chunk_h_flops(lengths, H, K, V, chunk_size)
     label = f"{backend_name}, {mode}, {state_layout}"
     h_tflops = h_flops / (h_ms * 1e-3) / 1e12
@@ -477,10 +544,12 @@ def test_bench_chunk_h_tflops(
         print(f"AITER chunk-h reference is unavailable: {exc}")
         return
 
+    reference_state = torch.zeros_like(state)
+
     def run_aiter_h():
         return aiter_chunk_h(
             k, w, u, g=g, gk=None,
-            initial_state=state, initial_state_indices=state_indices,
+            initial_state=reference_state, initial_state_indices=state_indices,
             output_final_state=True, chunk_size=chunk_size,
             save_new_value=True, cu_seqlens=cu, chunk_indices=chunk_indices,
             chunk_offsets=None, use_exp2=False, transpose_state_layout=True,
@@ -491,7 +560,7 @@ def test_bench_chunk_h_tflops(
     assert (
         torch.isfinite(reference_h).all()
         and torch.isfinite(reference_v_new).all()
-        and torch.isfinite(state).all()
+        and torch.isfinite(reference_state).all()
     )
     torch.testing.assert_close(
         actual_h, reference_h, atol=BF16_ATOL, rtol=BF16_RTOL
@@ -503,14 +572,44 @@ def test_bench_chunk_h_tflops(
         rtol=BF16_RTOL,
     )
 
+    torch.testing.assert_close(
+        actual_final, reference_state, atol=BF16_ATOL, rtol=BF16_RTOL
+    )
+
+    reference_state.zero_()
+    torch.cuda.synchronize()
     aiter_h_ms = _do_bench_ref(
-        run_aiter_h, warmup=bench_warmup, rep=bench_repeat
+        run_aiter_h, warmup=bench_warmup, rep=bench_repeat, return_mode="median"
     )
     print(
         "GDN chunk h "
         "(AITER HIP chunk_gated_delta_rule_fwd_sglang_hip_blockdim64, "
         f"{mode}, VK): {aiter_h_ms:.3f} ms, "
         f"{h_flops / (aiter_h_ms * 1e-3) / 1e12:.2f} TFLOPS"
+    )
+
+    print(f"TileLang/AITER speedup: {aiter_h_ms / h_ms:.3f}x (event median, state reset excluded)")
+
+@GPU_REQUIRED
+@pytest.mark.bench
+def test_bench_chunk_h_bv64_fixed(
+    time_ms, bench_warmup, bench_repeat, bench_seq_len,
+):
+    if "tilelang" not in CHUNK_H_BACKENDS:
+        pytest.skip("TileLang backend is unavailable")
+    chunk_h = CHUNK_H_BACKENDS["tilelang"]
+
+    def run_bv64(*args, **kwargs):
+        cfg = dict(kwargs.pop("kernel_cfg") or {})
+        cfg["block_v"] = 64
+        return chunk_h(*args, **kwargs, kernel_cfg=cfg)
+
+    print("GDN fixed BV64 benchmark: H=32, Hg=16")
+    test_bench_chunk_h_tflops(
+        chunk_h_backend=("tilelang", run_bv64),
+        use_varlen=False, heads=32, transpose_state=True,
+        time_ms=time_ms, bench_warmup=bench_warmup,
+        bench_repeat=bench_repeat, bench_seq_len=bench_seq_len,
     )
 
 
