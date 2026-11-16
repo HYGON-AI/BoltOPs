@@ -149,10 +149,6 @@ jobs:
     - correctness
     runs-on: hygon-bw1100-1card
     timeout-minutes: 180
-    concurrency:
-      group: boltops-performance-BW1100
-      cancel-in-progress: false
-      queue: max
     container:
       image: ${{ vars.DTK_IMAGE_REGISTRY || '10.16.1.152:5000/hcu/base/dtk' }}:${{ inputs.dtk_version }}-rockylinux8.6-py${{ inputs.py_version }}
     defaults:
