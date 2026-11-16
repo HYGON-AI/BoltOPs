@@ -171,10 +171,11 @@ def torch_compile_guard(
                 if is_torch_equal_or_newer("2.8.0")
                 else (torch.Tag.needs_fixed_stride_order,)
             )
-            op_schema = f"boltops::{loadName}" + schema
+            # Library already owns the namespace, including during teardown.
+            op_schema = f"{loadName}" + schema
             boltops_lib.define(op_schema, tags=tags)
-            boltops_lib.impl(f"boltops::{loadName}", custom_func, dispatch_key="CUDA")
-            boltops_lib.impl(f"boltops::{loadName}", custom_func, dispatch_key="CPU")
+            boltops_lib.impl(f"{loadName}", custom_func, dispatch_key="CUDA")
+            boltops_lib.impl(f"{loadName}", custom_func, dispatch_key="CPU")
             boltops_lib._register_fake(f"{loadName}", fake_func)
 
         return wrapper_custom
