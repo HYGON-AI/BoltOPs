@@ -24,7 +24,9 @@ import triton.language as tl
 
 from boltops.mqa_logits.triton.fp8_mqa_logits import _filter_hip_launch_kwargs
 from boltops.mqa_logits.triton.fp8_mqa_logits_gluon import (
+    _make_mfma_layout,
     _mfma_version_for_arch,
+    _use_explicit_mmac_layout,
     gluon_language_available,
 )
 from boltops.mqa_logits.triton.mqa_config_utils import (
@@ -83,6 +85,7 @@ if _GLUON_AVAILABLE:
         BLOCK_N: tl.constexpr,
         ASSUME_KS_ZERO: tl.constexpr,
         MFMA_VERSION: tl.constexpr,
+        EXPLICIT_MMAC: tl.constexpr,
         KV_TILES_N: tl.constexpr,
         NUM_WARPS: tl.constexpr,
         W_GROUP: tl.constexpr,
@@ -143,11 +146,12 @@ if _GLUON_AVAILABLE:
         # M tiles scale with BLOCK_M so we can match lightop-like BM=128
         # (``mqa_logits_128x128x32``): shape_m = 16 * (BLOCK_M/16) * warps_m.
         M_TILES: gl.constexpr = BLOCK_M // 16
-        mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
+        mfma_layout: gl.constexpr = _make_mfma_layout(
             version=MFMA_VERSION,
             instr_shape=[16, 16, 16],
-            # Explicit LIT (2), matching half BN accelerate.
-            mmac_layout=gl.amd.MmacLayout.LIT,
+            # Preserve the half BN register mode on both constructor APIs.
+            transposed=True,
+            explicit_mmac=EXPLICIT_MMAC,
             warps_per_cta=[1, NumWarps],
             tiles_per_warp=[M_TILES, KV_TILES_N],
         )
@@ -952,6 +956,7 @@ def mqa_logits_half_gluon_bn_align(
         num_stages=num_stages,
         ASSUME_KS_ZERO=assume_ks_zero,
         MFMA_VERSION=_mfma_version_for_arch(),
+        EXPLICIT_MMAC=_use_explicit_mmac_layout(),
         KV_TILES_N=int(kv_tiles_n),
         NUM_WARPS=int(num_warps),
         W_GROUP=w_grp,

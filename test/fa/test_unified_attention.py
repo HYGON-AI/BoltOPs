@@ -1106,11 +1106,15 @@ def test_runtime_reads_exact_versioned_json(
     assert _lookup_tuned_config(multibatch_case) == multibatch_expected
 
 
-def test_default_config_warning_is_emitted_once(monkeypatch, caplog) -> None:
+@pytest.mark.parametrize("package_propagates", [False, True])
+def test_default_config_warning_is_emitted_once(
+    monkeypatch, caplog, package_propagates
+) -> None:
     backend = importlib.import_module(
         "boltops.fa.unified_attention.triton.unified_attention"
     )
     backend._warn_default_config_once.cache_clear()
+    monkeypatch.setattr(logging.getLogger("boltops"), "propagate", package_propagates)
     monkeypatch.setattr(config, "get_kernel_config", lambda *args, **kwargs: None)
     kwargs = dict(
         cache_block_size=7,
@@ -1129,15 +1133,22 @@ def test_default_config_warning_is_emitted_once(monkeypatch, caplog) -> None:
         use_fp8=False,
         kv_dtype=torch.bfloat16,
     )
-    with caplog.at_level(logging.WARNING, logger=backend.__name__):
-        backend._get_unified_attention_2d_config(**kwargs)
-        backend._get_unified_attention_2d_config(**kwargs)
+    # The package logger may stop propagation before the root capture handler.
+    # Capture at the emitter, independently of the parent logger configuration.
+    monkeypatch.setattr(backend.logger, "propagate", False)
+    backend.logger.addHandler(caplog.handler)
+    try:
+        with caplog.at_level(logging.WARNING, logger=backend.__name__):
+            backend._get_unified_attention_2d_config(**kwargs)
+            backend._get_unified_attention_2d_config(**kwargs)
+    finally:
+        backend.logger.removeHandler(caplog.handler)
+        backend._warn_default_config_once.cache_clear()
     messages = [
         record.message for record in caplog.records
         if "No tuned UnifiedAttention 2D config" in record.message
     ]
     assert len(messages) == 1
-    backend._warn_default_config_once.cache_clear()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires an HCU/CUDA device")
