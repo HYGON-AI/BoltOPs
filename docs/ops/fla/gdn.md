@@ -20,6 +20,9 @@ from boltops.fla.gdn import (
 | `fused_recurrent_gated_delta_rule_packed_decode` | 单 token packed QKV decode | `output, updated_state` |
 | `fused_sigmoid_gating_delta_rule_update` | continuous batching 和线性 speculative decode | `output, final_state` |
 | `chunk_gated_delta_rule_fwd_h` | Chunk state propagation | `h, v_new, final_state` |
+| `gdn_qkvzba_split` | Qwen3.5 连续 QKVZ/BA 投影拆分 | `qkv, z, b, a` |
+| `gdn_fused_gating` | Prefill 独立门控，不更新 state | `g, beta`（FP32） |
+| `gdn_rmsnorm_gated` | GDN 输出逐 head RMSNorm + SiLU 门控 | 与输入相同 dtype 的输出 |
 | `chunk_fwd_o` | Chunk state项和局部 attention项合并 | `output` |
 
 当前范围均为 forward-only，不包含 backward。
@@ -451,6 +454,49 @@ kernel_cfg = {"implementation": "wasp_4p4c"}
 TileLang backend当前只替换 `chunk_gated_delta_rule_fwd_h`；后续
 `chunk_fwd_o` 仍使用公开接口提供的 Triton实现。TileLang `chunk_h` 的序列长度是
 运行时参数，相同 shape配置可复用同一 kernel处理不同 `T`。
+
+### 4.4 Qwen3.5 projection / gating / output helpers
+
+```python
+from boltops.fla.gdn import (
+    gdn_qkvzba_split,
+    gdn_fused_gating,
+    gdn_rmsnorm_gated,
+)
+
+qkv, z, b, a = gdn_qkvzba_split(
+    projected_qkvz, projected_ba,
+    num_heads_qk=16, num_heads_v=32,
+    head_size_qk=128, head_size_v=128,
+)
+g, beta = gdn_fused_gating(a, b, A_log, dt_bias)
+normalized = gdn_rmsnorm_gated(
+    attention_output.reshape(-1, 128), z.reshape(-1, 128), norm_weight, eps=1e-6,
+)
+```
+
+- `gdn_qkvzba_split` 输入是 `[T, 2*Hqk*K + 2*Hv*V]` 和 `[T, 2*Hv]`，
+  逻辑排列必须分别为 `all_Q | all_K | all_V | all_Z` 和 `all_B | all_A`。
+  不接受按 KV head 分组交错的 Qwen3-Next 投影排列。输出均为独立的连续矩阵，
+  shape 依次为 `[T, 2*Hqk*K + Hv*V]`、`[T, Hv*V]`、`[T, Hv]`、`[T, Hv]`。
+  `Hv` 必须是 `Hqk` 的整数倍，K/V 可以不同。
+- `gdn_fused_gating` 的前两个输入均为 `[T, Hv]`，后两个是 `[Hv]`。
+  输出 `g = -exp(A_log) * softplus(a + dt_bias)`、`beta = sigmoid(b)`，均为 FP32。
+  可传入 `softplus_beta`（默认 1.0）和 `softplus_threshold`（默认 20.0）；
+  softplus 使用稳定的 `log1p` 形式，不在这里累计 gate 或更新 state。
+- `gdn_rmsnorm_gated` 输入 hidden/gate 均为 `[rows, head_size]`，weight 为 `[head_size]`。
+  返回 `hidden * rsqrt(mean(hidden**2) + eps) * weight * SiLU(gate)`，归一化在门控之前，
+  用 FP32 中间值计算，最后转换到 hidden dtype。`eps` 必须为有限正数。
+- 三个 helper 支持 FP16/BF16/FP32 激活、正的行/列 stride 和空 token batch。
+  非连续逻辑输入无需调用方提前复制，输出不修改或别名引用输入。
+- shape 表中的 prefill T=2048/2560/3584/6656/28672/53248、Hv=8/32/64，
+  decode T=12/64/192，以及 RMSNorm 的全部 8 组行数均已有离线 gfx946 编译覆盖。
+
+数值测试可在 CUDA/HIP 上运行；无设备时，split / RMSNorm 及参数检查可用 interpreter：
+
+```bash
+pytest -q test/fla/test_gdn_prefill_helpers.py
+```
 
 ## 5. 使用约束
 

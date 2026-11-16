@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: MIT
 """Public Gated DeltaNet (GDN) operators -- public signature boundary.
 
-Operator names align 1:1 with the vLLM / SGLang public names.
+Decode/chunk names align with the vLLM / SGLang public names. The ``gdn_*``
+helpers expose projection splitting, prefill gating and gated output normalization.
 Implementations live in
 :mod:`boltops.fla.gdn.triton`; the KDA+GDN shared decode/verify kernels live
 in :mod:`boltops.fla.common.triton`. Importing this package never imports
@@ -27,6 +28,9 @@ from typing import Optional
 import torch
 
 __all__ = [
+    "gdn_fused_gating",
+    "gdn_qkvzba_split",
+    "gdn_rmsnorm_gated",
     "chunk_fwd_o",
     "chunk_gated_delta_rule_fwd_h",
     "fused_recurrent_gated_delta_rule_packed_decode",
@@ -40,6 +44,9 @@ __all__ = [
 # an entry whose public contract
 # differs from the implementation -- write a wrapper instead.
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
+    "gdn_fused_gating": (".triton", "gdn_fused_gating"),
+    "gdn_qkvzba_split": (".triton", "gdn_qkvzba_split"),
+    "gdn_rmsnorm_gated": (".triton", "gdn_rmsnorm_gated"),
     "chunk_fwd_o": (".triton", "chunk_fwd_o"),
     "chunk_gated_delta_rule_fwd_h": (".triton", "chunk_gated_delta_rule_fwd_h"),
     "fused_recurrent_gated_delta_rule_packed_decode": (".triton", "fused_recurrent_gated_delta_rule_packed_decode"),

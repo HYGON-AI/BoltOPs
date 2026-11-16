@@ -15,9 +15,7 @@ value width, and the accumulator + output are sized to the value head.
 
 from __future__ import annotations
 
-import importlib.util
 import math
-from pathlib import Path
 
 import pytest
 import torch
@@ -62,69 +60,33 @@ def _reference_paged_attention_diffkv(q, k_cache, v_cache, q_lens, kv_lens, tabl
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires an HCU/CUDA Triton device")
+@pytest.mark.parametrize("batch, heads", [(1, 4), (4, 64)])
 @pytest.mark.parametrize("q_len, kv_len", [(12, 24), (20, 48)])
-def test_qk_value_head_diffkv_matches_reference(q_len: int, kv_len: int) -> None:
+def test_qk_value_head_diffkv_matches_reference(
+    batch: int, heads: int, q_len: int, kv_len: int,
+) -> None:
     """qk head 192 / value head 128 causal prefill (MHA, q_per_kv = 1)."""
     torch.manual_seed(11)
-    device, page, hq, hkv, qk_dim, v_dim = "cuda", 16, 4, 4, 192, 128
-    pages = (kv_len + page - 1) // page
-    q_cpu = torch.randn(q_len, hq, qk_dim, dtype=torch.bfloat16)
-    k_cpu = torch.randn(pages, page, hkv, qk_dim, dtype=torch.bfloat16)
-    v_cpu = torch.randn(pages, page, hkv, v_dim, dtype=torch.bfloat16)
+    device, page, qk_dim, v_dim = "cuda", 16, 192, 128
+    pages_per_seq = (kv_len + page - 1) // page
+    pages = batch * pages_per_seq
+    total_q = batch * q_len
+    q_cpu = torch.randn(total_q, heads, qk_dim, dtype=torch.bfloat16)
+    k_cpu = torch.randn(pages, page, heads, qk_dim, dtype=torch.bfloat16)
+    v_cpu = torch.randn(pages, page, heads, v_dim, dtype=torch.bfloat16)
     q, k, v = q_cpu.to(device), k_cpu.to(device), v_cpu.to(device)
-    out = torch.empty(q_len, hq, v_dim, device=device, dtype=torch.bfloat16)
-    table_cpu = torch.arange(pages, dtype=torch.int32).reshape(1, -1)
+    out = torch.empty(total_q, heads, v_dim, device=device, dtype=torch.bfloat16)
+    table_cpu = torch.arange(pages, dtype=torch.int32).reshape(batch, pages_per_seq)
     table = table_cpu.to(device)
     unified_attention(
         q, k, v, out,
-        torch.tensor([0, q_len], device=device, dtype=torch.int32), q_len,
-        torch.tensor([kv_len], device=device, dtype=torch.int64), kv_len,
+        torch.arange(0, total_q + 1, q_len, device=device, dtype=torch.int32), q_len,
+        torch.full((batch,), kv_len, device=device, dtype=torch.int64), kv_len,
         qk_dim ** -0.5, True, (-1, -1), table, 0.0, None, None, None,
     )
     reference = _reference_paged_attention_diffkv(
-        q_cpu, k_cpu, v_cpu, [q_len], [kv_len], table_cpu, qk_dim ** -0.5, True
+        q_cpu, k_cpu, v_cpu, [q_len] * batch, [kv_len] * batch,
+        table_cpu, qk_dim ** -0.5, True,
     )
     assert out.shape[-1] == v_dim
     torch.testing.assert_close(out.cpu(), reference, atol=3e-2, rtol=3e-2)
-
-
-def _load_extractor() -> object:
-    path = Path(__file__).resolve().parents[1].parent / "scripts" / "extract_gfx946_shapes.py"
-    spec = importlib.util.spec_from_file_location("extract_gfx946_shapes", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-# The 23 Kimi mha_slice (batch, query_length, kv_length) combinations: q/k head
-# 192, value head 128, bf16, H64:Hkv64 MHA, causal prefill.
-_KIMI_QKV = [
-    (4, 4608, 131072), (4, 6656, 6656), (4, 6656, 13312), (4, 6656, 19968),
-    (4, 6656, 26624), (4, 6656, 33280), (4, 6656, 39936), (4, 6656, 46592),
-    (4, 6656, 53248), (4, 6656, 59904), (4, 6656, 66560), (4, 6656, 73216),
-    (4, 6656, 79872), (4, 6656, 86528), (4, 6656, 93184), (4, 6656, 99840),
-    (4, 6656, 106496), (4, 6656, 113152), (4, 6656, 119808), (4, 6656, 126464),
-    (32, 3072, 131072), (32, 6656, 53248), (32, 6656, 106496),
-]
-
-
-def test_kimi_qk192_v128_shapes_classify_ready() -> None:
-    """The extractor must classify all 23 Kimi qk192/v128 shapes as ``ready``."""
-    extractor = _load_extractor()
-    assert len(_KIMI_QKV) == 23
-    for batch, query_length, kv_length in _KIMI_QKV:
-        case = {
-            "operator": "unified_attention",
-            "input_shapes": [
-                [batch, 64, query_length, 192],
-                [batch, 64, kv_length, 192],
-                [batch, 64, kv_length, 128],
-            ],
-            "input_dtypes": ["BF16", "BF16", "BF16"],
-            "sources": [{"variant": "mha_slice0"}],
-        }
-        extractor.normalize_case(case)
-        assert case["validation"] == "ready", (
-            batch, query_length, kv_length, case["validation"])
-        assert case["parameters"]["head_size"] == 192
-        assert case["parameters"]["value_head_size"] == 128

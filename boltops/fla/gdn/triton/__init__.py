@@ -11,6 +11,7 @@ from .chunk_delta_h import (
     chunk_gated_delta_rule_fwd_kernel_h_blockdim64,
 )
 from .chunk_o import chunk_fwd_kernel_o, chunk_fwd_o
+from .prefill_helpers import gdn_fused_gating, gdn_qkvzba_split, gdn_rmsnorm_gated
 from .fused_recurrent import (
     fused_recurrent_gated_delta_rule_packed_decode,
     fused_recurrent_gated_delta_rule_packed_decode_kernel,
@@ -32,6 +33,9 @@ def recompute_w_u_fwd(k, v, beta, g_cumsum, A, cu_seqlens=None, chunk_indices=No
     return recompute_w_u_fwd_gdn(k, v, beta, g_cumsum, A, cu_seqlens, chunk_indices)
 
 __all__ = [
+    "gdn_fused_gating",
+    "gdn_qkvzba_split",
+    "gdn_rmsnorm_gated",
     "chunk_fwd_kernel_o",
     "chunk_fwd_o",
     "chunk_gated_delta_rule_fwd_h",

@@ -6,6 +6,10 @@ from __future__ import annotations
 
 import inspect
 
+import importlib
+import json
+from functools import partial
+
 import pytest
 import torch
 
@@ -797,3 +801,82 @@ def test_bench_recurrent_speculative_verify_bandwidth(
     )
     bandwidth = logical_bytes / (elapsed * 1e-3) / 1e9
     print(f"GDN target verify: N={N}, T={steps}, {elapsed * 1e3:.2f} us, {bandwidth:.2f} GB/s")
+
+
+_BENCH_1102_DTYPES = {'BF16': torch.bfloat16, 'FP16': torch.float16,
+                      'FP32': torch.float32, 'FP8E4M3': torch.float8_e4m3fn}
+
+
+_BENCH_1102_SHAPES = [
+    {'id': 's014', 'op': 'gdn_fused_recurrent', 'type': 'gdn_fused_recurrent', 'stage': 'Decode', 'inputs': [[64, 16, 128], [64, 16, 128], [64, 32, 128], [64, 32], [64, 32], [32], [32], [64, 32, 128, 128]], 'dtypes': ['BF16', 'BF16', 'BF16', 'BF16', 'BF16', 'FP32', 'FP32', 'FP32'], 'outputs': [[64, 32, 128], [64, 32, 128, 128]], 'output_dtypes': ['BF16', 'FP32'], 'locations': [{'file': 'shape_07_q35_fp8_4k_s150.xlsx', 'sheet': 'decode_shape', 'row': 13}]},
+    {'id': 's045', 'op': 'gdn_fused_recurrent', 'type': 'gdn_fused_recurrent', 'stage': 'Decode', 'inputs': [[12, 16, 128], [12, 16, 128], [12, 32, 128], [12, 32], [12, 32], [32], [32], [12, 32, 128, 128]], 'dtypes': ['BF16', 'BF16', 'BF16', 'BF16', 'BF16', 'FP32', 'FP32', 'FP32'], 'outputs': [[12, 32, 128], [12, 32, 128, 128]], 'output_dtypes': ['BF16', 'FP32'], 'locations': [{'file': 'shape_08_q35_mxfp4_128k_s150.xlsx', 'sheet': 'decode_shape', 'row': 12}]},
+    {'id': 's142', 'op': 'gdn_fused_recurrent', 'type': 'gdn_fused_recurrent', 'stage': 'Decode', 'inputs': [[192, 8, 128], [192, 8, 128], [192, 32, 128], [192, 32], [192, 32], [32], [32], [48, 32, 128, 128]], 'dtypes': ['BF16', 'BF16', 'BF16', 'BF16', 'BF16', 'FP32', 'FP32', 'FP32'], 'outputs': [[192, 32, 128], [48, 32, 128, 128]], 'output_dtypes': ['BF16', 'FP32'], 'locations': [{'file': 'shape_11_q397b_128k_s2000.xlsx', 'sheet': 'decode_shape', 'row': 13}]},
+]
+
+
+def _bench_1102_cases():
+    cases = []
+    for shape in _BENCH_1102_SHAPES:
+        routes = ('recurrent', 'shared_recurrent')
+        for route in routes:
+            cases.append({
+                'shape_id': shape['id'], 'source_op': shape['op'], 'route': route,
+                'measurement': 'component' if shape['op'] == 'gdn_chunk_delta' else 'operator',
+                'input_shapes': json.dumps(shape['inputs'], separators=(',', ':')),
+                'input_dtypes': ','.join(shape['dtypes']),
+                'output_shapes': json.dumps(shape['outputs'], separators=(',', ':')),
+                'output_dtypes': ','.join(shape['output_dtypes']),
+                'sources': json.dumps(shape['locations'], separators=(',', ':')),
+                'shape': shape,
+            })
+    return cases
+
+
+def _bench_1102_case_id(case):
+    return f"{case['source_op']}-{case['route']}-{case['shape_id']}"
+
+
+def _build_bench_1102_runner(case, device='cuda'):
+    """Allocate inputs once; return an operator/component invocation for timing."""
+    shape = case['shape']
+    inputs = shape['inputs']
+    dtypes = [_BENCH_1102_DTYPES[name] for name in shape['dtypes']]
+    route = case['route']
+
+    def tensor(*dims, dtype=torch.bfloat16, value=None):
+        tensor = torch.empty(dims, dtype=dtype, device=device)
+        if tensor.device.type != 'meta':
+            if value is not None:
+                tensor.fill_(value)
+            elif dtype == torch.float8_e4m3fn:
+                tensor.view(torch.uint8).random_(24, 40)
+            else:
+                tensor.uniform_(-0.02, 0.02)
+        return tensor
+
+    def indices(count):
+        return torch.arange(count, dtype=torch.int32, device=device)
+    (total, heads, width) = inputs[0]
+    (value_heads, value_width) = inputs[2][1:]
+    batch = inputs[-1][0]
+    tokens = total // batch
+    state = tensor(batch + 1, value_heads, value_width, width, dtype=torch.float32, value=0)
+    slots = indices(batch) + 1
+    log_decay = tensor(value_heads, dtype=torch.float32, value=0)
+    bias = tensor(value_heads, dtype=torch.float32, value=0)
+    if route == 'shared_recurrent':
+        target = importlib.import_module('boltops.fla.common.triton.fused_sigmoid_gating_recurrent')
+        return partial(target.fused_sigmoid_gating_delta_rule_update, A_log=log_decay, a=tensor(1, total, value_heads), dt_bias=bias, softplus_beta=1.0, softplus_threshold=20.0, q=tensor(1, total, heads, width), k=tensor(1, total, heads, width), v=tensor(1, total, value_heads, value_width), b=tensor(1, total, value_heads), initial_state_source=state, initial_state_indices=slots, cu_seqlens=indices(batch + 1) * tokens)
+    target = importlib.import_module('boltops.fla.gdn.triton.fused_sigmoid_gating')
+    slot_steps = slots[:, None].expand(batch, tokens).contiguous()
+    return partial(target.fused_sigmoid_gating_delta_rule_update, log_decay, tensor(batch, tokens, value_heads), tensor(batch, tokens, value_heads), bias, tensor(batch, tokens, heads, width), tensor(batch, tokens, heads, width), tensor(batch, tokens, value_heads, value_width), initial_state=state, ssm_state_indices=slot_steps)
+
+
+@GPU_REQUIRED
+@pytest.mark.bench
+@pytest.mark.parametrize('case', _bench_1102_cases(), ids=_bench_1102_case_id)
+def test_bench_1102_gdn_recurrent_triton(case, bench_warmup, bench_repeat, time_ms):
+    run = _build_bench_1102_runner(case)
+    run()
+    latency = time_ms(run, bench_warmup, bench_repeat, dtype=case['input_dtypes'])
+    print(f'{_bench_1102_case_id(case)} ({case["measurement"]}): {latency * 1000:.3f} us')
