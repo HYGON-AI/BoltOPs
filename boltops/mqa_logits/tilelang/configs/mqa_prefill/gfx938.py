@@ -1,9 +1,10 @@
 # Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # SPDX-License-Identifier: MIT
-"""gfx938 policy for the 12-wave MQA logits prefill kernel."""
+"""gfx938 launch policies for QSA and weighted (non-QSA) MQA prefill."""
 
 from __future__ import annotations
 
+from dataclasses import replace
 from functools import lru_cache
 from typing import Optional
 
@@ -200,6 +201,51 @@ def get_config(
         rows_divisible=num_rows % block_q == 0,
         heads=num_heads,
     )
+
+
+# Measured weighted-BF16 choices on the 72-CU device, K=4096 without an
+# effective-range hint. Larger Q tiles retain K reuse; split-N preserves
+# 64 CTAs. Measured 2048-key regular and ragged windows improve; short
+# windows should supply effective_range to retain the range-aware policy.
+# Keep other shapes and QSA/FP8 unchanged until independently measured.
+_WEIGHTED_SMALL_Q_4096 = {
+    128: (32, 16, 1),
+    256: (32, 8, 1),
+    512: (32, 4, 1),
+    1024: (32, 2, 2),
+}
+
+
+@lru_cache(maxsize=1024)
+def get_config_weighted(
+    num_rows: int,
+    num_keys: int,
+    cu_count: int,
+    effective_range: Optional[int] = None,
+    num_heads: int = 4,
+) -> QSAMQAPrefillConfig:
+    """Weighted BF16 policy, with measured small-Q overrides only.
+
+    With no range hint, assume long windows as in get_config. Short actual
+    windows should supply effective_range; they keep the original policy.
+    """
+    config = get_config(
+        num_rows, num_keys, cu_count,
+        effective_range=effective_range, num_heads=num_heads,
+    )
+    if (
+        num_heads == 4
+        and num_keys == 4096
+        and cu_count == 72
+        and effective_range is None
+        and num_rows in _WEIGHTED_SMALL_Q_4096
+    ):
+        block_q, split_n, phases = _WEIGHTED_SMALL_Q_4096[num_rows]
+        return replace(
+            config, block_q=block_q, split_n=split_n,
+            n_tile_phases=phases, rows_divisible=num_rows % block_q == 0,
+        )
+    return config
 
 
 @lru_cache(maxsize=1024)

@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Modified by Hygon Information Technology Co., Ltd., 2026.
 # Upstream reference: https://github.com/yht183/sglang-das/blob/4cc62ab1d0c7a63c770e2a275d42b67ae20c345c/python/sglang/srt/layers/attention/qsa/mqa.py
-"""Weight-free TileLang MQA logits (prefill + paged decode).
+"""TileLang QSA MQA logits (prefill + paged decode) and weighted backend adapter.
 
 Port of qwen38 ``src/qsa/mqa.py``. Prefill N-range loads Starts/Ends, then
 ``reduce_min`` / ``reduce_max``, then clamps the scalar range against ``keys``.
+The weighted (non-QSA) adapter delegates to ``mqa_logits.py``.
 """
 
 import math
@@ -765,4 +766,29 @@ def qsa_mqa_decode(
 ) -> torch.Tensor:
     return tilelang_qsa_mqa_decode(
         q, k_cache, page_table, context_lens, max_model_len, score_scale
+    )
+
+
+def weighted_mqa_prefill(
+    Q: torch.Tensor,
+    KV: torch.Tensor,
+    kv_scales: Optional[torch.Tensor],
+    weights: torch.Tensor,
+    cu_starts: torch.Tensor,
+    cu_ends: torch.Tensor,
+    *,
+    D_out: Optional[torch.Tensor] = None,
+    effective_range: Optional[int] = None,
+) -> torch.Tensor:
+    """Weighted (non-QSA) prefill fallback for architectures without WASP.
+
+    ``effective_range`` is accepted for dispatch-signature parity with the
+    gfx938 entry point; the generic tiling does not use it.  The import is
+    deferred because ``mqa_logits`` imports this module.
+    """
+    del effective_range
+    from .mqa_logits import weighted_mqa_prefill as generic_weighted_mqa_prefill
+
+    return generic_weighted_mqa_prefill(
+        Q, KV, kv_scales, weights, cu_starts, cu_ends, D_out=D_out
     )

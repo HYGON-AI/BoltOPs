@@ -14,6 +14,7 @@ Public operators:
 * ``triton_fp8_paged_mqa_logits`` — FP8 paged decode, KVBlockSize=1 or 64 (Triton)
   - ``triton_fp8_paged_mqa_logits_stage1`` → per-head scores (``out_qk.sum(dim=0)``)
   - ``triton_fp8_paged_mqa_logits_prepare`` / ``_build_bucket_schedule``
+* ``tilelang_mqa_logits`` — TileLang weighted (non-QSA) prefill / dense KV
 * ``tilelang_qsa_mqa_prefill`` — TileLang QSA prefill / dense KV
 * ``tilelang_qsa_mqa_decode`` — TileLang QSA paged decode
 """
@@ -58,6 +59,40 @@ def tilelang_qsa_mqa_prefill(
 
     return resolve("qsa_mqa_prefill", q.device)(
         q, k, row_starts, row_ends, score_scale, kv_scales, effective_range
+    )
+
+
+def tilelang_mqa_logits(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    kv_scales: Optional[torch.Tensor],
+    weights: torch.Tensor,
+    cu_starts: torch.Tensor,
+    cu_ends: torch.Tensor,
+    *,
+    D_out: Optional[torch.Tensor] = None,
+    effective_range: Optional[int] = None,
+) -> torch.Tensor:
+    """Compute weighted (non-QSA) MQA logits for prefill via TileLang.
+
+    ``logits[m, n] = sum_h relu(q[m, h] . kv[n]) * weights[m, h]`` with
+    ``q [rows, H, D]``, ``kv [keys, D]`` and ``weights [rows, H]`` float32.
+    Interface follows the ``triton_mqa_logits`` half path; bf16 only, so
+    ``kv_scales`` must be ``None``.  ``effective_range`` is the longest
+    valid key span ``max(cu_ends - cu_starts)``; ``None`` sizes the
+    heuristic from ``kv.shape[0]``.
+    """
+    from .tilelang._dispatch import resolve
+
+    return resolve("weighted_mqa_prefill", q.device)(
+        q,
+        kv,
+        kv_scales,
+        weights,
+        cu_starts,
+        cu_ends,
+        D_out=D_out,
+        effective_range=effective_range,
     )
 
 
@@ -469,6 +504,7 @@ def _run_triton_prefill(
 
 __all__ = [
     "triton_mqa_logits",
+    "tilelang_mqa_logits",
     "tilelang_qsa_mqa_decode",
     "tilelang_qsa_mqa_prefill",
     "triton_fp8_paged_mqa_logits",
