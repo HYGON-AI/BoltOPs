@@ -14,7 +14,7 @@ Public operators:
 * ``triton_fp8_paged_mqa_logits`` — FP8 paged decode, KVBlockSize=1 or 64 (Triton)
   - ``triton_fp8_paged_mqa_logits_stage1`` → per-head scores (``out_qk.sum(dim=0)``)
   - ``triton_fp8_paged_mqa_logits_prepare`` / ``_build_bucket_schedule``
-* ``tilelang_mqa_logits`` — TileLang weighted (non-QSA) prefill / dense KV
+* ``tilelang_mqa_logits`` — TileLang weighted prefill / dense KV (BF16, gfx938 FP8)
 * ``tilelang_qsa_mqa_prefill`` — TileLang QSA prefill / dense KV
 * ``tilelang_qsa_mqa_decode`` — TileLang QSA paged decode
 """
@@ -76,10 +76,13 @@ def tilelang_mqa_logits(
     """Compute weighted (non-QSA) MQA logits for prefill via TileLang.
 
     ``logits[m, n] = sum_h relu(q[m, h] . kv[n]) * weights[m, h]`` with
-    ``q [rows, H, D]``, ``kv [keys, D]`` and ``weights [rows, H]`` float32.
-    Interface follows the ``triton_mqa_logits`` half path; bf16 only, so
-    ``kv_scales`` must be ``None``.  ``effective_range`` is the longest
-    valid key span ``max(cu_ends - cu_starts)``; ``None`` sizes the
+    ``q [rows, H, D]``, ``kv [keys, D]`` and float32 ``weights [rows, H]``.
+    ``kv_scales=None`` selects BF16. On gfx938, float32 ``kv_scales [keys]``
+    selects FP8 E4M3FN Q/KV and scales each output Key column after the
+    weighted reduction. Any Query quantization scales belong in weights.
+    Both paths return float32 without an implicit attention scale.
+    ``effective_range`` is the longest valid key span
+    ``max(cu_ends - cu_starts)``; ``None`` sizes the
     heuristic from ``kv.shape[0]``.
     """
     from .tilelang._dispatch import resolve

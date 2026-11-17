@@ -111,7 +111,7 @@ def weighted_mqa_prefill(
 ) -> torch.Tensor:
     """Weighted MQA logits prefill (bf16) through the generic TileLang kernel."""
     if kv_scales is not None:
-        raise NotImplementedError("TileLang weighted MQA logits: FP8 not implemented yet")
+        raise NotImplementedError("TileLang weighted FP8 MQA prefill requires gfx938 WASP")
     if not HAS_TILELANG:
         raise RuntimeError("TileLang is unavailable")
     if Q.dtype != torch.bfloat16 or KV.dtype != torch.bfloat16:
