@@ -24,7 +24,7 @@
     → correctness（hygon-bw1100-4card，按事件决定）
       → 下载对应 wheel、setup-env.sh、流水线内校验四卡
       → .github/scripts/test-correctness.sh
-    → performance（hygon-bw1100-1card，PR/手动运行，可并行）
+    → performance（hygon-bw1100-1card，PR，可并行）
       → .github/scripts/setup-env.sh
       → .github/scripts/test-performance.sh
         → scripts/ci/optest_to_junit.py
@@ -48,12 +48,14 @@
 
 `ci.yml` 定义四组构建环境。DTK26.04 搭配 Python3.10/3.12 和 Torch2.11.0，共两组，NumPy 分别为 1.24.3/1.26.4。DTK26.10 搭配 Python3.12、NumPy1.26.4 和 Torch2.11.0/2.13.0，共两组。
 
-PR 和手动运行时，四组都构建 wheel 并运行正确性测试，通过后运行各自的性能测试。性能任务各用一张 HCU，按 runner 容量并行调度。main push 构建四组 wheel，各 DTK 的构建成功后由 `publish-2604` 和 `publish-2610` 分别发布。`ci-result` 检查两个 DTK 的构建和测试结果。为兼容组织质量门禁的 Workflow 解析器，当前使用显式值，不使用 YAML 锚点和别名；版本矩阵在 ci.yml 维护。
+PR 的四组环境都构建 wheel 并运行正确性测试，通过后运行各自的性能测试。性能任务各用一张 HCU，按 runner 容量并行调度。main push 构建四组 wheel，各 DTK 的构建成功后由 `publish-2604` 和 `publish-2610` 分别发布。`ci-result` 检查两个 DTK 的构建和测试结果。版本矩阵在 ci.yml 维护。
+
+在 Actions 的 **Run workflow** 中可选一组 DTK、Torch 和 Python。默认是 DTK 26.10、Torch 2.13.0 和 Python 3.12。填写完整 commit SHA 可指定源码提交，留空则使用所选分支或 tag 的提交。手动运行只构建 wheel，结果可在本次运行的 **Artifacts** 中下载。
 
 升级版本时，检查对应的 DTK/Python 容器及 HCU Torch/Triton/TileLang 包是否可用。不同 DTK 若需要不同版本，应拆开配置，不能只为减少重复而强行共用。发布任务的 Python3.12 容器只用于上传 wheel，不决定 wheel 的目标 Python 版本。
 
 Torch 与 NumPy 保持矩阵中的版本约束；Triton、TileLang 和 apache-tvm-ffi 不写死版本。Triton 使用内网 HCU 索引。`setup-env.sh` 内嵌代码通过 `pip index versions --json` 查询内网 TileLang，选择匹配当前 DTK/Torch 的最新兼容构建，再把完整 HCU 版本交给 pip；普通依赖允许从阿里云源解析，FFI 版本由 TileLang 声明的范围决定，不提前安装公共源最新版。没有单独的 wheel 筛选脚本。内网缺少当前 Torch 的配套 TileLang 时明确失败；不回退到公共版、不跳过测试。安装后执行 `pip check`，校验 Triton/TileLang 的 DTK、Torch 构建标签，并在日志中输出实际版本。包源更新可能改变解析结果，失败时应核对配套包，不能通过移除 Torch 约束或强装不兼容依赖绕过。
 
-发布任务调用 `_publish.yml`；在 `ci.yml` 中通过 `with.dtk_version`、`with.dtk_ver` 和 `with.dtk_pkg_name` 配置镜像版本、发布标识及真实 DTK 包名。发布密码通过 `secrets.PYPI_PASSWORD` 显式传给复用工作流，不放在 `with` 中。DTK 包名必须与发布服务实际使用的名称一致，不能仅通过替换版本号生成。
+发布任务调用 `_publish.yml`，传入镜像版本和构建产物的 DTK 标识。发布脚本读取镜像中的 `/opt/dtk/.info/rocm_version`，校验它与构建产物的 DTK 标识一致，再用 `CIUpload NIGHTLY --dtk_version` 上传 wheel。发布密码通过 `secrets.PYPI_PASSWORD` 传入。
 
 学习、配置与切换步骤见 [GitHub Actions 迁移说明](github-actions-migration.md)。

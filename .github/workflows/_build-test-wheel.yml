@@ -4,6 +4,9 @@ name: Build and test wheel
 on:
   workflow_call:
     inputs:
+      source_sha:
+        required: true
+        type: string
       dtk_version:
         required: true
         type: string
@@ -33,16 +36,14 @@ jobs:
     runs-on: hygon-build
     timeout-minutes: 180
     container:
-      image: ${{ vars.DTK_IMAGE_REGISTRY || '10.16.1.152:5000/hcu/base/dtk' }}:${{ inputs.dtk_version }}-rockylinux8.6-py${{ inputs.py_version
+      image: ${{ vars.HARBOR_SITE }}/hcu/base/dtk:${{ inputs.dtk_version }}-rockylinux8.6-py${{ inputs.py_version
         }}
     defaults:
       run:
         shell: bash
     env:
-      # Fork PRs may not receive vars; match lightop's non-secret URL fallback.
-      PYPI_URL: ${{ vars.PYPI_URL || 'http://12.12.12.201:9929' }}
-      TRITON_PYPI_URL: ${{ vars.TRITON_PYPI_URL || vars.PYPI_URL || 'http://12.12.12.201:9929' }}
-      AICC_INSTALLER_URL: ${{ vars.AICC_INSTALLER_URL || 'http://42.228.13.241:18000/ai_cc/Nightly/hcu_llvm_installer.sh' }}
+      PYPI_URL: ${{ vars.PYPI_URL }}
+      AICC_INSTALLER_URL: ${{ vars.AICC_INSTALLER_URL }}
       RESOURCE_SERVER_URL: ${{ vars.RESOURCE_SERVER_URL }}
       PYTHONUNBUFFERED: '1'
       DTK_VER: ${{ inputs.dtk_ver }}
@@ -50,13 +51,16 @@ jobs:
       NUMPY_VERSION: ${{ inputs.numpy_version }}
       TORCH_VERSION: ${{ inputs.torch_version }}
     steps:
-    - name: Checkout integrated source
+    - name: Checkout source
       uses: actions/checkout@v4
       with:
-        ref: ${{ github.sha }}
+        ref: ${{ github.event.pull_request.number && format('refs/pull/{0}/head', github.event.pull_request.number) || inputs.source_sha }}
         fetch-depth: 0
         persist-credentials: false
-    - name: Verify source
+    - name: Verify source and integrate PR base
+      env:
+        EXPECTED_SOURCE_SHA: ${{ inputs.source_sha }}
+        PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
       run: bash .github/scripts/checkout-source.sh
     - name: Install compiler and dependencies
       run: bash .github/scripts/setup-env.sh
@@ -87,16 +91,14 @@ jobs:
     runs-on: hygon-bw1100-4card
     timeout-minutes: 180
     container:
-      image: ${{ vars.DTK_IMAGE_REGISTRY || '10.16.1.152:5000/hcu/base/dtk' }}:${{ inputs.dtk_version }}-rockylinux8.6-py${{ inputs.py_version
+      image: ${{ vars.HARBOR_SITE }}/hcu/base/dtk:${{ inputs.dtk_version }}-rockylinux8.6-py${{ inputs.py_version
         }}
     defaults:
       run:
         shell: bash
     env:
-      # Fork PRs may not receive vars; match lightop's non-secret URL fallback.
-      PYPI_URL: ${{ vars.PYPI_URL || 'http://12.12.12.201:9929' }}
-      TRITON_PYPI_URL: ${{ vars.TRITON_PYPI_URL || vars.PYPI_URL || 'http://12.12.12.201:9929' }}
-      AICC_INSTALLER_URL: ${{ vars.AICC_INSTALLER_URL || 'http://42.228.13.241:18000/ai_cc/Nightly/hcu_llvm_installer.sh' }}
+      PYPI_URL: ${{ vars.PYPI_URL }}
+      AICC_INSTALLER_URL: ${{ vars.AICC_INSTALLER_URL }}
       RESOURCE_SERVER_URL: ${{ vars.RESOURCE_SERVER_URL }}
       PYTHONUNBUFFERED: '1'
       DTK_VER: ${{ inputs.dtk_ver }}
@@ -104,13 +106,16 @@ jobs:
       NUMPY_VERSION: ${{ inputs.numpy_version }}
       TORCH_VERSION: ${{ inputs.torch_version }}
     steps:
-    - name: Checkout integrated source
+    - name: Checkout source
       uses: actions/checkout@v4
       with:
-        ref: ${{ github.sha }}
+        ref: ${{ github.event.pull_request.number && format('refs/pull/{0}/head', github.event.pull_request.number) || inputs.source_sha }}
         fetch-depth: 0
         persist-credentials: false
-    - name: Verify source
+    - name: Verify source and integrate PR base
+      env:
+        EXPECTED_SOURCE_SHA: ${{ inputs.source_sha }}
+        PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
       run: bash .github/scripts/checkout-source.sh
     - name: Download built wheel
       uses: actions/download-artifact@v4
@@ -150,15 +155,13 @@ jobs:
     runs-on: hygon-bw1100-1card
     timeout-minutes: 180
     container:
-      image: ${{ vars.DTK_IMAGE_REGISTRY || '10.16.1.152:5000/hcu/base/dtk' }}:${{ inputs.dtk_version }}-rockylinux8.6-py${{ inputs.py_version }}
+      image: ${{ vars.HARBOR_SITE }}/hcu/base/dtk:${{ inputs.dtk_version }}-rockylinux8.6-py${{ inputs.py_version }}
     defaults:
       run:
         shell: bash
     env:
-      # Fork PRs may not receive vars; match lightop's non-secret URL fallback.
-      PYPI_URL: ${{ vars.PYPI_URL || 'http://12.12.12.201:9929' }}
-      TRITON_PYPI_URL: ${{ vars.TRITON_PYPI_URL || vars.PYPI_URL || 'http://12.12.12.201:9929' }}
-      AICC_INSTALLER_URL: ${{ vars.AICC_INSTALLER_URL || 'http://42.228.13.241:18000/ai_cc/Nightly/hcu_llvm_installer.sh' }}
+      PYPI_URL: ${{ vars.PYPI_URL }}
+      AICC_INSTALLER_URL: ${{ vars.AICC_INSTALLER_URL }}
       RESOURCE_SERVER_URL: ${{ vars.RESOURCE_SERVER_URL }}
       PYTHONUNBUFFERED: '1'
       # ARC allocates one HCU, exposed to optest as logical device 0.
@@ -168,13 +171,16 @@ jobs:
       NUMPY_VERSION: ${{ inputs.numpy_version }}
       TORCH_VERSION: ${{ inputs.torch_version }}
     steps:
-    - name: Checkout integrated source
+    - name: Checkout source
       uses: actions/checkout@v4
       with:
-        ref: ${{ github.sha }}
+        ref: ${{ github.event.pull_request.number && format('refs/pull/{0}/head', github.event.pull_request.number) || inputs.source_sha }}
         fetch-depth: 0
         persist-credentials: false
-    - name: Verify source
+    - name: Verify source and integrate PR base
+      env:
+        EXPECTED_SOURCE_SHA: ${{ inputs.source_sha }}
+        PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
       run: bash .github/scripts/checkout-source.sh
     - name: Download tested wheel
       uses: actions/download-artifact@v4

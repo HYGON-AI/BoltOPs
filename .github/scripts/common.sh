@@ -17,18 +17,13 @@ export PYTHONUNBUFFERED=1
 export PYTHONIOENCODING=utf-8
 export PIP_DEFAULT_TIMEOUT=600 PIP_RETRIES=10 PIP_RESUME_RETRIES=10
 : "${PYPI_URL:?Set the PYPI_URL repository variable}"
-: "${TRITON_PYPI_URL:?Set the TRITON_PYPI_URL repository variable}"
-export PIP_INDEX_URL="${PYPI_URL%/}/nightly/dtk2604/+simple/"
+export PIP_INDEX_URL="${PYPI_URL%/}/nightly/dtk${DTK_VER}/+simple/"
 # pip requires a hostname, without scheme, port or path.
 export PIP_TRUSTED_HOST
-PIP_TRUSTED_HOST=$(python -c 'import os,urllib.parse; print(" ".join(sorted({urllib.parse.urlparse(os.environ[k]).hostname for k in ["PYPI_URL","TRITON_PYPI_URL"]})))')
-export TORCH_INDEX_URL="${PYPI_URL%/}/nightly/dtk${DTK_VER}/+simple/"
-export TRITON_INDEX_URL="${TRITON_PYPI_URL%/}/das_nightly/dtk2604-rc4/+simple/"
+PIP_TRUSTED_HOST=$(python -c 'import os,urllib.parse; print(urllib.parse.urlparse(os.environ["PYPI_URL"]).hostname)')
 case "${DTK_VER}" in
   2604) export AICC_MAJOR_VERSION=1.0.0 ;;
-  2610) export AICC_MAJOR_VERSION=2.0.0
-        export TORCH_INDEX_URL="${TRITON_PYPI_URL%/}/das_nightly/dtk2610/+simple/"
-        export TRITON_INDEX_URL="${TORCH_INDEX_URL}" ;;
+  2610) export AICC_MAJOR_VERSION=2.0.0 ;;
   *) echo "Unsupported DTK ${DTK_VER}" >&2; exit 1 ;;
 esac
 mkdir -p "${CI_WORK_DIR}" "${WHEEL_OUTPUT}"

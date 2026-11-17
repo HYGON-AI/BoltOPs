@@ -4,8 +4,13 @@
 set -euo pipefail
 cd "${GITHUB_WORKSPACE:?}"
 git config --global --add safe.directory "${GITHUB_WORKSPACE}"
-# PRs use the same synthetic merge commit in every job, selected by GitHub.
-# Push and manual runs test the exact event SHA.
-test "$(git rev-parse HEAD)" = "${GITHUB_SHA:?}"
-echo "Integrated commit: $(git rev-parse HEAD)"
+# PR builds and tests receive the event's PR head SHA explicitly.
+# Publish uses the push event SHA.
+test "$(git rev-parse HEAD)" = "${EXPECTED_SOURCE_SHA:-${GITHUB_SHA:?}}"
+echo "Source commit: $(git rev-parse HEAD)"
 git show -s --format='Parents: %P'
+if [[ -n "${PR_BASE_SHA:-}" ]]; then
+  git -c user.name='BoltOPs CI' -c user.email='ci@localhost' \
+    merge --no-edit "${PR_BASE_SHA}"
+  echo "Integrated PR base: ${PR_BASE_SHA}"
+fi
