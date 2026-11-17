@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 name: BoltOPs CI
 on:
-  pull_request:
+  pull_request_target:
     branches:
     - main
     types:
@@ -13,14 +13,76 @@ on:
   push:
     branches:
     - main
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      dtk_version:
+        description: DTK version
+        type: choice
+        default: '26.10'
+        options:
+        - '26.04'
+        - '26.10'
+      torch_version:
+        description: Torch version
+        type: choice
+        default: '2.13.0'
+        options:
+        - '2.11.0'
+        - '2.13.0'
+      py_version:
+        description: Python version
+        type: choice
+        default: '3.12'
+        options:
+        - '3.10'
+        - '3.12'
+      commit:
+        description: Full commit SHA (leave blank to build the selected branch or tag)
+        type: string
 permissions:
   contents: read
 concurrency:
-  group: boltops-ci-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: boltops-ci-${{ github.event_name == 'workflow_dispatch' && github.run_id || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request_target' }}
 jobs:
+  validate-manual:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: hygon-cpu
+    steps:
+    - name: Validate manual build inputs
+      shell: bash
+      env:
+        DTK_VERSION: ${{ inputs.dtk_version }}
+        PYTHON_VERSION: ${{ inputs.py_version }}
+        TORCH_VERSION: ${{ inputs.torch_version }}
+        SOURCE_SHA: ${{ inputs.commit || github.sha }}
+      run: |
+        case "${DTK_VERSION}/${PYTHON_VERSION}/${TORCH_VERSION}" in
+          26.04/3.10/2.11.0|26.04/3.12/2.11.0|26.10/3.12/2.11.0|26.10/3.12/2.13.0) ;;
+          *)
+            echo "Unsupported build combination: DTK ${DTK_VERSION}, Python ${PYTHON_VERSION}, Torch ${TORCH_VERSION}." >&2
+            exit 1
+            ;;
+        esac
+        if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+          echo "Enter the full 40-character commit SHA, or leave commit blank." >&2
+          exit 1
+        fi
+  build-manual:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    needs: validate-manual
+    name: Build DTK${{ inputs.dtk_version }} (py${{ inputs.py_version }}, torch${{ inputs.torch_version }})
+    uses: ./.github/workflows/_build-test-wheel.yml
+    with:
+      dtk_version: ${{ inputs.dtk_version }}
+      dtk_ver: ${{ inputs.dtk_version == '26.04' && '2604' || '2610' }}
+      source_sha: ${{ inputs.commit || github.sha }}
+      py_version: ${{ inputs.py_version }}
+      numpy_version: ${{ inputs.py_version == '3.10' && '1.24.3' || '1.26.4' }}
+      torch_version: ${{ inputs.torch_version }}
+      run_tests: false
   build2604:
+    if: ${{ github.event_name != 'workflow_dispatch' }}
     name: DTK2604 (py${{ matrix.py_version }}, torch${{ matrix.torch_version }})
     strategy:
       fail-fast: false
@@ -36,11 +98,13 @@ jobs:
     with:
       dtk_version: '26.04'
       dtk_ver: '2604'
+      source_sha: ${{ github.event.pull_request.head.sha || github.sha }}
       py_version: ${{ matrix.py_version }}
       numpy_version: ${{ matrix.numpy_version }}
       torch_version: ${{ matrix.torch_version }}
-      run_tests: ${{ github.event_name != 'push' }}
+      run_tests: ${{ github.event_name == 'pull_request_target' }}
   build2610:
+    if: ${{ github.event_name != 'workflow_dispatch' }}
     name: DTK2610 (torch${{ matrix.torch_version }})
     strategy:
       fail-fast: false
@@ -52,10 +116,11 @@ jobs:
     with:
       dtk_version: '26.10'
       dtk_ver: '2610'
+      source_sha: ${{ github.event.pull_request.head.sha || github.sha }}
       py_version: '3.12'
       numpy_version: '1.26.4'
       torch_version: ${{ matrix.torch_version }}
-      run_tests: ${{ github.event_name != 'push' }}
+      run_tests: ${{ github.event_name == 'pull_request_target' }}
   publish-2604:
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     needs:
@@ -64,7 +129,6 @@ jobs:
     with:
       dtk_version: '26.04'
       dtk_ver: '2604'
-      dtk_pkg_name: DTK-26.04-rc4-centos8-x86_64.tar.gz
     secrets:
       PYPI_PASSWORD: ${{ secrets.PYPI_PASSWORD }}
   publish-2610:
@@ -75,11 +139,10 @@ jobs:
     with:
       dtk_version: '26.10'
       dtk_ver: '2610'
-      dtk_pkg_name: DTK-26.10-Rocky8.6-x86_64.tar.gz
     secrets:
       PYPI_PASSWORD: ${{ secrets.PYPI_PASSWORD }}
   ci-result:
-    if: ${{ always() }}
+    if: ${{ always() && github.event_name != 'workflow_dispatch' }}
     needs:
     - build2604
     - build2610

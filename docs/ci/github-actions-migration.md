@@ -4,9 +4,9 @@
 
 ## 1. 先理解整体流程
 
-PR 到 main 和手动运行时，`build2604` 和 `build2610` 各自的两组环境都在 `hygon-build` 构建 wheel，并在 `hygon-bw1100-4card` 运行正确性测试。每组通过正确性测试后，在 `hygon-bw1100-1card` 下载对应 wheel 并运行性能测试。`ci-result` 在 `hygon-cpu` 汇总两个 DTK 的构建和测试结果。
+PR 到 main 时，`build2604` 和 `build2610` 各自的两组环境都在 `hygon-build` 构建 wheel，并在 `hygon-bw1100-4card` 运行正确性测试。每组通过正确性测试后，在 `hygon-bw1100-1card` 下载对应 wheel 并运行性能测试。`ci-result` 在 `hygon-cpu` 汇总两个 DTK 的构建和测试结果。
 
-push 到 main 时构建并修复四组 wheel，各 DTK 的构建成功后，由 `publish-2604` 和 `publish-2610` 在 `hygon-build` 分别发布。正确性和性能测试在 PR 或手动运行时执行。
+push 到 main 时构建并修复四组 wheel，各 DTK 的构建成功后，由 `publish-2604` 和 `publish-2610` 在 `hygon-build` 分别发布。手动运行按输入构建一组 wheel，并上传到本次 Actions 运行的附件。
 
 ## 2. 文件怎么写、怎么看
 
@@ -14,8 +14,8 @@ push 到 main 时构建并修复四组 wheel，各 DTK 的构建成功后，由 
 |---|---|
 | .github/workflows/ci.yml | 事件、矩阵、依赖 needs、制品传递、发布条件 |
 | .github/workflows/_build-test-wheel.yml | workflow_call 复用构建流程，供两套 DTK 的版本矩阵调用 |
-| .github/workflows/_publish.yml | workflow_call 接收 DTK 镜像版本、发布标识、包名及发布密码，统一下载、校验、发布 wheel |
-| .github/scripts/checkout-source.sh | 校验实际 checkout 的事件 SHA |
+| .github/workflows/_publish.yml | 接收 DTK 镜像版本、构建产物标识及发布密码，从镜像读取 DTK 版本后发布 wheel |
+| .github/scripts/checkout-source.sh | 校验事件 SHA，并在 PR 任务中合并目标分支提交 |
 | .github/scripts/common.sh | 每一步加载 DTK；设置索引、输出目录和唯一运行标识 |
 | .github/scripts/setup-env.sh | 安装 AICC、精确选择 Torch/Triton/TileLang/NumPy 并验证版本 |
 | .github/scripts/_build_hcu_wheel.sh | 统一检查环境并打包；CIUpload REPAIR 由复用工作流执行 |
@@ -25,7 +25,7 @@ push 到 main 时构建并修复四组 wheel，各 DTK 的构建成功后，由 
 
 先写触发条件 on，再写矩阵和 container，然后给每个动作写一个 shell 脚本，最后用 needs 串起来。不要把 Actions 的 `${{ ... }}` 写进独立 shell 文件；先通过 env 传入，脚本只使用 `${VAR}`。
 
-PR checkout 采用 github.sha（GitHub 生成的 PR 合并提交），所有矩阵与性能任务使用同一个 SHA，包含目标分支集成结果。push 则验证实际提交。无需像 GitLab 那样在每个 job 临时 merge main。
+PR 使用 `pull_request_target` 触发，工作流定义来自目标分支。与 LightOP 一样，通过 `refs/pull/<编号>/head` 检出同仓库或 fork PR。构建、正确性和性能任务均校验触发事件记录的 PR head SHA，再合并该事件记录的目标分支 base SHA，保证使用相同的代码内容。push 使用事件 SHA。手动运行优先使用填写的完整 commit SHA，留空时使用事件 SHA。
 
 DTK26.04 构建 Python3.10 / NumPy1.24.3 与 Python3.12 / NumPy1.26.4，两组都搭配 Torch2.11.0。DTK26.10 构建 Python3.12 / NumPy1.26.4，搭配 Torch2.11.0 和 Torch2.13.0。环境准备阶段校验 HCU Torch 版本以及 Triton、TileLang 的 DTK 和 Torch 标签。
 
@@ -39,23 +39,21 @@ GitHub BoltOPs → Settings → Secrets and variables → Actions → Variables�
 
 | Variable | 值/含义 |
 |---|---|
-| PYPI_URL | 通用 devpi 服务根地址（包含 http:// 与端口，无 /nightly 后缀）；构建及性能任务默认 http://12.12.12.201:9929，与 lightop 一样支持 fork PR 的变量缺失场景；发布任务仍读取组织/仓库 Variable |
-| TRITON_PYPI_URL | Triton 镜像根地址；可与 PYPI_URL 相同，未设置时回退到 PYPI_URL |
-| AICC_INSTALLER_URL | 默认使用提供的 http://42.228.13.241:18000/ai_cc/Nightly/hcu_llvm_installer.sh；可配置覆盖 |
-| RESOURCE_SERVER_URL | 可选，准备脚本单独使用时用于拼接 AICC 地址的回退值 |
-| DTK_IMAGE_REGISTRY | 可选；默认 10.16.1.152:5000/hcu/base/dtk |
+| PYPI_URL | 必填。devpi 服务根地址，包含协议和端口。构建和测试用它拼接 `nightly/dtk2604/+simple/` 或 `nightly/dtk2610/+simple/` |
+| AICC_INSTALLER_URL | AICC 安装脚本的完整 URL，与 `RESOURCE_SERVER_URL` 至少配置一个 |
+| RESOURCE_SERVER_URL | 资源服务器根地址，未设置 `AICC_INSTALLER_URL` 时用于拼接安装脚本 URL |
+| HARBOR_SITE | 必填。Harbor 主机和端口，工作流拼接 `/hcu/base/dtk` 和镜像 tag |
 
 Secret：PYPI_PASSWORD，使用现有 nightly 发布密码（不要把密码写入文件或 PR）。直接使用授权给 BoltOPs 的组织级 Secret，也可以配置仓库级 Secret。
 
-发布需要 Variable `PYPI_URL` 和发布 Secret `PYPI_PASSWORD`。两者都可以使用已授权给 BoltOPs 的组织级配置，无需在仓库重复设置；其他构建 Variables 也可以使用组织级或仓库级配置。GitHub 自动提供工作流使用的 `GITHUB_TOKEN`，这套 CI 不需要额外配置 GitHub PAT 或 `GITHUB_MIRROR_TOKEN`。fork PR 运行可能拿不到 `vars`；构建与性能任务为非敏感包源地址提供默认值，不能仅依赖组织变量授权。个人 fork 还需要能使用对应 runner。发布 Secret 不提供默认值，也不传给 PR 构建与性能任务。
+构建、测试和发布使用 BoltOPs 可访问的组织级或仓库级 Actions Variables。发布使用 `PYPI_PASSWORD` Secret。
 
 发布任务与 lightop 一样，不绑定 GitHub Environment，无需创建 nightly 环境；工作流中的条件限制仅在 main 分支 push 后发布。
 
 Settings → Actions → Runners：确保 ARC 的 `hygon-cpu`、`hygon-build` 、`hygon-bw1100-1card` 和 `hygon-bw1100-4card` pools 都授权给 BoltOPs。其他仓库可使用不代表 BoltOPs 自动有权使用。构建、正确性、性能和发布继续使用同一个基础镜像：
 
-- `${DTK_IMAGE_REGISTRY}:26.04-rockylinux8.6-py3.10` 或 `:26.04-rockylinux8.6-py3.12`
-- `${DTK_IMAGE_REGISTRY}:26.10-rockylinux8.6-py3.12`
-- 默认 registry 为 `10.16.1.152:5000/hcu/base/dtk`
+- `${HARBOR_SITE}/hcu/base/dtk:26.04-rockylinux8.6-py3.10` 或 `:26.04-rockylinux8.6-py3.12`
+- `${HARBOR_SITE}/hcu/base/dtk:26.10-rockylinux8.6-py3.12`
 
 ARC/Kubernetes 负责拉镜像、创建和销毁 Pod，给正确性测试 Pod 分配四张 HCU、给性能测试 Pod 分配一张 HCU；工作流不传 Docker 的 `--device`、特权、共享内存或手工挂载选项。平台需要给构建和测试 Pod 提供所需的 `/opt/hyhal`，给测试 Pod 提供设备与足够的 `/dev/shm`。原 `--shm-size=80G` 不再由 workflow 设置；接入文档中的四卡池提供 96G、单卡池提供 32G 共享内存，实际容量需在平台 Pod 模板上确认。私有镜像认证由平台现有配置负责。
 
@@ -65,7 +63,7 @@ AICC、Torch、Triton、TileLang、NumPy 和测试依赖继续在各自的临时
 
 各版本组合的构建、正确性测试和性能测试可独立调度。性能任务各用一张 HCU，按单卡 runner 池的容量并行运行。同一节点上的任务仍可能共享 CPU、内存和 I/O。工作流仍会取消同一 PR 的旧运行。
 
-同仓库 PR 和 fork PR 均使用 pull_request 事件进入构建和 GPU 测试，不使用 pull_request_target。是否等待维护者批准取决于 GitHub 组织/仓库的 fork 工作流审批设置；个人 fork 还需要相应 pools 的使用权限。PR 不进入发布任务，发布 Secret 只用于 main push 的发布任务。
+同仓库 PR 和 fork PR 都可触发 ARC 构建和 GPU 测试，使用 BoltOPs 的 Actions Variables。main push 触发发布任务。
 
 ## 4. 把文件提交到 GitHub、试跑
 
@@ -84,7 +82,7 @@ git commit -m 'ci: add GitHub Actions build test and nightly workflows'
 git push -u fork ci/github-actions-migration
 ```
 
-从原仓库分支或个人 fork 创建 PR 到 main；如页面要求，等待维护者批准工作流运行。检查四组构建、正确性和性能作业，以及 ci-result 和已有 Quality Gate。PR 不会发布，也不接触 PYPI_PASSWORD。下载 artifact 核对 wheel、JUnit 与性能报告。四组性能作业均需在 BW1100 上实际验证。
+从 BoltOPs 仓库的分支创建 PR 到 main。检查四组构建、正确性和性能作业，以及 ci-result 和已有 Quality Gate。下载 artifact 核对 wheel、JUnit 与性能报告。四组性能作业均需在 BW1100 上实际验证。
 
 由于需要真实内网 runner、编译器和 GPU，本地只能验证 YAML/Actions 表达式、Bash 语法、矩阵、设备选择分支和脚本迁移逻辑；未实际运行 GPU 构建、测试或上传。
 
