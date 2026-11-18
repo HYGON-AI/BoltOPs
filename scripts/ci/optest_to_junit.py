@@ -22,11 +22,25 @@ from xml.etree.ElementTree import Element, SubElement, tostring
 import xml.dom.minidom
 
 _ANSI_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
-_FATAL_RE = re.compile(r"^Fatal Python error:")
+_FATAL_RE = re.compile(r"Fatal Python error:")
 _SUMMARY_RE = re.compile(r"^=* short test summary info =*$")
 _TRACEBACK = "Traceback (most recent call last):"
+_PYTEST_HEADER_RE = re.compile(r"=+ .+ =+$")
+_PYTEST_SECTION_RE = re.compile(r"=+ (?:FAILURES|ERRORS) =+$")
+_PYTEST_SUBSECTION_RE = re.compile(r"_+ .+ _+$")
+_RUNNER_LINE_RE = re.compile(r"\[(?:\d+/\d+\] backend=|summary\] )")
+_RUNNER_HEADER_RE = re.compile(r"\[\d+/\d+\] backend=")
+_RUNNER_VERDICT_RE = re.compile(r"\[summary\] \S+ file=(\S+): pytest rc=(-?\d+)")
 _MAX_FULL_LINES = 2000
+_MAX_CONTEXT = 990
+_TAIL_LINES = 5
 _FATAL_CONTEXT = 100
+_FATAL_WINDOW = 400
+_FAILURE_WINDOW = 400
+_FAILURES_BUDGET = 500
+_SUBSECTION_TAIL = 40
+_SUMMARY_WINDOW = 200
+_FILE_WINDOW = 150
 
 RESULTS_ROOT = Path("/op_test_output/boltops")
 LOG_ROOT = Path("/op_test_log/boltops")
@@ -56,12 +70,55 @@ def make_error_suite(message: str) -> str:
     return xml.dom.minidom.parseString(tostring(testsuite)).toprettyxml()
 
 
-def _read_error_context(log_dir: Path, log_rel: str) -> str:
-    """Extract the most relevant error information from a log file.
+def _is_boundary(line: str) -> bool:
+    """A pytest ``==== X ====``, a runner ``[i/n]`` or ``[summary]`` line."""
+    return bool(_PYTEST_HEADER_RE.match(line) or _RUNNER_LINE_RE.search(line))
 
-    - Total lines ≤ _MAX_FULL_LINES → full content.
-    - Larger logs → smart extraction (see inline comments).
-    ANSI escape codes are stripped for readability in GitLab's JUnit viewer.
+
+def _bounded(lines: list[str], start: int, cap: int, stop=None) -> list[str]:
+    """lines[start:start+cap], cut short at the next section boundary."""
+    end = min(len(lines), start + cap)
+    for i in range(start + 1, end):
+        if (_is_boundary if stop is None else stop)(lines[i]):
+            return lines[start:i]
+    return lines[start:end]
+
+
+def _failure_sections(lines: list[str]) -> list[list[str]]:
+    """Per-test tails of every FAILURES/ERRORS region: E lines and the
+    ``file:line`` locations that the short summary leaves out."""
+    sections: list[list[str]] = []
+    budget = _FAILURES_BUDGET
+    for i, line in enumerate(lines):
+        if not _PYTEST_SECTION_RE.match(line):
+            continue
+        region = _bounded(lines, i, _FAILURE_WINDOW)
+        heads = [j for j in range(i, i + len(region))
+                 if _PYTEST_SUBSECTION_RE.match(lines[j])]
+        if heads:
+            bounds = heads + [i + len(region)]
+            segment: list[str] = []
+            for a, b in zip(bounds, bounds[1:]):
+                segment.extend(lines[max(a, b - _SUBSECTION_TAIL):b])
+        else:
+            segment = region
+        if len(segment) > budget:
+            segment = segment[:budget]
+        sections.append(segment)
+        budget -= len(segment)
+        if budget <= 0:
+            break
+    return sections
+
+
+def _read_error_context(log_dir: Path, log_rel: str) -> str:
+    """Extract where a run failed from a log, not just that it failed.
+
+    Logs up to _MAX_FULL_LINES lines are returned whole; larger logs are
+    assembled, bounded to _MAX_CONTEXT lines, from: the fatal-error
+    window and the failing-test sections, the pytest short summary (with
+    each file's non-zero ``pytest rc`` verdict), and the final tally.
+    ANSI escapes are stripped for GitLab's JUnit viewer.
     """
     log_file = log_dir / log_rel
     if not log_file.is_file():
@@ -71,35 +128,58 @@ def _read_error_context(log_dir: Path, log_rel: str) -> str:
     except OSError as exc:
         return f"(failed to read log: {exc})"
 
-    lines = content.splitlines()
-
-    # ── small enough → return everything ─────────────────────────────
+    lines = [_ANSI_RE.sub("", line) for line in content.splitlines()]
     if len(lines) <= _MAX_FULL_LINES:
-        return "\n".join(_ANSI_RE.sub("", line) for line in lines)
+        return "\n".join(lines)
 
-    # ── smart extraction for large logs ──────────────────────────────
+    verdicts = [(i, match) for i, line in enumerate(lines)
+                if (match := _RUNNER_VERDICT_RE.search(line))
+                and match[2] != "0"]
 
-    # 1. Fatal Python error (SIGSEGV / SIGABRT / …).
-    #    Include 100 lines before the marker for debugging context.
-    for i, line in enumerate(lines):
-        if _FATAL_RE.match(line):
-            start = max(0, i - _FATAL_CONTEXT)
-            return "\n".join(_ANSI_RE.sub("", l) for l in lines[start:])
-
-    # 2. pytest short test summary (per-failure reasons + final tally).
+    segments: list[list[str]] = []
+    fatal = next((i for i, line in enumerate(lines)
+                  if _FATAL_RE.match(line)), None)
+    if fatal is not None:
+        segments.append(lines[max(0, fatal - _FATAL_CONTEXT):
+                              fatal + _FATAL_WINDOW])
+    segments.extend(_failure_sections(lines))
+    if fatal is None and not segments:
+        traceback_at = next((i for i, line in enumerate(lines)
+                             if line.rstrip() == _TRACEBACK), None)
+        if traceback_at is not None:
+            segments.append(lines[max(0, traceback_at - _FATAL_CONTEXT):
+                                  traceback_at + _FAILURE_WINDOW])
     for i, line in enumerate(lines):
         if _SUMMARY_RE.match(line):
-            return "\n".join(_ANSI_RE.sub("", l) for l in lines[i:])
+            # Keep each file's summary through its rc verdict (the only
+            # place naming which pytest run failed); the runner emits one
+            # summary per file, so failures in later files are covered too.
+            segments.append(_bounded(
+                lines, i, _SUMMARY_WINDOW,
+                stop=lambda l: bool(_RUNNER_HEADER_RE.search(l))))
+    for i, _ in verdicts:
+        start = max((j for j in range(i, -1, -1)
+                     if _RUNNER_HEADER_RE.search(lines[j])), default=max(0, i - 1))
+        segment = lines[start:i + 1]
+        if any(_PYTEST_SECTION_RE.match(l) for l in segment):
+            continue  # the FAILURES/ERRORS regions above carry the detail
+        # A file that died before pytest reported (rc<0) has no sections:
+        # keep its output tail, where the crash reason lives.
+        if len(segment) > _FILE_WINDOW:
+            segment = [segment[0]] + segment[-(_FILE_WINDOW - 1):]
+        segments.append(segment)
 
-    # 3. First Python traceback (unhandled exception).
-    #    Include 100 lines before for context.
-    for i, line in enumerate(lines):
-        if line == _TRACEBACK:
-            start = max(0, i - _FATAL_CONTEXT)
-            return "\n".join(_ANSI_RE.sub("", l) for l in lines[start:])
-
-    # 4. Fallback: last 200 lines.
-    return "\n".join(_ANSI_RE.sub("", line) for line in lines[-200:])
+    parts: list[str] = []
+    used = 0
+    for segment in [*segments, lines[-_TAIL_LINES:]]:
+        take = segment[:max(0, _MAX_CONTEXT - used)]
+        if not take:
+            continue
+        if parts:
+            parts.append("[...]")
+        parts.extend(take)
+        used += len(take)
+    return "\n".join(parts)
 
 
 def _failure_count(data: dict) -> int:
@@ -183,6 +263,10 @@ def build_junit(data: dict, log_dir: Path) -> str:
 
 
 def main() -> int:
+    if len(sys.argv) >= 3 and sys.argv[1] == "--error-context":
+        log_file = Path(sys.argv[2])
+        print(_read_error_context(log_file.parent, log_file.name))
+        return 0
     # CI selects the exact matrix job's report. Manual use keeps auto-discovery.
     results_file = Path(sys.argv[3]) if len(sys.argv) >= 4 else find_latest_results()
     if results_file is None:

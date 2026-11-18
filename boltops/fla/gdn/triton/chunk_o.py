@@ -199,10 +199,12 @@ def chunk_fwd_kernel_o(
         if EXACT:
             b_q = tl.load(p_q)
             b_k = tl.load(p_k)
-            b_h = tl.load(p_h)
         else:
             b_q = tl.load(p_q, boundary_check=(0, 1))
             b_k = tl.load(p_k, boundary_check=(0, 1))
+        if EXACT:
+            b_h = tl.load(p_h)
+        else:
             b_h = tl.load(p_h, boundary_check=(0, 1))
         if TRANSPOSE_STATE:
             b_o += tl.dot(b_q, tl.trans(b_h))

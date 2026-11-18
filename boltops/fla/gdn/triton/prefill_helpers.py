@@ -7,8 +7,14 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
+from boltops.utility import arch_info
+
 
 _FLOAT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+
+
+def _gfx946_helper_device_supported(device):
+    return device.type == 'cuda' and arch_info.get_arch(device) == 'gfx946'
 
 
 def _check_matrix(tensor, name):
@@ -48,9 +54,40 @@ def _gdn_qkvzba_split_kernel(
                  mask=(columns >= HEADS) & (columns < 2 * HEADS))
 
 
+@triton.jit
+def _gdn_qkvzba_split_rows_kernel(
+    projection, gate_projection, qkv_output, z_output, b_output, a_output,
+    projection_row_stride: tl.constexpr, projection_col_stride: tl.constexpr,
+    gate_row_stride: tl.constexpr, gate_col_stride: tl.constexpr,
+    QKV_WIDTH: tl.constexpr, Z_WIDTH: tl.constexpr, HEADS: tl.constexpr,
+    BLOCK: tl.constexpr, ROWS: tl.constexpr, TOTAL_ROWS: tl.constexpr,
+):
+    rows = tl.program_id(1) * ROWS + tl.arange(0, ROWS)
+    columns = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    valid_rows = rows[:, None] < TOTAL_ROWS
+    values = tl.load(projection + rows[:, None] * projection_row_stride
+                     + columns[None, :] * projection_col_stride,
+                     valid_rows & (columns[None, :] < QKV_WIDTH + Z_WIDTH), other=0)
+    tl.store(qkv_output + rows[:, None] * QKV_WIDTH + columns[None, :], values,
+             valid_rows & (columns[None, :] < QKV_WIDTH))
+    tl.store(z_output + rows[:, None] * Z_WIDTH + columns[None, :] - QKV_WIDTH, values,
+             valid_rows & (columns[None, :] >= QKV_WIDTH)
+             & (columns[None, :] < QKV_WIDTH + Z_WIDTH))
+    if tl.program_id(0) == 0:
+        gate_columns = tl.arange(0, triton.next_power_of_2(2 * HEADS))
+        gates = tl.load(gate_projection + rows[:, None] * gate_row_stride
+                        + gate_columns[None, :] * gate_col_stride,
+                        valid_rows & (gate_columns[None, :] < 2 * HEADS), other=0)
+        tl.store(b_output + rows[:, None] * HEADS + gate_columns[None, :], gates,
+                 valid_rows & (gate_columns[None, :] < HEADS))
+        tl.store(a_output + rows[:, None] * HEADS + gate_columns[None, :] - HEADS, gates,
+                 valid_rows & (gate_columns[None, :] >= HEADS)
+                 & (gate_columns[None, :] < 2 * HEADS))
+
+
 def gdn_qkvzba_split(
     projected_qkvz, projected_ba, num_heads_qk, num_heads_v,
-    head_size_qk=128, head_size_v=128,
+    head_size_qk=128, head_size_v=128, kernel_cfg=None,
 ):
     """Materialize contiguous ``qkv, z, b, a`` from Qwen3.5 projections.
 
@@ -77,11 +114,28 @@ def gdn_qkvzba_split(
     outputs = tuple(torch.empty((tokens, width), dtype=projected_qkvz.dtype, device=projected_qkvz.device)
                     for width in (qkv_width, value_width, num_heads_v, num_heads_v))
     if tokens:
-        _gdn_qkvzba_split_kernel[(triton.cdiv(qkv_width + value_width, 512), tokens)](
+        config = kernel_cfg or {}
+        wide_copy = (tokens >= 2048 and qkv_width + value_width == 12288
+                     and projected_qkvz.dtype == torch.bfloat16
+                     and projected_qkvz.stride(1) == projected_ba.stride(1) == 1
+                     and _gfx946_helper_device_supported(projected_qkvz.device))
+        grouped_copy = (kernel_cfg is None and tokens >= 28672
+                        and qkv_width + value_width == 2560
+                        and projected_qkvz.dtype == torch.bfloat16
+                        and projected_qkvz.stride(1) == projected_ba.stride(1) == 1
+                        and _gfx946_helper_device_supported(projected_qkvz.device))
+        block = config.get('BLOCK', 4096 if wide_copy or grouped_copy else 512)
+        rows = config.get('ROWS', 8 if grouped_copy else 1)
+        grouped = rows != 1
+        kernel = _gdn_qkvzba_split_rows_kernel if grouped else _gdn_qkvzba_split_kernel
+        extra = dict(ROWS=rows, TOTAL_ROWS=tokens) if grouped else {}
+        column_tiles = triton.cdiv(qkv_width + value_width, block)
+        kernel[(column_tiles, triton.cdiv(tokens, rows))](
             projected_qkvz, projected_ba, *outputs,
             *projected_qkvz.stride(), *projected_ba.stride(),
-            QKV_WIDTH=qkv_width, Z_WIDTH=value_width, HEADS=num_heads_v, BLOCK=512,
-            num_warps=4,
+            QKV_WIDTH=qkv_width, Z_WIDTH=value_width, HEADS=num_heads_v, BLOCK=block,
+            num_warps=config.get('num_warps', 4),
+            **extra,
         )
     return outputs
 
@@ -94,6 +148,7 @@ def _gdn_fused_gating_kernel(
     decay_stride: tl.constexpr, bias_stride: tl.constexpr,
     TOTAL: tl.constexpr, HEADS: tl.constexpr, SOFTPLUS_BETA: tl.constexpr,
     SOFTPLUS_THRESHOLD: tl.constexpr, BLOCK: tl.constexpr,
+    FAST_MATH: tl.constexpr,
 ):
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     rows = offsets // HEADS
@@ -107,14 +162,29 @@ def _gdn_fused_gating_kernel(
     bias_value = tl.load(time_bias + heads * bias_stride, mask=valid, other=0).to(tl.float32)
     shifted = a_value + bias_value
     scaled = SOFTPLUS_BETA * shifted
-    softplus = (tl.maximum(scaled, 0) + libdevice.log1p(tl.exp(-tl.abs(scaled)))) / SOFTPLUS_BETA
+    exponential = tl.exp(-tl.abs(scaled))
+    if FAST_MATH:
+        # Preserve log1p accuracy when 1 + exponential would round to 1.
+        # On [0, .01], the fourth-order remainder is at most x**5 / 5.
+        polynomial = exponential * (1.0 + exponential * (
+            -0.5 + exponential * (1.0 / 3.0 - 0.25 * exponential)))
+        logarithm = tl.where(exponential < .01, polynomial, tl.log(1.0 + exponential))
+    else:
+        logarithm = libdevice.log1p(exponential)
+    softplus = (tl.maximum(scaled, 0) + logarithm) / SOFTPLUS_BETA
     softplus = tl.where(scaled > SOFTPLUS_THRESHOLD, shifted, softplus)
     tl.store(decay_output + offsets, -tl.exp(log_value) * softplus, mask=valid)
-    tl.store(beta_output + offsets, tl.sigmoid(b_value), mask=valid)
+    if FAST_MATH:
+        beta = tl.inline_asm_elementwise(
+            "v_rcp_f32 $0, $1", constraints="=v,v", args=[1.0 + tl.exp(-b_value)],
+            dtype=tl.float32, is_pure=True, pack=1)
+    else:
+        beta = tl.sigmoid(b_value)
+    tl.store(beta_output + offsets, beta, mask=valid)
 
 
 def gdn_fused_gating(a_projection, b_projection, A_log, dt_bias,
-                     softplus_beta=1.0, softplus_threshold=20.0):
+                     softplus_beta=1.0, softplus_threshold=20.0, kernel_cfg=None):
     """Return FP32 ``g, beta`` without state update or cumulative summation.
 
     ``g = -exp(A_log) * softplus(a_projection + dt_bias)`` and
@@ -137,11 +207,19 @@ def gdn_fused_gating(a_projection, b_projection, A_log, dt_bias,
     outputs = tuple(torch.empty((tokens, heads), device=a_projection.device, dtype=torch.float32)
                     for _ in range(2))
     if tokens:
-        _gdn_fused_gating_kernel[(triton.cdiv(tokens * heads, 256),)](
+        config = kernel_cfg or {}
+        fast_math = config.get('FAST_MATH', kernel_cfg is None
+                               and a_projection.dtype == torch.bfloat16
+                               and _gfx946_helper_device_supported(a_projection.device))
+        block = config.get('BLOCK', 1024 if kernel_cfg is None and fast_math
+                           and tokens * heads >= 200000 else 256)
+        _gdn_fused_gating_kernel[(triton.cdiv(tokens * heads, block),)](
             a_projection, b_projection, A_log, dt_bias, *outputs,
             *a_projection.stride(), *b_projection.stride(), A_log.stride(0), dt_bias.stride(0),
             TOTAL=tokens * heads, HEADS=heads, SOFTPLUS_BETA=softplus_beta,
-            SOFTPLUS_THRESHOLD=softplus_threshold, BLOCK=256, num_warps=4,
+            SOFTPLUS_THRESHOLD=softplus_threshold, BLOCK=block,
+            FAST_MATH=fast_math,
+            num_warps=config.get('num_warps', 4),
         )
     return outputs
 
@@ -167,7 +245,37 @@ def _gdn_rmsnorm_gated_kernel(
     tl.store(output + row * WIDTH + columns, result, mask=columns < WIDTH)
 
 
-def gdn_rmsnorm_gated(hidden, gate, weight, eps=1e-6):
+@triton.jit
+def _gdn_rmsnorm_gated_rows_kernel(
+    hidden, gate, weight, output,
+    hidden_row_stride: tl.constexpr, hidden_col_stride: tl.constexpr,
+    gate_row_stride: tl.constexpr, gate_col_stride: tl.constexpr,
+    weight_stride: tl.constexpr, WIDTH: tl.constexpr, EPS: tl.constexpr,
+    BLOCK: tl.constexpr, TOTAL_ROWS: tl.constexpr, ROWS: tl.constexpr,
+    SILU_RCP: tl.constexpr,
+):
+    rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
+    columns = tl.arange(0, BLOCK)
+    mask = (rows[:, None] < TOTAL_ROWS) & (columns[None, :] < WIDTH)
+    values = tl.load(hidden + rows[:, None] * hidden_row_stride
+                     + columns[None, :] * hidden_col_stride, mask, other=0).to(tl.float32)
+    gates = tl.load(gate + rows[:, None] * gate_row_stride
+                    + columns[None, :] * gate_col_stride, mask, other=0).to(tl.float32)
+    weights = tl.load(weight + columns * weight_stride, columns < WIDTH, other=0).to(tl.float32)
+    inverse_rms = tl.rsqrt(tl.sum(values * values, 1) / WIDTH + EPS)
+    normalized = values * inverse_rms[:, None] * weights[None, :]
+    if SILU_RCP:
+        denominator = 1.0 + tl.exp(-gates)
+        sigmoid = tl.inline_asm_elementwise(
+            "v_rcp_f32 $0, $1", constraints="=v,v", args=[denominator],
+            dtype=tl.float32, is_pure=True, pack=1)
+    else:
+        sigmoid = tl.sigmoid(gates)
+    result = normalized * (gates * sigmoid)
+    tl.store(output + rows[:, None] * WIDTH + columns[None, :], result, mask)
+
+
+def gdn_rmsnorm_gated(hidden, gate, weight, eps=1e-6, kernel_cfg=None):
     """Return ``RMSNorm(hidden, weight, eps) * SiLU(gate)`` in hidden dtype.
 
     Normalization and gating use FP32 intermediates; normalization precedes
@@ -185,9 +293,22 @@ def gdn_rmsnorm_gated(hidden, gate, weight, eps=1e-6):
         raise ValueError('eps must be finite and positive')
     output = torch.empty(hidden.shape, device=hidden.device, dtype=hidden.dtype)
     if rows:
-        _gdn_rmsnorm_gated_kernel[(rows,)](
-            hidden, gate, weight, output, *hidden.stride(), *gate.stride(), weight.stride(0),
-            WIDTH=width, EPS=eps, BLOCK=triton.next_power_of_2(width),
-            num_warps=4 if width <= 1024 else 8,
-        )
+        config = kernel_cfg or {}
+        grouped = (rows >= 384 and width == 128 and hidden.dtype == torch.bfloat16
+                   and hidden.stride(1) == gate.stride(1) == weight.stride(0) == 1
+                   and _gfx946_helper_device_supported(hidden.device))
+        row_block = config.get('ROWS', (4 if rows < 1536 else 16) if grouped else 1)
+        warps = config.get('num_warps', 4 if width <= 1024 else 8)
+        if row_block > 1:
+            _gdn_rmsnorm_gated_rows_kernel[(triton.cdiv(rows, row_block),)](
+                hidden, gate, weight, output, *hidden.stride(), *gate.stride(), weight.stride(0),
+                WIDTH=width, EPS=eps, BLOCK=triton.next_power_of_2(width),
+                TOTAL_ROWS=rows, ROWS=row_block, SILU_RCP=config.get('silu_rcp', grouped),
+                num_warps=warps)
+        else:
+            _gdn_rmsnorm_gated_kernel[(rows,)](
+                hidden, gate, weight, output, *hidden.stride(), *gate.stride(), weight.stride(0),
+                WIDTH=width, EPS=eps, BLOCK=triton.next_power_of_2(width),
+                num_warps=warps,
+            )
     return output

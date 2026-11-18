@@ -93,6 +93,44 @@ def test_causal_conv1d_package_has_compact_module_layout():
     assert hasattr(kernels, "causal_conv1d_fn_sglang")
     assert hasattr(kernels, "causal_conv1d_fn_vllm")
 
+
+@pytest.mark.parametrize("feature,enabled", [
+    ("decode", True), ("four_tokens", True), ("other_arch", False),
+    ("fp32", False), ("other_width", False), ("long_state", False),
+    ("cache_indices", False), ("speculative", False), ("explicit_off", False),
+])
+def test_update_register_state_dispatch(feature, enabled, monkeypatch):
+    from boltops.generic.triton.causal_conv1d import kernels
+
+    launches = []
+    class Capture:
+        def __getitem__(self, grid):
+            return lambda *args, **kwargs: launches.append(kwargs)
+
+    monkeypatch.setattr(kernels, "_sglang_causal_conv1d_update_kernel", Capture())
+    monkeypatch.setattr(kernels, "_rowscan_default_enabled", lambda device: feature != "other_arch")
+    monkeypatch.setattr(kernels, "is_arch_support_pdl", lambda: False)
+    dtype = torch.float32 if feature == "fp32" else torch.bfloat16
+    width = 3 if feature == "other_width" else 4
+    tokens = 4 if feature == "four_tokens" else 1
+    state_len = 6 if feature == "long_state" else width - 1
+    options = {}
+    if feature == "cache_indices":
+        options['conv_state_indices'] = torch.arange(2)
+    elif feature == "speculative":
+        options['num_accept_tokens'] = torch.ones(2, dtype=torch.int32)
+    elif feature == "explicit_off":
+        options['register_state'] = False
+    kernels.causal_conv1d_update_sglang(
+        torch.empty(2, 128, tokens, dtype=dtype),
+        torch.empty(2, 128, state_len, dtype=dtype),
+        torch.empty(128, width, dtype=dtype), activation='silu', **options,
+    )
+    assert len(launches) == 1
+    assert launches[0]['REGISTER_STATE'] is enabled
+    assert launches[0]['SILU_RCP'] is enabled
+    assert launches[0]['num_warps'] == (2 if enabled else 4)
+
 DEVICE = "cuda"
 GPU_REQUIRED = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA/HIP device is required"
