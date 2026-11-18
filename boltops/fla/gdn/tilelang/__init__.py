@@ -3,9 +3,11 @@
 """TileLang backend for the GDN chunk forward stages."""
 
 from .chunk_delta_h import chunk_gated_delta_rule_fwd_h
+from .chunk_o import chunk_fwd_o
 from .fused_chunk_fwd import fused_chunk_gated_delta_rule_fwd
 
 __all__ = [
+    "chunk_fwd_o",
     "chunk_gated_delta_rule_fwd_h",
     "fused_chunk_gated_delta_rule_fwd",
 ]

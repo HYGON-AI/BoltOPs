@@ -61,6 +61,24 @@ optest 的 `per` 模式内部即调用 `scripts/run_operator_benchmarks.py`
 `csv=N`），其余结果汇入同目录的 `.optest-results.json`，CI 用
 `ci_script/optest_to_junit.py` 转成 junit。
 
+### GitLab CI 结果下载
+
+进入流水线中的 `performance:optest` 任务，在 **Job artifacts** 中选择
+**Download** 下载归档，或选择 **Browse** 查看文件。产物保留 7 天
+（GitLab 对最新成功流水线的保留策略可能延长实际保留时间）。
+
+- `optest_results/`：各算子的性能 CSV。
+- `optest_artifacts/<runner>/dtk<版本>/py<Python>/torch<Torch>/results/`：
+  本次 job 的 optest 输出目录，包括 CSV、隐藏的 `.optest-results.json`
+  和 `raw/` 等实际生成的文件；多个输出目录分别保留。
+- 同级 `logs/`：本次 job 的 benchmark 日志。
+- `scripts/*_boltops_output.xml`：用于 GitLab Tests 页面展示的 JUnit 报告。
+
+结果和日志由 `after_script` 独立收集，`artifacts: when: always` 使普通测试失败时
+也能上传已生成的文件；收集不依赖 JSON 报告存在，不改变测试失败状态。
+如果任务在环境准备阶段失败，则可能没有 CSV；超时、强制终止或 runner 异常时，
+收尾及上传不保证完成。这里只收集当前 job 唯一分支前缀下的 optest 目录。
+
 本地快速跑可直接调用下层入口（支持选子集与指定输出目录）：
 
 ```bash
