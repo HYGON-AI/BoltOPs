@@ -4,9 +4,9 @@
 
 ## 1. 先理解整体流程
 
-PR 到 main 时，`build2604` 和 `build2610` 各自的两组环境都在 `hygon-build` 构建 wheel。DTK26.04 / Python3.10 / Torch2.11.0 与 DTK26.10 / Python3.12 / Torch2.13.0 两组在 `hygon-bw1100-4card` 运行正确性测试，通过后在 `hygon-bw1100-1card` 下载对应 wheel 并运行性能测试。`ci-result` 在 `hygon-cpu` 汇总两个 DTK 的构建和已启用的测试结果。
+PR 到 release/0.1.0 时，`build2604` 和 `build2610` 各自的两组环境都在 `hygon-build` 构建 wheel。DTK26.04 / Python3.10 / Torch2.11.0 与 DTK26.10 / Python3.12 / Torch2.13.0 两组在 `hygon-bw1100-4card` 运行正确性测试，通过后在 `hygon-bw1100-1card` 下载对应 wheel 并运行性能测试。`ci-result` 在 `hygon-cpu` 汇总两个 DTK 的构建和已启用的测试结果。
 
-push 到 main 时构建并修复四组 wheel，各 DTK 的构建成功后，由 `publish-2604` 和 `publish-2610` 在 `hygon-build` 分别发布。手动运行按输入构建一组 wheel，并上传到本次 Actions 运行的附件。
+push 到 release/0.1.0 时构建并修复四组 wheel，各 DTK 的构建成功后，由 `publish-2604` 和 `publish-2610` 在 `hygon-build` 分别发布。手动运行按输入构建一组 wheel，并上传到本次 Actions 运行的附件。
 
 ## 2. 文件怎么写、怎么看
 
@@ -48,7 +48,7 @@ Secret：PYPI_PASSWORD，使用现有 nightly 发布密码（不要把密码写�
 
 构建、测试和发布使用 BoltOPs 可访问的组织级或仓库级 Actions Variables。发布使用 `PYPI_PASSWORD` Secret。
 
-发布任务与 lightop 一样，不绑定 GitHub Environment，无需创建 nightly 环境；工作流中的条件限制仅在 main 分支 push 后发布。
+发布任务与 lightop 一样，不绑定 GitHub Environment，无需创建 nightly 环境；工作流中的条件限制仅在 release/0.1.0 分支 push 后发布。
 
 Settings → Actions → Runners：确保 ARC 的 `hygon-cpu`、`hygon-build` 、`hygon-bw1100-1card` 和 `hygon-bw1100-4card` pools 都授权给 BoltOPs。其他仓库可使用不代表 BoltOPs 自动有权使用。构建、正确性、性能和发布继续使用同一个基础镜像：
 
@@ -63,7 +63,7 @@ AICC、Torch、Triton、TileLang、NumPy 和测试依赖继续在各自的临时
 
 各版本组合的构建、正确性测试和性能测试可独立调度。性能任务各用一张 HCU，按单卡 runner 池的容量并行运行。同一节点上的任务仍可能共享 CPU、内存和 I/O。工作流仍会取消同一 PR 的旧运行。
 
-同仓库 PR 和 fork PR 都可触发 ARC 构建和 GPU 测试，使用 BoltOPs 的 Actions Variables。main push 触发发布任务。
+同仓库 PR 和 fork PR 都可触发 ARC 构建和 GPU 测试，使用 BoltOPs 的 Actions Variables。release/0.1.0 push 触发发布任务。
 
 ## 4. 把文件提交到 GitHub、试跑
 
@@ -74,7 +74,7 @@ AICC、Torch、Triton、TileLang、NumPy 和测试依赖继续在各自的临时
 可将交付 zip 中的 .github/ 与 docs/ci/ 合入该分支，或者使用交付 patch：
 
 ```bash
-git switch -c ci/github-actions-migration main
+git switch -c ci/github-actions-migration release/0.1.0
 git apply --check boltops-github-actions.patch
 git apply boltops-github-actions.patch
 git add -A -- .gitattributes .github .agents docs/ci scripts/ci ci_script build_wheel.sh .gitlab-ci.yml
@@ -82,7 +82,7 @@ git commit -m 'ci: add GitHub Actions build test and nightly workflows'
 git push -u fork ci/github-actions-migration
 ```
 
-创建 PR 到 main，检查四组构建、两组正确性和性能作业，以及 ci-result 和已有 Quality Gate。下载 artifact 核对 wheel、JUnit 与性能报告。两组测试均需在 BW1100 上实际验证。
+创建 PR 到 release/0.1.0，检查四组构建、两组正确性和性能作业，以及 ci-result 和已有 Quality Gate。下载 artifact 核对 wheel、JUnit 与性能报告。两组测试均需在 BW1100 上实际验证。
 
 由于需要真实内网 runner、编译器和 GPU，本地只能验证 YAML/Actions 表达式、Bash 语法、矩阵、设备选择分支和脚本迁移逻辑；未实际运行 GPU 构建、测试或上传。
 
@@ -92,7 +92,7 @@ PR 验证通过后，安排同一次切换窗口：
 
 1. 停止接受 GitLab 独立 main 更新，选定 GitHub 为唯一主入口。
 2. 维护者停用 GitLab 的发布与 mirror:github（或停用整个 GitLab CI），并等待/取消仍在运行的发布任务。不要同时让两边对同一提交发布。
-3. 合入 GitHub 的迁移 PR；main push 只构建并发布，不重复 PR 的测试。
+3. 合入 GitHub 的迁移 PR；release/0.1.0 push 只构建并发布，不重复 PR 的测试。
 4. 确认发布成功。将 BoltOPs CI 的 ci-result 设为必需检查，保留已有 Checks / All required checks。必须先实际运行一次，让 GitHub 能识别检查名称。
 5. 后续开发走 GitHub PR，GitLab 如需保留副本，应另行设计反向镜像，不能继续两边独立合入。
 
