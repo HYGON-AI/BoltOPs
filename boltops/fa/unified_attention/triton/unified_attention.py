@@ -545,7 +545,9 @@ def kernel_unified_attention_2d(
             acc2 += tl.dot(P.to(V2.dtype), V2)
 
     # epilogue
-    inv_L = 1.0 / L
+    # Fully masked rows have zero numerator and denominator. Preserve their
+    # zero output instead of producing 0 * inf in the normalization.
+    inv_L = 1.0 / tl.where(L == 0.0, 1.0, L)
     acc1 = acc1 * inv_L[:, None]
     if HEAD_SIZE_V_PART2 > 0:
         acc2 = acc2 * inv_L[:, None]
@@ -1302,6 +1304,102 @@ def _get_unified_attention_3d_config(
     return None
 
 
+def _gluon_wasp_device_supported(device):
+    return device.type == "cuda" and get_arch(device) == "gfx946"
+
+
+def _try_unified_attention_wasp_gluon(
+    *,
+    q,
+    k,
+    v,
+    out,
+    cu_seqlens_q,
+    max_seqlen_q,
+    seqused_k,
+    softmax_scale,
+    window_size,
+    block_table,
+    softcap,
+    k_descale,
+    v_descale,
+    alibi_slopes,
+    output_scale,
+    qq_bias,
+    sinks,
+    mm_prefix_range,
+):
+    """Launch the guarded Gluon WASP decode specialization when applicable."""
+    if (
+        max_seqlen_q != 1
+        or q.ndim != 3
+        or k.ndim != 4
+        or v.ndim != 4
+        or out.shape != q.shape
+        or q.shape[0] == 0
+        or not _gluon_wasp_device_supported(q.device)
+        or any(tensor.device != q.device for tensor in (
+            k, v, out, cu_seqlens_q, seqused_k, block_table
+        ))
+        or any(tensor.stride(-1) != 1 for tensor in (q, k, v, out))
+        or cu_seqlens_q.ndim != 1
+        or seqused_k.shape != (q.shape[0],)
+        or cu_seqlens_q.dtype not in (torch.int32, torch.int64)
+        or seqused_k.dtype not in (torch.int32, torch.int64)
+        or not cu_seqlens_q.is_contiguous()
+        or not seqused_k.is_contiguous()
+        or q.shape[0] != cu_seqlens_q.numel() - 1
+        or q.dtype != torch.bfloat16
+        or out.dtype != torch.bfloat16
+        or (q.shape[1:], k.shape[1:], v.shape[1:]) != (
+            (32, 128), (16, 8, 128), (16, 8, 128)
+        )
+        or k.dtype != torch.float8_e4m3fn
+        or v.dtype != torch.float8_e4m3fn
+        or block_table.ndim != 2
+        or block_table.shape[0] != q.shape[0]
+        or block_table.dtype not in (torch.int32, torch.int64)
+        or not block_table.is_contiguous()
+        or softcap != 0
+        or output_scale is not None
+        or alibi_slopes is not None
+        or qq_bias is not None
+        or sinks is not None
+        or mm_prefix_range is not None
+        or window_size[0] >= 0
+        or window_size[1] >= 0
+    ):
+        return False
+    if not isinstance(k_descale, torch.Tensor) or not isinstance(v_descale, torch.Tensor):
+        return False
+    if (
+        k_descale.numel() != 1
+        or v_descale.numel() != 1
+        or k_descale.dtype != torch.float32
+        or v_descale.dtype != torch.float32
+        or not k_descale.is_contiguous()
+        or not v_descale.is_contiguous()
+        or k_descale.device != q.device
+        or v_descale.device != q.device
+    ):
+        return False
+    from .unified_attention_wasp_gluon import launch_unified_attention_wasp_gluon
+
+    launch_unified_attention_wasp_gluon(
+        q,
+        k,
+        v,
+        out,
+        cu_seqlens_q,
+        seqused_k,
+        block_table,
+        k_descale,
+        v_descale,
+        softmax_scale,
+    )
+    return True
+
+
 def _unified_attention_core(
     q,  # [num_query_tokens, num_query_heads, head_size]
     k,  # [num_blks, blk_size, num_kv_heads, head_size]
@@ -1333,6 +1431,35 @@ def _unified_attention_core(
 ):
     assert causal, "Only causal attention is supported"
     assert q_descale is None, "Q scales not supported"
+
+    wasp_default = (
+        q.shape == (512, 32, 128)
+        and max_seqlen_q == 1 and max_seqlen_k == 376
+        and softmax_segm_output is None and softmax_segm_max is None
+        and softmax_segm_expsum is None
+    )
+    if wasp_default:
+        if _try_unified_attention_wasp_gluon(
+            q=q,
+            k=k,
+            v=v,
+            out=out,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=max_seqlen_q,
+            seqused_k=seqused_k,
+            softmax_scale=softmax_scale,
+            window_size=window_size,
+            block_table=block_table,
+            softcap=softcap,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            alibi_slopes=alibi_slopes,
+            output_scale=output_scale,
+            qq_bias=qq_bias,
+            sinks=sinks,
+            mm_prefix_range=mm_prefix_range,
+        ):
+            return
 
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
@@ -1511,7 +1638,6 @@ def _unified_attention_core(
             BLOCK_Q = config["BLOCK_M"] // num_queries_per_kv
             total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
             launch_config_2d = dict(config)
-
             grid_2d = (total_num_q_blocks, num_kv_heads)
             kernel_unified_attention_2d[grid_2d](
                 output_ptr=out,

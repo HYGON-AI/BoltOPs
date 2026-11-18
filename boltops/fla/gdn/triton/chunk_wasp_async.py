@@ -105,16 +105,19 @@ def _produce(keys, weights, values, states, residuals, shared, key_shared, h_sha
             (((begin + times[:, None]) * HG + head // (H // HG)) * 128 + columns[None, :]).to(gl.int32),
             times[:, None] < length, other=0)
         _ready("2")
-        if SAVE_VALUE:
-            _wait("8", chunk & 1)
-            value_tile = v_shared.load(u_layout)
-            _ready("9")
-            gl.store(residuals + u_offsets,value_tile,chunk * 64 + u_rows[:,None] < length)
+        # Publish the state before waiting for the residual. The consumer
+        # exposes this state before prediction starts; draining it here lets
+        # its global store overlap prediction and releases h_shared sooner.
         _wait("4", chunk & 1)
         state_tile = h_shared.load(layout)
         _ready("5")
         state_base = ((first_chunk + chunk) * H + head) * 16384
         gl.store(states + state_base + h_rows[:,None] * 128 + columns[None,:], state_tile)
+        if SAVE_VALUE:
+            _wait("8", chunk & 1)
+            value_tile = v_shared.load(u_layout)
+            _ready("9")
+            gl.store(residuals + u_offsets,value_tile,chunk * 64 + u_rows[:,None] < length)
 
 
 @gluon.jit
@@ -294,6 +297,15 @@ def _supports_async_wasp(options):
     return supported and arch_info.get_arch(k.device) == 'gfx946'
 
 
+def _fixed_async_tile_config(tokens, heads):
+    # H8 has only 16 CTAs with BV64. Splitting V once more improves
+    # occupancy on the measured T28672/T53248 workloads. H32 regresses
+    # with BV32, so keep this choice inside the verified long/H8 family.
+    if heads == 8 and tokens >= 28672 and tokens % 64 == 0:
+        return dict(BV=32, wasp_partition_regs=(48, 128))
+    return dict(BV=64, wasp_partition_regs=(64, 160))
+
+
 def _measured_async_config(options):
     if not _supports_async_wasp(options):
         return None
@@ -319,9 +331,11 @@ def _measured_async_config(options):
     elif (values.shape[2] != 32 or keys.shape[2] != 16
             or keys.shape[1] != 6656 or lengths.numel() != 4):
         return None
-    return dict(BK=128, BV=64, num_warps=4, num_stages=2,
+    tile = (_fixed_async_tile_config(keys.shape[1], values.shape[2])
+            if lengths is None else dict(BV=64, wasp_partition_regs=(64, 192)))
+    return dict(BK=128, num_warps=4, num_stages=2,
                 prediction_kwidth=4, weighted_k_major=lengths is None,
-                wasp_partition_regs=(64, 160) if lengths is None else (64, 192))
+                **tile)
 
 
 def _try_measured_async(k, w, u, **kwargs):

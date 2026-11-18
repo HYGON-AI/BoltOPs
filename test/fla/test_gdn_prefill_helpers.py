@@ -7,6 +7,7 @@ from functools import partial
 import pytest
 import torch
 import torch.nn.functional as functional
+import triton
 
 from boltops.fla import gdn
 from boltops.fla.gdn.triton import prefill_helpers
@@ -94,6 +95,171 @@ def test_rmsnorm_gated(device, dtype, width, eps):
 def test_public_exports_match_backend():
     for name in ('gdn_qkvzba_split', 'gdn_fused_gating', 'gdn_rmsnorm_gated'):
         assert getattr(gdn, name) is getattr(prefill_helpers, name)
+
+
+@pytest.mark.parametrize('rows,width,dtype,strided,supported,config,expected_rows', [
+    (384, 128, torch.bfloat16, False, True, None, 4),
+    (2048, 128, torch.bfloat16, False, True, None, 16),
+    (65536, 128, torch.bfloat16, False, True, None, 16),
+    (383, 128, torch.bfloat16, False, True, None, 1),
+    (384, 64, torch.bfloat16, False, True, None, 1),
+    (384, 128, torch.float32, False, True, None, 1),
+    (384, 128, torch.bfloat16, True, True, None, 1),
+    (384, 128, torch.bfloat16, False, False, None, 1),
+    (384, 128, torch.bfloat16, False, True, {'ROWS': 1}, 1),
+    (384, 128, torch.bfloat16, False, True, {'ROWS': 32}, 32),
+])
+def test_gfx946_rms_grouped_dispatch(rows, width, dtype, strided, supported,
+                                    config, expected_rows, monkeypatch):
+    launches = []
+
+    class Capture:
+        def __init__(self, grouped):
+            self.grouped = grouped
+
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                launches.append((self.grouped, grid, kwargs))
+            return launch
+
+    monkeypatch.setattr(prefill_helpers, '_gfx946_helper_device_supported', lambda device: supported)
+    monkeypatch.setattr(prefill_helpers, '_gdn_rmsnorm_gated_kernel', Capture(False))
+    monkeypatch.setattr(prefill_helpers, '_gdn_rmsnorm_gated_rows_kernel', Capture(True))
+    hidden = torch.empty(rows, width * (2 if strided else 1), dtype=dtype)
+    if strided:
+        hidden = hidden[:, ::2]
+    output = prefill_helpers.gdn_rmsnorm_gated(hidden, hidden, torch.empty(width, dtype=dtype),
+                                             kernel_cfg=config)
+    assert output.shape == hidden.shape and output.is_contiguous()
+    grouped, grid, kwargs = launches.pop()
+    assert not launches
+    assert grouped == (expected_rows > 1)
+    assert grid == (triton.cdiv(rows, expected_rows),)
+    if grouped:
+        assert kwargs['ROWS'] == expected_rows and kwargs['SILU_RCP']
+
+
+@pytest.mark.parametrize('tokens,dtype,supported,config,expected_block', [
+    (2048, torch.bfloat16, True, None, 4096),
+    (2047, torch.bfloat16, True, None, 512),
+    (2048, torch.float32, True, None, 512),
+    (2048, torch.bfloat16, False, None, 512),
+    (2048, torch.bfloat16, True, {'BLOCK': 512}, 512),
+])
+def test_gfx946_split_launch_config(tokens, dtype, supported, config, expected_block, monkeypatch):
+    launches = []
+
+    class Capture:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                launches.append((grid, kwargs))
+            return launch
+
+    monkeypatch.setattr(prefill_helpers, '_gfx946_helper_device_supported', lambda device: supported)
+    monkeypatch.setattr(prefill_helpers, '_gdn_qkvzba_split_kernel', Capture())
+    outputs = prefill_helpers.gdn_qkvzba_split(
+        torch.empty(tokens, 12288, dtype=dtype), torch.empty(tokens, 64, dtype=dtype),
+        16, 32, kernel_cfg=config)
+    assert all(output.is_contiguous() for output in outputs)
+    grid, kwargs = launches.pop()
+    assert not launches
+    assert grid == (triton.cdiv(12288, expected_block), tokens)
+    assert kwargs['BLOCK'] == expected_block
+
+
+@pytest.mark.parametrize('tokens,dtype,supported,strided,config,block,rows', [
+    (28672, torch.bfloat16, True, False, None, 4096, 8),
+    (28671, torch.bfloat16, True, False, None, 512, 1),
+    (28672, torch.bfloat16, False, False, None, 512, 1),
+    (28672, torch.float32, True, False, None, 512, 1),
+    (28672, torch.bfloat16, True, True, None, 512, 1),
+    (28672, torch.bfloat16, True, False, {}, 512, 1),
+    (28672, torch.bfloat16, True, False, {'BLOCK': 4096}, 4096, 1),
+    (28672, torch.bfloat16, True, False, {'BLOCK': 4096, 'ROWS': 8}, 4096, 8),
+    (3, torch.float32, False, False, {'ROWS': 1}, 512, 1),
+    (37, torch.bfloat16, True, True, {'ROWS': 8}, 512, 8),
+])
+def test_gfx946_split_grouped_launch_config(tokens, dtype, supported, strided,
+                                           config, block, rows, monkeypatch):
+    launches = []
+
+    class Capture:
+        def __init__(self, grouped):
+            self.grouped = grouped
+
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                launches.append((self.grouped, grid, kwargs))
+            return launch
+
+    monkeypatch.setattr(prefill_helpers, '_gfx946_helper_device_supported', lambda device: supported)
+    monkeypatch.setattr(prefill_helpers, '_gdn_qkvzba_split_kernel', Capture(False))
+    monkeypatch.setattr(prefill_helpers, '_gdn_qkvzba_split_rows_kernel', Capture(True))
+    step = 2 if strided else 1
+    projection = torch.empty(tokens, 2560 * step, dtype=dtype)[:, ::step]
+    gates = torch.empty(tokens, 16 * step, dtype=dtype)[:, ::step]
+    outputs = prefill_helpers.gdn_qkvzba_split(projection, gates, 2, 8, kernel_cfg=config)
+    assert all(output.is_contiguous() for output in outputs)
+    grouped, grid, options = launches.pop()
+    assert grouped is (rows > 1)
+    assert grid == (triton.cdiv(2560, block), triton.cdiv(tokens, rows))
+    assert options['BLOCK'] == block
+    if grouped:
+        assert options['ROWS'] == rows and options['TOTAL_ROWS'] == tokens
+
+
+@pytest.mark.parametrize('dtype,supported,config,expected', [
+    (torch.bfloat16, True, None, True),
+    (torch.bfloat16, False, None, False),
+    (torch.float32, True, None, False),
+    (torch.bfloat16, True, {}, False),
+    (torch.bfloat16, True, {'FAST_MATH': False}, False),
+    (torch.float32, False, {'FAST_MATH': True}, True),
+])
+def test_gfx946_gating_launch_config(dtype, supported, config, expected, monkeypatch):
+    launches = []
+
+    class Capture:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                launches.append(kwargs)
+            return launch
+
+    monkeypatch.setattr(prefill_helpers, '_gfx946_helper_device_supported', lambda device: supported)
+    monkeypatch.setattr(prefill_helpers, '_gdn_fused_gating_kernel', Capture())
+    values = torch.empty(7, 3, dtype=dtype)
+    prefill_helpers.gdn_fused_gating(values, values, torch.zeros(3), torch.zeros(3),
+                                    kernel_cfg=config)
+    assert launches.pop()['FAST_MATH'] is expected
+
+
+@pytest.mark.parametrize('tokens,heads,config,expected_block', [
+    (2048, 32, None, 256),
+    (6656, 32, None, 1024),
+    (6656, 64, None, 1024),
+    (3584, 64, None, 1024),
+    (28672, 8, None, 1024),
+    (53248, 8, None, 1024),
+    (6656, 64, {}, 256),
+    (6656, 64, {'BLOCK': 512}, 512),
+])
+def test_gfx946_gating_large_launch_config(tokens, heads, config, expected_block, monkeypatch):
+    launches = []
+
+    class Capture:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                launches.append((grid, kwargs))
+            return launch
+
+    monkeypatch.setattr(prefill_helpers, '_gfx946_helper_device_supported', lambda device: True)
+    monkeypatch.setattr(prefill_helpers, '_gdn_fused_gating_kernel', Capture())
+    values = torch.empty(tokens, heads, dtype=torch.bfloat16)
+    prefill_helpers.gdn_fused_gating(values, values, torch.zeros(heads), torch.zeros(heads),
+                                    kernel_cfg=config)
+    grid, options = launches.pop()
+    assert options['BLOCK'] == expected_block
+    assert grid == (triton.cdiv(tokens * heads, expected_block),)
 
 
 def test_zero_token_inputs_do_not_launch(monkeypatch):

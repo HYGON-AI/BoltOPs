@@ -8,16 +8,39 @@
     },
     "K=128,V=128,BT=64": {
       "BK": 128,
-      "BV": 64,
+      "BV": 128,
       "num_warps": 4,
-      "num_stages": 2,
-      "enable_v_mmac_cluster": 1
+      "num_stages": 2
     },
     "K=128,V=128,BT=32": {
       "BK": 128,
       "BV": 64,
       "num_warps": 4,
       "num_stages": 2
+    },
+    "K=128,V=8,BT=64": {
+      "BK": 128,
+      "BV": 8,
+      "num_warps": 2,
+      "num_stages": 2
+    },
+    "K=128,V=16,BT=64": {
+      "BK": 128,
+      "BV": 16,
+      "num_warps": 2,
+      "num_stages": 2
+    },
+    "K=128,V=32,BT=64": {
+      "BK": 128,
+      "BV": 32,
+      "num_warps": 4,
+      "num_stages": 2
+    },
+    "K=128,V=64,BT=64": {
+      "BK": 128,
+      "BV": 64,
+      "num_warps": 4,
+      "num_stages": 3
     }
   }
 }
