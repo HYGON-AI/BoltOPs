@@ -1110,6 +1110,10 @@ def test_default_config_warning_is_emitted_once(monkeypatch, caplog) -> None:
     backend = importlib.import_module(
         "boltops.fa.unified_attention.triton.unified_attention"
     )
+    # The boltops parent logger does not propagate to pytest's root handler.
+    # Capture at the emitting logger, independent of pytest's logging version.
+    monkeypatch.setattr(backend.logger, "handlers", [caplog.handler])
+    monkeypatch.setattr(backend.logger, "propagate", False)
     backend._warn_default_config_once.cache_clear()
     monkeypatch.setattr(config, "get_kernel_config", lambda *args, **kwargs: None)
     kwargs = dict(
