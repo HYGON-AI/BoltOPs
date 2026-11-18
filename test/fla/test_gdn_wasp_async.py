@@ -159,8 +159,7 @@ def test_public_dispatch_respects_explicit_config(config, eligible, architecture
 @pytest.mark.parametrize('block_v', [32, 64])
 @pytest.mark.parametrize('weighted_k_major', [False, True])
 def test_async_wasp_uses_native_matrix_reads(block_v, weighted_k_major):
-    if not _wasp_backend_compiles():
-        pytest.skip('Triton backend cannot compile WASP partitions')
+    _require_wasp_device()
     source, options = _wasp_compile_source(block_v, weighted_k_major)
     compiled = triton.compile(
         source, target=GPUTarget('hip', 'gfx946', 64), options=options)
