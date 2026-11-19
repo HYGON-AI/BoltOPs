@@ -10,6 +10,8 @@ on:
     - synchronize
     - reopened
     - ready_for_review
+    - labeled
+    - unlabeled
   push:
     branches:
     - release/0.1.0
@@ -22,13 +24,6 @@ on:
         options:
         - '26.04'
         - '26.10'
-      torch_version:
-        description: Torch version
-        type: choice
-        default: '2.13.0'
-        options:
-        - '2.11.0'
-        - '2.13.0'
       py_version:
         description: Python version
         type: choice
@@ -42,9 +37,50 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: boltops-ci-${{ github.event_name == 'workflow_dispatch' && github.run_id || github.event.pull_request.number || github.ref }}
+  group: boltops-ci-${{ (github.event_name == 'workflow_dispatch' || (github.event.label && github.event.label.name != 'ok-to-test')) && github.run_id || github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request_target' }}
 jobs:
+  authorize-ci:
+    if: >-
+      ${{ github.event_name != 'workflow_dispatch' &&
+          (!github.event.label || github.event.label.name == 'ok-to-test') }}
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+      issues: read
+    steps:
+    - name: Verify approval for this fork PR
+      if: github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name != github.repository
+      env:
+        GH_TOKEN: ${{ github.token }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        EXPECTED_SHA: ${{ github.event.pull_request.head.sha }}
+      run: |
+        set -euo pipefail
+        repo="repos/$GITHUB_REPOSITORY"
+        pr=$(gh api "$repo/pulls/$PR_NUMBER")
+        if ! jq -e --arg sha "$EXPECTED_SHA" '
+          .state == "open" and .head.sha == $sha and any(.labels[]; .name == "ok-to-test")
+        ' <<< "$pr" >/dev/null; then
+          echo "::error::The current fork PR head needs the ok-to-test label to run internal CI."
+          exit 1
+        fi
+
+        # Triage users can label PRs too. Verify who applied the active label.
+        approver=$(gh api --paginate --slurp "$repo/issues/$PR_NUMBER/events?per_page=100" --jq '
+          [ .[][] | select((.event == "labeled" or .event == "unlabeled") and .label.name == "ok-to-test") ]
+          | last | select(.event == "labeled") | .actor.login // empty')
+        if [[ -z "$approver" ]]; then
+          echo "::error::Could not verify who applied ok-to-test."
+          exit 1
+        fi
+        permission=$(gh api "$repo/collaborators/$approver/permission" --jq .permission)
+        case "$permission" in
+          admin|write|maintain) echo "Fork PR #$PR_NUMBER approved by $approver for internal CI." ;;
+          *) echo "::error::A maintainer with write access must remove and reapply ok-to-test."; exit 1 ;;
+        esac
+    - name: Confirm authorization
+      run: echo "CI may proceed."
   validate-manual:
     if: ${{ github.event_name == 'workflow_dispatch' }}
     runs-on: hygon-cpu
@@ -54,13 +90,12 @@ jobs:
       env:
         DTK_VERSION: ${{ inputs.dtk_version }}
         PYTHON_VERSION: ${{ inputs.py_version }}
-        TORCH_VERSION: ${{ inputs.torch_version }}
         SOURCE_SHA: ${{ inputs.commit || github.sha }}
       run: |
-        case "${DTK_VERSION}/${PYTHON_VERSION}/${TORCH_VERSION}" in
-          26.04/3.10/2.11.0|26.04/3.12/2.11.0|26.10/3.12/2.11.0|26.10/3.12/2.13.0) ;;
+        case "${DTK_VERSION}/${PYTHON_VERSION}" in
+          26.04/3.10|26.04/3.12|26.10/3.12) ;;
           *)
-            echo "Unsupported build combination: DTK ${DTK_VERSION}, Python ${PYTHON_VERSION}, Torch ${TORCH_VERSION}." >&2
+            echo "Unsupported build combination: DTK ${DTK_VERSION}, Python ${PYTHON_VERSION}." >&2
             exit 1
             ;;
         esac
@@ -71,47 +106,29 @@ jobs:
   build-manual:
     if: ${{ github.event_name == 'workflow_dispatch' }}
     needs: validate-manual
-    name: Build DTK${{ inputs.dtk_version }} (py${{ inputs.py_version }}, torch${{ inputs.torch_version }})
+    name: Build DTK${{ inputs.dtk_version }} (py${{ inputs.py_version }})
     uses: ./.github/workflows/_build-test-wheel.yml
     with:
       dtk_version: ${{ inputs.dtk_version }}
       dtk_ver: ${{ inputs.dtk_version == '26.04' && '2604' || '2610' }}
       source_sha: ${{ inputs.commit || github.sha }}
       py_version: ${{ inputs.py_version }}
-      numpy_version: ${{ inputs.py_version == '3.10' && '1.24.3' || '1.26.4' }}
-      torch_version: ${{ inputs.torch_version }}
       run_tests: false
   build2604:
-    if: ${{ github.event_name != 'workflow_dispatch' }}
-    name: DTK2604 (py${{ matrix.py_version }}, torch${{ matrix.torch_version }})
-    strategy:
-      fail-fast: false
-      matrix:
-        py_version: ['3.10', '3.12']
-        torch_version: ['2.11.0']
-        include:
-        - py_version: '3.10'
-          numpy_version: '1.24.3'
-        - py_version: '3.12'
-          numpy_version: '1.26.4'
+    needs: authorize-ci
+    name: DTK2604 (py3.10)
     uses: ./.github/workflows/_build-test-wheel.yml
     with:
       dtk_version: '26.04'
       dtk_ver: '2604'
       source_sha: ${{ github.event.pull_request.head.sha || github.sha }}
-      py_version: ${{ matrix.py_version }}
-      numpy_version: ${{ matrix.numpy_version }}
-      torch_version: ${{ matrix.torch_version }}
-      run_tests: ${{ github.event_name == 'pull_request_target' && matrix.py_version == '3.10' }}
+      py_version: '3.10'
+      numpy_version: '1.24.3'
+      torch_version: '2.11.0'
+      run_tests: ${{ github.event_name == 'pull_request_target' }}
   build2610:
-    if: ${{ github.event_name != 'workflow_dispatch' }}
-    name: DTK2610 (torch${{ matrix.torch_version }})
-    strategy:
-      fail-fast: false
-      matrix:
-        torch_version:
-        - '2.11.0'
-        - '2.13.0'
+    needs: authorize-ci
+    name: DTK2610 (py3.12)
     uses: ./.github/workflows/_build-test-wheel.yml
     with:
       dtk_version: '26.10'
@@ -119,8 +136,8 @@ jobs:
       source_sha: ${{ github.event.pull_request.head.sha || github.sha }}
       py_version: '3.12'
       numpy_version: '1.26.4'
-      torch_version: ${{ matrix.torch_version }}
-      run_tests: ${{ github.event_name == 'pull_request_target' && matrix.torch_version == '2.13.0' }}
+      torch_version: '2.13.0'
+      run_tests: ${{ github.event_name == 'pull_request_target' }}
   publish-2604:
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/release/0.1.0' }}
     needs:
@@ -142,7 +159,8 @@ jobs:
     secrets:
       PYPI_PASSWORD: ${{ secrets.PYPI_PASSWORD }}
   ci-result:
-    if: ${{ always() && github.event_name != 'workflow_dispatch' }}
+    name: ${{ github.event.label && github.event.label.name != 'ok-to-test' && 'Ignored label change' || 'ci-result' }}
+    if: ${{ always() && github.event_name != 'workflow_dispatch' && (!github.event.label || github.event.label.name == 'ok-to-test') }}
     needs:
     - build2604
     - build2610

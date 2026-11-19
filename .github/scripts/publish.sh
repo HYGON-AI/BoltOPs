@@ -31,13 +31,16 @@ import os
 import shutil
 
 dtk_version = os.environ["DTK_VER"]
-wheels = sorted(Path("output").glob(f"dtk{dtk_version}/py*/torch*/*.whl"))
-assert wheels, f"No built wheels found for DTK {dtk_version}"
+wheels = sorted(Path("output").glob("*.whl"))
+if len(wheels) != 1:
+    raise SystemExit(f"Expected one wheel for DTK {dtk_version}, found {len(wheels)}")
+wheel = wheels[0]
+if f"+dtk{dtk_version}." not in wheel.name:
+    raise SystemExit(f"Unexpected DTK tag in {wheel.name}")
 destination = Path("publish_wheels") / f"dtk{dtk_version}"
 destination.mkdir(parents=True, exist_ok=True)
-for wheel in wheels:
-    shutil.copy2(wheel, destination / wheel.name)
-    print(f"Publish wheel: {wheel}")
+shutil.copy2(wheel, destination / wheel.name)
+print(f"Publish wheel: {wheel}")
 PY
 
 for wheel in "publish_wheels/dtk${DTK_VER}"/*.whl; do
