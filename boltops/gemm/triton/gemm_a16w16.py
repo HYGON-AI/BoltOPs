@@ -3,8 +3,16 @@
 # Copyright © Advanced Micro Devices, Inc. All rights reserved.
 # Modified by Hygon Information Technology Co., Ltd., 2026.
 # Upstream reference: https://github.com/ROCm/aiter/blob/bbef5a6f2d3733b293c80d2cee6a8d464e88bc01/aiter/ops/triton/_triton_kernels/gemm/basic/gemm_a16w16.py
+import os
+from copy import deepcopy
+
+import torch
 import triton
 import triton.language as tl
+
+from boltops.utility.arch_info import DeviceInfo
+from ..config import get_gemm_config
+from ..validation import validate_output
 
 from boltops.gemm.triton.kernel_repr import make_kernel_repr
 from boltops.gemm.triton.pid_preprocessing import pid_grid, remap_xcd
@@ -177,3 +185,173 @@ def _gemm_a16_w16_kernel(
         else:
             c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
             tl.store(c_ptrs, c, mask=c_mask)
+
+
+def _resolve_activation(activation):
+    if activation is None:
+        return ""
+
+    from .activation import _get_activation_from_str
+
+    try:
+        return _get_activation_from_str(activation)
+    except (KeyError, TypeError):
+        raise ValueError(f"unsupported activation: {activation!r}") from None
+
+
+def gemm_a16w16(
+    a: torch.Tensor, b: torch.Tensor, out: torch.Tensor, *,
+    bias: torch.Tensor | None, activation: str | None,
+    device: DeviceInfo,
+    config: dict[str, object] | None = None,
+) -> None:
+    activation_fn = _resolve_activation(activation)
+    m, k = a.shape
+    n = b.shape[0]
+    out_dtype = out.dtype
+    validate_output(out, (m, n), a.device, (torch.float16, torch.bfloat16, torch.float32))
+    user_config = config
+    if user_config is not None:
+        config = deepcopy(user_config)
+    else:
+        use_tuned_shape = (
+            a.dtype == out_dtype == torch.float16
+            and bias is None
+            and activation is None
+            and out.is_contiguous()
+            and (a.stride() == (k, 1))
+            and (b.stride() == (1, n))
+        )
+        config, _ = get_gemm_config(
+            "GEMM-A16W16",
+            m,
+            n if use_tuned_shape else None,
+            k if use_tuned_shape else None,
+            backend="triton",
+            arch=device.arch,
+            cu_num=device.cu_count,
+        )
+
+    if "use_mls" in config:
+        from . import gemm_a16w16_wasp as kernels
+
+        if (
+            device.arch != "gfx946"
+            or a.dtype != torch.float16
+            or out_dtype != torch.float16
+            or bias is not None
+            or activation is not None
+            or a.stride() != (k, 1)
+            or b.stride() != (1, n)
+        ):
+            raise ValueError(
+                "recorded FP16 pipeline requires gfx946, FP16 output and TT operands without bias or activation"
+            )
+        wasp, wdra, use_mls, use_matrix_store = (
+            config.pop(key)
+            for key in ("wasp", "wdra", "use_mls", "use_matrix_store")
+        )
+        if wdra and (not wasp) or (use_matrix_store and (not use_mls)):
+            raise ValueError("invalid WDRA/MLS configuration")
+        if (wasp or wdra) and (not kernels.supports_wasp_wdra(device.arch)):
+            raise ValueError("target does not support WASP/WDRA")
+        if use_mls and (not kernels.arch_info.is_mls_avail()):
+            raise ValueError("target does not support MLS")
+        load_warps, mma_warps = kernels._resolve_wasp_topology(
+            wasp=wasp, wdra=wdra, wasp_num_load_warps=None, wasp_num_mma_warps=None
+        )
+        kernels._mode_launch_kwargs(
+            wasp=wasp, wdra=wdra, load_warps=load_warps, mma_warps=mma_warps
+        )
+        os.environ.setdefault("AMDGCN_USE_BUFFER_OPS", "1")
+        config = {
+            key: tuple(value) if isinstance(value, list) else value
+            for (key, value) in config.items()
+        }
+        config["HAS_BIAS"] = False
+        if use_mls:
+            config["USE_MATRIX_STORE"] = bool(use_matrix_store)
+        kernel = (
+            kernels._gemm_fp16_mls_kernel
+            if use_mls
+            else kernels._gemm_fp16_load_kernel
+        )
+        b = b.T
+        grid = lambda meta: (
+            triton.cdiv(m, meta["BLOCK_SIZE_M"])
+            * triton.cdiv(n, meta["BLOCK_SIZE_N"]),
+        )
+        kernel[grid](
+            a, b, out, b, m, n, k, *a.stride(), *b.stride(), *out.stride(), **config
+        )
+    else:
+        from .splitk_reduce import _gemm_splitk_reduce_kernel
+        from .gemm_config_utils import compute_splitk_params
+
+        if user_config is None:
+            config.setdefault("NUM_KSPLIT", 1)
+            config = compute_splitk_params(config, k)
+        M, N, K = (m, n, k)
+        w_t = b.T
+        if config["NUM_KSPLIT"] > 1:
+            y_pp = torch.empty(
+                (config["NUM_KSPLIT"], M, N), dtype=torch.float32, device=out.device
+            )
+        else:
+            y_pp = None
+        grid = lambda META: (
+            META["NUM_KSPLIT"]
+            * triton.cdiv(M, META["BLOCK_SIZE_M"])
+            * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+        )
+        _gemm_a16_w16_kernel[grid](
+            a,
+            w_t,
+            bias,
+            out if config["NUM_KSPLIT"] == 1 else y_pp,
+            M,
+            N,
+            K,
+            a.stride(0),
+            a.stride(1),
+            w_t.stride(0),
+            w_t.stride(1),
+            # The kernel assumes every stride is positive, even when
+            # the split dimension is unused.
+            M * N if config["NUM_KSPLIT"] == 1 else y_pp.stride(0),
+            out.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp.stride(1),
+            out.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
+            activation=activation_fn,
+            use_activation=activation is not None,
+            ADD_BIAS=bias is not None,
+            SKIP_REDUCE=False,
+            **config,
+        )
+        if config["NUM_KSPLIT"] > 1:
+            REDUCE_BLOCK_SIZE_M = 32
+            REDUCE_BLOCK_SIZE_N = 32
+            ACTUAL_KSPLIT = triton.cdiv(K, config["SPLITK_BLOCK_SIZE"])
+            grid_reduce = (
+                triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
+                triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
+            )
+            _gemm_splitk_reduce_kernel[grid_reduce](
+                y_pp,
+                out,
+                bias,
+                M,
+                N,
+                y_pp.stride(0),
+                y_pp.stride(1),
+                y_pp.stride(2),
+                out.stride(0),
+                out.stride(1),
+                REDUCE_BLOCK_SIZE_M,
+                REDUCE_BLOCK_SIZE_N,
+                ACTUAL_KSPLIT,
+                triton.next_power_of_2(config["NUM_KSPLIT"]),
+                ADD_BIAS=bias is not None,
+                activation=activation_fn,
+                use_activation=activation is not None,
+                KERNEL_NAME="_gemm_a16w16_reduce_kernel",
+            )

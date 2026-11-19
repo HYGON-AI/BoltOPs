@@ -5,8 +5,15 @@
 # Upstream reference: https://github.com/vllm-project/vllm/blob/aeeb36b1f17145975c6713242f2447bb8b98782b/vllm/model_executor/layers/quantization/awq_triton.py
 """Triton device kernels for gemm_a16w4."""
 
+from copy import deepcopy
+
+import torch
 import triton
 import triton.language as tl
+
+from boltops.utility.arch_info import DeviceInfo
+from ..config import get_gemm_config
+from ..validation import validate_output
 
 
 @triton.jit
@@ -246,3 +253,42 @@ def awq_gemm_kernel(a_ptr, b_ptr, c_ptr, zeros_ptr, scales_ptr, M, N, K,
 # qweights - [K     , M // 8], int32
 # scales   - [K // G, M     ], float16
 # zeros    - [K // G, M // 8], int32
+
+
+def gemm_a16w4(
+    a: torch.Tensor, packed_b: torch.Tensor, out: torch.Tensor, /, *,
+    b_scale: torch.Tensor, b_zero_points: torch.Tensor | None, group_size: int,
+    device: DeviceInfo, config: dict[str, object] | None = None,
+) -> None:
+    m, k = a.shape
+    n = packed_b.shape[1] * 8
+    validate_output(out, (m, n), a.device, (b_scale.dtype,), contiguous=True)
+    if b_zero_points is None:
+        b_zero_points = torch.zeros(
+            (k // group_size, n // 8), dtype=torch.int32, device=a.device,
+        )
+    user_config = config
+    if user_config is not None:
+        config = deepcopy(user_config)
+    else:
+        config, _ = get_gemm_config(
+            "GEMM-A16W4",
+            m,
+            n,
+            k,
+            backend="triton",
+            arch=device.arch,
+            cu_num=device.cu_count,
+        )
+
+    if config.get("SPLIT_K") != 1:
+        raise ValueError("AWQ public interface requires SPLIT_K=1")
+    M, N, K, b, result = (m, n, k, packed_b, out)
+    grid = lambda meta: (
+        triton.cdiv(m, meta["BLOCK_SIZE_M"]) * triton.cdiv(n, meta["BLOCK_SIZE_N"]),
+        1,
+    )
+    awq_gemm_kernel[grid](
+        a, b, result, b_zero_points, b_scale, M, N, K, group_size,
+        *a.stride(), *b_scale.stride(), *packed_b.stride(), *b_zero_points.stride(), **config
+    )

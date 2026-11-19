@@ -9,14 +9,21 @@ Upstream: ROCm/aiter ``aiter.ops.triton.batched_gemm_bf16``.
 Computes ``Y[i] = X[i] @ W[i]^T`` with ``W`` shaped ``[B, N, K]``.
 
 
-Launch parameters are supplied by the public interface configuration map.
+The backend entry resolves the launch configuration.
 """
 
 from __future__ import annotations
 
 
+from copy import deepcopy
+
+import torch
 import triton
 import triton.language as tl
+
+from boltops.utility.arch_info import DeviceInfo
+from ..config import get_gemm_config
+from ..validation import validate_output
 
 
 @triton.heuristics(
@@ -151,3 +158,64 @@ def _batched_gemm_a16w16_kernel(
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
 
     tl.store(c_ptrs, c, mask=c_mask)
+
+
+def batched_gemm_bf16(
+    a: torch.Tensor, b: torch.Tensor, out: torch.Tensor, /, *,
+    bias: torch.Tensor | None,
+    device: DeviceInfo, config: dict[str, object] | None = None,
+) -> None:
+    batch, m, k = a.shape
+    n = b.shape[1]
+    validate_output(out, (batch, m, n), a.device, (torch.float16, torch.bfloat16))
+    out_dtype = out.dtype
+    user_config = config
+    if user_config is not None:
+        config = deepcopy(user_config)
+    else:
+        layout = "TN" if b.stride(-1) == 1 else "TT"
+        use_tuned_shape = (a.dtype == out_dtype and a.stride(-1) == 1
+                          and (b.stride(-1) == 1 or b.stride(-2) == 1))
+        config, _ = get_gemm_config(
+            "BATCHED_GEMM-A16W16",
+            m,
+            n if use_tuned_shape else None,
+            k if use_tuned_shape else None,
+            B=batch if use_tuned_shape else None,
+            layout=layout,
+            backend="triton",
+            arch=device.arch,
+            cu_num=device.cu_count,
+        )
+    config.setdefault("BATCH_LAST_GRID", False)
+
+    for tensor in (a, b):
+        if batch > 1 and tensor.stride(0) == 1 and tensor.stride(-1) != 1 and tensor.stride(-2) != 1:
+            raise ValueError("batch-only contiguous storage does not provide a contiguous matrix axis")
+    b = b.transpose(1, 2)
+
+    def grid(meta):
+        tiles = triton.cdiv(m, meta["BLOCK_SIZE_M"]) * triton.cdiv(
+            n, meta["BLOCK_SIZE_N"]
+        )
+        return (
+            (tiles, 1, batch)
+            if meta.get("BATCH_LAST_GRID", False)
+            else (batch, tiles)
+        )
+
+    _batched_gemm_a16w16_kernel[grid](
+        a,
+        b,
+        out,
+        bias if bias is not None else out,
+        m,
+        n,
+        k,
+        *a.stride(),
+        *b.stride(),
+        *out.stride(),
+        bias.stride(0) if bias is not None else 1,
+        bias is not None,
+        **config,
+    )

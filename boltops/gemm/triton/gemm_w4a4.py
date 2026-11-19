@@ -1,8 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Modified by Hygon Information Technology Co., Ltd., 2026.
 
+from copy import deepcopy
+
+import torch
 import triton
 import triton.language as tl
+
+from boltops.utility.arch_info import DeviceInfo
+from ..config import get_gemm_config
+from ..validation import validate_output
 
 from boltops.gemm.triton.kernel_repr import make_kernel_repr
 from boltops.gemm.triton.pid_preprocessing import pid_grid, remap_xcd
@@ -712,3 +720,113 @@ def _gemm_w4a4_preshuffle_kernel(
         )
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
         tl.store(c_ptrs, c, mask=c_mask, cache_modifier=".wt")
+
+
+def gemm_w4a4(
+    a: torch.Tensor, b: torch.Tensor, out: torch.Tensor, /, *,
+    a_scale: torch.Tensor, b_scale: torch.Tensor,
+    device: DeviceInfo, config: dict[str, object] | None = None,
+) -> None:
+    m, stored_k = a.shape
+    n, k = b.shape[0], stored_k * 2
+    validate_output(out, (m, n), a.device, (torch.float16, torch.bfloat16))
+    user_config = config
+    if device.arch != "gfx946":
+        raise NotImplementedError("native FP4 is not supported on this target")
+    if user_config is not None:
+        config = deepcopy(user_config)
+    else:
+        config, _ = get_gemm_config(
+            "GEMM-W4A4",
+            m,
+            n,
+            k,
+            backend="triton",
+            arch=device.arch,
+            cu_num=device.cu_count,
+        )
+    from .splitk_reduce import _gemm_splitk_reduce_kernel
+    from .common_utils import get_splitk
+
+    if user_config is None:
+        config.setdefault("NUM_KSPLIT", 1)
+        config["BLOCK_SIZE_K"] = min(
+            config["BLOCK_SIZE_K"], 1 << (k - 1).bit_length()
+        )
+        config["SPLITK_BLOCK_SIZE"] = k
+    x, w, M, N, K = (a, b, m, n, k // 2)
+    w, x_scales, w_scales = (w.T, a_scale, b_scale)
+    if config["NUM_KSPLIT"] > 1:
+        SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(
+            K, config["BLOCK_SIZE_K"], config["NUM_KSPLIT"]
+        )
+        config["SPLITK_BLOCK_SIZE"] = SPLITK_BLOCK_SIZE
+        config["BLOCK_SIZE_K"] = BLOCK_SIZE_K
+        config["NUM_KSPLIT"] = NUM_KSPLIT
+    if config["BLOCK_SIZE_K"] >= 2 * K:
+        config["BLOCK_SIZE_K"] = triton.next_power_of_2(2 * K)
+        config["SPLITK_BLOCK_SIZE"] = 2 * K
+        config.setdefault("NUM_KSPLIT", 1)
+    config["BLOCK_SIZE_K"] = max(config["BLOCK_SIZE_K"], 128)
+    if config["NUM_KSPLIT"] > 1:
+        y_pp = torch.empty(
+            (config["NUM_KSPLIT"], M, N), dtype=torch.float32, device=x.device
+        )
+    else:
+        config["SPLITK_BLOCK_SIZE"] = 2 * K
+        y_pp = None
+    grid = lambda META: (
+        META["NUM_KSPLIT"]
+        * triton.cdiv(M, META["BLOCK_SIZE_M"])
+        * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+    )
+    _gemm_w4a4_kernel[grid](
+        x,
+        w,
+        out if config["NUM_KSPLIT"] == 1 else y_pp,
+        x_scales,
+        w_scales,
+        M,
+        N,
+        K,
+        x.stride(0),
+        x.stride(1),
+        w.stride(0),
+        w.stride(1),
+        0 if config["NUM_KSPLIT"] == 1 else y_pp.stride(0),
+        out.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp.stride(1),
+        out.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
+        x_scales.stride(0),
+        x_scales.stride(1),
+        w_scales.stride(0),
+        w_scales.stride(1),
+        **config,
+    )
+    if config["NUM_KSPLIT"] > 1:
+        REDUCE_BLOCK_SIZE_M = 16
+        REDUCE_BLOCK_SIZE_N = 64
+        ACTUAL_KSPLIT = triton.cdiv(K, config["SPLITK_BLOCK_SIZE"] // 2)
+        grid_reduce = (
+            triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
+            triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
+        )
+        _gemm_splitk_reduce_kernel[grid_reduce](
+            y_pp,
+            out,
+            None,
+            M,
+            N,
+            y_pp.stride(0),
+            y_pp.stride(1),
+            y_pp.stride(2),
+            out.stride(0),
+            out.stride(1),
+            REDUCE_BLOCK_SIZE_M,
+            REDUCE_BLOCK_SIZE_N,
+            ACTUAL_KSPLIT,
+            triton.next_power_of_2(config["NUM_KSPLIT"]),
+            ADD_BIAS=False,
+            activation="",
+            use_activation=False,
+            KERNEL_NAME="_gemm_w4a4_reduce_kernel",
+        )

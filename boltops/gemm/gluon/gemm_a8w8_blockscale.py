@@ -7,6 +7,10 @@ BF16 output and tile M/N/K=(128,256,128). Each entry owns its layouts,
 partition resources, pipeline and compile-time legality checks.
 """
 
+import sys
+
+import torch
+import triton
 from triton.experimental import gluon as g
 from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language.amd.cdna4 import async_copy
@@ -28,6 +32,9 @@ from triton.experimental.gluon.language.amd.hcu import (
     sched_barrier,
     packed_scale_fma,
 )
+
+from boltops.utility.arch_info import DeviceInfo
+from ..validation import validate_output
 
 
 @g.jit
@@ -392,3 +399,39 @@ def _gemm_a8w8_blockscale_as_fp32_bs_fp32_recipe_a_1x128_recipe_b_128x128_bm128_
         [8, 8, 240, 240],
     )
 
+
+def gemm_a8w8_blockscale(
+    a: torch.Tensor, b: torch.Tensor, out: torch.Tensor, /, *,
+    a_scale: torch.Tensor, b_scale: torch.Tensor,
+    block_size: tuple[int, int], device: DeviceInfo,
+    config: dict[str, object],
+) -> None:
+    m, k = a.shape
+    n = b.shape[0]
+    bn, bk = block_size
+    validate_output(
+        out, (m, n), a.device, (torch.float16, torch.bfloat16, torch.float32), contiguous=True,
+    )
+
+    kernel = getattr(sys.modules[__name__], config.pop("kernel"))
+    config = {
+        key: tuple(value) if isinstance(value, list) else value
+        for key, value in config.items()
+    }
+    grid = lambda meta: (
+        triton.cdiv(m, meta["BLOCK_SIZE_M"]),
+        triton.cdiv(n, meta["BLOCK_SIZE_N"]),
+    )
+    kernel[grid](
+        a,
+        b,
+        a_scale,
+        b_scale,
+        out,
+        M=m,
+        N=n,
+        K=k,
+        GROUP_N=bn,
+        GROUP_K=bk,
+        **config,
+    )

@@ -38,7 +38,7 @@ def test_gemm_a8w8_fp8(M: int, N: int, K: int):
 
 
 @GPU_REQUIRED
-def test_gemm_a8w8_int8_channel_scales():
+def test_gemm_a8w8_int8_channel_scales(override_gemm_config):
     torch.manual_seed(1)
     M, N, K = 32, 64, 64
     a = torch.randint(-8, 8, (M, K), dtype=torch.int8)
@@ -47,12 +47,12 @@ def test_gemm_a8w8_int8_channel_scales():
     scale_b = torch.rand((N, 1), dtype=torch.float32) * 0.1 + 0.01
     golden = (a.float() @ b.float()) * scale_a * scale_b.T
 
+    override_gemm_config("GEMM-A8W8", dict(BLOCK_SIZE_M=32, BLOCK_SIZE_N=32, BLOCK_SIZE_K=32))
     out = gemm_a8w8(
         a.to(DEVICE),
         b.T.contiguous().to(DEVICE),
         scale_a.to(DEVICE),
         scale_b.to(DEVICE),
         dtype=torch.float16,
-        config=dict(BLOCK_SIZE_M=32, BLOCK_SIZE_N=32, BLOCK_SIZE_K=32),
     )
     torch.testing.assert_close(out.cpu().float(), golden, atol=2e-2, rtol=2e-2)
