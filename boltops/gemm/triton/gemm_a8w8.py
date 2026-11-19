@@ -5,8 +5,15 @@
 # Source before relocation: https://github.com/HYGON-AI/BoltOPs/blob/4a179c81d1aa9f12fe5b63bb3caa800ea226c57f/boltops/gemm/triton/triton_scaled_mm.py
 """Triton device kernels for gemm_a8w8."""
 
+from copy import deepcopy
+
+import torch
 import triton
 import triton.language as tl
+
+from boltops.utility.arch_info import DeviceInfo
+from ..config import get_gemm_config
+from ..validation import validate_output
 
 
 @triton.jit
@@ -134,3 +141,78 @@ def scaled_mm_kernel(
 
 # input   - [M, K]
 # weight - [K, N]
+
+
+def gemm_a8w8(
+    a: torch.Tensor, b: torch.Tensor, out: torch.Tensor, /, *,
+    a_scale: torch.Tensor, b_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    device: DeviceInfo, config: dict[str, object] | None = None,
+) -> None:
+    m, k = a.shape
+    n = b.shape[0]
+    validate_output(out, (m, n), a.device, (torch.float16, torch.bfloat16, torch.float32))
+    try:
+        a_scale = a_scale.view(-1, 1)
+        b_scale = b_scale.view(-1, 1)
+    except RuntimeError:
+        raise ValueError("whole-K scales must be scalar or flattenable vector views") from None
+    user_config = config
+    if user_config is not None:
+        config = deepcopy(user_config)
+    else:
+        config, _ = get_gemm_config(
+            "GEMM-A8W8",
+            m,
+            n,
+            k,
+            backend="triton",
+            arch=device.arch,
+            cu_num=device.cu_count,
+        )
+
+    M, N, K, result = (m, n, k, out)
+    b = b.T
+    block_size_m, block_size_n, block_size_k = (
+        config["BLOCK_SIZE_" + dim] for dim in ("M", "N", "K")
+    )
+    block_size_sa = 1 if a_scale.numel() == 1 else block_size_m
+    block_size_sb = 1 if b_scale.numel() == 1 else block_size_n
+    accumulator_dtype = tl.float32 if a.is_floating_point() else tl.int32
+    grid = lambda meta: (
+        triton.cdiv(m, meta["BLOCK_SIZE_M"]) * triton.cdiv(n, meta["BLOCK_SIZE_N"]),
+    )
+    scaled_mm_kernel[grid](
+        a,
+        b,
+        a_scale,
+        b_scale,
+        result,
+        bias,
+        M,
+        N,
+        K,
+        a.stride(0),
+        a.stride(1),
+        b.stride(0),
+        b.stride(1),
+        result.stride(0),
+        result.stride(1),
+        a_scale.stride(0),
+        b_scale.stride(0),
+        accumulator_dtype,
+        BLOCK_SIZE_M=block_size_m,
+        BLOCK_SIZE_N=block_size_n,
+        BLOCK_SIZE_K=block_size_k,
+        **(
+            {
+                k: v
+                for (k, v) in config.items()
+                if k not in ("BLOCK_SIZE_M", "BLOCK_SIZE_N", "BLOCK_SIZE_K")
+            }
+            if config
+            else {}
+        ),
+        BLOCK_SIZE_SCALE_A=block_size_sa,
+        BLOCK_SIZE_SCALE_B=block_size_sb,
+    )

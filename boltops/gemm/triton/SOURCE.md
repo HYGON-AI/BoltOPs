@@ -1,9 +1,9 @@
 Triton GEMM implementations
 ===========================
 
-Public host functions live in `boltops/gemm/`. Backend files contain device
-kernels and their compilation/configuration helpers, without duplicate GEMM
-host entry points.
+Public GEMM entry points live in `boltops/gemm/`. Each Triton implementation
+module contains its backend entry point and device kernels. The block-scaled
+entry point loads the FP8 or INT8 kernel for the input dtype.
 
 | Backend file | Source / implementation |
 | --- | --- |

@@ -45,7 +45,7 @@ def _a8w8_blockscale_golden(
 
 
 @GPU_REQUIRED
-def test_gemm_a8w8_blockscale_correctness():
+def test_gemm_a8w8_blockscale_correctness(override_gemm_config):
     torch.manual_seed(0)
     M, N, K = 64, 128, 128
     block_k = block_n = 128
@@ -65,13 +65,13 @@ def test_gemm_a8w8_blockscale_correctness():
         "num_warps": 4,
         "num_stages": 2,
     }
+    override_gemm_config("GEMM-A8W8_BLOCKSCALE", config)
     out = gemm_a8w8_blockscale(
         x.to(DEVICE),
         w.to(DEVICE),
         x_scale.to(DEVICE),
         w_scale.to(DEVICE),
         dtype=torch.float16,
-        config=config,
         backend="triton",
     )
     torch.testing.assert_close(out.cpu().float(), golden, atol=5e-2, rtol=5e-2)

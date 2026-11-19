@@ -2,17 +2,45 @@
 # SPDX-License-Identifier: MIT
 """Recorded Gluon selection and its explicit native input contract."""
 
+import sys
 from importlib import import_module
+from types import ModuleType
 
 import pytest
 import torch
 
-from boltops.gemm import gemm_a8w8_blockscale
+from boltops.gemm import gemm_a8w8_blockscale, gluon as gluon_backend
 from boltops.gemm.config import get_gemm_config
 
 PROFILE = "DTYPE=float8_e4m3fn-AS=float32-BS=float32-OUT=bfloat16-RECIPE_A=1x128-RECIPE_B=128x128"
 MODULE = "gemm_a8w8_blockscale"
 KERNEL = "_gemm_a8w8_blockscale_as_fp32_bs_fp32_recipe_a_1x128_recipe_b_128x128_bm128_bn256_bk128_kernel"
+
+
+def _require_blockscale_intrinsic():
+    if not gluon_backend.supports_a8w8_blockscale():
+        pytest.skip("requires Triton HCU packed_scale_fma")
+
+
+def test_gluon_selection_requires_packed_scale_fma(monkeypatch):
+    from boltops.utility.arch_info import DeviceInfo
+
+    hcu = "triton.experimental.gluon.language.amd.hcu"
+    monkeypatch.setitem(sys.modules, hcu, ModuleType(hcu))
+    monkeypatch.setattr(
+        gluon_backend, "get_gemm_config", lambda *args, **kwargs: ({"kernel": KERNEL}, True),
+    )
+    a = torch.empty((16, 128), dtype=torch.float8_e4m3fn)
+    b = torch.empty((128, 128), dtype=a.dtype)
+    out = torch.empty((16, 128), dtype=torch.bfloat16)
+    options = dict(
+        a_scale=torch.empty((16, 1)), b_scale=torch.empty((1, 1)),
+        block_size=(128, 128), device=DeviceInfo(0, "gfx946", 48),
+    )
+    resolve = gluon_backend.resolve_a8w8_blockscale_backend
+    assert resolve(a, b, out, automatic=True, **options) is None
+    with pytest.raises(NotImplementedError, match="requires Triton HCU packed_scale_fma"):
+        resolve(a, b, out, automatic=False, **options)
 
 
 def test_48tg_config_is_exact_and_cu_specific():
@@ -52,16 +80,17 @@ def test_48tg_config_is_exact_and_cu_specific():
 
 
 @pytest.mark.parametrize(
-    "m,scale_dtype,expected_backend",
+    "m,scale_dtype,expected_backend,strided_out",
     [
-        (768, torch.float32, "gluon"),
-        (640, torch.float32, "triton"),
-        (768, torch.float16, "triton"),
+        (768, torch.float32, "gluon", False),
+        (640, torch.float32, "triton", False),
+        (768, torch.float16, "triton", False),
+        (768, torch.float32, "gluon", True),
     ],
 )
 @pytest.mark.parametrize("a_column_major", [False, True])
 def test_auto_selects_only_the_recorded_gluon_shape(
-    monkeypatch, m, scale_dtype, expected_backend, a_column_major
+    monkeypatch, m, scale_dtype, expected_backend, a_column_major, strided_out
 ):
     if not torch.cuda.is_available():
         pytest.skip("requires GPU allocations")
@@ -69,7 +98,7 @@ def test_auto_selects_only_the_recorded_gluon_shape(
 
     if get_device_info().arch != "gfx946" or get_device_info().cu_count != 48:
         pytest.skip("requires gfx946 with 48 CU")
-    pytest.importorskip("triton.experimental.gluon.language.amd.hcu")
+    _require_blockscale_intrinsic()
     gluon = import_module(f"boltops.gemm.gluon.{MODULE}")
     triton = import_module("boltops.gemm.triton.gemm_a8w8_blockscale_fp8")
     calls = []
@@ -99,8 +128,18 @@ def test_auto_selects_only_the_recorded_gluon_shape(
     b = torch.empty((2048, 6144), dtype=a.dtype, device=a.device)
     sa = torch.empty((m, 48), dtype=scale_dtype, device=a.device)
     sb = torch.empty((16, 48), dtype=torch.float32, device=a.device)
-    out = gemm_a8w8_blockscale(a, b, sa, sb)
-    assert out.shape == (m, 2048) and out.dtype == torch.bfloat16
+    out = None
+    if strided_out:
+        out = torch.empty((2048, m), dtype=torch.bfloat16, device=a.device).T
+    if strided_out and expected_backend == "gluon":
+        with pytest.raises(ValueError, match="output must be contiguous"):
+            gemm_a8w8_blockscale(a, b, sa, sb, out=out)
+        assert not calls
+        return
+    result = gemm_a8w8_blockscale(a, b, sa, sb, out=out)
+    if strided_out:
+        assert result is out
+    assert result.shape == (m, 2048) and result.dtype == torch.bfloat16
     assert len(calls) == 1 and calls[0][0] == expected_backend
     if expected_backend == "gluon":
         assert calls[0][1] == (6, 8)
@@ -123,7 +162,7 @@ def test_explicit_gluon_rejects_unsupported_combinations(k, scale_dtype, out_dty
 
     if get_device_info().arch != "gfx946" or get_device_info().cu_count != 48:
         pytest.skip("requires gfx946 with 48 CU")
-    pytest.importorskip("triton.experimental.gluon.language.amd.hcu")
+    _require_blockscale_intrinsic()
     a = torch.empty((128, k), dtype=torch.float8_e4m3fn, device="cuda")
     b = torch.empty((256, k), dtype=a.dtype, device=a.device)
     sa = torch.empty((128, k // 128), dtype=scale_dtype, device=a.device)
@@ -142,7 +181,7 @@ def test_native_gluon_blockscale_small():
 
     if get_device_info().arch != "gfx946" or get_device_info().cu_count != 48:
         pytest.skip("requires gfx946 with 48 CU")
-    pytest.importorskip("triton.experimental.gluon.language.amd.hcu")
+    _require_blockscale_intrinsic()
     torch.manual_seed(713)
     a = (torch.randint(-4, 5, (128, 256)).float() / 4).to(torch.float8_e4m3fn)
     b = (torch.randint(-4, 5, (256, 256)).float() / 4).to(torch.float8_e4m3fn)
@@ -160,7 +199,7 @@ def test_native_gluon_blockscale_small():
     torch.testing.assert_close(out.cpu(), golden.bfloat16(), atol=0, rtol=0)
 
 
-def test_gluon_kernel_and_tile_come_from_config(monkeypatch):
+def test_gluon_kernel_and_tile_come_from_config(monkeypatch, override_gemm_config):
     if not torch.cuda.is_available():
         pytest.skip("requires GPU allocations")
     seen = {}
@@ -172,7 +211,7 @@ def test_gluon_kernel_and_tile_come_from_config(monkeypatch):
 
             return launch
 
-    pytest.importorskip("triton.experimental.gluon.language.amd.hcu")
+    _require_blockscale_intrinsic()
     kernels = import_module("boltops.gemm.gluon.gemm_a8w8_blockscale")
     monkeypatch.setattr(kernels, "kernel_another_tile", CaptureKernel(), raising=False)
     config = dict(
@@ -188,7 +227,8 @@ def test_gluon_kernel_and_tile_come_from_config(monkeypatch):
     b = torch.empty((256, 256), dtype=a.dtype, device=a.device)
     sa = torch.empty((128, 2), dtype=torch.float32, device=a.device)
     sb = torch.empty((2, 2), dtype=torch.float32, device=a.device)
-    gemm_a8w8_blockscale(a, b, sa, sb, backend="gluon", config=config)
+    override_gemm_config("GEMM-A8W8_BLOCKSCALE", config, backend="gluon")
+    gemm_a8w8_blockscale(a, b, sa, sb, backend="gluon")
     assert config == before
     assert seen["grid"] == (2, 2)
     assert tuple(seen["params"]["BLOCK_SIZE_" + dim] for dim in ("M", "N", "K")) == (

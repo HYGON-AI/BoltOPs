@@ -134,6 +134,7 @@ def test_fp4_unpacked_scale_layouts(dtype, a_column_major, b_column_major):
 @pytest.mark.parametrize("split_k", [1, 2])
 @pytest.mark.parametrize("transpose_bm", [False, True])
 def test_batched_fp4_unpacked_matrix_layouts(
+    override_gemm_config,
     dtype, a_column_major, scale_column_major, split_k, transpose_bm, request
 ):
     require_hcu()
@@ -167,8 +168,9 @@ def test_batched_fp4_unpacked_matrix_layouts(
         num_stages=1,
         cache_modifier=".cg",
     )
+    override_gemm_config("BATCHED_GEMM-A16W4", config)
     result = batched_gemm_a16w4(
-        a, b, scales, dtype=dtype, config=config, transpose_bm=transpose_bm
+        a, b, scales, dtype=dtype, transpose_bm=transpose_bm
     )
     weights = torch.tensor([1, 2, 4, 1, 2])[None, :, None] * torch.exp2(
         scales_cpu.float() - 127
@@ -222,7 +224,7 @@ def test_explicit_gluon_rejects_noncontiguous_operands():
     b = torch.empty((256, 256), dtype=a.dtype, device=a.device)
     sa = torch.ones((128, 2), device=a.device)
     sb = torch.ones((2, 2), device=a.device)
-    with pytest.raises(NotImplementedError, match="requires contiguous"):
+    with pytest.raises(NotImplementedError, match="requires contiguous operands"):
         gemm_a8w8_blockscale(a, b, sa, sb, backend="gluon")
 
 

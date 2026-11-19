@@ -21,7 +21,7 @@ GPU_REQUIRED = pytest.mark.skipif(
 
 
 @GPU_REQUIRED
-def test_gemm_a16w4_correctness():
+def test_gemm_a16w4_correctness(override_gemm_config):
     torch.manual_seed(0)
     # Keep small on PMD; larger grids have aborted under gfx946 sim.
     M, N, K, G = 16, 64, 64, 64
@@ -45,7 +45,8 @@ def test_gemm_a16w4_correctness():
         "GROUP_SIZE_M": 8,
         "SPLIT_K": 1,
     }
-    out = gemm_a16w4(x, qweight, scales, qzeros, config=config)
+    override_gemm_config("GEMM-A16W4", config)
+    out = gemm_a16w4(x, qweight, scales, qzeros)
     shifts = torch.tensor([0, 4, 1, 5, 2, 6, 3, 7]) * 4
     weights = ((qweight.cpu().unsqueeze(-1) >> shifts) & 15).reshape(K, N)
     zeros = ((qzeros.cpu().unsqueeze(-1) >> shifts) & 15).reshape(K // G, N)

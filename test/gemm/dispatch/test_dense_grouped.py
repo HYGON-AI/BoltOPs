@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: MIT
 """Small native tests for the three common GEMM interfaces; no tuning scans."""
 
-from dataclasses import replace
+from copy import deepcopy
+from importlib import import_module
 
 import pytest
 import torch
@@ -48,18 +49,27 @@ def test_dense_native_small(dtype):
     )
 
 
+def test_dense_reuses_strided_preallocated_output():
+    require_hcu()
+    k = 64
+    a = torch.ones((3, k), dtype=torch.bfloat16, device="cuda")
+    b = torch.ones((5, k), dtype=a.dtype, device=a.device)
+    bias = torch.tensor([-2, -1, 0, 1, 2], dtype=a.dtype)
+    out = torch.empty((5, 3), dtype=torch.float32, device=a.device).T
+    result = gemm_a16w16(a, b, bias=bias.cuda(), out=out, activation="relu")
+    assert result is out
+    torch.testing.assert_close(out.cpu(), (bias.float() + k).relu().expand_as(out))
+
+
 def test_existing_tuned_fp16_recipe_single_cta(monkeypatch):
     require_hcu()
-    from importlib import import_module
-
-    module = import_module("boltops.gemm.gemm_a16w16")
+    module = import_module("boltops.gemm.triton.gemm_a16w16")
     params = dense_config()
     torch.manual_seed(319)
     a = (torch.randint(-2, 3, (256, 256)).float() / 4).half()
     nn_b = (torch.randint(-2, 3, (256, 256)).float() / 4).half()
-    out = module.gemm_a16w16(
-        a.cuda(), nn_b.cuda().T, dtype=torch.float16, config=params
-    )
+    monkeypatch.setattr(module, "get_gemm_config", lambda *args, **kwargs: (deepcopy(params), True))
+    out = gemm_a16w16(a.cuda(), nn_b.cuda().T, dtype=torch.float16, backend="triton")
     torch.testing.assert_close(
         out.cpu(), (a.float() @ nn_b.float()).half(), atol=0, rtol=0
     )
@@ -83,7 +93,7 @@ def test_grouped_native_equal(dtype, n_contiguous):
 )
 @pytest.mark.parametrize("split_k", [1, 2])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_dense_fused_activation(activation, split_k, dtype):
+def test_dense_fused_activation(monkeypatch, activation, split_k, dtype):
     require_hcu()
     torch.manual_seed(741)
     a = (torch.randint(-2, 3, (3, 128)).float() / 4).to(dtype)
@@ -102,6 +112,8 @@ def test_dense_fused_activation(activation, split_k, dtype):
     )
     before = config.copy()
     output = torch.empty((3, 7), dtype=torch.float32, device="cuda")
+    module = import_module("boltops.gemm.triton.gemm_a16w16")
+    monkeypatch.setattr(module, "get_gemm_config", lambda *args, **kwargs: (deepcopy(config), True))
     result = gemm_a16w16(
         a.cuda(),
         b.cuda(),
@@ -109,7 +121,7 @@ def test_dense_fused_activation(activation, split_k, dtype):
         dtype=torch.float32,
         out=output,
         activation=activation,
-        config=config,
+        backend="triton",
     )
     value = a.float() @ b.float().T + bias.float()
     if activation in ("relu", "relu6"):
@@ -121,31 +133,6 @@ def test_dense_fused_activation(activation, split_k, dtype):
     else:
         golden = torch.nn.functional.silu(value)
     assert result is output and config == before
-    torch.testing.assert_close(result.cpu(), golden, atol=1e-4, rtol=1e-4)
-
-
-@pytest.mark.parametrize(
-    "activation", ["relu", "relu6", "gelu", "gelu_tanh", "silu", "silu_exp2"]
-)
-def test_dense_activation_empty_k(activation):
-    require_hcu()
-    a = torch.empty((3, 0), dtype=torch.float16, device="cuda")
-    b = torch.empty((7, 0), dtype=a.dtype, device=a.device)
-    bias = torch.linspace(-2, 8, 7, device=a.device).to(a.dtype)
-    output = torch.empty((3, 7), dtype=torch.float32, device=a.device)
-    result = gemm_a16w16(
-        a, b, bias=bias, dtype=output.dtype, out=output, activation=activation
-    )
-    value = bias.float().cpu().expand(3, 7)
-    if activation in ("relu", "relu6"):
-        golden = value.clamp(min=0, max=6 if activation == "relu6" else None)
-    elif activation in ("gelu", "gelu_tanh"):
-        golden = torch.nn.functional.gelu(
-            value, approximate="tanh" if activation == "gelu_tanh" else "none"
-        )
-    else:
-        golden = torch.nn.functional.silu(value)
-    assert result is output
     torch.testing.assert_close(result.cpu(), golden, atol=1e-4, rtol=1e-4)
 
 

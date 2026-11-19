@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # SPDX-License-Identifier: MIT
-"""Each operation owns backend branching and directly launches native kernels."""
+"""Public GEMM entry points select and invoke native backends."""
 
 from importlib import import_module
 import pytest
@@ -63,7 +63,8 @@ def test_unimplemented_backend_fails_without_retry(interface, backend):
         getattr(gemm, interface)(*args, **kwargs)
 
 
-def test_public_batched_directly_launches_jit():
+@pytest.mark.parametrize("backend", ["auto", "unknown"])
+def test_public_batched_reuses_strided_output(backend):
     if not torch.cuda.is_available():
         pytest.skip("requires GPU allocations")
     public = import_module("boltops.gemm.batched_gemm_bf16")
@@ -72,13 +73,15 @@ def test_public_batched_directly_launches_jit():
     assert not hasattr(kernels, "batched_gemm_a16w16")
     a = torch.ones((2, 3, 32), device="cuda", dtype=torch.float16)
     b = torch.ones((2, 5, 32), device="cuda", dtype=torch.float16)
-    out = public.batched_gemm_bf16(a, b, dtype=torch.float16)
+    output = torch.empty((2, 5, 3), device=a.device, dtype=a.dtype).transpose(1, 2)
+    out = public.batched_gemm_bf16(a, b, out=output, backend=backend)
+    assert out is output
     torch.testing.assert_close(
         out.cpu(), torch.full((2, 3, 5), 32.0, dtype=torch.float16), atol=0, rtol=0
     )
 
 
-def test_batched_aiter_output_and_config(monkeypatch):
+def test_batched_aiter_output_and_config(override_gemm_config):
     if not torch.cuda.is_available():
         pytest.skip("requires GPU")
     a = torch.ones((1, 3, 32), device="cuda", dtype=torch.float16)
@@ -94,7 +97,8 @@ def test_batched_aiter_output_and_config(monkeypatch):
         BATCH_LAST_GRID=True,
     )
     before = params.copy()
-    result = gemm.batched_gemm_bf16(a, b, dtype=torch.float16, out=output, config=params)
+    override_gemm_config("BATCHED_GEMM-A16W16", params)
+    result = gemm.batched_gemm_bf16(a, b, dtype=torch.float16, out=output)
     assert result is output and params == before
     torch.testing.assert_close(
         result.cpu(), torch.full((1, 3, 5), 32.0, dtype=torch.float16), atol=0, rtol=0

@@ -1,8 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Modified by Hygon Information Technology Co., Ltd., 2026.
 
+from copy import deepcopy
+
+import torch
 import triton
 import triton.language as tl
+
+from boltops.utility.arch_info import DeviceInfo
+from ..config import get_gemm_config
+from ..validation import validate_output
 
 from boltops.gemm.triton.kernel_repr import make_kernel_repr
 from boltops.gemm.triton.pid_preprocessing import pid_grid, remap_xcd
@@ -424,3 +432,72 @@ def _gemm_a8w8_blockscale_preshuffle_kernel(
         )
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
         tl.store(c_ptrs, c, mask=c_mask)
+
+
+def gemm_a8w8_blockscale(
+    a: torch.Tensor, b: torch.Tensor, out: torch.Tensor, /, *,
+    a_scale: torch.Tensor, b_scale: torch.Tensor,
+    block_size: tuple[int, int], device: DeviceInfo,
+    config: dict[str, object] | None = None,
+) -> None:
+    m, k = a.shape
+    n = b.shape[0]
+    validate_output(out, (m, n), a.device, (torch.float16, torch.bfloat16, torch.float32))
+    bn, bk = block_size
+    user_config = config
+    if user_config is not None:
+        config = deepcopy(user_config)
+    else:
+        config, _ = get_gemm_config(
+            "GEMM-A8W8_BLOCKSCALE",
+            m,
+            n,
+            k,
+            backend="triton",
+            arch=device.arch,
+            cu_num=device.cu_count,
+        )
+
+    if a.dtype == torch.int8:
+        from .gemm_a8w8_blockscale_int8 import (
+            _w8a8_block_int8_matmul as kernel,
+        )
+    else:
+        from .gemm_a8w8_blockscale_fp8 import (
+            _w8a8_triton_block_scaled_mm as kernel,
+        )
+    config.setdefault("BLOCK_SIZE_N", bn)
+    config.setdefault("BLOCK_SIZE_K", bk)
+    if bk % config["BLOCK_SIZE_K"]:
+        raise ValueError("BLOCK_SIZE_K must divide the scale K block")
+    M, N, K, C, block_n, block_k = (m, n, k, out, bn, bk)
+
+    def grid(META):
+        return (
+            triton.cdiv(M, META["BLOCK_SIZE_M"])
+            * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+        )
+
+    kernel[grid](
+        a,
+        b,
+        C,
+        a_scale,
+        b_scale,
+        M,
+        N,
+        K,
+        block_n,
+        block_k,
+        a.stride(-2),
+        a.stride(-1),
+        b.stride(1),
+        b.stride(0),
+        C.stride(-2),
+        C.stride(-1),
+        a_scale.stride(-2),
+        a_scale.stride(-1),
+        b_scale.stride(1),
+        b_scale.stride(0),
+        **config,
+    )

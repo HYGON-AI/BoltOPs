@@ -64,6 +64,7 @@ def _assert_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
 @pytest.mark.parametrize("prealloc", [False, True])
 @pytest.mark.parametrize("layout", ["tn", "tt"])
 def test_batched_gemm_a16w16_correctness(
+    override_gemm_config,
     dtype: torch.dtype,
     use_bias: bool,
     B: int,
@@ -91,7 +92,8 @@ def test_batched_gemm_a16w16_correctness(
         "num_stages": 2,
     }
     stored_w = w if layout == "tn" else w.transpose(1, 2).contiguous().transpose(1, 2)
-    out = batched_gemm_bf16(x, stored_w, bias, dtype=dtype, out=y, config=config)
+    override_gemm_config("BATCHED_GEMM-A16W16", config)
+    out = batched_gemm_bf16(x, stored_w, bias, dtype=dtype, out=y)
     golden = _golden(x, w, bias, dtype)
     assert out.shape == (B, M, N)
     _assert_close(out, golden)
@@ -99,7 +101,7 @@ def test_batched_gemm_a16w16_correctness(
 
 
 @GPU_REQUIRED
-def test_batched_gemm_a16w16_batch_last_grid():
+def test_batched_gemm_a16w16_batch_last_grid(override_gemm_config):
     """The rocBLAS-aligned grid order preserves batched GEMM semantics."""
     B, M, N, K = 3, 17, 48, 32
     x = torch.randn((B, M, K), dtype=torch.float16, device=DEVICE)
@@ -114,7 +116,8 @@ def test_batched_gemm_a16w16_batch_last_grid():
         "num_stages": 2,
         "BATCH_LAST_GRID": True,
     }
-    out = batched_gemm_bf16(x, w, dtype=torch.float16, config=config)
+    override_gemm_config("BATCHED_GEMM-A16W16", config)
+    out = batched_gemm_bf16(x, w, dtype=torch.float16)
     torch.testing.assert_close(
         out.cpu(), torch.bmm(x.cpu(), w_kn.cpu()), atol=1e-2, rtol=1e-2
     )
@@ -150,6 +153,7 @@ _BENCH_CASES = [
     ids=[f"{layout} B={B} M={M} N={N} K={K}" for B, M, N, K, layout in _BENCH_CASES],
 )
 def test_bench_batched_gemm_bf16(
+    override_gemm_config,
     B: int,
     M: int,
     N: int,
@@ -173,8 +177,10 @@ def test_bench_batched_gemm_bf16(
     config = selected_config(B, M, N, K, _BENCH_DTYPE, layout)
     config["BATCH_LAST_GRID"] = True
 
+    override_gemm_config("BATCHED_GEMM-A16W16", config)
+
     def run() -> None:
-        batched_gemm_bf16(x, weight, dtype=_BENCH_DTYPE, out=output, config=config)
+        batched_gemm_bf16(x, weight, dtype=_BENCH_DTYPE, out=output)
 
     run()
     assert output.shape == (B, M, N)

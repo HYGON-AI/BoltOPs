@@ -16,8 +16,15 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
+from copy import deepcopy
+
+import torch
 import triton
 import triton.language as tl
+
+from boltops.utility.arch_info import DeviceInfo
+from ..config import get_gemm_config
+from ..validation import validate_output
 
 
 def _matmul_launch_metadata(
@@ -142,3 +149,56 @@ def matmul_kernel_persistent(
             accumulator += bias
         c = accumulator.to(c_ptr.dtype.element_ty)
         tl.store(c_ptrs, c, mask=c_mask)
+
+
+def gemm_a32w32(
+    a: torch.Tensor, b: torch.Tensor, out: torch.Tensor, /, *,
+    bias: torch.Tensor | None,
+    device: DeviceInfo, config: dict[str, object] | None = None,
+) -> None:
+    m, k = a.shape
+    n = b.shape[0]
+    validate_output(out, (m, n), a.device, (torch.float32,))
+    user_config = config
+    if user_config is not None:
+        config = deepcopy(user_config)
+    else:
+        config, _ = get_gemm_config(
+            "GEMM-A32W32",
+            m,
+            n,
+            k,
+            backend="triton",
+            arch=device.arch,
+            cu_num=device.cu_count,
+        )
+
+    b = b.T
+
+    def grid(meta):
+        return (
+            min(
+                device.cu_count,
+                triton.cdiv(m, meta["BLOCK_SIZE_M"])
+                * triton.cdiv(n, meta["BLOCK_SIZE_N"]),
+            ),
+        )
+
+    matmul_kernel_persistent[grid](
+        a,
+        b,
+        out,
+        bias,
+        m,
+        n,
+        k,
+        *a.stride(),
+        *b.stride(),
+        *out.stride(),
+        NUM_SMS=device.cu_count,
+        A_LARGE=a.numel() > 2**31,
+        B_LARGE=b.numel() > 2**31,
+        C_LARGE=out.numel() > 2**31,
+        HAS_BIAS=bias is not None,
+        **config,
+    )

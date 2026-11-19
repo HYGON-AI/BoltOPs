@@ -173,6 +173,7 @@ def test_strided_bias_is_rejected_before_launch(operation):
 @pytest.mark.parametrize("preallocate", [False, True])
 @pytest.mark.parametrize("output_scale", [None, 2.0])
 def test_batched_a16w4_output_layout(
+    override_gemm_config,
     dtype, split_k, transpose_bm, preallocate, output_scale
 ):
     require_hcu()
@@ -200,13 +201,13 @@ def test_batched_a16w4_output_layout(
         cache_modifier=".cg",
     )
     before = config.copy()
+    override_gemm_config("BATCHED_GEMM-A16W4", config)
     result = gemm.batched_gemm_a16w4(
         a,
         b,
         scales,
         dtype=dtype,
         out=output,
-        config=config,
         transpose_bm=transpose_bm,
         out_scale=(
             None if output_scale is None else torch.tensor(output_scale, device="cuda")
