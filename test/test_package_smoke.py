@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import importlib.util
 
+from packaging.version import Version
+
 from boltops import __version__
 from boltops.fused_moe import (
     fused_experts,
@@ -100,7 +102,7 @@ from boltops.tools.extend_attention_triton_tune.tune_extend_attention import (
 
 
 def test_version():
-    assert __version__ == "0.1.0"
+    assert Version(__version__).public == "0.1.0"
 
 
 def test_operator_package_exports():
