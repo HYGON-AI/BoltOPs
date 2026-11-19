@@ -10,6 +10,42 @@
       "BK": 128,
       "num_warps": 4,
       "num_stages": 1
+    },
+    "K=128,V=8,BT=64,H=2": {
+      "BV": 8,
+      "BK": 128,
+      "num_warps": 8,
+      "num_stages": 2
+    },
+    "K=128,V=16,BT=64,H=16": {
+      "BV": 16,
+      "BK": 128,
+      "num_warps": 8,
+      "num_stages": 2
+    },
+    "K=128,V=32,BT=64,H=16": {
+      "BV": 32,
+      "BK": 128,
+      "num_warps": 8,
+      "num_stages": 3
+    },
+    "K=128,V=64,BT=64,H=16": {
+      "BV": 32,
+      "BK": 128,
+      "num_warps": 8,
+      "num_stages": 3
+    },
+    "K=128,V=8,BT=64,H=8": {
+      "BV": 8,
+      "BK": 128,
+      "num_warps": 8,
+      "num_stages": 2
+    },
+    "K=128,V=32,BT=64,H=32": {
+      "BV": 32,
+      "BK": 128,
+      "num_warps": 8,
+      "num_stages": 3
     }
   }
 }

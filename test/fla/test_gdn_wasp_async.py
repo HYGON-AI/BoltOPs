@@ -70,6 +70,7 @@ def _require_wasp_device():
     # fixed: envelope generalization (unmeasured but in-bounds)
     (2112, 16, 32, False, True), (2048, 16, 64, False, True),
     (2048, 2, 8, False, True), (2048, 2, 16, False, True),
+    (28608, 2, 8, False, True), (28672, 2, 16, False, True),
     # fixed: out of envelope
     (1984, 16, 32, False, False), (2080, 16, 32, False, False),
     (2048, 16, 4, False, False), (1984, 16, 64, False, False),
@@ -90,9 +91,11 @@ def test_measured_dispatch_scope(tokens, kv_heads, heads, varlen, expected, monk
         use_exp2=False, output_final_state=True, save_new_value=True))
     assert (config is not None) == expected
     if config is not None:
-        assert config['BV'] == 64
+        small_heads = not varlen and heads == 8 and tokens >= 28672
+        assert config['BV'] == (32 if small_heads else 64)
         assert config['weighted_k_major'] == (not varlen)
-        assert config['wasp_partition_regs'] == ((64, 192) if varlen else (64, 160))
+        assert config['wasp_partition_regs'] == (
+            (64, 192) if varlen else (48, 128) if small_heads else (64, 160))
 
 
 @pytest.mark.parametrize('option,value', [
@@ -302,7 +305,9 @@ def _build_bench_1102_runner(case, device='cuda'):
     states = tensor(1, total // 64, value_heads, value_width, width)
     residuals = tensor(1, total, value_heads, value_width)
     final = tensor(*inputs[-1], dtype=torch.float32)
-    return partial(target.chunk_wasp_async_kernel[2, value_heads], keys, weights, values, gates, initial, states, residuals, final, None, None, None, total, H=value_heads, HG=heads, BV=64, USE_INITIAL=True, STATE_ROWS=1, HAS_INDICES=False, IS_VARLEN=False, SAVE_VALUE=True, SAVE_FINAL=True, USE_EXP2=False, STATE_VK=True, SMALL=False, PREDICTION_KWIDTH=4, WEIGHTED_K_MAJOR=True, PARTITION_REGS=(64, 160), num_warps=4, num_stages=2, use_async_copy=True, wasp_partition_warps=(4, 4), wasp_partition_regs=(64, 160), wasp_wdra=True)
+    config = target._fixed_async_tile_config(total, value_heads)
+    block_v, regs = config['BV'], config['wasp_partition_regs']
+    return partial(target.chunk_wasp_async_kernel[128 // block_v, value_heads], keys, weights, values, gates, initial, states, residuals, final, None, None, None, total, H=value_heads, HG=heads, BV=block_v, USE_INITIAL=True, STATE_ROWS=1, HAS_INDICES=False, IS_VARLEN=False, SAVE_VALUE=True, SAVE_FINAL=True, USE_EXP2=False, STATE_VK=True, SMALL=False, PREDICTION_KWIDTH=4, WEIGHTED_K_MAJOR=True, PARTITION_REGS=regs, num_warps=4, num_stages=2, use_async_copy=True, wasp_partition_warps=(4, 4), wasp_partition_regs=regs, wasp_wdra=True)
 
 
 @pytest.mark.bench

@@ -244,7 +244,7 @@ def run_op_benches(files: list[str], raw_dir: Path, backend: str) -> int:
         sys.executable, "-m", "pytest", *files,
         "--bench", "-m", "bench",
         "--continue-on-collection-errors",
-        "-q", "-s", "--no-header", "-p", "no:cacheprovider",
+        "-q", "-s", "-ra", "--no-header", "-p", "no:cacheprovider",
     ]
     env = dict(
         os.environ,

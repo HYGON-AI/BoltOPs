@@ -5,12 +5,16 @@
 from __future__ import annotations
 
 import importlib
+import gc
 import inspect
 import json
 import logging
 import math
 import os
+import re
 import sys
+from collections import defaultdict
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -350,6 +354,30 @@ def test_unified_attention_matches_independent_paged_reference(causal: bool) -> 
         q, k, v, q_lens, kv_lens, table, q.shape[-1] ** -0.5, causal
     )
     torch.testing.assert_close(out, reference, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires an HCU/CUDA Triton device")
+def test_gfx946_fully_masked_prefill_rows_return_zero() -> None:
+    generator = torch.Generator().manual_seed(17)
+    q_cpu = torch.randn(5, 4, 32, generator=generator).bfloat16()
+    k_cpu = torch.randn(1, 16, 2, 32, generator=generator).bfloat16()
+    v_cpu = torch.randn(1, 16, 2, 32, generator=generator).bfloat16()
+    reference = _reference_single_masked(
+        q_cpu, k_cpu, v_cpu, 3, 32**-.5,
+        lambda query_pos, keys: keys <= query_pos,
+    ).nan_to_num(0.0)
+    q, k, v = q_cpu.cuda(), k_cpu.cuda(), v_cpu.cuda()
+    out = torch.empty_like(q)
+    unified_attention(
+        q, k, v, out, torch.tensor([0, 5], device='cuda', dtype=torch.int32),
+        5, torch.tensor([3], device='cuda', dtype=torch.int32), 3, 32**-.5,
+        True, (-1, -1), torch.zeros(1, 1, dtype=torch.int32).cuda(),
+        0.0, None, None, None,
+    )
+    actual = out.cpu()
+    assert torch.isfinite(actual).all()
+    assert torch.count_nonzero(actual[:2]) == 0
+    torch.testing.assert_close(actual, reference, atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires an HCU/CUDA Triton device")
@@ -1399,6 +1427,107 @@ def test_gfx946_workload_fallback_dispatch(case: _UaWorkloadShape, monkeypatch) 
     assert result == expected
 
 
+@pytest.mark.parametrize('feature', ['plain', 'other_arch', 'prefill', 'softcap', 'window', 'bf16_cache', 'missing_scale'])
+def test_gfx946_gluon_wasp_route_guards(feature, monkeypatch):
+    backend = importlib.import_module('boltops.fa.unified_attention.triton.unified_attention')
+    wasp = importlib.import_module('boltops.fa.unified_attention.triton.unified_attention_wasp_gluon')
+    calls = []
+    monkeypatch.setattr(backend, '_gluon_wasp_device_supported', lambda device: feature != 'other_arch')
+    monkeypatch.setattr(wasp, 'launch_unified_attention_wasp_gluon', lambda *args: calls.append(args))
+    q = torch.empty(2, 32, 128, dtype=torch.bfloat16)
+    cache_dtype = torch.bfloat16 if feature == 'bf16_cache' else torch.float8_e4m3fn
+    kwargs = dict(
+        q=q, k=torch.empty(2, 16, 8, 128, dtype=cache_dtype),
+        v=torch.empty(2, 16, 8, 128, dtype=cache_dtype), out=torch.empty_like(q),
+        cu_seqlens_q=torch.arange(3, dtype=torch.int32),
+        max_seqlen_q=2 if feature == 'prefill' else 1,
+        seqused_k=torch.full((2,), 16, dtype=torch.int32), softmax_scale=128**-.5,
+        window_size=(8, -1) if feature == 'window' else (-1, -1),
+        block_table=torch.arange(2, dtype=torch.int32)[:, None],
+        softcap=1.0 if feature == 'softcap' else 0.0,
+        k_descale=None if feature == 'missing_scale' else torch.ones(1), v_descale=torch.ones(1),
+        alibi_slopes=None, output_scale=None, qq_bias=None, sinks=None, mm_prefix_range=None,
+    )
+    assert backend._try_unified_attention_wasp_gluon(**kwargs) is (feature == 'plain')
+    assert len(calls) == (1 if feature == 'plain' else 0)
+
+
+def test_gfx946_gluon_wasp_device_guard_rejects_cpu(monkeypatch):
+    backend = importlib.import_module('boltops.fa.unified_attention.triton.unified_attention')
+    monkeypatch.setattr(backend, 'get_arch', lambda device: 'gfx946')
+    assert not backend._gluon_wasp_device_supported(torch.device('cpu'))
+    assert backend._gluon_wasp_device_supported(torch.device('cuda', 0))
+
+
+def test_gfx946_gluon_wasp_measured_launch_options(monkeypatch):
+    backend = importlib.import_module('boltops.fa.unified_attention.triton.unified_attention_wasp_gluon')
+    calls = []
+
+    class CaptureKernel:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                calls.append((grid, kwargs))
+            return launch
+
+    monkeypatch.setattr(backend, 'unified_attention_wasp_gluon', CaptureKernel())
+    q = torch.empty(2, 32, 128, dtype=torch.bfloat16)
+    cache = torch.empty(2, 16, 8, 128, dtype=torch.float8_e4m3fn)
+    backend.launch_unified_attention_wasp_gluon(
+        q, cache, cache, torch.empty_like(q), torch.arange(3, dtype=torch.int32),
+        torch.full((2,), 16, dtype=torch.int32), torch.zeros(2, 1, dtype=torch.int32),
+        torch.ones(1), torch.ones(1), 128**-.5,
+    )
+    grid, options = calls.pop()
+    assert grid == (2, 8)
+    assert options['TILE_SIZE'] == 64
+    assert options['PARTITION_WARPS'] == options['wasp_partition_warps'] == (4, 4)
+    assert options['PARTITION_REGS'] == options['wasp_partition_regs'] == (40, 116)
+    assert options['wasp_wdra'] is True
+
+
+@pytest.mark.parametrize('feature,expected', [
+    ('plain', 'wasp'), ('batch511', 'ordinary'), ('key377', 'ordinary'),
+    ('softcap', 'ordinary'), ('other_device', 'ordinary'),
+    ('partial_scratch', 'ordinary'),
+])
+def test_gfx946_wasp_default_dispatch(feature, expected, monkeypatch):
+    backend = importlib.import_module('boltops.fa.unified_attention.triton.unified_attention')
+    wasp = importlib.import_module('boltops.fa.unified_attention.triton.unified_attention_wasp_gluon')
+    calls = []
+
+    class CaptureKernel:
+        def __init__(self, route):
+            self.route = route
+
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                calls.append((self.route, kwargs))
+            return launch
+
+    monkeypatch.setattr(backend, 'kernel_unified_attention_2d', CaptureKernel('ordinary'))
+    monkeypatch.setattr(wasp, 'unified_attention_wasp_gluon', CaptureKernel('wasp'))
+    monkeypatch.setattr(backend, '_gluon_wasp_device_supported', lambda device: feature != 'other_device')
+    monkeypatch.setattr(backend, 'get_arch', lambda device: 'gfx946')
+    monkeypatch.setattr(backend, '_get_unified_attention_2d_config', lambda **kwargs: dict(BLOCK_M=16, TILE_SIZE=32, num_warps=4, num_stages=2))
+    batch = 511 if feature == 'batch511' else 512
+    length = 377 if feature == 'key377' else 376
+    q = torch.empty(batch, 32, 128, dtype=torch.bfloat16)
+    cache = torch.empty(2, 16, 8, 128, dtype=torch.float8_e4m3fn)
+    backend._unified_attention_core(
+        q, cache, cache, torch.empty_like(q), torch.arange(batch + 1, dtype=torch.int32), 1,
+        torch.full((batch,), length, dtype=torch.int32), length, 128**-.5, True, (-1, -1),
+        torch.zeros(batch, 24, dtype=torch.int32), 1.0 if feature == 'softcap' else 0.0,
+        None, torch.ones(1), torch.ones(1),
+        softmax_segm_output=torch.empty(1) if feature == 'partial_scratch' else None,
+    )
+    route, options = calls.pop()
+    assert route == expected
+    if expected == 'wasp':
+        assert options['TILE_SIZE'] == 64
+        assert options['PARTITION_REGS'] == (40, 116)
+        assert options['PARTITION_WARPS'] == (4, 4)
+
+
 _SMALL_UA_SHAPE_SCORES = 2 * 10**8
 _HUGE_UA_SHAPE_BYTES = 96 * 1024**3
 _UA_LARGE_ENABLED = os.environ.get("BOLTOPS_UA_RUN_LARGE", "") not in ("", "0")
@@ -1593,6 +1722,10 @@ _BENCH_1102_SHAPES = [
     {'id': 's067', 'op': 'mha_slice19', 'type': 'mha', 'stage': 'Prefill_Chunk', 'inputs': [[4, 64, 4608, 192], [4, 64, 131072, 192], [4, 64, 131072, 128]], 'dtypes': ['BF16', 'BF16', 'BF16'], 'outputs': [[4, 64, 4608, 128]], 'output_dtypes': ['BF16'], 'locations': [{'file': 'shape_09_kimi26_128k_s2000.xlsx', 'sheet': 'prefill_shape', 'row': 35}, {'file': 'shape_09_kimi26_128k_s2000.xlsx', 'sheet': 'prefill_shape', 'row': 72}]},
     {'id': 's068', 'op': 'mha_slice0', 'type': 'mha', 'stage': 'Prefill_Chunk', 'inputs': [[32, 64, 6656, 192], [32, 64, 53248, 192], [32, 64, 53248, 128]], 'dtypes': ['BF16', 'BF16', 'BF16'], 'outputs': [[32, 64, 6656, 128]], 'output_dtypes': ['BF16'], 'locations': [{'file': 'shape_09_kimi26_128k_s2000.xlsx', 'sheet': 'prefill_shape_cp8', 'row': 16}, {'file': 'shape_09_kimi26_128k_s2000.xlsx', 'sheet': 'prefill_shape_cp8', 'row': 36}]},
     {'id': 's069', 'op': 'mha_slice1', 'type': 'mha', 'stage': 'Prefill_Chunk', 'inputs': [[32, 64, 6656, 192], [32, 64, 106496, 192], [32, 64, 106496, 128]], 'dtypes': ['BF16', 'BF16', 'BF16'], 'outputs': [[32, 64, 6656, 128]], 'output_dtypes': ['BF16'], 'locations': [{'file': 'shape_09_kimi26_128k_s2000.xlsx', 'sheet': 'prefill_shape_cp8', 'row': 17}, {'file': 'shape_09_kimi26_128k_s2000.xlsx', 'sheet': 'prefill_shape_cp8', 'row': 37}]},
+    # s070: all-gather CP modeling needs ~150.6-163.8 GiB per rank, past any
+    # current card -- the runtime guard skips it (reason kept via -ra) rather
+    # than OOMing. To actually run this scale, rewrite as a ring-style case
+    # (SGLang issue #22223, vLLM PCP strategy 2).
     {'id': 's070', 'op': 'mha_slice2', 'type': 'mha', 'stage': 'Prefill_Chunk', 'inputs': [[32, 64, 3072, 192], [32, 64, 131072, 192], [32, 64, 131072, 128]], 'dtypes': ['BF16', 'BF16', 'BF16'], 'outputs': [[32, 64, 3072, 128]], 'output_dtypes': ['BF16'], 'locations': [{'file': 'shape_09_kimi26_128k_s2000.xlsx', 'sheet': 'prefill_shape_cp8', 'row': 18}, {'file': 'shape_09_kimi26_128k_s2000.xlsx', 'sheet': 'prefill_shape_cp8', 'row': 38}]},
     {'id': 's071', 'op': 'eagle3_paged_attn', 'type': 'mha', 'stage': 'NextN_Decode', 'inputs': [[4, 64, 1, 128], [4, 64, 131072, 128], [4, 64, 131072, 128]], 'dtypes': ['BF16', 'FP8E4M3', 'FP8E4M3'], 'outputs': [[4, 64, 1, 128]], 'output_dtypes': ['BF16'], 'locations': [{'file': 'shape_09_kimi26_128k_s2000.xlsx', 'sheet': 'decode_shape', 'row': 66}]},
     {'id': 's072', 'op': 'gqa_attention_slice0', 'type': 'mha', 'stage': 'Prefill_Chunk', 'inputs': [[1, 64, 6656, 128], [1, 8, 6656, 128], [1, 8, 6656, 128]], 'dtypes': ['BF16', 'FP8E4M3', 'FP8E4M3'], 'outputs': [[1, 64, 6656, 128]], 'output_dtypes': ['BF16'], 'locations': [{'file': 'shape_10_hy3_128k_s2000.xlsx', 'sheet': 'prefill_shape', 'row': 15}, {'file': 'shape_10_hy3_128k_s2000.xlsx', 'sheet': 'prefill_shape', 'row': 53}]},
@@ -1654,29 +1787,100 @@ _BENCH_1102_SHAPES = [
 ]
 
 
-def _bench_1102_cases():
+def _ua1102_parallel_layout(location):
+    """DP/CP assignment of one source row; see docs/ops/fa/bench_1102.md.
+
+    Nominal TP8 and CP8 use the same eight cards, so CP must not also
+    divide heads by eight."""
+    name, sheet = location['file'], location['sheet']
+    if sheet == 'prefill_shape_cp8':
+        return 8, 1, 8
+    if name.startswith(('shape_07_', 'shape_08_', 'shape_12_')):
+        return 1, 1, 1
+    if name.startswith(('shape_09_', 'shape_10_')):
+        return (16, 16, 1) if sheet == 'decode_shape' else (8, 8, 1)
+    if name.startswith('shape_11_'):
+        return (8, 4, 1) if sheet == 'decode_shape' else (8, 8, 1)
+    raise ValueError(f'Unspecified 1102 parallel layout: {location}')
+
+
+def _ua1102_cp_intervals(shape, size, rank):
+    local_q = shape['inputs'][0][2]
+    key_len = shape['inputs'][1][2]
+    # A CP chunk holds 8 * 6656 tokens. The final chunk can be shorter;
+    # some GQA source rows still say 6656 for that final local query.
+    match = re.search(r'_slice(\d+)$', shape['op'])
+    if match:
+        history = int(match[1]) * 53248
+        current = min(53248, key_len - history)
+    else:
+        current = local_q * size
+        history = key_len - current
+    if history < 0 or current <= 0:
+        raise ValueError(f'Invalid CP query history for {shape["id"]}')
+    blocks = 2 * size
+    lengths = [current // blocks + (i < current % blocks) for i in range(blocks)]
+    offsets = [history]
+    for length in lengths:
+        offsets.append(offsets[-1] + length)
+    return [[offsets[i], offsets[i + 1]] for i in (rank, blocks - rank - 1)
+            if lengths[i]]
+
+
+def _ua1102_parallel_cases(shapes):
+    """Expand source rows into the per-rank workloads actually timed."""
     cases = []
-    for shape in _BENCH_1102_SHAPES:
-        routes = ('no_scratch', 'scratch')
-        for route in routes:
-            cases.append({
-                'shape_id': shape['id'], 'source_op': shape['op'], 'route': route,
-                'measurement': 'component' if shape['op'] == 'gdn_chunk_delta' else 'operator',
-                'input_shapes': json.dumps(shape['inputs'], separators=(',', ':')),
-                'input_dtypes': ','.join(shape['dtypes']),
-                'output_shapes': json.dumps(shape['outputs'], separators=(',', ':')),
-                'output_dtypes': ','.join(shape['output_dtypes']),
-                'sources': json.dumps(shape['locations'], separators=(',', ':')),
-                'shape': shape,
-            })
+    for source in shapes:
+        profiles = defaultdict(list)
+        for location in source['locations']:
+            profiles[_ua1102_parallel_layout(location)].append(location)
+        for (tp, dp, cp), locations in profiles.items():
+            mode = f'tp{tp}_cp{cp}' if cp > 1 else f'tp{tp}_dp{dp}'
+            for rank in range(cp):
+                shape = deepcopy(source)
+                shape['locations'] = deepcopy(locations)
+                q, k, v = shape['inputs']
+                if cp > 1:
+                    intervals = _ua1102_cp_intervals(source, cp, rank)
+                    q[2] = sum(end - begin for begin, end in intervals)
+                    # The two descriptors share one paged KV allocation. Only
+                    # the longest causal prefix used by this rank is needed.
+                    k[2] = v[2] = max(end for _, end in intervals)
+                    shape['outputs'][0][1:3] = q[1:3]
+                else:
+                    # DPA batches and decode's TP-local heads are already
+                    # reflected in the source table; do not shard them again.
+                    intervals = [[k[2] - q[2], k[2]]]
+                for route in ('no_scratch', 'scratch'):
+                    cases.append({
+                        'shape_id': source['id'], 'source_op': source['op'],
+                        'route': route, 'measurement': 'operator',
+                        'parallel_mode': mode, 'tp': tp, 'dp': dp, 'cp': cp,
+                        'attention_tp': tp // (dp * cp),
+                        'rank': rank,
+                        'q_intervals': json.dumps(intervals, separators=(',', ':')),
+                        'input_shapes': json.dumps(shape['inputs'], separators=(',', ':')),
+                        'input_dtypes': ','.join(shape['dtypes']),
+                        'output_shapes': json.dumps(shape['outputs'], separators=(',', ':')),
+                        'output_dtypes': ','.join(shape['output_dtypes']),
+                        'source_input_shapes': json.dumps(source['inputs'], separators=(',', ':')),
+                        'source_output_shapes': json.dumps(source['outputs'], separators=(',', ':')),
+                        'sources': json.dumps(locations, separators=(',', ':')),
+                        'shape': shape,
+                    })
     return cases
 
 
+def _bench_1102_cases():
+    return _ua1102_parallel_cases(_BENCH_1102_SHAPES)
+
+
 def _bench_1102_case_id(case):
-    return f"{case['source_op']}-{case['route']}-{case['shape_id']}"
+    return (f"{case['source_op']}-{case['route']}-{case['shape_id']}-"
+            f"{case['parallel_mode']}-r{case['rank']}")
 
 
-def _build_bench_1102_runner(case, device='cuda'):
+def _build_bench_1102_runner(case, device='cuda', initialize=True):
     """Allocate inputs once; return an operator/component invocation for timing."""
     shape = case['shape']
     inputs = shape['inputs']
@@ -1685,7 +1889,7 @@ def _build_bench_1102_runner(case, device='cuda'):
 
     def tensor(*dims, dtype=torch.bfloat16, value=None):
         tensor = torch.empty(dims, dtype=dtype, device=device)
-        if tensor.device.type != 'meta':
+        if tensor.device.type != 'meta' and initialize:
             if value is not None:
                 tensor.fill_(value)
             elif dtype == torch.float8_e4m3fn:
@@ -1702,12 +1906,62 @@ def _build_bench_1102_runner(case, device='cuda'):
     value_width = inputs[2][-1]
     page_size = 16
     pages = (key_len + page_size - 1) // page_size
+    intervals = json.loads(case['q_intervals'])
+    lengths = [end - begin for begin, end in intervals]
+    num_sequences = batch * len(intervals)
+    offsets = [0]
+    for length in lengths * batch:
+        offsets.append(offsets[-1] + length)
+    block_table = indices(batch * pages).reshape(batch, pages)
+    if len(intervals) > 1:
+        block_table = block_table.repeat_interleave(len(intervals), dim=0)
     options = {}
     if route == 'scratch':
-        rows = batch * query_len if query_len <= 512 and width == value_width else 1
+        rows = batch * query_len if max(lengths) <= 512 and width == value_width else 1
         padded = target.config_module.head_size_layout(width)[0]
-        options.update(seq_threshold_3D=batch, num_par_softmax_segments=16, softmax_segm_output=tensor(rows, heads, 16, padded, dtype=torch.float32), softmax_segm_max=tensor(rows, heads, 16, dtype=torch.float32), softmax_segm_expsum=tensor(rows, heads, 16, dtype=torch.float32))
-    return partial(target.unified_attention, q=tensor(batch * query_len, heads, width, dtype=dtypes[0]), k=tensor(batch * pages, page_size, groups, width, dtype=dtypes[1]), v=tensor(batch * pages, page_size, groups, value_width, dtype=dtypes[2]), out=tensor(batch * query_len, heads, value_width), cu_seqlens_q=indices(batch + 1) * query_len, max_seqlen_q=query_len, seqused_k=torch.full((batch,), key_len, dtype=torch.int32, device=device), max_seqlen_k=key_len, softmax_scale=width ** (-0.5), causal=shape['op'] != 'vit_bi_attention', window_size=(-1, -1), softcap=0.0, block_table=indices(batch * pages).reshape(batch, pages), q_descale=None, k_descale=tensor(1, dtype=torch.float32, value=1), v_descale=tensor(1, dtype=torch.float32, value=1), **options)
+        options.update(seq_threshold_3D=num_sequences, num_par_softmax_segments=16, softmax_segm_output=tensor(rows, heads, 16, padded, dtype=torch.float32), softmax_segm_max=tensor(rows, heads, 16, dtype=torch.float32), softmax_segm_expsum=tensor(rows, heads, 16, dtype=torch.float32))
+    return partial(
+        target.unified_attention,
+        q=tensor(batch * query_len, heads, width, dtype=dtypes[0]),
+        k=tensor(batch * pages, page_size, groups, width, dtype=dtypes[1]),
+        v=tensor(batch * pages, page_size, groups, value_width, dtype=dtypes[2]),
+        out=tensor(batch * query_len, heads, value_width),
+        cu_seqlens_q=torch.tensor(offsets, dtype=torch.int32, device=device),
+        max_seqlen_q=max(lengths),
+        seqused_k=torch.tensor([end for _, end in intervals] * batch,
+                              dtype=torch.int32, device=device),
+        max_seqlen_k=key_len, softmax_scale=width ** (-0.5),
+        causal=shape['op'] != 'vit_bi_attention', window_size=(-1, -1),
+        softcap=0.0, block_table=block_table, q_descale=None,
+        k_descale=tensor(1, dtype=torch.float32, value=1),
+        v_descale=tensor(1, dtype=torch.float32, value=1), **options)
+
+
+def _prepare_bench_1102_runner(case):
+    # Previous pytest cases/graphs can leave reclaimable blocks cached. Check
+    # the actual rank's allocation after reclaiming those, not the source's
+    # global shape, and do not shrink the batch or drop attention heads.
+    gc.collect()
+    torch.cuda.empty_cache()
+    tensors = _build_bench_1102_runner(case, device='meta').keywords.values()
+    required = sum(t.numel() * t.element_size() for t in tensors
+                   if isinstance(t, torch.Tensor))
+    free, total = torch.cuda.mem_get_info()
+    capacity = (f'{_bench_1102_case_id(case)}: per-rank buffers need >= '
+                f'{required / 2**30:.3f} GiB; free={free / 2**30:.3f} GiB, '
+                f'total={total / 2**30:.3f} GiB')
+    if required > free:
+        pytest.skip(f'{capacity}; insufficient device memory')
+    oom = None
+    try:
+        return _build_bench_1102_runner(case)
+    except torch.cuda.OutOfMemoryError as exc:
+        oom = str(exc)
+    # An allocation may still fail due to fragmentation/external allocations.
+    # Leave the handler before cleanup so its traceback releases partial inputs.
+    gc.collect()
+    torch.cuda.empty_cache()
+    pytest.skip(f'{capacity}; input allocation OOM: {oom}')
 
 
 @pytest.mark.bench
@@ -1715,7 +1969,170 @@ def _build_bench_1102_runner(case, device='cuda'):
 def test_bench_1102_unified_attention_triton(case, bench_warmup, bench_repeat, time_ms):
     if not torch.cuda.is_available():
         pytest.skip('CUDA/HIP device required for benchmarks')
-    run = _build_bench_1102_runner(case)
+    run = _prepare_bench_1102_runner(case)
     run()
     latency = time_ms(run, bench_warmup, bench_repeat, dtype=case['input_dtypes'])
     print(f'{_bench_1102_case_id(case)} ({case["measurement"]}): {latency * 1000:.3f} us')
+
+
+def _ua1102_cases():
+    return _ua1102_parallel_cases(_BENCH_1102_SHAPES)
+
+
+def test_ua1102_dp_and_cp_workloads_both_kept():
+    rows = [c for c in _ua1102_cases() if c['shape_id'] == 's128'
+            and c['route'] == 'no_scratch']
+    assert {(c['parallel_mode'], c['rank']) for c in rows} == {
+        ('tp8_dp8', 0), *(('tp8_cp8', r) for r in range(8))}
+    dp = next(c for c in rows if c['parallel_mode'] == 'tp8_dp8')
+    assert dp['shape']['inputs'] == [[1, 32, 3584, 256], [1, 2, 131072, 256],
+                                     [1, 2, 131072, 256]]
+    cp = next(c for c in rows if c['parallel_mode'] == 'tp8_cp8')
+    assert cp['shape']['inputs'][0] == [1, 32, 3584, 256]
+    assert cp['attention_tp'] == 1
+    assert {l['sheet'] for l in cp['shape']['locations']} == {'prefill_shape_cp8'}
+    assert {l['sheet'] for l in dp['shape']['locations']} == {'prefill_shape'}
+
+
+@pytest.mark.parametrize('shape_id,history,end,local_q', [
+    ('s068', 0, 53248, 6656),
+    ('s069', 53248, 106496, 6656),
+    ('s070', 106496, 131072, 3072),
+    ('s095', 106496, 131072, 3072),
+    ('s135', 106496, 131072, 3072),
+    ('s092', 126976, 131072, 512),
+    ('s128', 102400, 131072, 3584),
+])
+def test_ua1102_cp_ranks_partition_current_chunk_once(shape_id, history, end, local_q):
+    rows = [c for c in _ua1102_cases() if c['shape_id'] == shape_id
+            and c['route'] == 'no_scratch' and c['cp'] == 8]
+    assert len(rows) == 8
+    intervals = sorted(interval for c in rows for interval in json.loads(c['q_intervals']))
+    assert intervals[0][0] == history
+    assert intervals[-1][1] == end
+    assert all(left[1] == right[0] for left, right in zip(intervals, intervals[1:]))
+    assert all(sum(b - a for a, b in json.loads(c['q_intervals'])) == local_q for c in rows)
+    assert all(c['shape']['inputs'][0][2] == local_q for c in rows)
+    source_heads = next(s for s in _BENCH_1102_SHAPES if s['id'] == shape_id)['inputs'][0][1]
+    # Eight physical ranks must cover every (query position, head) once.
+    assert all(c['shape']['inputs'][0][1] == source_heads for c in rows)
+    assert sum(c['shape']['inputs'][0][1] * c['shape']['inputs'][0][2]
+               for c in rows) == source_heads * (end - history)
+
+
+def test_ua1102_cp_case_uses_rank_causal_prefixes():
+    rows = [c for c in _ua1102_cases() if c['shape_id'] == 's069'
+            and c['route'] == 'no_scratch']
+    r0, r7 = rows[0], rows[-1]
+    assert json.loads(r0['q_intervals']) == [[53248, 56576], [103168, 106496]]
+    assert json.loads(r7['q_intervals']) == [[76544, 79872], [79872, 83200]]
+    assert r0['shape']['inputs'] == [[32, 64, 6656, 192], [32, 64, 106496, 192],
+                                     [32, 64, 106496, 128]]
+    assert r7['shape']['inputs'][1] == [32, 64, 83200, 192]
+
+
+def test_ua1102_attention_tp_from_physical_devices():
+    for case in _ua1102_cases():
+        assert case['attention_tp'] * case['dp'] * case['cp'] == case['tp']
+    # Qwen decode's table already contains TP2-local heads (32 -> 16).
+    decode = next(c for c in _ua1102_cases() if c['shape_id'] == 's144')
+    assert decode['attention_tp'] == 2
+    assert decode['shape']['inputs'][0] == [48, 16, 4, 256]
+
+
+def test_ua1102_manifest_unchanged_and_rows_covered():
+    shapes = _BENCH_1102_SHAPES
+    before = json.dumps(shapes, sort_keys=True)
+    rows = _ua1102_parallel_cases(shapes)
+    assert json.dumps(shapes, sort_keys=True) == before
+    expected = {(s['id'], l['file'], l['sheet'], l['row'])
+                for s in shapes for l in s['locations']}
+    got = {(c['shape_id'], l['file'], l['sheet'], l['row'])
+           for c in rows for l in c['shape']['locations']}
+    assert got == expected
+    ids = [(c['shape_id'], c['route'], c['parallel_mode'], c['rank']) for c in rows]
+    assert len(ids) == len(set(ids))
+
+
+def test_ua1102_runner_matches_reported_shapes():
+    for case in _ua1102_cases():
+        args = _build_bench_1102_runner(case, device='meta').keywords
+        q, k, v = json.loads(case['input_shapes'])
+        assert list(args['q'].shape) == [q[0] * q[2], q[1], q[3]]
+        assert list(args['out'].shape) == [q[0] * q[2], q[1], v[3]]
+        assert list(args['k'].shape) == [k[0] * ((k[2] + 15) // 16), 16, k[1], k[3]]
+        assert list(args['v'].shape) == [v[0] * ((v[2] + 15) // 16), 16, v[1], v[3]]
+        segments = len(json.loads(case['q_intervals']))
+        assert args['cu_seqlens_q'].numel() == q[0] * segments + 1
+        assert args['seqused_k'].numel() == q[0] * segments
+        assert args['block_table'].shape[0] == q[0] * segments
+
+
+def test_ua1102_skip_before_gpu_allocation(monkeypatch):
+    case = next(c for c in _ua1102_cases() if c['shape_id'] == 's070' and c['rank'] == 0)
+    original = _build_bench_1102_runner
+
+    def guarded_build(case, device='cuda', **kwargs):
+        if device != 'meta':
+            pytest.fail('Resource limit must be checked before GPU allocation')
+        return original(case, device=device, **kwargs)
+
+    monkeypatch.setattr(sys.modules[__name__], '_build_bench_1102_runner', guarded_build)
+    monkeypatch.setattr(torch.cuda, 'mem_get_info', lambda: (144 * 2**30, 144 * 2**30))
+    monkeypatch.setattr(torch.cuda, 'empty_cache', lambda: None)
+    with pytest.raises(pytest.skip.Exception, match=r's070.*163\.75.*144\.000'):
+        _prepare_bench_1102_runner(case)
+
+
+def test_ua1102_operator_errors_stay_errors(monkeypatch):
+    def broken_operator():
+        raise RuntimeError('kernel regression')
+
+    monkeypatch.setattr(sys.modules[__name__], '_prepare_bench_1102_runner',
+                        lambda case: broken_operator)
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
+    with pytest.raises(RuntimeError, match='kernel regression'):
+        test_bench_1102_unified_attention_triton(_ua1102_cases()[0], 0, 1, None)
+
+
+@pytest.mark.parametrize('rank', range(8))
+@pytest.mark.parametrize('route', ['no_scratch', 'scratch'])
+def test_ua1102_cp_runner_matches_global_mask(rank, route):
+    if not torch.cuda.is_available():
+        pytest.skip('CUDA/HIP device required')
+    source = {
+        'id': 'tiny', 'op': 'gqa_attention', 'stage': 'Prefill_Remainder',
+        'inputs': [[2, 8, 8, 32], [2, 8, 81, 32], [2, 8, 81, 16]],
+        'dtypes': ['BF16'] * 3, 'outputs': [[2, 8, 8, 16]],
+        'output_dtypes': ['BF16'], 'locations': [{
+            'file': 'shape_09_kimi26_128k_s2000.xlsx',
+            'sheet': 'prefill_shape_cp8', 'row': 1}],
+    }
+    case = next(c for c in _ua1102_parallel_cases([source])
+                if c['rank'] == rank and c['route'] == route)
+    run = _build_bench_1102_runner(case)
+    args = run.keywords
+    intervals = json.loads(case['q_intervals'])
+    expected_ends = [end for _, end in intervals] * 2
+    assert args['seqused_k'].tolist() == expected_ends
+    assert args['cu_seqlens_q'].tolist() == [0, 4, 8, 12, 16]
+    assert torch.equal(args['block_table'][0], args['block_table'][1])
+    assert not torch.equal(args['block_table'][0], args['block_table'][2])
+
+    generator = torch.Generator().manual_seed(1102)
+    for name in ('q', 'k', 'v'):
+        value = torch.randn(args[name].shape, generator=generator).to(torch.bfloat16)
+        args[name].copy_(value)
+    q = args['q'].cpu().float().reshape(2, 8, 8, 32)
+    k = args['k'].cpu().float().reshape(2, -1, 8, 32)
+    v = args['v'].cpu().float().reshape(2, -1, 8, 16)
+    positions = torch.tensor([p for begin, end in intervals for p in range(begin, end)])
+    expected = []
+    for b in range(2):
+        scores = (q[b].transpose(0, 1) @ k[b].permute(1, 2, 0)) * (32 ** -0.5)
+        visible = torch.arange(k.shape[1])[None, :] <= positions[:, None]
+        scores.masked_fill_(~visible, -torch.inf)
+        expected.append((scores.softmax(-1) @ v[b].transpose(0, 1)).transpose(0, 1))
+    run()
+    actual = args['out'].cpu().float().reshape(2, 8, 8, 16)
+    torch.testing.assert_close(actual, torch.stack(expected), rtol=.02, atol=.003)
