@@ -17,10 +17,8 @@ on:
         required: true
         type: string
       numpy_version:
-        required: true
         type: string
       torch_version:
-        required: true
         type: string
       run_tests:
         required: true
@@ -43,18 +41,12 @@ jobs:
         shell: bash
     env:
       PYPI_URL: ${{ vars.PYPI_URL }}
-      AICC_INSTALLER_URL: ${{ vars.AICC_INSTALLER_URL }}
-      RESOURCE_SERVER_URL: ${{ vars.RESOURCE_SERVER_URL }}
-      PYTHONUNBUFFERED: '1'
       DTK_VER: ${{ inputs.dtk_ver }}
-      PYTHON_VERSION: ${{ inputs.py_version }}
-      NUMPY_VERSION: ${{ inputs.numpy_version }}
-      TORCH_VERSION: ${{ inputs.torch_version }}
     steps:
     - name: Checkout source
       uses: actions/checkout@v4
       with:
-        ref: ${{ github.event.pull_request.number && format('refs/pull/{0}/head', github.event.pull_request.number) || inputs.source_sha }}
+        ref: ${{ inputs.source_sha }}
         fetch-depth: 0
         persist-credentials: false
     - name: Verify source and integrate PR base
@@ -62,27 +54,54 @@ jobs:
         EXPECTED_SOURCE_SHA: ${{ inputs.source_sha }}
         PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
       run: bash .github/scripts/checkout-source.sh
-    - name: Install compiler and dependencies
-      run: bash .github/scripts/setup-env.sh
-    - name: Build and repair wheel
+    - name: Build wheel without Torch
       run: |
-        source .github/scripts/common.sh
+        : "${PYPI_URL:?Set the PYPI_URL repository variable}"
+        export PIP_INDEX_URL="${PYPI_URL%/}/nightly/dtk${DTK_VER}/+simple/"
+        export PIP_TRUSTED_HOST
+        PIP_TRUSTED_HOST=$(python -c 'import os, urllib.parse; print(urllib.parse.urlparse(os.environ["PYPI_URL"]).hostname)')
 
-        bash .github/scripts/_build_hcu_wheel.sh \
-          --out-dir "${CI_WORK_DIR}/dist"
+        build_dir=$(mktemp -d)
+        trap 'rm -rf -- "$build_dir"' EXIT
+        python -m venv "$build_dir/venv"
+        build_python="$build_dir/venv/bin/python"
+        "$build_python" -m pip install build
 
-        CIUpload REPAIR \
-          --dtk_version "${DTK_VER}" \
-          --torch_version "${TORCH_VERSION}" \
-          --git_commit "$(git rev-parse --short=6 HEAD)" \
-          --outputdir "${WHEEL_OUTPUT}" \
-          -f "${CI_WORK_DIR}"/dist/*.whl
+        # Set the nightly version before building so the filename and metadata agree.
+        version_file=boltops/_version.py
+        cp "$version_file" "$build_dir/_version.py"
+        trap 'cp "$build_dir/_version.py" "$version_file"; rm -rf -- "$build_dir"' EXIT
+        suffix="dtk${DTK_VER}.$(date -u +%y%m%d%H%M).g$(git rev-parse --short=6 HEAD)"
+        "$build_python" - "$version_file" "$suffix" <<'PY'
+        import runpy
+        import sys
+        from pathlib import Path
+
+        path = Path(sys.argv[1])
+        version = runpy.run_path(str(path))["__version__"]
+        if "+" in version:
+            raise SystemExit(f"Expected a base version without a local tag: {version}")
+        source = path.read_text(encoding="utf-8")
+        assignment = f'__version__ = "{version}"'
+        if assignment not in source.splitlines():
+            raise SystemExit(f"Expected a literal __version__ assignment in {path}")
+        path.write_text(source.replace(assignment, f'__version__ = "{version}+{sys.argv[2]}"', 1), encoding="utf-8")
+        PY
+
+        "$build_python" -m build --wheel --outdir "$build_dir/wheels"
+        shopt -s nullglob
+        wheels=("$build_dir"/wheels/*.whl)
+        if [[ ${#wheels[@]} -ne 1 || "${wheels[0]:-}" != *-py3-none-any.whl ]]; then
+          echo "Expected exactly one pure Python wheel" >&2
+          exit 1
+        fi
+        mkdir -p output
+        cp "${wheels[0]}" output/
     - name: Upload built wheels
-      if: ${{ always() }}
       uses: actions/upload-artifact@v4
       with:
-        name: wheel-dtk${{ inputs.dtk_ver }}-py${{ inputs.py_version }}-torch${{ inputs.torch_version }}
-        path: output/
+        name: wheel-dtk${{ inputs.dtk_ver }}
+        path: output/*.whl
         if-no-files-found: error
         retention-days: 7
   correctness:
@@ -109,7 +128,7 @@ jobs:
     - name: Checkout source
       uses: actions/checkout@v4
       with:
-        ref: ${{ github.event.pull_request.number && format('refs/pull/{0}/head', github.event.pull_request.number) || inputs.source_sha }}
+        ref: ${{ inputs.source_sha }}
         fetch-depth: 0
         persist-credentials: false
     - name: Verify source and integrate PR base
@@ -120,8 +139,8 @@ jobs:
     - name: Download built wheel
       uses: actions/download-artifact@v4
       with:
-        name: wheel-dtk${{ inputs.dtk_ver }}-py${{ inputs.py_version }}-torch${{ inputs.torch_version }}
-        path: output
+        name: wheel-dtk${{ inputs.dtk_ver }}
+        path: output/dtk${{ inputs.dtk_ver }}/py${{ inputs.py_version }}/torch${{ inputs.torch_version }}
     - name: Install compiler and dependencies
       run: bash .github/scripts/setup-env.sh
     - name: Verify allocated HCU
@@ -174,7 +193,7 @@ jobs:
     - name: Checkout source
       uses: actions/checkout@v4
       with:
-        ref: ${{ github.event.pull_request.number && format('refs/pull/{0}/head', github.event.pull_request.number) || inputs.source_sha }}
+        ref: ${{ inputs.source_sha }}
         fetch-depth: 0
         persist-credentials: false
     - name: Verify source and integrate PR base
@@ -185,8 +204,8 @@ jobs:
     - name: Download tested wheel
       uses: actions/download-artifact@v4
       with:
-        name: wheel-dtk${{ inputs.dtk_ver }}-py${{ inputs.py_version }}-torch${{ inputs.torch_version }}
-        path: output
+        name: wheel-dtk${{ inputs.dtk_ver }}
+        path: output/dtk${{ inputs.dtk_ver }}/py${{ inputs.py_version }}/torch${{ inputs.torch_version }}
     - name: Install compiler and dependencies
       run: bash .github/scripts/setup-env.sh
     - name: Verify allocated HCU

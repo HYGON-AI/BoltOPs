@@ -4,9 +4,9 @@
 
 ## 1. 先理解整体流程
 
-PR 到 release/0.1.0 时，`build2604` 和 `build2610` 各自的两组环境都在 `hygon-build` 构建 wheel。DTK26.04 / Python3.10 / Torch2.11.0 与 DTK26.10 / Python3.12 / Torch2.13.0 两组在 `hygon-bw1100-4card` 运行正确性测试，通过后在 `hygon-bw1100-1card` 下载对应 wheel 并运行性能测试。`ci-result` 在 `hygon-cpu` 汇总两个 DTK 的构建和已启用的测试结果。
+PR 到 release/0.1.0 时，`build2604` 和 `build2610` 各自在 `hygon-build` 构建一个 wheel。DTK26.04 / Python3.10 / Torch2.11.0 与 DTK26.10 / Python3.12 / Torch2.13.0 两组在 `hygon-bw1100-4card` 运行正确性测试，通过后在 `hygon-bw1100-1card` 下载对应 wheel 并运行性能测试。`ci-result` 在 `hygon-cpu` 汇总两个 DTK 的构建和已启用的测试结果。
 
-push 到 release/0.1.0 时构建并修复四组 wheel，各 DTK 的构建成功后，由 `publish-2604` 和 `publish-2610` 在 `hygon-build` 分别发布。手动运行按输入构建一组 wheel，并上传到本次 Actions 运行的附件。
+push 到 release/0.1.0 时按 DTK 各构建一个 wheel，各 DTK 的构建成功后，由 `publish-2604` 和 `publish-2610` 在 `hygon-build` 分别发布。手动运行按输入构建一组 wheel，并上传到本次 Actions 运行的附件。
 
 ## 2. 文件怎么写、怎么看
 
@@ -18,20 +18,20 @@ push 到 release/0.1.0 时构建并修复四组 wheel，各 DTK 的构建成功�
 | .github/scripts/checkout-source.sh | 校验事件 SHA，并在 PR 任务中合并目标分支提交 |
 | .github/scripts/common.sh | 每一步加载 DTK；设置索引、输出目录和唯一运行标识 |
 | .github/scripts/setup-env.sh | 安装 AICC、精确选择 Torch/Triton/TileLang/NumPy 并验证版本 |
-| .github/scripts/_build_hcu_wheel.sh | 统一检查环境并打包；CIUpload REPAIR 由复用工作流执行 |
+| .github/scripts/_build_hcu_wheel.sh | 本地与 GitLab 使用的环境检查和打包入口 |
 | .github/scripts/test-correctness.sh | 把 wheel 安装到临时目录，在该目录运行 test，避免误测源码 |
 | .github/scripts/test-performance.sh | 下载并安装对应版本构建的 wheel，运行 optest，收集 JSON、日志、JUnit |
 | .github/scripts/publish.sh | 收集 wheel 到发布目录，使用 CIUpload NIGHTLY 上传 |
 
 先写触发条件 on，再写矩阵和 container，然后给每个动作写一个 shell 脚本，最后用 needs 串起来。不要把 Actions 的 `${{ ... }}` 写进独立 shell 文件；先通过 env 传入，脚本只使用 `${VAR}`。
 
-PR 使用 `pull_request_target` 触发，工作流定义来自目标分支。与 LightOP 一样，通过 `refs/pull/<编号>/head` 检出同仓库或 fork PR。构建、正确性和性能任务均校验触发事件记录的 PR head SHA，再合并该事件记录的目标分支 base SHA，保证使用相同的代码内容。push 使用事件 SHA。手动运行优先使用填写的完整 commit SHA，留空时使用事件 SHA。
+PR 使用 `pull_request_target` 触发，工作流定义来自目标分支。工作流按事件记录的完整 SHA 检出同仓库或 fork PR。构建、正确性和性能任务均校验触发事件记录的 PR head SHA，再合并该事件记录的目标分支 base SHA，保证使用相同的代码内容。push 使用事件 SHA。手动运行优先使用填写的完整 commit SHA，留空时使用事件 SHA。
 
-DTK26.04 构建 Python3.10 / NumPy1.24.3 与 Python3.12 / NumPy1.26.4，两组都搭配 Torch2.11.0。DTK26.10 构建 Python3.12 / NumPy1.26.4，搭配 Torch2.11.0 和 Torch2.13.0。环境准备阶段校验 HCU Torch 版本以及 Triton、TileLang 的 DTK 和 Torch 标签。
+DTK26.04 测试使用 Python3.10 / NumPy1.24.3 / Torch2.11.0。DTK26.10 测试使用 Python3.12 / NumPy1.26.4 / Torch2.13.0。测试环境准备阶段校验 HCU Torch 版本以及 Triton、TileLang 的 DTK 和 Torch 标签。
 
-统一入口为`.github/scripts/_build_hcu_wheel.sh`，旧 `build_wheel.sh` 转发到新入口；GitLab 与 GitHub CI 都调用同一脚本。环境需预先准备，入口不隐式安装工具。检查通过后输出 wheel，测试和发布使用同一构建路径。
+GitHub CI 在独立 Python 环境运行 `python -m build --wheel`，打包阶段只安装 Python 构建依赖。测试和发布使用同一份 wheel。`build_wheel.sh` 仍转发到本地和 GitLab 的环境检查入口。
 
-lightop 的 manylinux_repair.sh 面向含原生 .so 的 wheel；BoltOPs 当前是纯 Python wheel，因此保留 CIUpload 的版本标签修复，不增加 auditwheel repair。
+GitHub 在打包前生成 wheel 的 DTK、构建时间和提交版本标识。产物的兼容性标签为 `py3-none-any`。
 
 ## 3. 管理员先配置这些项
 
@@ -57,17 +57,17 @@ Settings → Actions → Runners：确保 ARC 的 `hygon-cpu`、`hygon-build` �
 
 ARC/Kubernetes 负责拉镜像、创建和销毁 Pod，给正确性测试 Pod 分配四张 HCU、给性能测试 Pod 分配一张 HCU；工作流不传 Docker 的 `--device`、特权、共享内存或手工挂载选项。平台需要给构建和测试 Pod 提供所需的 `/opt/hyhal`，给测试 Pod 提供设备与足够的 `/dev/shm`。原 `--shm-size=80G` 不再由 workflow 设置；接入文档中的四卡池提供 96G、单卡池提供 32G 共享内存，实际容量需在平台 Pod 模板上确认。私有镜像认证由平台现有配置负责。
 
-AICC、Torch、Triton、TileLang、NumPy 和测试依赖继续在各自的临时作业容器中安装，版本和校验逻辑不变，不重新打环境镜像。编译并发沿用平台注入的 `MAX_JOBS`，未提供时回退到 4，不再覆盖为 32。
+AICC、Torch、Triton、TileLang、NumPy 和其他测试依赖在各测试容器中安装，版本和校验逻辑不变，不重新打环境镜像。编译并发沿用平台注入的 `MAX_JOBS`，未提供时回退到 4，不再覆盖为 32。
 
 正确性工作流校验可见 HCU 数量必须为 4，性能工作流校验必须为 1，不运行 `CIsmi need`，不重写平台提供的 `ROCR_VISIBLE_DEVICES` 或 `HIP_VISIBLE_DEVICES`。性能 job 在 env 中设置 `BOLTOPS_TEST_GPU: '0'`，optest 使用 Pod 内逻辑卡号 0，保留现有单卡基准语义；正确性测试可见逻辑卡 0～3，原有跨卡用例可以执行。没有额外的设备选择脚本。
 
 各版本组合的构建、正确性测试和性能测试可独立调度。性能任务各用一张 HCU，按单卡 runner 池的容量并行运行。同一节点上的任务仍可能共享 CPU、内存和 I/O。工作流仍会取消同一 PR 的旧运行。
 
-同仓库 PR 和 fork PR 都可触发 ARC 构建和 GPU 测试，使用 BoltOPs 的 Actions Variables。release/0.1.0 push 触发发布任务。
+同仓库 PR 自动运行。外部 fork PR 需要有写权限的维护者添加 `ok-to-test` 标签，之后同一 PR 的新提交自动运行。移除标签会撤销批准，新 PR 需重新批准。release/0.1.0 push 触发发布任务。
 
 ## 4. 把文件提交到 GitHub、试跑
 
-当前 GitHub 登录账号 guochenyang99 对 BoltOPs 只有 pull 权限。迁移修改位于 `ci/github-actions-migration` 分支；origin 指向 HYGON-AI/BoltOPs，fork 指向 guochenyang99/BoltOPs。
+迁移修改位于 `ci/github-actions-migration` 分支；origin 指向 HYGON-AI/BoltOPs，fork 指向 guochenyang99/BoltOPs。
 
 当前迁移分支已整合 GitLab main@e4c2c58，但这不代表 GitHub main 已更新。维护者合入 PR 前应确认 GitLab 是否又有新提交；如有，应再次合并并验证，避免遗漏近期算子/测试修复。
 
@@ -82,7 +82,7 @@ git commit -m 'ci: add GitHub Actions build test and nightly workflows'
 git push -u fork ci/github-actions-migration
 ```
 
-创建 PR 到 release/0.1.0，检查四组构建、两组正确性和性能作业，以及 ci-result 和已有 Quality Gate。下载 artifact 核对 wheel、JUnit 与性能报告。两组测试均需在 BW1100 上实际验证。
+创建 PR 到 release/0.1.0，检查两组构建、正确性和性能作业，以及 ci-result 和已有 Quality Gate。下载 artifact 核对 wheel、JUnit 与性能报告。两组测试均需在 BW1100 上实际验证。
 
 由于需要真实内网 runner、编译器和 GPU，本地只能验证 YAML/Actions 表达式、Bash 语法、矩阵、设备选择分支和脚本迁移逻辑；未实际运行 GPU 构建、测试或上传。
 

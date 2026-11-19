@@ -35,12 +35,11 @@ jobs:
         ref: ${{ github.sha }}
         fetch-depth: 0
         persist-credentials: false
-    - name: Download repaired wheels
+    - name: Download built wheel
       uses: actions/download-artifact@v4
       with:
-        pattern: wheel-dtk${{ inputs.dtk_ver }}-*
+        name: wheel-dtk${{ inputs.dtk_ver }}
         path: output
-        merge-multiple: true
     - name: Verify and publish nightly wheels
       run: bash .github/scripts/publish.sh
     - name: Upload published wheels

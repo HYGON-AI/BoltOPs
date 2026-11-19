@@ -18,8 +18,7 @@
 .github/workflows/ci.yml
   → .github/workflows/_build-test-wheel.yml
     → build（hygon-build）
-      → .github/scripts/setup-env.sh
-      → .github/scripts/_build_hcu_wheel.sh
+      → python -m build --wheel（独立 Python 环境）
       → 上传 wheel artifact
     → correctness（hygon-bw1100-4card，按事件决定）
       → 下载对应 wheel、setup-env.sh、流水线内校验四卡
@@ -46,11 +45,13 @@
 
 ## 版本配置
 
-`ci.yml` 定义四组构建环境。DTK26.04 搭配 Python3.10/3.12 和 Torch2.11.0，共两组，NumPy 分别为 1.24.3/1.26.4。DTK26.10 搭配 Python3.12、NumPy1.26.4 和 Torch2.11.0/2.13.0，共两组。
+`ci.yml` 为 DTK26.04 和 DTK26.10 各构建一个纯 Python wheel。构建环境不安装 Torch，wheel 版本包含 DTK、构建时间和 Git 提交标识。
 
-PR 的四组环境都构建 wheel。正确性和性能测试只运行 DTK26.04 / Python3.10 / Torch2.11.0 与 DTK26.10 / Python3.12 / Torch2.13.0 两组，每组正确性通过后执行性能测试。性能任务各用一张 HCU，按 runner 容量并行调度。release/0.1.0 push 构建四组 wheel，各 DTK 的构建成功后由 `publish-2604` 和 `publish-2610` 分别发布。`ci-result` 检查两个 DTK 的构建和已启用的测试结果。版本矩阵在 ci.yml 维护。
+外部 fork PR 首次运行前，由有仓库写权限的维护者审查提交并在 PR 页面添加 `ok-to-test` 标签（首次使用时在仓库 Labels 中创建）。标签有效期间，后续提交自动运行；移除标签即可撤销。每个新 PR 单独批准。同仓库 PR 自动运行。
 
-在 Actions 的 **Run workflow** 中可选一组 DTK、Torch 和 Python。默认是 DTK 26.10、Torch 2.13.0 和 Python 3.12。填写完整 commit SHA 可指定源码提交，留空则使用所选分支或 tag 的提交。手动运行只构建 wheel，结果可在本次运行的 **Artifacts** 中下载。
+PR 的正确性和性能测试运行 DTK26.04 / Python3.10 / Torch2.11.0 与 DTK26.10 / Python3.12 / Torch2.13.0 两组，每组安装对应的 Torch 并使用对应 DTK 的 wheel。正确性通过后执行性能测试。release/0.1.0 push 构建两个 wheel，分别由 `publish-2604` 和 `publish-2610` 发布。`ci-result` 汇总构建和已启用的测试结果。
+
+在 Actions 的 **Run workflow** 中可选构建用的 DTK 和 Python，默认是 DTK 26.10 和 Python 3.12。填写完整 commit SHA 可指定源码提交，留空则使用所选分支或 tag 的提交。手动运行构建的 wheel 可在本次运行的 **Artifacts** 中下载。
 
 升级版本时，检查对应的 DTK/Python 容器及 HCU Torch/Triton/TileLang 包是否可用。不同 DTK 若需要不同版本，应拆开配置，不能只为减少重复而强行共用。发布任务的 Python3.12 容器只用于上传 wheel，不决定 wheel 的目标 Python 版本。
 
