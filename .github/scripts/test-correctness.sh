@@ -6,6 +6,8 @@ source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 wheel_test_dir=$(mktemp -d)
 python -m pip install --no-deps --target "${wheel_test_dir}" "${WHEEL_OUTPUT}"/*.whl
 cp -r test "${wheel_test_dir}/test"
+mkdir -p "${wheel_test_dir}/scripts/ci"
+cp scripts/ci/optest_to_junit.py "${wheel_test_dir}/scripts/ci/"
 cp pyproject.toml "${wheel_test_dir}/pyproject.toml"
 (
   cd "${wheel_test_dir}"
