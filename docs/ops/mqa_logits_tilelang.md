@@ -4,6 +4,10 @@
 `kernels/gfx938`（WASP）或 `kernels/common`（通用 GEMM）。调用方使用
 `tilelang_qsa_mqa_prefill` / `tilelang_qsa_mqa_decode`。
 
+非 QSA paged decode 使用独立入口 `tilelang_mqa_decode`，支持 gfx938 BF16 与 packed FP8，
+并在 kernel 内处理运行时 `score_scale`；接口、调度和正确性测试见
+[非 QSA decode](mqa_decode_weighted.md)。原有 QSA decode 入口保持不变。
+
 FP8 Triton 入口见 `docs/ops/mqa_logits_triton.md`。
 
 ```python

@@ -15,6 +15,7 @@ Public operators:
   - ``triton_fp8_paged_mqa_logits_stage1`` → per-head scores (``out_qk.sum(dim=0)``)
   - ``triton_fp8_paged_mqa_logits_prepare`` / ``_build_bucket_schedule``
 * ``tilelang_mqa_logits`` — TileLang weighted prefill / dense KV (BF16, gfx938 FP8)
+* ``tilelang_mqa_decode`` — TileLang weighted paged decode (gfx938 BF16 / packed E4M3FN)
 * ``tilelang_qsa_mqa_prefill`` — TileLang QSA prefill / dense KV
 * ``tilelang_qsa_mqa_decode`` — TileLang QSA paged decode
 """
@@ -96,6 +97,35 @@ def tilelang_mqa_logits(
         cu_ends,
         D_out=D_out,
         effective_range=effective_range,
+    )
+
+
+def tilelang_mqa_decode(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    weights: torch.Tensor,
+    page_table: torch.Tensor,
+    context_lens: torch.Tensor,
+    max_model_len: int,
+    score_scale: Optional[float] = None,
+    *,
+    D_out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Weighted paged decode: sum_h(relu(Q dot K) * weights) / score_scale.
+
+    gfx938: H=4/8/16/32/64, D=128, page_size=8/16/32/64. BF16 Q/K,
+    or E4M3FN Q with page-wise packed D+4 cache (Key bytes then FP32
+    per-Key scales). Weights are float32 [B,H]. The runtime denominator
+    score_scale defaults to sqrt(D), matching QSA; use 1.0 for unscaled
+    logits. Scaling runs inside the kernel after head reduction.
+    Output is FP32 with -inf suffix.
+    Ordinary/persistent scheduling follows the independent weighted policy.
+    """
+    from .tilelang._dispatch import resolve
+
+    return resolve("weighted_mqa_decode", q.device)(
+        q, k_cache, weights, page_table, context_lens, max_model_len,
+        score_scale=score_scale, D_out=D_out,
     )
 
 
@@ -508,6 +538,7 @@ def _run_triton_prefill(
 __all__ = [
     "triton_mqa_logits",
     "tilelang_mqa_logits",
+    "tilelang_mqa_decode",
     "tilelang_qsa_mqa_decode",
     "tilelang_qsa_mqa_prefill",
     "triton_fp8_paged_mqa_logits",
