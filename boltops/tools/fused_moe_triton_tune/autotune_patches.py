@@ -769,8 +769,6 @@ def dynamic_autotune(fn):
                          'MUL_ROUTED_WEIGHT', 'BLOCK_SIZE_M', 'per_channel_quant',
                          'use_mxfp8', 'group_n', 'group_k')
                          if name in arg_names],
-                    perf_debug=True,
-                    perf_profiling=False,
                     rep=20
                 )(self.kernel_fn)
                 autotuned_fn.__dict__["do_bench"] = _check_hip_loads(
@@ -782,9 +780,10 @@ def dynamic_autotune(fn):
                     return autotuned_fn.warmup(*args, grid=grid, **launch_kwargs)
                 else:
                     result = autotuned_fn[grid](*args, **launch_kwargs)
-                    if len(dynamic_configs) == 1:
-                        _ensure_single_config_timing(autotuned_fn, lambda: autotuned_fn[grid](*args, **launch_kwargs))
-                        _print_best_config(autotuned_fn)
+                    # Emit our parser ABI for every candidate count instead of
+                    # relying on vendor-only Triton debug options/formatting.
+                    _ensure_single_config_timing(autotuned_fn, lambda: autotuned_fn[grid](*args, **launch_kwargs))
+                    _print_best_config(autotuned_fn)
                     return result
 
             return launcher
