@@ -427,6 +427,19 @@ class _PerfCollectContext:
                 )
             )
 
+        # ``time_ms`` (bolt_time_ms) routes the triton CUDA-graph path through
+        # bench._pooled_graph_bench (shared capture pool; avoids the DTK2604
+        # hipMalloc hang), so observe THAT for the row to be recorded.
+        import boltops.utility.bench as bolt_bench
+
+        pooled = getattr(bolt_bench, "_pooled_graph_bench", None)
+        if pooled is not None:
+            self._patches[(bolt_bench, "_pooled_graph_bench")] = pooled
+            setattr(
+                bolt_bench, "_pooled_graph_bench",
+                self._observed(pooled, "cudagraph"),
+            )
+
         try:
             import tilelang.profiler as tilelang_profiler
         except ImportError:

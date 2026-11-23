@@ -5,9 +5,13 @@
 
 def test_graph_timing_syncs_input_stream_first(monkeypatch):
     """The graph bench tool runs on its own side stream, so the caller's
-    stream must be synchronized before any timed kernel starts."""
+    stream must be synchronized before any timed kernel starts.
+
+    ``time_ms`` routes the triton CUDA-graph path through
+    ``bench._pooled_graph_bench`` (shared capture pool), so patch THAT to
+    isolate the stream-ordering contract.
+    """
     import torch
-    import triton
 
     from boltops.utility import bench as bench_module
 
@@ -17,11 +21,11 @@ def test_graph_timing_syncs_input_stream_first(monkeypatch):
         def synchronize(self):
             calls.append("sync")
 
-    def fake_cudagraph_bench(run, rep=None, return_mode=None):
+    def fake_pooled_bench(run, rep=None, return_mode=None):
         calls.append("bench")
         return 1.25
 
-    monkeypatch.setattr(triton.testing, "do_bench_cudagraph", fake_cudagraph_bench)
+    monkeypatch.setattr(bench_module, "_pooled_graph_bench", fake_pooled_bench)
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: _Stream())
 
     ms, method = bench_module.time_ms(lambda: None, use_graph=True)
