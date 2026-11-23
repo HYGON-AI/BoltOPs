@@ -7,7 +7,21 @@ CI 触发条件或公共收集规则。QSA prefill 测试此前已有的 Q=256/1
 
 ## 正确性
 
-| QSA 覆盖 | 非 QSA 对应覆盖 | CI 分层 |
+### 最新主线的 CI 分工
+
+GitLab `main`（本次迁移基线 `f97d4ea`）的 `.gitlab-ci.yml` 仅在
+目标为 `main` 的 MR 中构建 DTK 27.04 / Python 3.12 wheel；合入后
+另行发布。当前没有正确性或性能任务，GitLab 构建通过不代表 GPU
+正确性和性能测试通过。
+
+GitHub 的 workflow 配置以 `release/0.1.0` 为目标，按其矩阵执行
+构建和选定环境的测试。两端触发条件以各自目标分支中的实际配置为准。
+本次仅迁移非 QSA 实现与测试，不修改两端 CI 工作流。
+
+下表中的默认 / slow 是 pytest 分层。GitLab 仍保留这些测试文件，
+以便本地或启用测试的 CI 使用，不能据此声称当前 GitLab 自动运行它们。
+
+| QSA 覆盖 | 非 QSA 对应覆盖 | pytest 分层 |
 | --- | --- | --- |
 | BF16 prefill 公共入口，Q=41/513、K=96、H=4、不同有效范围 | `test_weighted_prefill_public_matches_torch` | Q=41 默认；513 为 slow |
 | Common prefill 非整块 Q=33、K=83 | `test_common_weighted_prefill_handles_partial_rows_without_host_padding` | slow |
@@ -24,7 +38,8 @@ QSA 和非 QSA 复用的 mask kernel 仍由原 QSA mask 测试验证；非 QSA
 公共入口另外检查无效区间为 `-inf`。数值参考使用各自的 PyTorch FP32
 公式；非 QSA 包含带正负号的 head 权重，不要求两侧输出相等。
 
-CI 默认执行 `python -m pytest test -s --tb=short -m "not slow"`。
+主线 GitHub 的正确性脚本执行
+`python -m pytest test -s --tb=short -m "not slow"`。
 `bench` 用例在该阶段跳过；slow 网格不会自动执行。MQA 全量正确性命令：
 
 ```bash
@@ -46,6 +61,9 @@ VMFault 无条件跳过。非 QSA 的对应网格可独立执行，但不能据�
 已完成两侧的性能比较。QSA 当前没有 FP8 prefill bench，因此本次不
 额外新增该性能网格。
 
+新主线还将 `test_qsa_mqa_prefill_fp8_matches_torch` 标记为已知失败并
+跳过；该标记原样保留。非 QSA FP8 测试独立运行，不继承这一跳过标记。
+
 两侧使用各自生产默认分块；相同 workload 不要求内部 tiling 一致。
 这里的 prefill scale 设置遵循当前 QSA bench，与包含运行时 scale 的
 独立性能报告口径不同。
@@ -62,7 +80,7 @@ python scripts/run_operator_benchmarks.py \
 [optest 性能基准](../optest_perf.md)。该入口记录性能数据，不自动完成
 QSA 对照百分比、spill 或 bank conflict 分析。
 
-## 本机验证（2026-11-23）
+## 本机验证（迁移前，2026-11-23）
 
 - gfx938 / GPU 6：TileLang 默认用例、配置测试与包导出检查，117 passed。
 - 新增及相关正确性检查 31 项，加上完整的 36 组 BF16 decode bench，
@@ -74,5 +92,31 @@ QSA 对照百分比、spill 或 bank conflict 分析。
   核对；未全量重跑所有 slow 用例。
 
 本机使用 Torch 2.11.0 / DTK2604 与 TileLang 0.1.15 开发源码。
-CI 配置安装 TileLang 0.1.12，并包含多个 Python/Torch 组合；上述本机
-结果不替代这些 CI 环境的实际流水线验证。
+以上记录对应旧基线的验证，不代表迁移后的代码已验证；新主线 CI 分工
+见上文，也不能以本机结果代替 DTK 27.04 的实际构建结果。
+
+## 本机验证（迁移后，2026-11-23）
+
+基于 GitLab `main` 的 `f97d4ea`，迁移四笔非 QSA 提交后完成本地回归。
+测试期间保持 kernel 源码不变，启用 `--runslow` 并排除 `bench`：
+
+```bash
+python -m pytest test/mqa_logits/test_tilelang*.py test/test_package_smoke.py \
+  --runslow -m 'not bench' -q --tb=short
+```
+
+- 共 460 项：457 passed、1 skipped、2 failed；中断后按剩余用例续跑，
+  以唯一 pytest nodeid 汇总覆盖。
+- 非 QSA BF16 prefill 95 项、FP8 prefill 22 项、BF16/FP8 decode 173 项
+  全部通过。数值用例对照 PyTorch FP32 参考结果。
+- 两项失败均在不含非 QSA 改动的纯 `f97d4ea` 上复现：QSA FP8 prefill
+  H32 无可用 layout；QSA BF16 persistent decode H32/S32 的 ThreadSync
+  无法处理有 3 个参与线程的分支。上游原有 FP8 prefill skip 保留。
+- QSA BF16/FP8 prefill、decode 四个核心文件与 `f97d4ea` 逐字节一致。
+  非 QSA BF16 decode 对齐上游的 `TL_Z3_RLIMIT=50000` 编译配置。
+- 本地原始 wheel 构建成功，43 个 MQA Python 文件与验证源码一致；
+  安装后 package smoke 测试 8 项通过。
+
+验证环境为 Python 3.10 / Torch 2.11.0 / DTK2604 / TileLang 0.1.15
+开发源码，使用 gfx938 GPU 6。本次记录为正确性与本地打包验证，不包含
+迁移后的性能复测，也不替代 GitLab DTK 27.04 / Python 3.12 构建。

@@ -1,4 +1,6 @@
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: Apache-2.0
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+# Upstream reference: https://github.com/yht183/sglang-das/blob/4cc62ab1d0c7a63c770e2a275d42b67ae20c345c/python/sglang/srt/layers/attention/qsa/mqa.py
 """Weighted (non-QSA) TileLang MQA logits prefill, bf16.
 
 Same tiling as the generic QSA prefill in ``mqa.py``; the head reduction is

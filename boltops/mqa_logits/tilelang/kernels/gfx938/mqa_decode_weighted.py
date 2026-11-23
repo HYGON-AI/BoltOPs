@@ -1,4 +1,6 @@
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: Apache-2.0
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+# Upstream reference: https://github.com/yht183/sglang-das/blob/4cc62ab1d0c7a63c770e2a275d42b67ae20c345c/python/sglang/srt/layers/attention/qsa/mqa.py
 """Independent weighted BF16 / packed E4M3FN paged decode on gfx938.
 
 QSA-compatible FullRow geometry and ordinary/persistent partitioning.
@@ -18,6 +20,8 @@ from tilelang import language as T
         tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
         tilelang.PassConfigKey.TL_DISABLE_DATA_RACE_CHECK: True,
         tilelang.PassConfigKey.TL_DEVICE_COMPILE_FLAGS: ["-ffast-math"],
+        # Match main's ordinary/persistent BF16 decode layout solver budget.
+        tilelang.PassConfigKey.TL_Z3_RLIMIT: 50000,
     }
 )
 def _weighted_decode_kernel(
