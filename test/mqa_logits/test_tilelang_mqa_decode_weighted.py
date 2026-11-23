@@ -290,6 +290,9 @@ def test_weighted_decode_fp8_scale_async(heads, persistent_splits):
 @pytest.mark.parametrize("batch,capacity,heads", [
     (1, 8192, 4), (8, 8192, 8), (16, 8192, 4), (16, 8192, 64),
     (32, 16384, 32), (64, 65536, 16), (1, 131072, 64),
+    # Complete QSA's suffix-split policy grid with public weighted launches.
+    (16, 16384, 4), (32, 65536, 4), (48, 65536, 4),
+    (64, 65536, 4), (4, 65536, 4),
 ])
 def test_weighted_decode_public_schedule_buckets(batch, capacity, heads, fp8):
     """Exercise real selector branches, long suffixes and full long contexts."""
@@ -344,6 +347,48 @@ def test_weighted_decode_fp8_rejects_unpacked_and_wrong_storage():
                 cache.float()):
         with pytest.raises(ValueError, match="k_cache"):
             tilelang_mqa_decode(q, bad, weights, table, lens, 128)
+
+
+@GFX938_REQUIRED
+@pytest.mark.bench
+@pytest.mark.parametrize("context_len", [8192, 32768, 65536])
+@pytest.mark.parametrize("batch", [16, 32, 64, 128])
+@pytest.mark.parametrize("heads", [4, 32, 64])
+def test_bench_weighted_mqa_decode_cooperative_load(
+    context_len, batch, heads, time_ms, bench_warmup, bench_repeat,
+):
+    """QSA's BF16 decode benchmark grid, with the weighted default policy.
+
+    QSA currently skips its counterpart due to a known VMFault. Keep the
+    weighted cases executable and publish their shape columns explicitly.
+    Both benchmarks time only compute, use contiguous pages, page16/D128,
+    full contexts and the runtime sqrt(D) score scale.
+    """
+    from boltops.mqa_logits.tilelang.configs.mqa_decode import weighted as policy
+
+    page_size, head_dim = 16, 128
+    max_pages = context_len // page_size
+    pages = batch * max_pages
+    torch.manual_seed(41)
+    q = torch.randn(batch, heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    cache = torch.randn(pages, page_size, 1, head_dim,
+                        device="cuda", dtype=torch.bfloat16)
+    weights = torch.randn(batch, heads, device="cuda", dtype=torch.float32) * .5
+    table = torch.arange(pages, device="cuda", dtype=torch.int32).reshape(batch, max_pages)
+    lengths = torch.full((batch,), context_len, device="cuda", dtype=torch.int32)
+    args = q, cache, weights, table, lengths
+    config = policy.get_config(batch, context_len, get_device_info("cuda").cu_count, heads)
+    output = torch.empty(batch, context_len, device="cuda", dtype=torch.float32)
+    kernel = _direct(args, output, group_size=config.group_size,
+                     groups_per_cta=config.groups_per_cta,
+                     persistent_splits=config.persistent_splits,
+                     num_stages=config.num_stages, use_async=config.use_async)
+    _check(output, args, context_len)
+    elapsed = time_ms(lambda: kernel(*args, output, math.sqrt(head_dim)),
+                      bench_warmup, bench_repeat, dtype=torch.bfloat16,
+                      flops=2 * batch * context_len * heads * head_dim)
+    print(f"[bench] weighted_mqa_decode B={batch} H={heads} "
+          f"context={context_len} {config}: {elapsed * 1000:.3f} us")
 
 
 @GFX938_REQUIRED

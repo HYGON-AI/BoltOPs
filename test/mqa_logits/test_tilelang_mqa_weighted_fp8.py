@@ -123,6 +123,19 @@ def test_weighted_fp8_effective_range(monkeypatch):
 
 @GFX938_REQUIRED
 @SLOW
+@pytest.mark.parametrize("heads", [32, 64])
+def test_weighted_fp8_heuristic_shape_matches_torch(heads):
+    """Mirror QSA's large FP8 policy cases: rows=4608, keys=8192."""
+    q, kv, scales, weights, _, _ = _inputs(4608, 8192, heads, seed=11)
+    starts = torch.zeros(4608, device="cuda", dtype=torch.int32)
+    ends = torch.full((4608,), 8192, device="cuda", dtype=torch.int32)
+    args = q, kv, scales, weights, starts, ends
+    out = tilelang_mqa_logits(*args)
+    _assert_reference(out, *args)
+
+
+@GFX938_REQUIRED
+@SLOW
 @pytest.mark.parametrize("rows,heads", [(128, 4), (1024, 8), (256, 32), (256, 64)])
 def test_weighted_fp8_public_configurations(rows, heads):
     """Actual dispatch: split-N, phase, and logical-M128/256; full reference."""

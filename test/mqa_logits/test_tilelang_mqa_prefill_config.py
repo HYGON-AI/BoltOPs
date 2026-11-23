@@ -4,6 +4,8 @@
 
 import inspect
 
+import pytest
+
 from boltops.mqa_logits import tilelang_qsa_mqa_prefill
 from boltops.mqa_logits.tilelang.configs.mqa_prefill import resolve_get_config
 from boltops.mqa_logits.tilelang._dispatch import _resolve_for_arch
@@ -17,6 +19,30 @@ def test_mqa_logits_tilelang_dispatch_falls_back_by_symbol():
     assert prefill_938.__module__.endswith("kernels.gfx938.mqa")
     assert decode_938.__module__.endswith("kernels.gfx938.mqa")
     assert prefill_936.__module__.endswith("kernels.common.mqa")
+
+
+def test_mqa_logits_weighted_dispatch_resolves_every_arch():
+    """The weighted op resolves on gfx938 and falls back to common elsewhere.
+
+    Covers the third ``_DEFAULT_IMPLEMENTATIONS`` entry, which the QSA-only
+    dispatch test never exercises.
+    """
+    weighted_938 = _resolve_for_arch("weighted_mqa_prefill", "gfx938")
+    weighted_936 = _resolve_for_arch("weighted_mqa_prefill", "gfx936")
+    weighted_946 = _resolve_for_arch("weighted_mqa_prefill", "gfx946")
+
+    for resolved in (weighted_938, weighted_936, weighted_946):
+        assert callable(resolved)
+        assert resolved.__name__ == "weighted_mqa_prefill"
+
+    assert weighted_938.__module__.endswith("kernels.gfx938.mqa")
+    assert weighted_936.__module__.endswith("kernels.common.mqa")
+    assert weighted_946.__module__.endswith("kernels.common.mqa")
+
+
+def test_weighted_dispatch_unknown_op_raises():
+    with pytest.raises(RuntimeError):
+        _resolve_for_arch("mqa_logits_decode", "gfx938")
 
 
 def test_gfx938_mqa_prefill_config_tracks_cu_wave_boundary():
@@ -80,6 +106,60 @@ def test_gfx938_h4_small_rows_use_key_dependent_logical_m_floor():
     for keys, choice in expected.items():
         config = get_config(256, keys, 72, num_heads=4)
         assert (config.block_q, config.split_n, config.n_tile_phases) == choice
+
+
+def test_gfx938_weighted_small_query_policy_is_separate():
+    from boltops.mqa_logits.tilelang.configs.mqa_prefill import (
+        resolve_get_config_fp8,
+        resolve_get_config_weighted,
+    )
+    from boltops.mqa_logits.tilelang.configs.mqa_prefill.gfx938 import (
+        get_config,
+        get_config_fp8,
+        get_config_weighted,
+    )
+
+    assert resolve_get_config("gfx938") is get_config
+    assert resolve_get_config_fp8("gfx938") is get_config_fp8
+    assert resolve_get_config_weighted("gfx938") is get_config_weighted
+    for rows, split, phases in ((128, 16, 1), (256, 8, 1),
+                                (512, 4, 1), (1024, 2, 2)):
+        config = get_config_weighted(rows, 4096, 72)
+        assert (config.block_q, config.split_n, config.n_tile_phases) == (
+            32, split, phases,
+        )
+        assert config.logical_m == 128
+        assert config.rows_divisible
+        assert (rows // config.block_q) * config.split_n == 64
+        assert get_config(rows, 4096, 72) != config
+        assert get_config_fp8(rows, 4096, 72) == get_config(rows, 4096, 72)
+
+
+def test_gfx938_weighted_small_query_policy_preserves_unmeasured_shapes():
+    from boltops.mqa_logits.tilelang.configs.mqa_prefill.gfx938 import (
+        get_config,
+        get_config_weighted,
+    )
+
+    cases = [
+        (rows, keys, cu_count, hint, heads)
+        for rows in (64, 128, 256, 512, 1024)
+        for keys, cu_count, hint, heads in (
+            (4096, 72, None, 8),
+            (4096, 72, None, 32),
+            (4096, 72, None, 64),
+            (8192, 72, None, 4),
+            (4096, 64, None, 4),
+            (4096, 72, 2048, 4),
+            (4096, 72, 4096, 4),
+        )
+    ]
+    cases.extend((rows, 4096, 72, None, 4)
+                 for rows in (1, 41, 64, 127, 129, 513, 4096, 8192))
+    for rows, keys, cu_count, hint, heads in cases:
+        assert get_config_weighted(rows, keys, cu_count, hint, heads) == (
+            get_config(rows, keys, cu_count, hint, heads)
+        )
 
 
 def test_gfx938_mqa_prefill_config_tracks_key_stride():

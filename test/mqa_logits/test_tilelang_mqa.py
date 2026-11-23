@@ -842,7 +842,7 @@ def test_qsa_mqa_decode_group128_persistent_matches_torch(
 
 @GPU_REQUIRED
 @pytest.mark.bench
-@pytest.mark.parametrize("rows", [4096, 8192, 16384])
+@pytest.mark.parametrize("rows", [256, 1024, 4096, 8192, 16384])
 def test_bench_qsa_mqa_prefill_kernel(
     rows: int,
     time_ms,
