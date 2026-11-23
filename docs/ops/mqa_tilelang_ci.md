@@ -9,14 +9,20 @@ CI 触发条件或公共收集规则。QSA prefill 测试此前已有的 Q=256/1
 
 ### 最新主线的 CI 分工
 
-GitLab `main`（本次迁移基线 `f97d4ea`）的 `.gitlab-ci.yml` 仅在
+GitLab 迁移基线 `main` 的 `f97d4ea` 中，`.gitlab-ci.yml` 仅在
 目标为 `main` 的 MR 中构建 DTK 27.04 / Python 3.12 wheel；合入后
 另行发布。当前没有正确性或性能任务，GitLab 构建通过不代表 GPU
 正确性和性能测试通过。
 
-GitHub 的 workflow 配置以 `release/0.1.0` 为目标，按其矩阵执行
-构建和选定环境的测试。两端触发条件以各自目标分支中的实际配置为准。
-本次仅迁移非 QSA 实现与测试，不修改两端 CI 工作流。
+GitHub 本次迁移基线为 `release/0.1.0` 的 `3fa0991`。其 workflow
+在 PR 中构建 DTK 26.04 / Python 3.10 / Torch 2.11.0 和 DTK 26.10 /
+Python 3.12 / Torch 2.13.0，并执行正确性与性能任务。个人 Fork 的 PR
+须由有相应仓库权限的人员添加 `ok-to-test` 标签，通过 `authorize-ci`
+检查后才能使用内部 Runner；创建 PR 不代表测试已获准执行。
+
+两端触发条件以各自目标分支中的实际配置为准。GitHub 基线保留自己的
+`.gitlab-ci.yml` 和 `.github/` 文件，本次仅迁移非 QSA 实现与测试，
+不将 GitLab 的构建工作流覆盖到 GitHub。
 
 下表中的默认 / slow 是 pytest 分层。GitLab 仍保留这些测试文件，
 以便本地或启用测试的 CI 使用，不能据此声称当前 GitLab 自动运行它们。
@@ -95,7 +101,7 @@ QSA 对照百分比、spill 或 bank conflict 分析。
 以上记录对应旧基线的验证，不代表迁移后的代码已验证；新主线 CI 分工
 见上文，也不能以本机结果代替 DTK 27.04 的实际构建结果。
 
-## 本机验证（迁移后，2026-11-23）
+## 本机验证（GitLab 迁移后，2026-11-23）
 
 基于 GitLab `main` 的 `f97d4ea`，迁移四笔非 QSA 提交后完成本地回归。
 测试期间保持 kernel 源码不变，启用 `--runslow` 并排除 `bench`：
@@ -120,3 +126,22 @@ python -m pytest test/mqa_logits/test_tilelang*.py test/test_package_smoke.py \
 验证环境为 Python 3.10 / Torch 2.11.0 / DTK2604 / TileLang 0.1.15
 开发源码，使用 gfx938 GPU 6。本次记录为正确性与本地打包验证，不包含
 迁移后的性能复测，也不替代 GitLab DTK 27.04 / Python 3.12 构建。
+
+## GitHub 迁移核对（2026-11-23）
+
+从 `release/0.1.0` 的 `3fa0991` 创建独立功能分支，迁移非 QSA 的
+实现、测试和编译适配。64 个 MQA 源码和测试文件与上述已完成全量回归
+的 GitLab 分支逐字节一致；QSA 四个核心 kernel 与 GitHub 基线一致。
+GitHub 的 CI、版本号及包版本检查保留上游内容，未复制 GitLab 的
+工作流改动。
+
+在同一本机环境中运行默认 CI 分层的 MQA 与 package smoke 子集：
+
+```bash
+python -m pytest test/mqa_logits/test_tilelang*.py test/test_package_smoke.py \
+  -m 'not slow and not bench' -q --tb=short
+```
+
+结果为 116 passed、1 skipped、402 deselected。该次未重新运行 slow
+网格；其源码和 MQA 实现已与 GitLab 全量验证版本核对一致。本次子集
+验证不代表已执行 GitHub 全仓库 CI、DTK 26.10 环境或性能测试。
