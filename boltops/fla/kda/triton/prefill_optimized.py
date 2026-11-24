@@ -197,12 +197,10 @@ def _prefill_optimized_prepare_kernel(
     if NORMALIZE_QK:
         b_qf = b_q.to(tl.float32)
         b_kf = b_k.to(tl.float32)
-        b_q = (
-            b_qf * tl.rsqrt(tl.sum(b_qf * b_qf, axis=1)[:, None] + 1e-6)
-        ).to(tl.bfloat16)
-        b_k = (
-            b_kf * tl.rsqrt(tl.sum(b_kf * b_kf, axis=1)[:, None] + 1e-6)
-        ).to(tl.bfloat16)
+        # Normalize and apply decay before narrowing the workspace operands.
+        # An extra BF16 round here compounds the later dot/inverse rounding.
+        b_q = b_qf * tl.rsqrt(tl.sum(b_qf * b_qf, axis=1)[:, None] + 1e-6)
+        b_k = b_kf * tl.rsqrt(tl.sum(b_kf * b_kf, axis=1)[:, None] + 1e-6)
 
     if FUSE_GATE:
         o_d = tl.arange(0, DIM)
@@ -236,7 +234,7 @@ def _prefill_optimized_prepare_kernel(
     b_a = tl.where(strict_lower, b_l * b_beta[:, None], 0.0)
     identity = (rows[:, None] == rows[None, :]).to(tl.float32)
     b_a2 = tl.dot(b_a, b_a, input_precision="ieee", out_dtype=tl.float32)
-    b_x = tl.dot(identity + b_a, identity + b_a2,
+    b_x = tl.dot(identity - b_a, identity + b_a2,
               input_precision="ieee", out_dtype=tl.float32)
     b_a4 = tl.dot(b_a2, b_a2, input_precision="ieee", out_dtype=tl.float32)
     b_x = tl.dot(b_x, identity + b_a4,
@@ -245,7 +243,7 @@ def _prefill_optimized_prepare_kernel(
     b_x = tl.dot(b_x, identity + b_a8,
                 input_precision="ieee", out_dtype=tl.float32)
     # ``b_a`` is strictly lower triangular with K1_CHUNK=16, so b_a**16 is
-    # exactly zero.  The Neumann series is complete after the A^8 step.
+    # exactly zero. (I-A)(I+A^2)(I+A^4)(I+A^8) is the complete (I+A)^-1.
     b_mqk = tl.where(
         lower_equal,
         tl.dot(b_qd, tl.trans(b_ki), input_precision="ieee"),
@@ -357,12 +355,9 @@ def _prefill_recurrence_step(
     ).to(tl.float32)
     if APPLY_BETA_SIGMOID:
         b_beta = tl.sigmoid(b_beta)
-    # Deliberately NOT symmetric with the fp32 output accumulation below: doing
-    # this subtraction in fp32 instead (``b_v.to(tl.float32) - b_u``) keeps the
-    # solve's operand in registers a stage longer and was measured *slower* at
-    # small head counts -- 8192/H=16 -3.1%, 1024/H=8 -5.2% -- while only helping
-    # at H=64.  The bf16 round here is on the critical path into the UT solve.
-    b_u = ((b_v - b_u.to(b_v.dtype)) * b_beta[:, None]).to(tl.bfloat16)
+    # Form the residual before narrowing: rounding the prediction first loses
+    # cancellation accuracy and can push bounded-gate prefill over its limit.
+    b_u = ((b_v.to(tl.float32) - b_u) * b_beta[:, None]).to(tl.bfloat16)
 
     p_inv = tl.make_block_ptr(
         inv + tile_lm, (K1_CHUNK, K1_CHUNK), (K1_CHUNK, 1), (0, 0),
@@ -425,14 +420,14 @@ def _prefill_segment_operator_kernel(
     """Summarize one time segment as the affine map it applies to the state.
 
     A chunk sends the state ``S`` in R^[K,V] to ``M_c S + d_c`` with
-    ``M_c = (I - kr^T inv diag(beta) kd) diag(g)``, so a whole segment is
+    ``M_c = diag(gt) - kr^T inv diag(beta) kd``, so a whole segment is
     ``F_s(S) = M_s S + Delta_s``.  ``M`` is only [K,K] -- the map acts the same
     way on every V column -- which is what makes the time axis parallelizable.
 
     Both halves obey the identical per-chunk update on a right-hand block
     ``R`` in R^[K,C]::
 
-        P = diag(g) R;  Y = kd P;  Z = inv (beta .* (Vterm - Y));  R' = P + kr^T Z
+        P = diag(gt) R;  Y = kd R;  Z = inv (beta .* (Vterm - Y));  R' = P + kr^T Z
 
     so one kernel computes both: columns [0, DIM) carry ``M`` (``Vterm`` = 0,
     init identity) and columns [DIM, 2*DIM) carry ``Delta`` (``Vterm`` = v,
@@ -451,12 +446,14 @@ def _prefill_segment_operator_kernel(
 
     o_k = tl.arange(0, 64)
     o_c = c0 + tl.arange(0, BC)
+    # Match the main recurrence: carry state in FP32 and narrow only the dot
+    # operands. A BF16 carry discards small gate decay on every chunk.
     if is_delta:
-        b_r1 = tl.zeros((BC, 64), dtype=tl.bfloat16)
-        b_r2 = tl.zeros((BC, 64), dtype=tl.bfloat16)
+        b_r1 = tl.zeros((BC, 64), dtype=tl.float32)
+        b_r2 = tl.zeros((BC, 64), dtype=tl.float32)
     else:
-        b_r1 = (o_c[:, None] == o_k[None, :]).to(tl.bfloat16)
-        b_r2 = (o_c[:, None] == (o_k + 64)[None, :]).to(tl.bfloat16)
+        b_r1 = (o_c[:, None] == o_k[None, :]).to(tl.float32)
+        b_r2 = (o_c[:, None] == (o_k + 64)[None, :]).to(tl.float32)
 
     o_t = tl.arange(0, K1_CHUNK)
     for i_t in tl.range(i_s * NT, i_s * NT + NT, num_stages=PIPE_STAGES):
@@ -476,10 +473,10 @@ def _prefill_segment_operator_kernel(
             (K1_CHUNK, 64), (1, 0),
         )
         b_y = tl.dot(
-            tl.load(p_kd1, eviction_policy="evict_last"), tl.trans(b_r1)
+            tl.load(p_kd1, eviction_policy="evict_last"), tl.trans(b_r1.to(tl.bfloat16))
         )
         b_y += tl.dot(
-            tl.load(p_kd2, eviction_policy="evict_last"), tl.trans(b_r2)
+            tl.load(p_kd2, eviction_policy="evict_last"), tl.trans(b_r2.to(tl.bfloat16))
         )
 
         b_beta = tl.load(
@@ -498,9 +495,9 @@ def _prefill_segment_operator_kernel(
                 (K1_CHUNK, BC), (1, 0),
             )
             b_v = tl.load(p_v, eviction_policy="evict_first")
-            b_z = ((b_v - b_y.to(b_v.dtype)) * b_beta[:, None]).to(tl.bfloat16)
+            b_z = ((b_v.to(tl.float32) - b_y) * b_beta[:, None]).to(tl.bfloat16)
         else:
-            b_z = (-b_y.to(tl.bfloat16) * b_beta[:, None]).to(tl.bfloat16)
+            b_z = (-b_y * b_beta[:, None]).to(tl.bfloat16)
 
         p_inv = tl.make_block_ptr(
             inv + tile_lm, (K1_CHUNK, K1_CHUNK), (K1_CHUNK, 1), (0, 0),
@@ -522,13 +519,13 @@ def _prefill_segment_operator_kernel(
         b_gt2 = tl.load(gt + tile * DIM + 64 + o_k, eviction_policy="evict_last")
         b_y_t = tl.trans(b_z)
         b_r1 = (
-            b_r1.to(tl.float32) * b_gt1[None, :]
+            b_r1 * b_gt1[None, :]
             + tl.dot(b_y_t, tl.load(p_kr1, eviction_policy="evict_last"))
-        ).to(tl.bfloat16)
+        )
         b_r2 = (
-            b_r2.to(tl.float32) * b_gt2[None, :]
+            b_r2 * b_gt2[None, :]
             + tl.dot(b_y_t, tl.load(p_kr2, eviction_policy="evict_last"))
-        ).to(tl.bfloat16)
+        )
 
     part = i_c // n_col
     base = ((part * SEG + i_s) * H + i_h) * DIM * DIM
@@ -728,10 +725,9 @@ def prefill_optimized_fwd(
     kd = kd_qd_kr[0]
     qd = kd_qd_kr[1]
     kr = kd_qd_kr[2]
-    # Gate totals are consumed as BF16 by the K2 recurrence.  Keeping this
-    # workspace in FP32 doubles the state-loop traffic without improving the
-    # FP32 accumulator, which already widens the value on load.
-    gt = torch.empty((nt, H, D), device=q.device, dtype=q.dtype)
+    # Near-unit decay can round to exactly one in BF16. Preserve the total
+    # through the workspace so its error does not accumulate across chunks.
+    gt = torch.empty((nt, H, D), device=q.device, dtype=torch.float32)
     inv_mqk = torch.empty(
         (2, nt, H, K1_CHUNK, K1_CHUNK), device=q.device, dtype=q.dtype
     )

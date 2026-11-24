@@ -204,6 +204,118 @@ def tflops(flops: float, latency_ms: float) -> float:
 STAT_MODES = ("min", "max", "mean", "median")
 
 
+# Reused CUDA-graph capture resources for :func:`_pooled_graph_bench`.
+# Sharing ONE memory pool (and one side stream) across every graph
+# capture in the process avoids the driver-level hang seen on DTK2604 /
+# gfx938: with a fresh pool per capture, many varying-size graphs
+# fragment the driver VA space, and a later large allocation deadlocks
+# inside hipMalloc (hsaKmtWaitOnEvent, uninterruptible).  Reusing a
+# single pool keeps one VA region alive and growing to the largest
+# graph, so no new segment is ever requested from the driver mid-bench.
+# ``stream`` / ``pool`` are created lazily on first use (keeps this module
+# importable on CPU-only hosts); both stay alive for the process lifetime
+# (the pool grows to the largest graph and is intentionally never freed).
+_GRAPH_BENCH_STATE: dict = {"stream": None, "pool": None}
+
+
+def _capture_and_time(
+    run: Callable[[], None],
+    rep: float,
+    return_mode: str,
+    stream,
+    state: dict,
+    share_pool: bool,
+) -> float:
+    """One graph capture + timed replay on ``stream``.
+
+    ``share_pool=True`` reuses (and grows) ``state["pool"]``; ``False``
+    captures into a throwaway pool, leaving ``state`` untouched.
+    """
+    import torch
+
+    pool = state["pool"] if share_pool else None
+    with torch.cuda.stream(stream):
+        # warmup on the side stream (JIT, allocator priming)
+        run()
+        torch.cuda.synchronize()
+        s0 = torch.cuda.Event(enable_timing=True)
+        s1 = torch.cuda.Event(enable_timing=True)
+        s0.record()
+        for _ in range(5):
+            run()
+        s1.record()
+        torch.cuda.synchronize()
+        estimate_ms = s0.elapsed_time(s1) / 5
+        n_repeat = 1000 if estimate_ms == 0 else max(1, int(rep / estimate_ms))
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, pool=pool):
+            for _ in range(n_repeat):
+                run()
+        if share_pool:
+            # hand the (possibly grown) pool to the next capture
+            state["pool"] = graph.pool()
+        torch.cuda.synchronize()
+
+        samples: list[float] = []
+        for _ in range(10):
+            e0 = torch.cuda.Event(enable_timing=True)
+            e1 = torch.cuda.Event(enable_timing=True)
+            e0.record()
+            graph.replay()
+            e1.record()
+            torch.cuda.synchronize()
+            samples.append(e0.elapsed_time(e1) / n_repeat)
+        del graph
+
+    ordered = sorted(samples)
+    if return_mode == "median":
+        return float(ordered[len(ordered) // 2])
+    if return_mode == "min":
+        return float(min(samples))
+    if return_mode == "max":
+        return float(max(samples))
+    return float(sum(samples) / len(samples))  # mean
+
+
+def _pooled_graph_bench(
+    run: Callable[[], None],
+    rep: float = 20.0,
+    return_mode: str = "median",
+    **_ignored: object,
+) -> float:
+    """CUDA-graph timing that reuses a shared capture stream + memory pool.
+
+    Drop-in for ``triton.testing.do_bench_cudagraph`` (same contract:
+    returns a scalar latency in ms), but reuses :data:`_GRAPH_BENCH_STATE`
+    across calls.  See that annotation for why the pool must be shared.
+    Kept as a module global (not a closure) so the perf collector in
+    ``test/conftest.py`` can rebind it to an observing wrapper.
+
+    Falls back to a throwaway pool when reusing the shared pool hits the
+    DTK-PyTorch small-allocation ``use_count`` assert (reusing a pool for
+    very small graphs is buggy in this torch fork), so ops with small
+    intermediates keep working just like triton's fresh-pool path.
+    """
+    import torch
+
+    state = _GRAPH_BENCH_STATE
+    if state["stream"] is None:
+        state["stream"] = torch.cuda.Stream()
+    stream = state["stream"]
+    try:
+        return _capture_and_time(
+            run, rep, return_mode, stream, state, share_pool=True
+        )
+    except RuntimeError as exc:
+        if "use_count" not in str(exc):
+            raise
+        torch.cuda.synchronize()
+        return _capture_and_time(
+            run, rep, return_mode, stream, state, share_pool=False
+        )
+
+
 def time_ms(
     run: Callable[[], None],
     warmup_ms: float = 10.0,
@@ -239,7 +351,11 @@ def time_ms(
     if backend == "triton":
         import triton
 
-        cudagraph_bench = triton.testing.do_bench_cudagraph
+        # Shared-pool graph bench (see _GRAPH_BENCH_STATE) instead of
+        # triton's fresh-stream/fresh-pool do_bench_cudagraph.  Reads the
+        # module global at call time so the perf collector can rebind it
+        # to an observing wrapper without changing this call site.
+        cudagraph_bench = _pooled_graph_bench
         event_bench = triton.testing.do_bench
     elif backend == "tilelang":
         import tilelang.profiler as tilelang_profiler

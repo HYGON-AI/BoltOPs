@@ -270,13 +270,14 @@ def test_full_fused_gate_prefill_matches_recurrent_reference() -> None:
 @GPU_REQUIRED
 def test_prefill_optimized_path_matches_recurrent_reference() -> None:
     """The K=128 fixed-schedule prefill (dispatched by ``chunk_kda_with_fused_gate``
-    for T <= 1024) must match the naive recurrence reference, and T > 1024
-    must fall back to the standard chunk pipeline at K=128."""
+    across its whole T window) must match the naive recurrence reference, and
+    T beyond the 16384-token window must fall back to the standard chunk
+    pipeline at K=128."""
     from boltops.fla.kda.triton.prefill_optimized import can_run_prefill_optimized
 
     torch.manual_seed(231)
     B, H, K, V = 1, 24, 128, 128
-    for T in (16, 1024, 1040):
+    for T in (16, 1024, 1040, 16400):
         q = torch.randn(B, T, H, K, device=DEVICE, dtype=torch.bfloat16) * 0.1
         k = torch.randn_like(q)
         v = torch.randn(B, T, H, V, device=DEVICE, dtype=torch.bfloat16) * 0.1
@@ -285,12 +286,12 @@ def test_prefill_optimized_path_matches_recurrent_reference() -> None:
         A_log = (torch.randn(H, device=DEVICE, dtype=torch.float32) * 0.5) - 2.0
         bias = torch.randn(H, K, device=DEVICE, dtype=torch.float32) * 0.1
         initial = torch.randn(B, H, V, K, device=DEVICE, dtype=torch.float32) * 0.01
-        # Inputs stay eligible for the fixed schedule at every T here; the
-        # wrapper additionally gates T <= 1024 and H <= 64, so T=16/1024 run
-        # the optimized path and T=1040 exercises the K=128 fallback.
+        # Inputs stay eligible for the fixed schedule at every T here, so
+        # T=16/1024/1040 route to the optimized path; T=16400 overflows the
+        # schedule's own 16384-token window and exercises the K=128 fallback.
         assert can_run_prefill_optimized(
             q, k, v, raw_g, raw_beta, lower_bound=-3.0
-        ), T
+        ) == (T <= 16384), T
         gate = naive_kda_gate(raw_g, A_log, bias, lower_bound=-3.0)
         beta = raw_beta.float().sigmoid()
         expected, expected_state = naive_recurrent_kda(

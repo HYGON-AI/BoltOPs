@@ -1436,11 +1436,14 @@ def chunk_kda_with_fused_gate(
     if scale is None:
         scale = k.shape[-1] ** -0.5
     # The fixed-schedule prefill is single-sequence: route pooled or
-    # in-place state through the standard pipeline instead.
+    # in-place state through the standard pipeline instead.  The T window is
+    # ``can_run_prefill_optimized``'s own (K1_CHUNK <= T <= 16384): measured on
+    # BW1100 the fixed schedule beats the chunk pipeline at every H in
+    # {8, 24, 64} and every T in {1024..16384} -- by 13-31% at H=24, 23-49%
+    # at H=8 and 36-50% at H=64 end to end -- so there is no early T cutoff.
     if (
         initial_state_indices is None
         and not inplace_final_state
-        and q.shape[1] <= 1024
         and q.shape[2] <= 64
         and can_run_prefill_optimized(
             q,
