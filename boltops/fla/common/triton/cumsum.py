@@ -21,6 +21,8 @@ import torch
 import triton
 import triton.language as tl
 
+from boltops.utility import arch_info
+
 from .utils import prepare_chunk_indices
 
 CHUNK_LOCAL_CUMSUM_SCALAR_CONFIGS: tuple[dict[str, int], ...] = (
@@ -34,6 +36,10 @@ CHUNK_LOCAL_CUMSUM_VECTOR_CONFIGS: tuple[dict[str, int], ...] = (
     {"BS": 64, "num_warps": 4},
     {"BS": 128, "num_warps": 4},
 )
+
+
+def _grouped_scalar_device_supported(device):
+    return device.type == 'cuda' and arch_info.get_arch(device) == 'gfx946'
 
 
 def get_chunk_local_cumsum_scalar_config(
@@ -196,6 +202,26 @@ def chunk_local_cumsum_vector_kernel(
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
 
+@triton.jit(do_not_specialize=["T"])
+def chunk_local_cumsum_scalar_heads_kernel(
+    s, o, cu_seqlens, chunk_indices, cumsum_scale, T,
+    B: tl.constexpr, H: tl.constexpr, BT: tl.constexpr, BH: tl.constexpr,
+    REVERSE: tl.constexpr, HEAD_FIRST: tl.constexpr, IS_VARLEN: tl.constexpr,
+):
+    tl.static_assert(not HEAD_FIRST and not IS_VARLEN)
+    group = tl.program_id(1)
+    batch = group // tl.cdiv(H, BH)
+    heads = group % tl.cdiv(H, BH) * BH + tl.arange(0, BH)
+    times = tl.program_id(0) * BT + tl.arange(0, BT)
+    offsets = (batch * T + times[:, None]) * H + heads[None, :]
+    valid = (times[:, None] < T) & (heads[None, :] < H)
+    values = tl.load(s + offsets, valid, other=0).to(tl.float32)
+    result = tl.cumsum(values, 0)
+    if REVERSE:
+        result = tl.sum(values, 0)[None, :] - result + values
+    tl.store(o + offsets, (result * cumsum_scale).to(o.dtype.element_ty), valid)
+
+
 def chunk_local_cumsum_scalar(
     g: torch.Tensor,
     chunk_size: int,
@@ -205,6 +231,7 @@ def chunk_local_cumsum_scalar(
     head_first: bool = False,
     output_dtype: torch.dtype | None = torch.float,
     cumsum_scale: float = 1.0,
+    kernel_cfg: dict | None = None,
 ) -> torch.Tensor:
     if head_first:
         B, H, T = g.shape
@@ -219,8 +246,22 @@ def chunk_local_cumsum_scalar(
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     g_org, g = g, torch.empty_like(g, dtype=output_dtype or g.dtype)
     grid = (NT, B * H)
-    config = get_chunk_local_cumsum_scalar_config(T, H, cu_seqlens is not None)
-    chunk_local_cumsum_scalar_kernel[grid](
+    config = dict(get_chunk_local_cumsum_scalar_config(T, H, cu_seqlens is not None))
+    if (kernel_cfg is None and not head_first and cu_seqlens is None
+            and g_org.is_contiguous() and g_org.dtype == torch.float32
+            and g.dtype == torch.float32 and BT == 64 and T >= 2048
+            and H in (8, 32, 64) and _grouped_scalar_device_supported(g_org.device)):
+        config.update(BH=8, num_warps=1 if H == 64 and T >= 6656 else 4)
+    config.update(kernel_cfg or {})
+    head_block = config.pop('BH', 0)
+    kernel = chunk_local_cumsum_scalar_kernel
+    if head_block:
+        if head_first or cu_seqlens is not None or not g_org.is_contiguous():
+            raise ValueError('Grouped scalar cumsum requires contiguous fixed token-major inputs')
+        kernel = chunk_local_cumsum_scalar_heads_kernel
+        grid = (NT, B * triton.cdiv(H, head_block))
+        config.update(BH=head_block, IS_VARLEN=False)
+    kernel[grid](
         g_org,
         g,
         cu_seqlens,

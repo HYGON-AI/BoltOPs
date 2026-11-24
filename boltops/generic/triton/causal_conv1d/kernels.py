@@ -632,8 +632,15 @@ def causal_conv1d_fn_sglang(
     # it, so the knob falls back to the precise `/` division there.
     silu_fast = kwargs.get("silu_fast", hasattr(tl, "fdiv_fast"))
     rs_warps = kwargs.get("rowscan_warps", 1)
-    rs_block_n = 8 * 64 * rs_warps  # one dwordx4 (8 x bf16) per lane
-    rs_rows = 8
+    # For SiLU the reciprocal denominator is >= 1 for finite inputs. gfx946
+    # can use its native reciprocal without general division scaling guards.
+    # The narrower channel tile avoids crossing a VGPR residency threshold.
+    rs_silu_rcp = kwargs.get(
+        "silu_rcp", silu_fast and activation in ("silu", "swish")
+        and x.dtype == torch.bfloat16 and _rowscan_default_enabled(x.device),
+    )
+    rs_block_n = kwargs.get("rowscan_block_n", (4 if rs_silu_rcp else 8) * 64 * rs_warps)
+    rs_rows = kwargs.get("rowscan_rows", 8)
     rs_groups = kwargs.get("rowscan_groups", 0)
     use_rowscan = (
         use_vec8 and kwargs.get("rowscan", _rowscan_default_enabled(x.device))
@@ -688,6 +695,7 @@ def causal_conv1d_fn_sglang(
             ROWS=rs_rows,
             GROUPS=rs_groups,
             SILU_FAST=silu_fast,
+            SILU_RCP=rs_silu_rcp,
             num_warps=rs_warps,
             **_flush_denorm_options(x.device),
         )
@@ -942,7 +950,7 @@ def _sglang_causal_conv1d_fwd_kernel_rowscan(
     HAS_INITIAL_STATES: tl.constexpr, HAS_CACHE: tl.constexpr,
     IS_CONTINUOUS_BATCHING: tl.constexpr, USE_PAD_SLOT: tl.constexpr,
     BLOCK_N: tl.constexpr, ROWS: tl.constexpr, GROUPS: tl.constexpr,
-    SILU_FAST: tl.constexpr,
+    SILU_FAST: tl.constexpr, SILU_RCP: tl.constexpr = False,
 ):
     T_TILE: tl.constexpr = ROWS * GROUPS
     idx_seq = tl.program_id(0)
@@ -1019,7 +1027,14 @@ def _sglang_causal_conv1d_fwd_kernel_rowscan(
             xr = rows[r].to(tl.float32)
             acc = bias + h0 * w0 + h1 * w1 + h2 * w2 + xr * w3
             if SILU_ACTIVATION:
-                if SILU_FAST:
+                if SILU_RCP:
+                    denominator = 1 + tl.exp(-acc)
+                    reciprocal = tl.inline_asm_elementwise(
+                        "v_rcp_f32 $0, $1", constraints="=v,v",
+                        args=[denominator], dtype=tl.float32, is_pure=True, pack=1,
+                    )
+                    acc = acc * reciprocal
+                elif SILU_FAST:
                     acc = tl.fdiv_fast(acc, 1 + tl.exp(-acc))
                 else:
                     acc = acc / (1 + tl.exp(-acc))
@@ -1115,6 +1130,8 @@ def _sglang_causal_conv1d_update_kernel(
     BLOCK_N: tl.constexpr,
     SAVE_INTERMEDIATE: tl.constexpr,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr,
+    SILU_RCP: tl.constexpr = False,
+    REGISTER_STATE: tl.constexpr = False,
     USE_GDC: tl.constexpr = False,
 ):
     # ruff: noqa: E501
@@ -1185,55 +1202,59 @@ def _sglang_causal_conv1d_update_kernel(
         conv_states_ptrs = prior_tokens + 3 * stride_conv_state_tok  # [BLOCK_N]
         col3 = tl.load(conv_states_ptrs, mask_w, 0.0)
 
-    # STEP 2: assume state_len > seqlen
-    idx_tokens = tl.arange(0, NP2_STATELEN)  # [BLOCK_M]
+    x_base = x_ptr + (idx_seq * stride_x_seq) + (idx_feats * stride_x_dim)
+    if REGISTER_STATE:
+        tl.static_assert(KERNEL_WIDTH == 4 and state_len == 3)
+        tl.static_assert(not IS_SPEC_DECODING and not HAS_EAGLE_TREE_CUSTOM_ATTN_MASK)
+    else:
+        # STEP 2: assume state_len > seqlen
+        idx_tokens = tl.arange(0, NP2_STATELEN)  # [BLOCK_M]
 
-    # The conv_state updates works in a sliding window manner,
-    # at each forward pass, the tokens are shift by 1, so we
-    # load since idx_tokens + 1.
-    conv_state_ptrs_source = (
-        conv_state_ptr
-        + (conv_state_batch_coord * stride_conv_state_seq)
-        + conv_state_token_offset * stride_conv_state_tok
-        + (idx_feats * stride_conv_state_dim)[None, :]
-        + ((idx_tokens + (1 if IS_SPEC_DECODING else seqlen)) * stride_conv_state_tok)[
-            :, None
-        ]
-    )  # [BLOCK_M, BLOCK_N]
-    mask = (
-        (conv_state_batch_coord < num_cache_lines)
-        & ((idx_tokens + seqlen) < state_len)[:, None]
-        & (idx_feats < dim)[None, :]
-    )
-    conv_state = tl.load(conv_state_ptrs_source, mask, other=0.0)
+        # The conv_state updates works in a sliding window manner,
+        # at each forward pass, the tokens are shift by 1, so we
+        # load since idx_tokens + 1.
+        conv_state_ptrs_source = (
+            conv_state_ptr
+            + (conv_state_batch_coord * stride_conv_state_seq)
+            + conv_state_token_offset * stride_conv_state_tok
+            + (idx_feats * stride_conv_state_dim)[None, :]
+            + ((idx_tokens + (1 if IS_SPEC_DECODING else seqlen)) * stride_conv_state_tok)[
+                :, None
+            ]
+        )  # [BLOCK_M, BLOCK_N]
+        mask = (
+            (conv_state_batch_coord < num_cache_lines)
+            & ((idx_tokens + seqlen) < state_len)[:, None]
+            & (idx_feats < dim)[None, :]
+        )
+        conv_state = tl.load(conv_state_ptrs_source, mask, other=0.0)
 
-    VAL = state_len - seqlen
-    x_base = x_ptr + (idx_seq * stride_x_seq) + (idx_feats * stride_x_dim)  # [BLOCK_N]
+        VAL = state_len - seqlen
 
-    x_ptrs = (
-        x_base[None, :] + ((idx_tokens - VAL) * stride_x_token)[:, None]
-    )  # [BLOCK_M, BLOCK_N]
+        x_ptrs = (
+            x_base[None, :] + ((idx_tokens - VAL) * stride_x_token)[:, None]
+        )  # [BLOCK_M, BLOCK_N]
 
-    mask_x = (
-        (idx_tokens - VAL >= 0)[:, None]
-        & (idx_tokens - VAL < seqlen)[:, None]
-        & (idx_feats < dim)[None, :]
-    )  # token-index  # token-index  # feature-index
-    loaded_x = tl.load(x_ptrs, mask_x, 0.0)
-    tl.debug_barrier()
+        mask_x = (
+            (idx_tokens - VAL >= 0)[:, None]
+            & (idx_tokens - VAL < seqlen)[:, None]
+            & (idx_feats < dim)[None, :]
+        )  # token-index  # token-index  # feature-index
+        loaded_x = tl.load(x_ptrs, mask_x, 0.0)
+        tl.debug_barrier()
 
-    new_conv_state = tl.where(mask, conv_state, loaded_x)
+        new_conv_state = tl.where(mask, conv_state, loaded_x)
 
-    conv_state_base = (
-        conv_state_ptr
-        + (conv_state_batch_coord * stride_conv_state_seq)
-        + (idx_feats * stride_conv_state_dim)
-    )  # [BLOCK_N,]
-    conv_state_ptrs_target = (
-        conv_state_base + (idx_tokens * stride_conv_state_tok)[:, None]
-    )  # [BLOCK_M, BLOCK_N]
-    mask = (idx_tokens < state_len)[:, None] & (idx_feats < dim)[None, :]
-    tl.store(conv_state_ptrs_target, new_conv_state, mask)
+        conv_state_base = (
+            conv_state_ptr
+            + (conv_state_batch_coord * stride_conv_state_seq)
+            + (idx_feats * stride_conv_state_dim)
+        )  # [BLOCK_N,]
+        conv_state_ptrs_target = (
+            conv_state_base + (idx_tokens * stride_conv_state_tok)[:, None]
+        )  # [BLOCK_M, BLOCK_N]
+        mask = (idx_tokens < state_len)[:, None] & (idx_feats < dim)[None, :]
+        tl.store(conv_state_ptrs_target, new_conv_state, mask)
 
     # STEP 3: init accumulator
     if HAS_BIAS:
@@ -1445,7 +1466,14 @@ def _sglang_causal_conv1d_update_kernel(
                     tl.store(base_ptr + 2 * stride_inter_win, col2, mask=mask_w)
 
         if SILU_ACTIVATION:
-            if SILU_FAST:
+            if SILU_RCP:
+                denominator = 1 + tl.exp(-acc)
+                inverse = tl.inline_asm_elementwise(
+                    "v_rcp_f32 $0, $1", constraints="=v,v", args=[denominator],
+                    dtype=tl.float32, is_pure=True, pack=1,
+                )
+                acc = acc * inverse
+            elif SILU_FAST:
                 acc = tl.fdiv_fast(acc, 1 + tl.exp(-acc))
             else:
                 acc = acc / (1 + tl.exp(-acc))
@@ -1471,6 +1499,13 @@ def _sglang_causal_conv1d_update_kernel(
                 mask=mask_retrieve,
             )
 
+    if REGISTER_STATE:
+        # col0/1/2 are the final rolling convolution window. Every channel
+        # owns its state, so no CTA exchange or duplicate state load is needed.
+        tl.store(conv_states_base, col0, mask_w)
+        tl.store(conv_states_base + stride_conv_state_tok, col1, mask_w)
+        tl.store(conv_states_base + 2 * stride_conv_state_tok, col2, mask_w)
+
     if USE_GDC:
         tl.extra.cuda.gdc_launch_dependents()
 
@@ -1493,6 +1528,10 @@ def causal_conv1d_update_sglang(
     metadata=None,
     validate_data=False,
     silu_fast: bool = False,
+    silu_rcp: Optional[bool] = None,
+    register_state: Optional[bool] = None,
+    update_warps: Optional[int] = None,
+    update_block_n: int = 256,
 ):
     """
     x: (batch, dim) or (batch, dim, seqlen)
@@ -1534,6 +1573,23 @@ def causal_conv1d_update_sglang(
     _, width = weight.shape
     # conv_state: (..., dim, state_len), where state_len >= width - 1
     num_cache_lines, _, state_len = conv_state.size()
+    # PMD-verified plain BF16 decode and four-token verification workloads.
+    # The convolution loop already holds the final rolling state in registers.
+    if register_state is None:
+        register_state = (
+            _rowscan_default_enabled(x.device)
+            and x.dtype == weight.dtype == conv_state.dtype == torch.bfloat16
+            and width == 4 and state_len == 3 and seqlen in (1, 4)
+            and cache_seqlens is None and conv_state_indices is None
+            and num_accept_tokens is None and intermediate_conv_window is None
+            and retrieve_next_token is None
+        )
+    if silu_rcp is None:
+        silu_rcp = (register_state and x.dtype == torch.bfloat16
+                    and activation in ("silu", "swish")
+                    and _rowscan_default_enabled(x.device))
+    if update_warps is None:
+        update_warps = 2 if register_state else 4
 
     if validate_data:
         assert dim == weight.size(0)
@@ -1679,10 +1735,14 @@ def causal_conv1d_update_sglang(
         NP2_STATELEN=np2_statelen,
         NP2_SEQLEN=np2_seqlen,
         USE_PAD_SLOT=pad_slot_id is not None,
-        BLOCK_N=256,
+        BLOCK_N=update_block_n,
         SAVE_INTERMEDIATE=intermediate_conv_window is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_next_token is not None,
         SILU_FAST=silu_fast,
+        SILU_RCP=silu_rcp,
+        REGISTER_STATE=(register_state and width == 4 and state_len == 3
+                        and num_accept_tokens is None and retrieve_next_token is None),
+        num_warps=update_warps,
         **pdl_kwargs,
     )
     if unsqueeze:
