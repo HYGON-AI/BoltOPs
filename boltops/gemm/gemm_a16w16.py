@@ -49,8 +49,8 @@ def gemm_a16w16(
         backend (str | None): "auto", "triton", "gluon" or "tilelang"; None means
             "auto".
             Explicit selection never retries another backend. Currently only Triton
-            is implemented for this operation; unimplemented backends raise
-            NotImplementedError for nonempty computation.
+            and TileLang are implemented for this operation; unimplemented backends
+            raise NotImplementedError for nonempty computation.
 
     Returns:
         torch.Tensor: Contiguous [M,N] result in dtype.
@@ -278,5 +278,16 @@ def gemm_a16w16(
         elif backend == "gluon":
             raise NotImplementedError("gemm_a16w16: no Gluon kernel is implemented")
         elif backend == "tilelang":
-            raise NotImplementedError("gemm_a16w16: no TileLang kernel is implemented")
+            from .tilelang.activation import _get_activation_from_str
+            from .tilelang.gemm_a16w16 import shape, _gemm_a16_w16_kernel, get_swizzle_group_size
+            kernel = _gemm_a16_w16_kernel(
+                *shape,
+                dtype=x.dtype,
+                out_dtype=out_dtype,
+                add_bias=(bias is not None),
+                activation=_get_activation_from_str(activation) if activation else None,
+                group_size=get_swizzle_group_size(m, n, k),
+            )
+            kernel(x, w, bias, out)
+            return out
     return out
