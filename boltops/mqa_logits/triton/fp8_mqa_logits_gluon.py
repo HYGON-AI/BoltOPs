@@ -38,6 +38,9 @@ from boltops.mqa_logits.triton.mqa_config_utils import (
 )
 from boltops.utility import arch_info
 
+_make_mfma_layout = None
+_HAS_EXPLICIT_MMAC_LAYOUT = False
+
 try:
     from triton.experimental import gluon
     from triton.experimental.gluon import language as gl
@@ -64,8 +67,16 @@ def gluon_prefill_available() -> bool:
     return bool(_GLUON_AVAILABLE) and bool(arch_info.is_fp8_avail())
 
 
+def _use_explicit_mmac_layout() -> bool:
+    return _HAS_EXPLICIT_MMAC_LAYOUT and arch_info.get_arch() in ("gfx938", "gfx946")
+
+
 if _GLUON_AVAILABLE:
     from triton.experimental.gluon.language._layouts import constexpr_function
+    from boltops.utility.gluon_layout import (
+        HAS_EXPLICIT_MMAC_LAYOUT as _HAS_EXPLICIT_MMAC_LAYOUT,
+        make_mfma_layout as _make_mfma_layout,
+    )
 
     @constexpr_function
     def _lift_row_layout_to_1m(ll, block_m):
@@ -105,6 +116,7 @@ if _GLUON_AVAILABLE:
         BLOCK_N: tl.constexpr,
         ASSUME_KS_ZERO: tl.constexpr,
         MFMA_VERSION: tl.constexpr,
+        EXPLICIT_MMAC: tl.constexpr,
         # MFMA N tiling: tiles_n=2 → 4 warps (default); tiles_n=1 → 8 warps.
         KV_TILES_N: tl.constexpr,
         NUM_WARPS: tl.constexpr,
@@ -159,10 +171,11 @@ if _GLUON_AVAILABLE:
         )
 
         # Gluon AMDMFMALayout requires (M, N, K) instr_shape.
-        mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
+        mfma_layout: gl.constexpr = _make_mfma_layout(
             version=MFMA_VERSION,
             instr_shape=[16, 16, 32],
-            mmac_layout=gl.amd.MmacLayout.LIT_LTS,
+            transposed=False,
+            explicit_mmac=EXPLICIT_MMAC,
             warps_per_cta=[1, NumWarps],
             tiles_per_warp=[1, KV_TILES_N],
         )
@@ -761,6 +774,7 @@ def fp8_mqa_logits_gluon(
         num_stages=num_stages,
         ASSUME_KS_ZERO=assume_ks_zero,
         MFMA_VERSION=_mfma_version_for_arch(),
+        EXPLICIT_MMAC=_use_explicit_mmac_layout(),
         KV_TILES_N=int(kv_tiles_n),
         NUM_WARPS=int(num_warps),
         W_GROUP=w_grp,

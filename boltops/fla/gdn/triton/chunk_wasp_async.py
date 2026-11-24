@@ -9,8 +9,11 @@ from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language.amd.cdna4 import async_copy
 
 from boltops.utility import arch_info
+from boltops.utility.gluon_layout import HAS_EXPLICIT_MMAC_LAYOUT, make_mfma_layout
 from .chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from boltops.fla.common.triton.utils import prepare_chunk_indices, prepare_chunk_offsets
+
+_EXPLICIT_MMAC_LAYOUT = gl.constexpr(HAS_EXPLICIT_MMAC_LAYOUT)
 
 
 _SIGNATURE = inspect.signature(chunk_gated_delta_rule_fwd_h)
@@ -126,11 +129,14 @@ def _consume(values, gates, initial, states, residuals, final, indices, shared, 
              STATE_VK: gl.constexpr, SMALL: gl.constexpr, PREDICTION_KWIDTH: gl.constexpr,
              WEIGHTED_K_MAJOR: gl.constexpr):
     state_waves: gl.constexpr = [1,4] if STATE_VK else [4,1]
-    mma: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=3, instr_shape=[16, 16, 16], mmac_layout=gl.amd.MmacLayout.LIT,
-        warps_per_cta=state_waves, tiles_per_warp=[1,2])
-    prediction_mma: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=3, instr_shape=[16,16,16], mmac_layout=gl.amd.MmacLayout.LIT, warps_per_cta=[4,1])
+    mma: gl.constexpr = make_mfma_layout(
+        version=3, instr_shape=[16, 16, 16], transposed=True,
+        explicit_mmac=_EXPLICIT_MMAC_LAYOUT,
+        warps_per_cta=state_waves, tiles_per_warp=[1, 2])
+    prediction_mma: gl.constexpr = make_mfma_layout(
+        version=3, instr_shape=[16, 16, 16], transposed=True,
+        explicit_mmac=_EXPLICIT_MMAC_LAYOUT,
+        warps_per_cta=[4, 1], tiles_per_warp=[1, 1])
     prediction_a: gl.constexpr = gl.DotOperandLayout(0,prediction_mma,PREDICTION_KWIDTH)
     prediction_b: gl.constexpr = gl.DotOperandLayout(1,prediction_mma,PREDICTION_KWIDTH)
     dot_a: gl.constexpr = gl.DotOperandLayout(0, mma, 4)

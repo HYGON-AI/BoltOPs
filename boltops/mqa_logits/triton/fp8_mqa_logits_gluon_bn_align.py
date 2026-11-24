@@ -33,7 +33,9 @@ import triton.language as tl
 
 from boltops.mqa_logits.triton.fp8_mqa_logits import _filter_hip_launch_kwargs
 from boltops.mqa_logits.triton.fp8_mqa_logits_gluon import (
+    _make_mfma_layout,
     _mfma_version_for_arch,
+    _use_explicit_mmac_layout,
     gluon_prefill_available,
 )
 from boltops.mqa_logits.triton.mqa_config_utils import (
@@ -96,6 +98,7 @@ if _GLUON_AVAILABLE:
         BLOCK_N: tl.constexpr,
         ASSUME_KS_ZERO: tl.constexpr,
         MFMA_VERSION: tl.constexpr,
+        EXPLICIT_MMAC: tl.constexpr,
         KV_TILES_N: tl.constexpr,
         NUM_WARPS: tl.constexpr,
         W_GROUP: tl.constexpr,
@@ -157,10 +160,10 @@ if _GLUON_AVAILABLE:
             )
 
         if SHIP_MMA:
-            mmac_layout: gl.constexpr = gl.amd.MmacLayout.LIT_LTS
+            transposed: gl.constexpr = False
             mfma_k_width: gl.constexpr = 8
         else:
-            mmac_layout: gl.constexpr = gl.amd.MmacLayout.LIT
+            transposed: gl.constexpr = True
             mfma_k_width: gl.constexpr = 16
 
         layout_kv: gl.constexpr = gl.BlockedLayout(
@@ -175,10 +178,11 @@ if _GLUON_AVAILABLE:
             warps_per_cta=[NumWarps, 1],
             order=[1, 0],
         )
-        mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
+        mfma_layout: gl.constexpr = _make_mfma_layout(
             version=MFMA_VERSION,
             instr_shape=[16, 16, 32],
-            mmac_layout=mmac_layout,
+            transposed=transposed,
+            explicit_mmac=EXPLICIT_MMAC,
             warps_per_cta=[1, NumWarps],
             tiles_per_warp=[1, KV_TILES_N],
         )
@@ -973,6 +977,7 @@ def fp8_mqa_logits_gluon_bn_align(
         num_stages=num_stages,
         ASSUME_KS_ZERO=assume_ks_zero,
         MFMA_VERSION=_mfma_version_for_arch(),
+        EXPLICIT_MMAC=_use_explicit_mmac_layout(),
         KV_TILES_N=int(kv_tiles_n),
         NUM_WARPS=int(num_warps),
         W_GROUP=w_grp,
