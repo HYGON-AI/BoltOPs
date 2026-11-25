@@ -6,10 +6,9 @@ set -eo pipefail
 usage() {
   cat <<'HELP'
 Usage: bash .github/scripts/_build_hcu_wheel.sh [--out-dir DIR] [--check-only] [--help]
-Requires Python >=3.9, importable HCU Torch, DTK and an executable aicc.
-Environment: PYTHON (default python), DTK_ROOT (default /opt/dtk),
-             BOLT_OPS_AICC (optional compiler path, also used by the JIT).
-The environment must already be installed. This script does not install DTK/Torch/AICC.
+Requires Python >=3.9, importable HCU Torch, DTK and Python build.
+Environment: PYTHON (default python), DTK_ROOT (default /opt/dtk).
+The environment must already be installed. This script does not install DTK/Torch.
 HELP
 }
 out_dir=dist
@@ -40,9 +39,6 @@ fi
 "$python_bin" - <<'PY'
 import importlib.util
 import os
-from pathlib import Path
-import shutil
-import subprocess
 import sys
 
 def fail(message):
@@ -58,19 +54,9 @@ if not getattr(torch.version, 'hip', None):
     fail("Torch is not an HCU/HIP build. Install the Torch wheel matching your DTK.")
 if importlib.util.find_spec('build') is None:
     fail(f"Python build is missing. Run: {sys.executable} -m pip install build")
-configured = os.environ.get('BOLT_OPS_AICC')
-candidates = [configured] if configured else [shutil.which('aicc'), str(Path(os.environ['DTK_ROOT']) / 'bin/aicc')]
-compiler = next((shutil.which(c) for c in candidates if c and shutil.which(c)), None)
-if not compiler:
-    fail("AICC is missing. Install AICC, or set BOLT_OPS_AICC to the aicc executable.")
-try:
-    result = subprocess.run([compiler, '--version'], check=True, capture_output=True, text=True, timeout=30)
-except (OSError, subprocess.SubprocessError) as exc:
-    fail(f"AICC cannot run: {compiler}: {exc}")
 print(f"Python: {sys.executable} ({sys.version.split()[0]})")
 print(f"DTK: {os.environ['DTK_ROOT']}")
 print(f"Torch: {torch.__version__}; HIP: {torch.version.hip}")
-print(f"AICC: {compiler}\n{result.stdout.strip()}")
 print("Environment checks passed (GPU availability is checked by tests, not packaging).")
 PY
 if [ "$check_only" -eq 1 ]; then exit 0; fi

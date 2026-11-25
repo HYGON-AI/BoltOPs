@@ -109,7 +109,6 @@ packages = [
     "boltops.ihc.tilelang.kernels",
     "boltops.ihc.tilelang.kernels.common",
     "boltops.utility",
-    "boltops.fused_moe.triton.moe_sorting_hipc",
     "boltops.tools",
     "boltops.tools.fused_moe_triton_tune",
     "boltops.tools.sparse_gqa_triton_tune",
@@ -123,7 +122,6 @@ version = { attr = "boltops._version.__version__" }
 
 [tool.setuptools.package-data]
 boltops = [
-    "fused_moe/triton/moe_sorting_hipc/csrc/*",
     "fused_moe/triton/configs/triton_*/*.json",
     "fused_moe/triton/configs/triton_*/*.csv",
     "gemm/triton/configs/awq_gemm_triton/*.json",

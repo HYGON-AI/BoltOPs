@@ -1584,8 +1584,7 @@ def test_public_mxfp4_cpu_reference(monkeypatch, case):
     def cpu_align(*args):
         return tuple(t.cuda() for t in make_cpu_routes(*args))
 
-    def cpu_ck(topk_ids, topk_weights, num_experts, model_dim, dtype,
-               block_size, expert_mask=None):
+    def cpu_ck(topk_ids, topk_weights, num_experts, block_size, expert_mask=None):
         assert expert_mask is None
         routes, blocks, padded = make_cpu_routes(topk_ids, block_size, num_experts)
         encoded = torch.where(
@@ -1593,10 +1592,10 @@ def test_public_mxfp4_cpu_reference(monkeypatch, case):
             (routes % topk) * (1 << 24) + routes // topk,
             torch.full_like(routes, 0x00ffffff),
         )
-        return encoded.cuda(), None, blocks.cuda(), padded.cuda(), None, None
+        return encoded.cuda(), None, blocks.cuda(), padded.cuda(), None
 
     monkeypatch.setattr(core, 'moe_align_block_size', cpu_align)
-    monkeypatch.setattr(core, 'moe_sorting_ck', cpu_ck)
+    monkeypatch.setattr(core, 'moe_sorting_gluon', cpu_ck)
     input_q, input_scale = _quantize_mxfp4_reference(
         x, return_scales=True, group_size=group_size)
     prequantized = 'prequantized' in case
@@ -1856,10 +1855,10 @@ def test_public_w8a8_dequant_bias_then_router(monkeypatch, dtype, prequantized, 
         return (torch.tensor(routes, dtype=torch.int32).cuda(),
                 torch.tensor(sorted_weights).cuda(),
                 torch.tensor(blocks, dtype=torch.int32).cuda(),
-                torch.tensor([len(routes)], dtype=torch.int32).cuda(), None, None)
+                torch.tensor([len(routes)], dtype=torch.int32).cuda(), None)
 
     monkeypatch.setattr(core, 'get_optimal_moe_config_func', config_query)
-    monkeypatch.setattr(core, 'moe_sorting_ck', cpu_sort)
+    monkeypatch.setattr(core, 'moe_sorting_gluon', cpu_sort)
     actual = fused_experts(
         (aq.to(dtype) if prequantized else x).cuda(),
         w1.cuda(), w2.cuda(), router.cuda(), ids.cuda(),
@@ -1943,7 +1942,7 @@ def test_public_mxfp8_cpu_reference(monkeypatch, case):
             blocks += [expert if mapping is None else mapping[expert]] * (padded // block_size)
         return tuple(t.cuda() for t in (torch.tensor(routes, dtype=torch.int32),
                      torch.tensor(blocks, dtype=torch.int32), torch.tensor([len(routes)], dtype=torch.int32)))
-    def ck(topk_ids, topk_weights, num_experts, model_dim, dtype, block_size, expert_mask=None):
+    def ck(topk_ids, topk_weights, num_experts, block_size, expert_mask=None):
         assert topk_ids.is_contiguous()
         assert topk_weights.is_contiguous() and topk_weights.dtype == torch.float32
         routes, blocks, padded = align(topk_ids, block_size, num_experts)
@@ -1952,10 +1951,10 @@ def test_public_mxfp8_cpu_reference(monkeypatch, case):
         sw = topk_weights.cpu().flatten()[safe]
         encoded = torch.where(cpu < topk_ids.numel(), (cpu % topk) * (1 << 24) + cpu // topk,
                               torch.full_like(cpu, 0x00ffffff))
-        return encoded.cuda(), sw.cuda(), blocks, padded, None, None
+        return encoded.cuda(), sw.cuda(), blocks, padded, None
     if case != 'chunked_ep_invalid':
         monkeypatch.setattr(core, 'moe_align_block_size', align)
-    monkeypatch.setattr(core, 'moe_sorting_ck', ck)
+    monkeypatch.setattr(core, 'moe_sorting_gluon', ck)
     device_weights = (torch.stack((weights, weights), -1).cuda()[..., 0]
                       if case in ('chunked_ep_strided_router', 'strided_routing') else weights.cuda())
     if case == 'bf16_router':
