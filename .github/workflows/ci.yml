@@ -40,6 +40,26 @@ concurrency:
   group: boltops-ci-${{ (github.event_name == 'workflow_dispatch' || (github.event.label && github.event.label.name != 'ok-to-test')) && github.run_id || github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request_target' }}
 jobs:
+  verify-release-ci:
+    if: ${{ github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    steps:
+    - name: Checkout release verification script
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.sha }}
+        persist-credentials: false
+    - name: Require successful pre-merge tests
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const verify = require('./.github/scripts/verify-release-ci.cjs');
+          await verify({ github, context, core });
   authorize-ci:
     if: >-
       ${{ github.event_name != 'workflow_dispatch' &&
@@ -142,6 +162,8 @@ jobs:
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/release/0.1.0' }}
     needs:
     - build2604
+    - build2610
+    - verify-release-ci
     uses: ./.github/workflows/_publish.yml
     with:
       dtk_version: '26.04'
@@ -151,7 +173,9 @@ jobs:
   publish-2610:
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/release/0.1.0' }}
     needs:
+    - build2604
     - build2610
+    - verify-release-ci
     uses: ./.github/workflows/_publish.yml
     with:
       dtk_version: '26.10'

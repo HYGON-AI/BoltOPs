@@ -144,3 +144,9 @@ bash .github/scripts/_build_hcu_wheel.sh --out-dir dist
 任务超时、runner 异常等情况不保证收集和上传完成。
 
 目录规则见 [CI 目录与文件职责](README.md)。GitLab/GitHub 共用的报告转换工具统一放在 `scripts/ci/optest_to_junit.py`。
+
+## 发布前核对 PR 测试
+
+合入后的 push 流程通过 `verify-release-ci` 查询当前发布提交对应的已合并 PR，核对该 PR 最终 head SHA 的最新 BoltOPs CI 和 Quality Gate 运行。两组环境的构建、正确性、性能及汇总任务，以及质量、安全、合规检查必须在合入前全部成功。失败、取消、跳过、未完成、缺失任务、只有旧 SHA 通过，或直接推送且没有匹配的已合并 PR，均阻止发布。API 查询失败同样不放行。
+
+两个发布任务都依赖此检查以及两个 DTK 的构建。合入后仍可构建，但不重复测试；未满足条件时两个 DTK 均不发布。合入后才完成的测试不会追溯放行本次提交。工作流或任务改名时应同步维护 `.github/scripts/verify-release-ci.cjs` 的校验列表。此检查核对 PR head 的测试记录，不代表对合并后提交重新执行测试。
