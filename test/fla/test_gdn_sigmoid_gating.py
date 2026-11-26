@@ -344,8 +344,10 @@ def _one_step(
         pytest.param(2, False, True, id="spec-compact-kda"),
     ],
 )
+@pytest.mark.parametrize("index_token_stride", [1, 2])
 def test_sigmoid_update_matches_fla_torch_reference(
     tokens_per_seq: int,
+    index_token_stride: int,
     inplace: bool,
     is_kda: bool,
 ) -> None:
@@ -371,6 +373,12 @@ def test_sigmoid_update_matches_fla_torch_reference(
     else:
         indices = torch.tensor([[3, 4, 5], [7, 8, 9]], device=DEVICE, dtype=torch.int32)[:, :tokens_per_seq]
         accepted = torch.tensor([2, 1], device=DEVICE, dtype=torch.int32).clamp_max(tokens_per_seq)
+
+    if indices.ndim == 2 and index_token_stride != 1:
+        storage = torch.full((N, tokens_per_seq * index_token_stride), -99,
+                             device=DEVICE, dtype=indices.dtype)
+        storage[:, ::index_token_stride] = indices
+        indices = storage[:, ::index_token_stride]
 
     actual_output, actual_final = fused_sigmoid_gating_delta_rule_update(
         A_log,
@@ -880,3 +888,27 @@ def test_bench_1102_gdn_recurrent_triton(case, bench_warmup, bench_repeat, time_
     run()
     latency = time_ms(run, bench_warmup, bench_repeat, dtype=case['input_dtypes'])
     print(f'{_bench_1102_case_id(case)} ({case["measurement"]}): {latency * 1000:.3f} us')
+
+
+def test_dense_batch_compact_state_allocation(monkeypatch):
+    """Dense multi-batch decode needs a final-state row for every token."""
+    import importlib
+    module = importlib.import_module('boltops.fla.gdn.triton.fused_sigmoid_gating')
+
+    class CaptureKernel:
+        def __getitem__(self, grid):
+            def launch(**kwargs):
+                assert kwargs['ht'].shape == (6, 4, 8, 8)
+            return launch
+
+    monkeypatch.setattr(module, 'fused_sigmoid_gating_delta_rule_update_kernel', CaptureKernel())
+    q = torch.zeros(2, 3, 2, 8)
+    v = torch.zeros(2, 3, 4, 8)
+    _, state = module.fused_sigmoid_gating_delta_rule_update(
+        torch.zeros(4), torch.zeros(2, 3, 4), torch.zeros(2, 3, 4),
+        torch.zeros(4), q, q, v,
+        initial_state=torch.zeros(6, 4, 8, 8),
+        inplace_final_state=False,
+        kernel_cfg={'BV': 8, 'num_warps': 4},
+    )
+    assert state.shape == (6, 4, 8, 8)

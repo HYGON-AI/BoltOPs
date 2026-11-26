@@ -59,6 +59,52 @@ def _sequence(BARRIER: gl.constexpr):
         constraints="=s,~{memory}", args=[], dtype=gl.int32, is_pure=False, pack=1)
 
 
+# ABarriers track only global-to-LDS copies: weights=1, values=2,
+# keys=3/4. The consumer's final try_wait is keys, so alternate that ID and
+# advance each ID's phase every two chunks. Producers never try_wait.
+# LDS publication/release uses EBarriers after lgkmcnt(0):
+# 8/9/10 = weights/values/keys empty, 11/12 = state ready/empty,
+# 13/15 = residual ready/empty. ID 14 is the initial rendezvous.
+# Keep these separate from compiler-private EBarriers 0..7.
+@gluon.jit
+def _release(BARRIER: gl.constexpr):
+    gl.inline_asm_elementwise(
+        "s_waitcnt lgkmcnt(0)\n\ts_ebarrier_arrive " + BARRIER + ", 8\n\ts_mov_b32 $0, 0",
+        constraints="=s,~{memory}", args=[], dtype=gl.int32, is_pure=False, pack=1)
+
+
+@gluon.jit
+def _acquire(BARRIER: gl.constexpr):
+    gl.inline_asm_elementwise(
+        "s_waitcnt lgkmcnt(0)\n\ts_ebarrier_sync " + BARRIER + ", 8\n\ts_mov_b32 $0, 0",
+        constraints="=s,~{memory}", args=[], dtype=gl.int32, is_pure=False, pack=1)
+
+
+@gluon.jit
+def _ready_round(EVEN: gl.constexpr, ODD: gl.constexpr, chunk):
+    if chunk & 1:
+        _ready(ODD)
+    else:
+        _ready(EVEN)
+
+
+@gluon.jit
+def _wait_round(EVEN: gl.constexpr, ODD: gl.constexpr, chunk):
+    phase = (chunk // 2) & 1
+    if chunk & 1:
+        _wait(ODD, phase)
+    else:
+        _wait(EVEN, phase)
+
+
+@gluon.jit
+def _sequence_round(EVEN: gl.constexpr, ODD: gl.constexpr, chunk):
+    if chunk & 1:
+        _sequence(ODD)
+    else:
+        _sequence(EVEN)
+
+
 @gluon.jit
 def _produce(keys, weights, values, states, residuals, shared, key_shared, h_shared, u_shared, v_shared, T, cu_seqlens, chunk_offsets, H: gl.constexpr, HG: gl.constexpr, BV: gl.constexpr, SAVE_VALUE: gl.constexpr, IS_VARLEN: gl.constexpr, SMALL: gl.constexpr):
     waves: gl.constexpr = 1 if SMALL else 4
@@ -75,9 +121,14 @@ def _produce(keys, weights, values, states, residuals, shared, key_shared, h_sha
         first_chunk = sequence * gl.cdiv(T, 64)
     rows = gl.arange(0, 64, layout=gl.SliceLayout(1, layout))
     columns = gl.arange(0, 128, layout=gl.SliceLayout(0, layout))
+    # Logical thread IDs elect exactly one wave, independent of HW wave slots.
+    threads = gl.arange(0, 256, layout=gl.BlockedLayout([1], [64], [4], [0]))
     gl.inline_asm_elementwise(
-        "s_abarrier_init 0, 4\n\ts_abarrier_init 1, 4\n\ts_abarrier_init 2, 4\n\ts_abarrier_init 3, 4\n\ts_abarrier_init 4, 4\n\ts_abarrier_init 5, 4\n\ts_abarrier_init 6, 4\n\ts_abarrier_init 7, 4\n\ts_abarrier_init 8, 4\n\ts_abarrier_init 9, 4\n\ts_mov_b32 $0, 0",
-        constraints="=s,~{memory}", args=[], dtype=gl.int32, is_pure=False, pack=1)
+        "v_readfirstlane_b32 $0, $1\n\ts_cmp_eq_u32 $0, 0\n\ts_cbranch_scc0 1f\n\t"
+        "s_abarrier_init 1, 4\n\ts_abarrier_init 2, 4\n\t"
+        "s_abarrier_init 3, 4\n\ts_abarrier_init 4, 4\n1:",
+        constraints="=&s,v,~{memory},~{scc}", args=[threads], dtype=gl.int32,
+        is_pure=False, pack=1)
     _exchange(False)
     h_rows = gl.program_id(0) * BV + gl.arange(0, BV, layout=gl.SliceLayout(1, layout))
     u_layout: gl.constexpr = gl.BlockedLayout([1,8], [512 // BV, BV // 8], [4,1], [1,0])
@@ -85,39 +136,53 @@ def _produce(keys, weights, values, states, residuals, shared, key_shared, h_sha
     u_columns = gl.program_id(0) * BV + gl.arange(0,BV,layout=gl.SliceLayout(0,u_layout))
     for chunk in range(gl.cdiv(length, 64)):
         if chunk > 0:
-            _wait("1", (chunk - 1) & 1)
+            _acquire("8")
         times = chunk * 64 + rows
-        _sequence("0")
+        _sequence("1")
         async_copy.buffer_load_to_shared(shared, weights,
             (((begin + times[:, None]) * H + head) * 128 + columns[None, :]).to(gl.int32),
             times[:, None] < length, other=0)
-        _ready("0")
+        _ready("1")
         if chunk > 0:
-            _wait("7", (chunk - 1) & 1)
-        _sequence("6")
+            _acquire("9")
+        _sequence("2")
         u_offsets = (((begin + chunk * 64 + u_rows[:,None]) * H + head) * 128 + u_columns[None,:]).to(gl.int32)
         async_copy.buffer_load_to_shared(u_shared,values,u_offsets,chunk * 64 + u_rows[:,None] < length,other=0)
-        _ready("6")
+        _ready("2")
         if chunk > 0:
-            _wait("3", (chunk - 1) & 1)
-        _sequence("2")
+            _acquire("10")
+        _sequence_round("3", "4", chunk)
         async_copy.buffer_load_to_shared(key_shared, keys,
             (((begin + times[:, None]) * HG + head // (H // HG)) * 128 + columns[None, :]).to(gl.int32),
             times[:, None] < length, other=0)
-        _ready("2")
+        _ready_round("3", "4", chunk)
         # Publish the state before waiting for the residual. The consumer
         # exposes this state before prediction starts; draining it here lets
         # its global store overlap prediction and releases h_shared sooner.
-        _wait("4", chunk & 1)
+        _acquire("11")
         state_tile = h_shared.load(layout)
-        _ready("5")
+        _release("12")
         state_base = ((first_chunk + chunk) * H + head) * 16384
         gl.store(states + state_base + h_rows[:,None] * 128 + columns[None,:], state_tile)
         if SAVE_VALUE:
-            _wait("8", chunk & 1)
+            _acquire("13")
             value_tile = v_shared.load(u_layout)
-            _ready("9")
+            _release("15")
             gl.store(residuals + u_offsets,value_tile,chunk * 64 + u_rows[:,None] < length)
+    # Complete the last read-release generation before partition teardown.
+    if length > 0:
+        _acquire("8")
+        _acquire("9")
+        _acquire("10")
+
+    _exchange(False)
+    # Both partitions rendezvous before the elected producer invalidates.
+    gl.inline_asm_elementwise(
+        "v_readfirstlane_b32 $0, $1\n\ts_cmp_eq_u32 $0, 0\n\t"
+        "s_cbranch_scc0 1f\n\ts_abarrier_inv 1\n\ts_abarrier_inv 2\n\t"
+        "s_abarrier_inv 3\n\ts_abarrier_inv 4\n1:",
+        constraints="=&s,v,~{memory},~{scc}", args=[threads], dtype=gl.int32,
+        is_pure=False, pack=1)
 
 
 @gluon.jit
@@ -173,27 +238,27 @@ def _consume(values, gates, initial, states, residuals, final, indices, shared, 
         last_time = gl.minimum((chunk + 1) * 64, length) - 1
         last_gate = gl.load(gates + (begin + last_time) * H + head)
         if chunk > 0:
-            _wait("5", (chunk - 1) & 1)
+            _acquire("12")
         if STATE_VK:
             h_shared.store(state.to(gl.bfloat16))
         else:
             h_shared.store(state.permute((1,0)).to(gl.bfloat16))
-        _ready("4")
-        _wait("0", chunk & 1)
+        _release("11")
+        _wait("1", chunk & 1)
         weight_tile = shared.load(prediction_a)
-        _ready("1")
+        _release("8")
         state_operand = h_shared.permute((1,0)).load(prediction_b)
         prediction = gl.amd.cdna3.mfma(
             weight_tile, state_operand, gl.zeros((64, BV), gl.float32, layout=prediction_mma))
-        _wait("6", chunk & 1)
+        _wait("2", chunk & 1)
         value_tile = u_shared.load(prediction_mma)
-        _ready("7")
+        _release("9")
         residual = value_tile.to(gl.float32) - prediction
         if SAVE_VALUE:
-            if chunk > 0:
-                _wait("9", (chunk - 1) & 1)
+            # The previous residual was already drained by the wait below
+            # before v_shared was reused for the weighted operand.
             v_shared.store(residual.to(gl.bfloat16))
-            _ready("8")
+            _release("13")
         difference = last_gate - gate
         difference = gl.where((times < length) & (difference <= 0), difference, float("-inf"))
         if USE_EXP2:
@@ -203,7 +268,7 @@ def _consume(values, gates, initial, states, residuals, final, indices, shared, 
             weighted = residual * gl.exp2(difference * 1.4426950408889634)[:, None]
             state = state * gl.exp2(last_gate * 1.4426950408889634)
         if SAVE_VALUE:
-            _wait("9", chunk & 1)
+            _acquire("15")
         if STATE_VK:
             if WEIGHTED_K_MAJOR:
                 weighted_shared.store(weighted.permute((1,0)).to(gl.bfloat16))
@@ -211,19 +276,25 @@ def _consume(values, gates, initial, states, residuals, final, indices, shared, 
             else:
                 v_shared.store(weighted.to(gl.bfloat16))
                 weighted_operand = v_shared.permute((1,0)).load(dot_a)
-            _wait("2", chunk & 1)
+            _wait_round("3", "4", chunk)
             key_operand = key_shared.load(dot_b)
-            _ready("3")
+            _release("10")
             state = gl.amd.cdna3.mfma(weighted_operand, key_operand, state)
         else:
             v_shared.store(weighted.to(gl.bfloat16))
             weighted_operand = v_shared.load(dot_b)
-            _wait("2", chunk & 1)
+            _wait_round("3", "4", chunk)
             key_operand = key_shared.permute((1, 0)).load(dot_a)
-            _ready("3")
+            _release("10")
             state = gl.amd.cdna3.mfma(key_operand, weighted_operand, state)
+    # The final state read also publishes an empty credit, even though there
+    # is no next chunk to consume it at the top of the loop.
+    if length > 0:
+        _acquire("12")
     if SAVE_FINAL:
         gl.store(final + state_offsets, state)
+
+    _exchange(False)
 
 
 @gluon.jit
@@ -237,6 +308,7 @@ def chunk_wasp_async_kernel(keys, weights, values, gates, initial, states, resid
                       PREDICTION_KWIDTH: gl.constexpr = 4,
                       WEIGHTED_K_MAJOR: gl.constexpr = False,
                       PARTITION_REGS: gl.constexpr = (64, 192)):
+    gl.static_assert(not SMALL, "GDN async handoffs require four producer and four consumer waves")
     layout: gl.constexpr = gl.SwizzledSharedLayout(8, 1, 16, [1, 0])
     shared = gl.allocate_shared_memory(gl.bfloat16, (64, 128), layout)
     matrix_layout: gl.constexpr = gl.SwizzledSharedLayout(8,2,2,[1,0])
@@ -259,6 +331,7 @@ def chunk_wasp_async_kernel(keys, weights, values, gates, initial, states, resid
             (_consume, (values, gates, initial, states, residuals, final, indices, shared, key_shared, h_shared, u_shared, v_shared,
                         T, cu_seqlens, H, BV, USE_INITIAL, HAS_INDICES, STATE_ROWS, IS_VARLEN, USE_EXP2, SAVE_VALUE, SAVE_FINAL, STATE_VK, SMALL, PREDICTION_KWIDTH, WEIGHTED_K_MAJOR)),
         ], [4, 4], PARTITION_REGS)
+
 
 
 def _supports_async_wasp(options):
