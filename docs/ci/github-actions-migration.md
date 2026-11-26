@@ -27,7 +27,7 @@ push 到 release/0.1.0 时按 DTK 各构建一个 wheel，各 DTK 的构建成�
 
 PR 使用 `pull_request_target` 触发，工作流定义来自目标分支。工作流按事件记录的完整 SHA 检出同仓库或 fork PR。构建、正确性和性能任务均校验触发事件记录的 PR head SHA，再合并该事件记录的目标分支 base SHA，保证使用相同的代码内容。push 使用事件 SHA。手动运行优先使用填写的完整 commit SHA，留空时使用事件 SHA。
 
-DTK26.04 测试使用 Python3.10 / NumPy1.24.3 / Torch2.11.0。DTK26.10 测试使用 Python3.12 / NumPy1.26.4 / Torch2.13.0。测试环境准备阶段校验 HCU Torch 版本以及 Triton、TileLang 的 DTK 和 Torch 标签。
+DTK26.04 测试使用 Python3.10 / NumPy1.25.2 / Torch2.11.0。DTK26.10 测试使用 Python3.12 / NumPy1.26.4 / Torch2.13.0。测试环境准备阶段校验 HCU Torch 版本以及 Triton、TileLang 的 DTK 和 Torch 标签。
 
 GitHub CI 在独立 Python 环境运行 `python -m build --wheel`，打包阶段只安装 Python 构建依赖。测试和发布使用同一份 wheel。`build_wheel.sh` 仍转发到本地和 GitLab 的环境检查入口。
 
