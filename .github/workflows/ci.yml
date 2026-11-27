@@ -37,48 +37,92 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: boltops-ci-${{ (github.event_name == 'workflow_dispatch' || (github.event.label && github.event.label.name != 'ok-to-test')) && github.run_id || github.event.pull_request.number || github.ref }}
+  group: boltops-ci-${{ (github.event_name == 'workflow_dispatch' || (github.event.label && github.event.label.name != 'ready hcu')) && github.run_id || github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request_target' }}
 jobs:
   authorize-ci:
     if: >-
       ${{ github.event_name != 'workflow_dispatch' &&
-          (!github.event.label || github.event.label.name == 'ok-to-test') }}
+          (!github.event.label || github.event.label.name == 'ready hcu') }}
     runs-on: ubuntu-latest
     permissions:
+      contents: read
       pull-requests: read
-      issues: read
+      issues: write
+      statuses: write
     steps:
-    - name: Verify approval for this fork PR
+    - name: Require approval for this fork PR commit
       if: github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name != github.repository
+      uses: actions/github-script@v7
       env:
-        GH_TOKEN: ${{ github.token }}
-        PR_NUMBER: ${{ github.event.pull_request.number }}
-        EXPECTED_SHA: ${{ github.event.pull_request.head.sha }}
-      run: |
-        set -euo pipefail
-        repo="repos/$GITHUB_REPOSITORY"
-        pr=$(gh api "$repo/pulls/$PR_NUMBER")
-        if ! jq -e --arg sha "$EXPECTED_SHA" '
-          .state == "open" and .head.sha == $sha and any(.labels[]; .name == "ok-to-test")
-        ' <<< "$pr" >/dev/null; then
-          echo "::error::The current fork PR head needs the ok-to-test label to run internal CI."
-          exit 1
-        fi
-
-        # Triage users can label PRs too. Verify who applied the active label.
-        approver=$(gh api --paginate --slurp "$repo/issues/$PR_NUMBER/events?per_page=100" | jq -r '
-          [ .[][] | select((.event == "labeled" or .event == "unlabeled") and .label.name == "ok-to-test") ]
-          | last | select(.event == "labeled") | .actor.login // empty')
-        if [[ -z "$approver" ]]; then
-          echo "::error::Could not verify who applied ok-to-test."
-          exit 1
-        fi
-        permission=$(gh api "$repo/collaborators/$approver/permission" --jq .permission)
-        case "$permission" in
-          admin|write|maintain) echo "Fork PR #$PR_NUMBER approved by $approver for internal CI." ;;
-          *) echo "::error::A maintainer with write access must remove and reapply ok-to-test."; exit 1 ;;
-        esac
+        HCU_APPROVAL_LABEL: ready hcu
+      with:
+        script: |
+          const { owner, repo } = context.repo;
+          const number = context.payload.pull_request.number;
+          const sha = context.payload.pull_request.head.sha;
+          const label = process.env.HCU_APPROVAL_LABEL;
+          const statusContext = `hcu-approval/pr-${number}`;
+          const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: number });
+          if (pr.state !== 'open' || pr.head.sha !== sha) {
+            throw new Error('PR head changed or PR closed. This run cannot use internal runners.');
+          }
+          if (!pr.labels.some(item => item.name === label)) {
+            throw new Error(`Review commit ${sha} and apply ${label} to approve this commit.`);
+          }
+          const events = await github.paginate(github.rest.issues.listEvents, {
+            owner, repo, issue_number: number, per_page: 100,
+          });
+          const last = events.filter(item =>
+            ['labeled', 'unlabeled'].includes(item.event) && item.label?.name === label
+          ).sort((a, b) => b.id - a.id)[0];
+          if (!last || last.event !== 'labeled' || !last.actor?.login) {
+            throw new Error('Cannot verify who applied the active approval label.');
+          }
+          const { data: collaborator } = await github.rest.repos.getCollaboratorPermissionLevel({
+            owner, repo, username: last.actor.login,
+          });
+          if (!collaborator.user?.permissions?.triage &&
+              !['triage', 'write', 'maintain', 'admin'].includes(collaborator.permission)) {
+            throw new Error('The approval label must be applied by a repository collaborator with at least triage access.');
+          }
+          // Bind approval to both the exact head SHA and this application of the label.
+          const marker = `label-event:${last.id}`;
+          if (context.payload.action === 'labeled' && context.payload.label?.name === label &&
+              context.payload.sender.login === last.actor.login) {
+            await github.rest.repos.createCommitStatus({
+              owner, repo, sha, context: statusContext, state: 'success',
+              description: marker,
+              target_url: `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`,
+            });
+          }
+          const statuses = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
+            owner, repo, ref: sha, per_page: 100,
+          });
+          const approval = statuses.filter(item => item.context === statusContext)
+            .sort((a, b) => b.id - a.id)[0];
+          if (!approval || approval.state !== 'success' || approval.description !== marker ||
+              approval.creator?.login !== 'github-actions[bot]') {
+            if (context.payload.action === 'synchronize') {
+              // Recheck before changing labels: an old queued run must not touch a new head.
+              const { data: current } = await github.rest.pulls.get({ owner, repo, pull_number: number });
+              if (current.head.sha === sha && current.labels.some(item => item.name === label)) {
+                try {
+                  await github.rest.issues.removeLabel({ owner, repo, issue_number: number, name: label });
+                } catch (error) {
+                  if (error.status !== 404) throw error;
+                }
+              }
+            }
+            throw new Error(`Commit ${sha} is not approved. Review it, then remove and reapply ${label}.`);
+          }
+          // Revalidate after API calls before allowing build and test jobs to proceed.
+          const { data: current } = await github.rest.pulls.get({ owner, repo, pull_number: number });
+          if (current.state !== 'open' || current.head.sha !== sha ||
+              !current.labels.some(item => item.name === label)) {
+            throw new Error('Approval was revoked or the PR head changed.');
+          }
+          core.info(`PR #${number} commit ${sha} approved by ${last.actor.login}.`);
     - name: Confirm authorization
       run: echo "CI may proceed."
   validate-manual:
@@ -157,8 +201,8 @@ jobs:
     secrets:
       PYPI_PASSWORD: ${{ secrets.PYPI_PASSWORD }}
   ci-result:
-    name: ${{ github.event.label && github.event.label.name != 'ok-to-test' && 'Ignored label change' || 'ci-result' }}
-    if: ${{ always() && github.event_name != 'workflow_dispatch' && (!github.event.label || github.event.label.name == 'ok-to-test') }}
+    name: ${{ github.event.label && github.event.label.name != 'ready hcu' && 'Ignored label change' || 'ci-result' }}
+    if: ${{ always() && github.event_name != 'workflow_dispatch' && (!github.event.label || github.event.label.name == 'ready hcu') }}
     needs:
     - build2604
     - build2610

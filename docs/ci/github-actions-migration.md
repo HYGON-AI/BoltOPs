@@ -63,7 +63,7 @@ AICC、Torch、Triton、TileLang、NumPy 和其他测试依赖在各测试容器
 
 各版本组合的构建、正确性测试和性能测试可独立调度。性能任务各用一张 HCU，按单卡 runner 池的容量并行运行。同一节点上的任务仍可能共享 CPU、内存和 I/O。工作流仍会取消同一 PR 的旧运行。
 
-同仓库 PR 自动运行。外部 fork PR 需要有写权限的维护者添加 `ok-to-test` 标签，之后同一 PR 的新提交自动运行。移除标签会撤销批准，新 PR 需重新批准。release/0.1.0 push 触发发布任务。
+同仓库 PR 自动运行。外部 fork PR 需要具有 BoltOPs 仓库 Triage 或更高权限的协作者添加 `ready hcu` 标签，批准记录同时绑定 PR、完整 head SHA 和本次标签事件。后续每次推送新提交都需要重新审查并打标签；仅保留旧标签不能放行新 SHA。未批准的 synchronize 运行会阻止内部任务并自动移除旧标签。同一 SHA 的重跑可复用批准，移除标签则撤销。审批只在 GitHub 托管 runner 上使用自动 GITHUB_TOKEN 的 issues/statuses 写权限，构建和测试 job 不获得这些写权限。release/0.1.0 push 触发发布任务。
 
 ## 4. 把文件提交到 GitHub、试跑
 
