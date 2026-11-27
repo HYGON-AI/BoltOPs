@@ -6,6 +6,12 @@ set -eo pipefail
 source /opt/dtk/env.sh
 set -u
 cd "${GITHUB_WORKSPACE:?}"
+# Keep correctness and performance on the same NumPy for each Python version.
+case "${PYTHON_VERSION:?}" in
+  3.10) export NUMPY_VERSION=1.25.2 ;;
+  3.12) export NUMPY_VERSION=1.26.4 ;;
+  *) echo "Unsupported Python ${PYTHON_VERSION}: configure a matching NumPy version in common.sh" >&2; exit 1 ;;
+esac
 export CI_PROJECT_DIR="${GITHUB_WORKSPACE}"
 export CI_JOB_ID="${GITHUB_RUN_ID:?}_${GITHUB_RUN_ATTEMPT:?}_${GITHUB_JOB:?}_${DTK_VER:?}_${PYTHON_VERSION:?}_${TORCH_VERSION:?}"
 export CI_WORK_DIR="${RUNNER_TEMP:?}/boltops-${CI_JOB_ID}"
