@@ -40,26 +40,6 @@ concurrency:
   group: boltops-ci-${{ (github.event_name == 'workflow_dispatch' || (github.event.label && github.event.label.name != 'ok-to-test')) && github.run_id || github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request_target' }}
 jobs:
-  verify-release-ci:
-    if: ${{ github.event_name == 'push' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: read
-      actions: read
-      pull-requests: read
-    steps:
-    - name: Checkout release verification script
-      uses: actions/checkout@v4
-      with:
-        ref: ${{ github.sha }}
-        persist-credentials: false
-    - name: Require successful pre-merge tests
-      uses: actions/github-script@v7
-      with:
-        script: |
-          const verify = require('./.github/scripts/verify-release-ci.cjs');
-          await verify({ github, context, core });
   authorize-ci:
     if: >-
       ${{ github.event_name != 'workflow_dispatch' &&
@@ -145,7 +125,7 @@ jobs:
       py_version: '3.10'
       numpy_version: '1.25.2'
       torch_version: '2.11.0'
-      run_tests: ${{ github.event_name == 'pull_request_target' }}
+      run_tests: true
   build2610:
     needs: authorize-ci
     name: DTK2610 (py3.12)
@@ -157,13 +137,11 @@ jobs:
       py_version: '3.12'
       numpy_version: '1.26.4'
       torch_version: '2.13.0'
-      run_tests: ${{ github.event_name == 'pull_request_target' }}
+      run_tests: true
   publish-2604:
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/release/0.1.0' }}
     needs:
     - build2604
-    - build2610
-    - verify-release-ci
     uses: ./.github/workflows/_publish.yml
     with:
       dtk_version: '26.04'
@@ -173,9 +151,7 @@ jobs:
   publish-2610:
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/release/0.1.0' }}
     needs:
-    - build2604
     - build2610
-    - verify-release-ci
     uses: ./.github/workflows/_publish.yml
     with:
       dtk_version: '26.10'

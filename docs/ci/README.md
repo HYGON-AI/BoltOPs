@@ -49,7 +49,7 @@
 
 外部 fork PR 首次运行前，由有仓库写权限的维护者审查提交并在 PR 页面添加 `ok-to-test` 标签（首次使用时在仓库 Labels 中创建）。标签有效期间，后续提交自动运行；移除标签即可撤销。每个新 PR 单独批准。同仓库 PR 自动运行。
 
-PR 的正确性和性能测试运行 DTK26.04 / Python3.10 / Torch2.11.0 与 DTK26.10 / Python3.12 / Torch2.13.0 两组，每组安装对应的 Torch 并使用对应 DTK 的 wheel。正确性通过后执行性能测试。release/0.1.0 push 构建两个 wheel，分别由 `publish-2604` 和 `publish-2610` 发布。`ci-result` 汇总构建和已启用的测试结果。
+PR 的正确性和性能测试运行 DTK26.04 / Python3.10 / Torch2.11.0 与 DTK26.10 / Python3.12 / Torch2.13.0 两组，每组安装对应的 Torch 并使用对应 DTK 的 wheel。正确性通过后执行性能测试。release/0.1.0 push 构建两个 wheel，并重新运行两组正确性和性能测试；每组构建、正确性及性能测试全部成功后，由对应的 `publish-2604` 或 `publish-2610` 发布。一组失败或取消不影响另一组发布。`ci-result` 汇总构建和已启用的测试结果。
 
 在 Actions 的 **Run workflow** 中可选构建用的 DTK 和 Python，默认是 DTK 26.10 和 Python 3.12。填写完整 commit SHA 可指定源码提交，留空则使用所选分支或 tag 的提交。手动运行构建的 wheel 可在本次运行的 **Artifacts** 中下载。
 

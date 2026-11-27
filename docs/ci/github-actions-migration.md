@@ -6,7 +6,7 @@
 
 PR 到 release/0.1.0 时，`build2604` 和 `build2610` 各自在 `hygon-build` 构建一个 wheel。DTK26.04 / Python3.10 / Torch2.11.0 与 DTK26.10 / Python3.12 / Torch2.13.0 两组在 `hygon-bw1100-4card` 运行正确性测试，通过后在 `hygon-bw1100-1card` 下载对应 wheel 并运行性能测试。`ci-result` 在 `hygon-cpu` 汇总两个 DTK 的构建和已启用的测试结果。
 
-push 到 release/0.1.0 时按 DTK 各构建一个 wheel，各 DTK 的构建成功后，由 `publish-2604` 和 `publish-2610` 在 `hygon-build` 分别发布。手动运行按输入构建一组 wheel，并上传到本次 Actions 运行的附件。
+push 到 release/0.1.0 时按 DTK 各构建一个 wheel，并重新执行两组正确性和性能测试。每组 DTK 的构建、正确性及性能测试全部成功后，由对应的 `publish-2604` 或 `publish-2610` 在 `hygon-build` 发布；一组失败或取消只阻止该组发布，不影响另一组。手动运行按输入构建一组 wheel，并上传到本次 Actions 运行的附件。
 
 ## 2. 文件怎么写、怎么看
 
@@ -145,8 +145,4 @@ bash .github/scripts/_build_hcu_wheel.sh --out-dir dist
 
 目录规则见 [CI 目录与文件职责](README.md)。GitLab/GitHub 共用的报告转换工具统一放在 `scripts/ci/optest_to_junit.py`。
 
-## 发布前核对 PR 测试
-
-合入后的 push 流程通过 `verify-release-ci` 查询当前发布提交对应的已合并 PR，核对该 PR 最终 head SHA 的最新 BoltOPs CI 和 Quality Gate 运行。两组环境的构建、正确性、性能及汇总任务，以及质量、安全、合规检查必须在合入前全部成功。失败、取消、跳过、未完成、缺失任务、只有旧 SHA 通过，或直接推送且没有匹配的已合并 PR，均阻止发布。API 查询失败同样不放行。
-
-两个发布任务都依赖此检查以及两个 DTK 的构建。合入后仍可构建，但不重复测试；未满足条件时两个 DTK 均不发布。合入后才完成的测试不会追溯放行本次提交。工作流或任务改名时应同步维护 `.github/scripts/verify-release-ci.cjs` 的校验列表。此检查核对 PR head 的测试记录，不代表对合并后提交重新执行测试。
+发布直接依赖本次 push 的各组构建及测试结果，不查询合入前的 PR 历史。即使 PR 测试未通过就合入，也必须在合入后对应 DTK 的构建、正确性及性能测试全部通过才发布该组包。手动运行仍只构建，不测试、不发布。
