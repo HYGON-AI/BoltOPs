@@ -16,8 +16,6 @@ on:
       py_version:
         required: true
         type: string
-      numpy_version:
-        type: string
       torch_version:
         type: string
       run_tests:
@@ -122,7 +120,6 @@ jobs:
       PYTHONUNBUFFERED: '1'
       DTK_VER: ${{ inputs.dtk_ver }}
       PYTHON_VERSION: ${{ inputs.py_version }}
-      NUMPY_VERSION: ${{ inputs.numpy_version }}
       TORCH_VERSION: ${{ inputs.torch_version }}
     steps:
     - name: Checkout source
@@ -187,7 +184,6 @@ jobs:
       BOLTOPS_TEST_GPU: '0'
       DTK_VER: ${{ inputs.dtk_ver }}
       PYTHON_VERSION: ${{ inputs.py_version }}
-      NUMPY_VERSION: ${{ inputs.numpy_version }}
       TORCH_VERSION: ${{ inputs.torch_version }}
     steps:
     - name: Checkout source

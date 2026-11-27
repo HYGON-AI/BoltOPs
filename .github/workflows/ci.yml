@@ -123,7 +123,6 @@ jobs:
       dtk_ver: '2604'
       source_sha: ${{ github.event.pull_request.head.sha || github.sha }}
       py_version: '3.10'
-      numpy_version: '1.25.2'
       torch_version: '2.11.0'
       run_tests: true
   build2610:
@@ -135,7 +134,6 @@ jobs:
       dtk_ver: '2610'
       source_sha: ${{ github.event.pull_request.head.sha || github.sha }}
       py_version: '3.12'
-      numpy_version: '1.26.4'
       torch_version: '2.13.0'
       run_tests: true
   publish-2604:
