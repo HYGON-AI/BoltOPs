@@ -1182,7 +1182,13 @@ def fused_moe_kernel_gptq_awq_w4a8_channelwise(
     b_scale = tl.load(b_scale_ptrs).to(tl.float32)
 
     a_scale = tl.load(a_scale_ptrs, mask=token_mask, other=0.0).to(tl.float32)
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    # Signed INT8 x signed INT4 is bounded by 1024 per logical K element.
+    # Keep every partial sum in range; larger reductions retain block scaling.
+    safe_int32_acc: tl.constexpr = K > 0 and K <= 2147483647 // 1024
+    if safe_int32_acc:
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.int32)
+    else:
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         remaining_k = K - k * BLOCK_SIZE_K
@@ -1206,10 +1212,16 @@ def fused_moe_kernel_gptq_awq_w4a8_channelwise(
         b = ((b >> b_shifter) & 0xF).to(tl.int32)
         b = tl.where(b >= 8, b - 16, b).to(tl.int8)
 
-        accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale
+        if safe_int32_acc:
+            accumulator = tl.dot(a, b, acc=accumulator)
+        else:
+            accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale
 
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += (BLOCK_SIZE_K // 2) * stride_bk
+
+    if safe_int32_acc:
+        accumulator = accumulator.to(tl.float32) * a_scale[:, None] * b_scale
 
     if MUL_ROUTED_WEIGHT:
         moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
