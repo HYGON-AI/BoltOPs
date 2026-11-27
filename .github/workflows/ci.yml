@@ -37,13 +37,13 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: boltops-ci-${{ (github.event_name == 'workflow_dispatch' || (github.event.label && github.event.label.name != 'ok-to-test')) && github.run_id || github.event.pull_request.number || github.ref }}
+  group: boltops-ci-${{ (github.event_name == 'workflow_dispatch' || (github.event.label && github.event.label.name != 'ready hcu')) && github.run_id || github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request_target' }}
 jobs:
   authorize-ci:
     if: >-
       ${{ github.event_name != 'workflow_dispatch' &&
-          (!github.event.label || github.event.label.name == 'ok-to-test') }}
+          (!github.event.label || github.event.label.name == 'ready hcu') }}
     runs-on: ubuntu-latest
     permissions:
       pull-requests: read
@@ -60,24 +60,24 @@ jobs:
         repo="repos/$GITHUB_REPOSITORY"
         pr=$(gh api "$repo/pulls/$PR_NUMBER")
         if ! jq -e --arg sha "$EXPECTED_SHA" '
-          .state == "open" and .head.sha == $sha and any(.labels[]; .name == "ok-to-test")
+          .state == "open" and .head.sha == $sha and any(.labels[]; .name == "ready hcu")
         ' <<< "$pr" >/dev/null; then
-          echo "::error::The current fork PR head needs the ok-to-test label to run internal CI."
+          echo "::error::The current fork PR head needs the ready hcu label to run internal CI."
           exit 1
         fi
 
         # Triage users can label PRs too. Verify who applied the active label.
         approver=$(gh api --paginate --slurp "$repo/issues/$PR_NUMBER/events?per_page=100" | jq -r '
-          [ .[][] | select((.event == "labeled" or .event == "unlabeled") and .label.name == "ok-to-test") ]
+          [ .[][] | select((.event == "labeled" or .event == "unlabeled") and .label.name == "ready hcu") ]
           | last | select(.event == "labeled") | .actor.login // empty')
         if [[ -z "$approver" ]]; then
-          echo "::error::Could not verify who applied ok-to-test."
+          echo "::error::Could not verify who applied ready hcu."
           exit 1
         fi
         permission=$(gh api "$repo/collaborators/$approver/permission" --jq .permission)
         case "$permission" in
           admin|write|maintain) echo "Fork PR #$PR_NUMBER approved by $approver for internal CI." ;;
-          *) echo "::error::A maintainer with write access must remove and reapply ok-to-test."; exit 1 ;;
+          *) echo "::error::A maintainer with write access must remove and reapply ready hcu."; exit 1 ;;
         esac
     - name: Confirm authorization
       run: echo "CI may proceed."
@@ -157,8 +157,8 @@ jobs:
     secrets:
       PYPI_PASSWORD: ${{ secrets.PYPI_PASSWORD }}
   ci-result:
-    name: ${{ github.event.label && github.event.label.name != 'ok-to-test' && 'Ignored label change' || 'ci-result' }}
-    if: ${{ always() && github.event_name != 'workflow_dispatch' && (!github.event.label || github.event.label.name == 'ok-to-test') }}
+    name: ${{ github.event.label && github.event.label.name != 'ready hcu' && 'Ignored label change' || 'ci-result' }}
+    if: ${{ always() && github.event_name != 'workflow_dispatch' && (!github.event.label || github.event.label.name == 'ready hcu') }}
     needs:
     - build2604
     - build2610
