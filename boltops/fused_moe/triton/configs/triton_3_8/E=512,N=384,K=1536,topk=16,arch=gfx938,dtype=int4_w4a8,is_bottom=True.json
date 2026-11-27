@@ -1,0 +1,128 @@
+{
+  "1": {
+    "BLOCK_SIZE_K": 64,
+    "BLOCK_SIZE_M": 16,
+    "BLOCK_SIZE_N": 32,
+    "COMBINE_SCALE_LOAD": false,
+    "GROUP_SIZE_M": 1
+  },
+  "2047": {
+    "BLOCK_SIZE_K": 32,
+    "BLOCK_SIZE_M": 64,
+    "BLOCK_SIZE_N": 64,
+    "COMBINE_SCALE_LOAD": false,
+    "GROUP_SIZE_M": 8
+  },
+  "2048": {
+    "BLOCK_SIZE_K": 64,
+    "BLOCK_SIZE_M": 64,
+    "BLOCK_SIZE_N": 128,
+    "COMBINE_SCALE_LOAD": false,
+    "GROUP_SIZE_M": 8
+  },
+  "2049": {
+    "BLOCK_SIZE_K": 32,
+    "BLOCK_SIZE_M": 64,
+    "BLOCK_SIZE_N": 64,
+    "COMBINE_SCALE_LOAD": false,
+    "GROUP_SIZE_M": 8
+  },
+  "32767": {
+    "BLOCK_SIZE_K": 32,
+    "BLOCK_SIZE_M": 64,
+    "BLOCK_SIZE_N": 64,
+    "COMBINE_SCALE_LOAD": false,
+    "GROUP_SIZE_M": 8
+  },
+  "32768": {
+    "BLOCK_SIZE_K": 64,
+    "BLOCK_SIZE_M": 64,
+    "BLOCK_SIZE_N": 128,
+    "COMBINE_SCALE_LOAD": false,
+    "GROUP_SIZE_M": 8
+  },
+  "32769": {
+    "BLOCK_SIZE_K": 32,
+    "BLOCK_SIZE_M": 64,
+    "BLOCK_SIZE_N": 64,
+    "COMBINE_SCALE_LOAD": false,
+    "GROUP_SIZE_M": 8
+  },
+  "383": {
+    "BLOCK_SIZE_K": 64,
+    "BLOCK_SIZE_M": 16,
+    "BLOCK_SIZE_N": 32,
+    "COMBINE_SCALE_LOAD": false,
+    "GROUP_SIZE_M": 1
+  },
+  "384": {
+    "BLOCK_SIZE_K": 64,
+    "BLOCK_SIZE_M": 16,
+    "BLOCK_SIZE_N": 64,
+    "COMBINE_SCALE_LOAD": false,
+    "GROUP_SIZE_M": 1
+  },
+  "385": {
+    "BLOCK_SIZE_K": 64,
+    "BLOCK_SIZE_M": 16,
+    "BLOCK_SIZE_N": 32,
+    "COMBINE_SCALE_LOAD": false,
+    "GROUP_SIZE_M": 1
+  },
+  "4095": {
+    "BLOCK_SIZE_K": 32,
+    "BLOCK_SIZE_M": 64,
+    "BLOCK_SIZE_N": 64,
+    "COMBINE_SCALE_LOAD": false,
+    "GROUP_SIZE_M": 8
+  },
+  "4096": {
+    "BLOCK_SIZE_K": 64,
+    "BLOCK_SIZE_M": 64,
+    "BLOCK_SIZE_N": 128,
+    "COMBINE_SCALE_LOAD": false,
+    "GROUP_SIZE_M": 8
+  },
+  "4097": {
+    "BLOCK_SIZE_K": 32,
+    "BLOCK_SIZE_M": 64,
+    "BLOCK_SIZE_N": 64,
+    "COMBINE_SCALE_LOAD": false,
+    "GROUP_SIZE_M": 8
+  },
+  "512": {
+    "BLOCK_SIZE_K": 64,
+    "BLOCK_SIZE_M": 16,
+    "BLOCK_SIZE_N": 32,
+    "COMBINE_SCALE_LOAD": false,
+    "GROUP_SIZE_M": 1
+  },
+  "513": {
+    "BLOCK_SIZE_K": 32,
+    "BLOCK_SIZE_M": 64,
+    "BLOCK_SIZE_N": 64,
+    "COMBINE_SCALE_LOAD": false,
+    "GROUP_SIZE_M": 8
+  },
+  "8191": {
+    "BLOCK_SIZE_K": 32,
+    "BLOCK_SIZE_M": 64,
+    "BLOCK_SIZE_N": 64,
+    "COMBINE_SCALE_LOAD": false,
+    "GROUP_SIZE_M": 8
+  },
+  "8192": {
+    "BLOCK_SIZE_K": 64,
+    "BLOCK_SIZE_M": 64,
+    "BLOCK_SIZE_N": 64,
+    "COMBINE_SCALE_LOAD": false,
+    "GROUP_SIZE_M": 8
+  },
+  "8193": {
+    "BLOCK_SIZE_K": 32,
+    "BLOCK_SIZE_M": 64,
+    "BLOCK_SIZE_N": 64,
+    "COMBINE_SCALE_LOAD": false,
+    "GROUP_SIZE_M": 8
+  }
+}
