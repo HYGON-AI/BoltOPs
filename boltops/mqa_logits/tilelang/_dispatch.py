@@ -18,6 +18,8 @@ from ._arch import targets_for_arch
 _DEFAULT_IMPLEMENTATIONS = {
     "qsa_mqa_decode": ("mqa", "qsa_mqa_decode"),
     "qsa_mqa_prefill": ("mqa", "qsa_mqa_prefill"),
+    "weighted_mqa_prefill": ("mqa", "weighted_mqa_prefill"),
+    "weighted_mqa_decode": ("mqa_decode_weighted", "weighted_mqa_decode"),
 }
 
 

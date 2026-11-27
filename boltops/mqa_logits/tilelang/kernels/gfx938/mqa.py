@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # SPDX-License-Identifier: MIT
-"""gfx938 entry points for TileLang QSA MQA kernels."""
+"""gfx938 entry points for TileLang QSA and weighted (non-QSA) MQA kernels."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from boltops.mqa_logits.tilelang.configs.mqa_decode import (
 from boltops.mqa_logits.tilelang.configs.mqa_prefill import (
     resolve_get_config as resolve_get_prefill_config,
     resolve_get_config_fp8 as resolve_get_prefill_config_fp8,
+    resolve_get_config_weighted as resolve_get_weighted_prefill_config,
 )
 from boltops.utility.arch_info import get_device_info
 
@@ -274,4 +275,200 @@ def qsa_mqa_prefill(
     return logits
 
 
-__all__ = ["qsa_mqa_decode", "qsa_mqa_prefill", "prefill_mask_launch_kwargs"]
+def weighted_mqa_prefill(
+    Q: torch.Tensor,
+    KV: torch.Tensor,
+    kv_scales: Optional[torch.Tensor],
+    weights: torch.Tensor,
+    cu_starts: torch.Tensor,
+    cu_ends: torch.Tensor,
+    *,
+    D_out: Optional[torch.Tensor] = None,
+    effective_range: Optional[int] = None,
+) -> torch.Tensor:
+    """Weighted (non-QSA) MQA logits prefill on the gfx938 WASP schedule.
+
+    ``logits[m, n] = sum_h relu(Q[m, h] . K[n]) * W[m, h]`` for BF16.
+    Providing per-Key ``kv_scales`` selects the independent E4M3FN kernel
+    and multiplies each Key column by its scale. Both paths output FP32.
+    Uses the WASP launch policy with measured weighted-BF16 small-Q
+    overrides. The fixed consumer geometry and 64-KiB LDS budget are shared
+    with QSA. Falls back to the architecture-independent kernel when the
+    WASP fixed geometry does not apply.
+    """
+    from ..common.mqa_logits import (
+        weighted_mqa_prefill as generic_weighted_mqa_prefill,
+    )
+
+    if kv_scales is not None:
+        return _weighted_mqa_prefill_fp8(
+            Q, KV, kv_scales, weights, cu_starts, cu_ends,
+            D_out=D_out, effective_range=effective_range,
+        )
+    if (
+        not _common.HAS_TILELANG
+        or Q.ndim != 3
+        or Q.shape[1] not in (4, 8, 32, 64)
+        or Q.shape[-1] != 128
+        or KV.ndim != 2
+    ):
+        return generic_weighted_mqa_prefill(
+            Q, KV, kv_scales, weights, cu_starts, cu_ends, D_out=D_out,
+        )
+
+    if Q.dtype != torch.bfloat16 or KV.dtype != torch.bfloat16:
+        raise ValueError(f"expects bf16 Q/KV, got {Q.dtype}/{KV.dtype}")
+    if Q.shape[-1] != KV.shape[-1]:
+        raise ValueError(
+            f"expects Q [rows, H, D] and KV [keys, D], got {tuple(Q.shape)} "
+            f"and {tuple(KV.shape)}"
+        )
+    rows, heads = Q.shape[0], Q.shape[1]
+    keys = KV.shape[0]
+    if weights.shape != (rows, heads):
+        raise ValueError(
+            f"weights must be [rows, H]={rows, heads}, got {tuple(weights.shape)}"
+        )
+
+    if D_out is not None:
+        if D_out.shape != (rows, keys) or D_out.dtype != torch.float32:
+            raise ValueError("D_out must be float32 [rows, keys]")
+        logits = D_out
+    else:
+        logits = torch.empty((rows, keys), dtype=torch.float32, device=Q.device)
+    if not rows or not keys:
+        return logits.fill_(-float("inf"))
+
+    # Keep the weighted implementation out of the QSA-only import path.
+    from .mqa_prefill_wasp_weighted import (
+        _tilelang_mqa_prefill_wasp_weighted_kernel,
+    )
+
+    device_info = get_device_info(Q.device)
+    config = resolve_get_weighted_prefill_config(device_info.arch)(
+        rows,
+        keys,
+        device_info.cu_count,
+        effective_range=effective_range,
+        num_heads=heads,
+    )
+    starts = cu_starts.to(device=Q.device, dtype=torch.int32).contiguous()
+    ends = cu_ends.to(device=Q.device, dtype=torch.int32).contiguous()
+
+    # The weighted reduction carries no 1/sqrt(D) term: the caller folds any
+    # scaling into Q or W, matching the generic weighted entry point.
+    _tilelang_mqa_prefill_wasp_weighted_kernel(
+        block_q=config.block_q,
+        block_n=config.block_n,
+        heads=config.heads,
+        threads=config.threads,
+        rows_divisible=config.rows_divisible,
+        n_tile_phases=config.n_tile_phases,
+        split_n=config.split_n,
+        apply_scale=False,
+    )(
+        Q.contiguous().reshape(-1, 128),
+        KV.contiguous(),
+        weights.to(device=Q.device, dtype=torch.float32).contiguous(),
+        logits,
+        starts,
+        ends,
+        1.0,
+    )
+    _common._tilelang_qsa_mqa_mask_kernel(
+        **prefill_mask_launch_kwargs(rows, keys)
+    )(logits, starts, ends)
+    return logits
+
+
+def _weighted_mqa_prefill_fp8(
+    Q: torch.Tensor,
+    KV: torch.Tensor,
+    kv_scales: torch.Tensor,
+    weights: torch.Tensor,
+    cu_starts: torch.Tensor,
+    cu_ends: torch.Tensor,
+    *,
+    D_out: Optional[torch.Tensor] = None,
+    effective_range: Optional[int] = None,
+) -> torch.Tensor:
+    """Weighted E4M3FN prefill, with per-Key scale and FP32 output.
+
+    Q is already quantized; any per-Query/head quantization scale must be
+    folded into weights by the caller. No attention 1/sqrt(D) is added.
+    FP8 configuration currently follows QSA FP8, independently of weighted
+    BF16 overrides. Both weighted kernels are imported only on demand.
+    """
+    if not _common.HAS_TILELANG:
+        raise RuntimeError("TileLang is unavailable")
+    if Q.ndim != 3 or KV.ndim != 2 or Q.shape[-1] != KV.shape[-1]:
+        raise ValueError("expects Q [rows, H, D] and KV [keys, D] with matching D")
+    rows, heads, head_dim = Q.shape
+    keys = KV.shape[0]
+    if heads not in (4, 8, 32, 64) or head_dim != 128:
+        raise NotImplementedError(
+            "weighted FP8 WASP requires gfx938, H in {4,8,32,64}, D=128"
+        )
+    if Q.dtype != torch.float8_e4m3fn or KV.dtype != torch.float8_e4m3fn:
+        raise ValueError("kv_scales requires float8_e4m3fn Q/KV")
+    if weights.shape != (rows, heads):
+        raise ValueError(f"weights must be [rows, H]={rows, heads}")
+    if kv_scales.shape != (keys,) or kv_scales.dtype != torch.float32:
+        raise ValueError("kv_scales must be float32 [keys]")
+    if cu_starts.shape != (rows,) or cu_ends.shape != (rows,):
+        raise ValueError("cu_starts and cu_ends must be [rows]")
+    if not Q.is_cuda or any(t.device != Q.device for t in (KV, kv_scales)):
+        raise ValueError("FP8 Q/KV and kv_scales must be on the same GPU")
+    if D_out is not None:
+        if (
+            D_out.shape != (rows, keys)
+            or D_out.dtype != torch.float32
+            or D_out.device != Q.device
+            or not D_out.is_contiguous()
+        ):
+            raise ValueError("D_out must be contiguous float32 [rows, keys] on Q.device")
+        logits = D_out
+    else:
+        logits = torch.empty((rows, keys), dtype=torch.float32, device=Q.device)
+    if not rows or not keys:
+        return logits.fill_(-float("inf"))
+
+    from .mqa_prefill_wasp_weighted_fp8 import (
+        _tilelang_mqa_prefill_wasp_weighted_fp8_kernel,
+    )
+
+    device_info = get_device_info(Q.device)
+    config = resolve_get_prefill_config_fp8(device_info.arch)(
+        rows, keys, device_info.cu_count,
+        effective_range=effective_range, num_heads=heads,
+    )
+    starts = cu_starts.to(device=Q.device, dtype=torch.int32).contiguous()
+    ends = cu_ends.to(device=Q.device, dtype=torch.int32).contiguous()
+    _tilelang_mqa_prefill_wasp_weighted_fp8_kernel(
+        heads=heads,
+        block_q=config.block_q,
+        block_n=config.block_n,
+        threads=config.threads,
+        rows_divisible=config.rows_divisible,
+        n_tile_phases=config.n_tile_phases,
+        split_n=config.split_n,
+        apply_scale=False,
+    )(
+        Q.contiguous().reshape(-1, head_dim),
+        KV.contiguous(),
+        kv_scales.contiguous(),
+        weights.to(device=Q.device, dtype=torch.float32).contiguous(),
+        logits, starts, ends, 1.0,
+    )
+    _common._tilelang_qsa_mqa_mask_kernel(
+        **prefill_mask_launch_kwargs(rows, keys)
+    )(logits, starts, ends)
+    return logits
+
+
+__all__ = [
+    "qsa_mqa_decode",
+    "qsa_mqa_prefill",
+    "weighted_mqa_prefill",
+    "prefill_mask_launch_kwargs",
+]

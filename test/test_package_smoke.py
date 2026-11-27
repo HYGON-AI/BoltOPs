@@ -28,6 +28,8 @@ from boltops.qsa import (
 from boltops.fla.kda import recompute_w_u_fwd as recompute_w_u_fwd_kda
 from boltops.fla.gdn import recompute_w_u_fwd as recompute_w_u_fwd_gdn
 from boltops.mqa_logits import (
+    tilelang_mqa_decode,
+    tilelang_mqa_logits,
     tilelang_qsa_mqa_decode,
     tilelang_qsa_mqa_prefill,
     triton_mqa_logits,
@@ -112,6 +114,8 @@ def test_operator_package_exports():
     assert callable(qsa_select_paged_tokens)
     assert callable(expand_qsa_block_indices)
     assert callable(qsa_sparse_paged_attention)
+    assert callable(tilelang_mqa_decode)
+    assert callable(tilelang_mqa_logits)
     assert callable(tilelang_qsa_mqa_decode)
     assert callable(tilelang_qsa_mqa_prefill)
     assert callable(fused_mamba_state_scatter_with_mask)

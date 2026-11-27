@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # SPDX-License-Identifier: MIT
-"""Architecture-aware configuration dispatch for TileLang MQA prefill."""
+"""Separate QSA BF16/FP8 and weighted BF16 policies for TileLang MQA prefill."""
 
 from __future__ import annotations
 
@@ -47,8 +47,15 @@ def _load_prefill_config_module(arch: str):
 
 @lru_cache(maxsize=None)
 def resolve_get_config(arch: str) -> GetConfig:
-    """BF16 WASP launch policy."""
+    """QSA BF16 WASP launch policy; also the weighted policy baseline."""
     return _load_prefill_config_module(arch).get_config
+
+
+@lru_cache(maxsize=None)
+def resolve_get_config_weighted(arch: str) -> GetConfig:
+    """Weighted BF16 policy; reuse BF16 defaults without an arch overlay."""
+    module = _load_prefill_config_module(arch)
+    return getattr(module, "get_config_weighted", module.get_config)
 
 
 @lru_cache(maxsize=None)
@@ -61,5 +68,6 @@ def resolve_get_config_fp8(arch: str) -> GetConfig:
 __all__ = [
     "QSAMQAPrefillConfig",
     "resolve_get_config",
+    "resolve_get_config_weighted",
     "resolve_get_config_fp8",
 ]
