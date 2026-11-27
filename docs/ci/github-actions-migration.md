@@ -92,7 +92,7 @@ PR 验证通过后，安排同一次切换窗口：
 
 1. 停止接受 GitLab 独立 main 更新，选定 GitHub 为唯一主入口。
 2. 维护者停用 GitLab 的发布与 mirror:github（或停用整个 GitLab CI），并等待/取消仍在运行的发布任务。不要同时让两边对同一提交发布。
-3. 合入 GitHub 的迁移 PR；release/0.1.0 push 只构建并发布，不重复 PR 的测试。
+3. 合入 GitHub 的迁移 PR；release/0.1.0 push 重新构建并执行正确性、性能测试，每组 DTK 全部通过后独立发布。
 4. 确认发布成功。将 BoltOPs CI 的 ci-result 设为必需检查，保留已有 Checks / All required checks。必须先实际运行一次，让 GitHub 能识别检查名称。
 5. 后续开发走 GitHub PR，GitLab 如需保留副本，应另行设计反向镜像，不能继续两边独立合入。
 
