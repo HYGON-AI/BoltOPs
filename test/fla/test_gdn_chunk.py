@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import inspect
 import math
+import sys
 from collections.abc import Callable
+from types import ModuleType
 
 import importlib
 import json
@@ -478,8 +480,7 @@ def test_bench_chunk_h_tflops(
             chunk_gated_delta_rule_fwd_sglang_hip_blockdim64 as aiter_chunk_h,
         )
     except ImportError as exc:
-        print(f"AITER chunk-h reference is unavailable: {exc}")
-        return
+        pytest.skip(f"AITER chunk-h reference unavailable: {exc}")
 
     def run_aiter_h():
         return aiter_chunk_h(
@@ -490,7 +491,11 @@ def test_bench_chunk_h_tflops(
             chunk_offsets=None, use_exp2=False, transpose_state_layout=True,
         )
 
-    reference_h, reference_v_new = run_aiter_h()
+    try:
+        # AITER loads its native extension lazily on the first invocation.
+        reference_h, reference_v_new = run_aiter_h()
+    except ImportError as exc:
+        pytest.skip(f"AITER chunk-h reference unavailable: {exc}")
     assert reference_v_new is not None
     assert (
         torch.isfinite(reference_h).all()

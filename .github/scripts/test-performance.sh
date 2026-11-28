@@ -52,8 +52,8 @@ if [ "${optest_rc}" -ne 0 ] || [ "${report_rc}" -ne 0 ]; then
   # Keep console output bounded; the complete logs remain in artifacts.
   log_count=0
   while IFS= read -r -d '' log_file; do
-    echo "===== Last 120 lines: ${log_file} ====="
-    tail -n 120 "${log_file}"
+    echo "===== Failure context: ${log_file} ====="
+    python scripts/ci/optest_to_junit.py --error-context "${log_file}"
     log_count=$((log_count + 1))
     if [ "${log_count}" -ge 10 ]; then
       break
