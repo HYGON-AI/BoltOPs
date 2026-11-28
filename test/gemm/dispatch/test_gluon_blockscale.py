@@ -3,6 +3,7 @@
 """Recorded Gluon selection and its explicit native input contract."""
 
 from importlib import import_module
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -172,9 +173,9 @@ def test_gluon_kernel_and_tile_come_from_config(monkeypatch):
 
             return launch
 
-    pytest.importorskip("triton.experimental.gluon.language.amd.hcu")
-    kernels = import_module("boltops.gemm.gluon.gemm_a8w8_blockscale")
-    monkeypatch.setattr(kernels, "kernel_another_tile", CaptureKernel(), raising=False)
+    gluon = import_module("boltops.gemm.gluon")
+    kernels = SimpleNamespace(kernel_another_tile=CaptureKernel())
+    monkeypatch.setattr(gluon, MODULE, kernels, raising=False)
     config = dict(
         kernel="kernel_another_tile",
         BLOCK_SIZE_M=64,
