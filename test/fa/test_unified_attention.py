@@ -1433,7 +1433,7 @@ def test_gfx946_gluon_wasp_route_guards(feature, monkeypatch):
     wasp = importlib.import_module('boltops.fa.unified_attention.triton.unified_attention_wasp_gluon')
     calls = []
     monkeypatch.setattr(backend, '_gluon_wasp_device_supported', lambda device: feature != 'other_arch')
-    monkeypatch.setattr(wasp, 'launch_unified_attention_wasp_gluon', lambda *args: calls.append(args))
+    monkeypatch.setattr(wasp, 'launch_unified_attention_decode_gluon', lambda *args: calls.append(args))
     q = torch.empty(2, 32, 128, dtype=torch.bfloat16)
     cache_dtype = torch.bfloat16 if feature == 'bf16_cache' else torch.float8_e4m3fn
     kwargs = dict(
@@ -1448,7 +1448,7 @@ def test_gfx946_gluon_wasp_route_guards(feature, monkeypatch):
         k_descale=None if feature == 'missing_scale' else torch.ones(1), v_descale=torch.ones(1),
         alibi_slopes=None, output_scale=None, qq_bias=None, sinks=None, mm_prefix_range=None,
     )
-    assert backend._try_unified_attention_wasp_gluon(**kwargs) is (feature == 'plain')
+    assert backend._try_unified_attention_decode_wasp_gluon(**kwargs) is (feature == 'plain')
     assert len(calls) == (1 if feature == 'plain' else 0)
 
 
@@ -1469,10 +1469,10 @@ def test_gfx946_gluon_wasp_measured_launch_options(monkeypatch):
                 calls.append((grid, kwargs))
             return launch
 
-    monkeypatch.setattr(backend, 'unified_attention_wasp_gluon', CaptureKernel())
+    monkeypatch.setattr(backend, 'unified_attention_decode_gluon', CaptureKernel())
     q = torch.empty(2, 32, 128, dtype=torch.bfloat16)
     cache = torch.empty(2, 16, 8, 128, dtype=torch.float8_e4m3fn)
-    backend.launch_unified_attention_wasp_gluon(
+    backend.launch_unified_attention_decode_gluon(
         q, cache, cache, torch.empty_like(q), torch.arange(3, dtype=torch.int32),
         torch.full((2,), 16, dtype=torch.int32), torch.zeros(2, 1, dtype=torch.int32),
         torch.ones(1), torch.ones(1), 128**-.5,
@@ -1486,9 +1486,9 @@ def test_gfx946_gluon_wasp_measured_launch_options(monkeypatch):
 
 
 @pytest.mark.parametrize('feature,expected', [
-    ('plain', 'wasp'), ('batch511', 'ordinary'), ('key377', 'ordinary'),
+    ('plain', 'wasp'), ('batch511', 'wasp'), ('key377', 'wasp'),
     ('softcap', 'ordinary'), ('other_device', 'ordinary'),
-    ('partial_scratch', 'ordinary'),
+    ('partial_scratch', 'wasp'),
 ])
 def test_gfx946_wasp_default_dispatch(feature, expected, monkeypatch):
     backend = importlib.import_module('boltops.fa.unified_attention.triton.unified_attention')
@@ -1505,7 +1505,7 @@ def test_gfx946_wasp_default_dispatch(feature, expected, monkeypatch):
             return launch
 
     monkeypatch.setattr(backend, 'kernel_unified_attention_2d', CaptureKernel('ordinary'))
-    monkeypatch.setattr(wasp, 'unified_attention_wasp_gluon', CaptureKernel('wasp'))
+    monkeypatch.setattr(wasp, 'unified_attention_decode_gluon', CaptureKernel('wasp'))
     monkeypatch.setattr(backend, '_gluon_wasp_device_supported', lambda device: feature != 'other_device')
     monkeypatch.setattr(backend, 'get_arch', lambda device: 'gfx946')
     monkeypatch.setattr(backend, '_get_unified_attention_2d_config', lambda **kwargs: dict(BLOCK_M=16, TILE_SIZE=32, num_warps=4, num_stages=2))
@@ -1530,6 +1530,150 @@ def test_gfx946_wasp_default_dispatch(feature, expected, monkeypatch):
         assert options['PARTITION_REGS'] == (40, 116)
         assert options['PARTITION_WARPS'] == (4, 4)
 
+
+
+@pytest.mark.parametrize('feature,expected', [
+    ('short', 'gfx946'), ('long', 'gfx946'), ('long4k', 'gfx946'), ('long8', 'gfx946'), ('s147', 'gfx946'), ('s148', 'gfx946'),
+    ('unmeasured', 'gfx946'), ('other_device', 'ordinary'),
+    ('softcap', 'ordinary'), ('window', 'ordinary'),
+    ('missing_scale', 'ordinary'), ('int64_metadata', 'ordinary'),
+    ('noncontiguous', 'ordinary'), ('partial_scratch', 'ordinary'),
+])
+def test_gfx946_prefill_default_dispatch(feature, expected, monkeypatch):
+    backend = importlib.import_module('boltops.fa.unified_attention.triton.unified_attention')
+    specialized = importlib.import_module('boltops.fa.unified_attention.triton.unified_attention_wasp_gluon')
+    calls = []
+
+    class Ordinary:
+        def __getitem__(self, grid):
+            def launch(**kwargs):
+                calls.append('ordinary')
+            return launch
+
+    monkeypatch.setattr(backend, 'kernel_unified_attention_2d', Ordinary())
+    monkeypatch.setattr(specialized, 'launch_unified_attention_wasp_prefill',
+                        lambda *args: calls.append('gfx946'))
+    monkeypatch.setattr(backend, '_gluon_wasp_device_supported',
+                        lambda device: feature != 'other_device')
+    monkeypatch.setattr(backend, '_get_unified_attention_2d_config',
+                        lambda **kwargs: dict(BLOCK_M=16, TILE_SIZE=32, num_warps=4, num_stages=2))
+    monkeypatch.setattr(backend.config_module, 'get_device_info',
+                        lambda device=None: SimpleNamespace(arch='gfx946', cu_count=48))
+    batch,qlen,klen = (11,232,226) if feature == 's148' else (1,16,1024)
+    if feature == 'short':qlen,klen = 8,128
+    if feature == 'long4k':klen = 4096
+    if feature == 'long8':batch = 8
+    if feature == 's147':batch,qlen,klen = 29,229,226
+    if feature == 'unmeasured':klen = 128
+    q = torch.empty(batch*qlen,32,128,dtype=torch.bfloat16)
+    if feature == 'noncontiguous':
+        q = torch.empty(batch*qlen,32,256,dtype=torch.bfloat16)[...,::2]
+    cache = torch.empty(2,16,8,128,dtype=torch.float8_e4m3fn)
+    meta_dtype = torch.int64 if feature == 'int64_metadata' else torch.int32
+    backend.unified_attention(
+        q,cache,cache,torch.empty_like(q),torch.arange(batch+1,dtype=meta_dtype)*qlen,
+        qlen,torch.full((batch,),klen,dtype=torch.int32),klen,128**-.5,True,
+        (8,-1) if feature == 'window' else (-1,-1),
+        torch.zeros(batch,((klen+15)//16),dtype=torch.int32),
+        1.0 if feature == 'softcap' else 0.0,None,
+        None if feature == 'missing_scale' else torch.ones(1),torch.ones(1),
+        softmax_segm_output=torch.empty(1) if feature == 'partial_scratch' else None,
+    )
+    assert calls == [expected]
+
+
+def test_gfx946_prefill_dispatch_does_not_read_scale_to_host(monkeypatch):
+    backend = importlib.import_module('boltops.fa.unified_attention.triton.unified_attention')
+    specialized = importlib.import_module('boltops.fa.unified_attention.triton.unified_attention_wasp_gluon')
+    monkeypatch.setattr(backend,'_gluon_wasp_device_supported',lambda device: True)
+    calls=[]
+    monkeypatch.setattr(specialized,'launch_unified_attention_wasp_prefill',lambda *args: calls.append(args))
+    q=torch.empty(16,32,128,dtype=torch.bfloat16)
+    cache=torch.empty(64,16,8,128,dtype=torch.float8_e4m3fn)
+    ks,vs=torch.tensor([0.7]),torch.tensor([1.3])
+    def forbidden(*args,**kwargs):
+        raise AssertionError('dispatch must not copy/read tensor values on host')
+    monkeypatch.setattr(torch.Tensor,'item',forbidden)
+    monkeypatch.setattr(torch.Tensor,'cpu',forbidden)
+    assert backend._try_unified_attention_gfx946_prefill(
+        q=q,k=cache,v=cache,out=torch.empty_like(q),
+        cu_seqlens_q=torch.tensor([0,16],dtype=torch.int32),max_seqlen_q=16,
+        seqused_k=torch.tensor([1024],dtype=torch.int32),max_seqlen_k=1024,
+        softmax_scale=128**-.5,window_size=(-1,-1),block_table=torch.zeros(1,64,dtype=torch.int32),
+        softcap=0.,k_descale=ks,v_descale=vs,alibi_slopes=None,output_scale=None,
+        qq_bias=None,sinks=None,mm_prefix_range=None)
+    assert calls[0][7] is ks and calls[0][8] is vs
+
+
+@pytest.mark.parametrize('q_lens,kv_lens', [([16], [1024]), ([9,3], [5,35])])
+@pytest.mark.parametrize('seed,ks,vs,extrema', [
+    (2047, 0.125, 8.0, False), (3001, 0.0, 0.0, False), (2051, 0.7, 1.3, True),
+])
+def test_gfx946_prefill_precision(q_lens, kv_lens, seed, ks, vs, extrema):
+    backend=importlib.import_module('boltops.fa.unified_attention.triton.unified_attention')
+    if not torch.cuda.is_available():
+        pytest.skip('GPU required')
+    device=torch.device('cuda',torch.cuda.current_device())
+    if not backend._gluon_wasp_device_supported(device):
+        pytest.skip('gfx946 required')
+    specialized=importlib.import_module('boltops.fa.unified_attention.triton.unified_attention_wasp_gluon')
+    rng=torch.Generator(device='cpu').manual_seed(seed)
+    counts=[(n+15)//16 for n in kv_lens]
+    q=torch.randn(sum(q_lens),32,128,generator=rng,device='cpu').bfloat16()
+    k=(torch.randn(sum(counts),16,8,128,generator=rng,device='cpu')*.3).to(torch.float8_e4m3fn)
+    v=(torch.randn(sum(counts),16,8,128,generator=rng,device='cpu')*.3).to(torch.float8_e4m3fn)
+    if extrema:
+        for cache in (k,v):
+            raw=cache.view(torch.uint8).flatten()
+            raw[0],raw[128]=126,254
+    permutation=torch.randperm(sum(counts),generator=rng,device='cpu')
+    table=torch.zeros(len(q_lens),max(counts),dtype=torch.int32,device='cpu')
+    cursor=0
+    for seq,count in enumerate(counts):
+        table[seq,:count]=permutation[cursor:cursor+count]
+        cursor+=count
+    cu=[0]
+    for length in q_lens:cu.append(cu[-1]+length)
+    references={True:[],False:[]}
+    for seq,(qlen,klen) in enumerate(zip(q_lens,kv_lens)):
+        pages=table[seq,:counts[seq]].long()
+        kk=(k.float()[pages]*ks).reshape(-1,8,128)[:klen]
+        vv=(v.float()[pages]*vs).reshape(-1,8,128)[:klen]
+        qq=q[cu[seq]:cu[seq+1]].float().transpose(0,1)
+        causal=torch.arange(klen,device='cpu')[None,:] <= (klen-qlen+torch.arange(qlen,device='cpu')[:,None])
+        for rounded in references:
+            kr=kk.bfloat16().float() if rounded else kk
+            vr=vv.bfloat16().float() if rounded else vv
+            keys=kr.repeat_interleave(4,dim=1).permute(1,2,0)
+            values=vr.repeat_interleave(4,dim=1).transpose(0,1)
+            scores=(qq@keys)*(128**-.5)
+            probs=scores.masked_fill(~causal[None,:,:],float('-inf')).softmax(-1).nan_to_num()
+            references[rounded].append((probs@values).transpose(0,1))
+    args=dict(q=q.to(device),k=k.to(device),v=v.to(device),
+              out=torch.empty_like(q,device=device),
+              cu_seqlens_q=torch.tensor(cu,dtype=torch.int32,device=device),
+              seqused_k=torch.tensor(kv_lens,dtype=torch.int32,device=device),
+              block_table=table.to(device),
+              k_descale=torch.tensor([ks],dtype=torch.float32,device=device),
+              v_descale=torch.tensor([vs],dtype=torch.float32,device=device))
+    # The measured long case exercises public dispatch. The ragged case also
+    # exercises the specialized kernel directly, even though dispatch falls back.
+    backend.unified_attention(**args,max_seqlen_q=max(q_lens),max_seqlen_k=max(kv_lens),
+                              softmax_scale=128**-.5,causal=True,window_size=(-1,-1),
+                              softcap=0.,q_descale=None)
+    results=[args['out'].cpu().float()]
+    if len(q_lens)>1:
+        specialized.launch_unified_attention_wasp_prefill(
+            args['q'],args['k'],args['v'],args['out'],args['cu_seqlens_q'],args['seqused_k'],
+            args['block_table'],args['k_descale'],args['v_descale'],128**-.5,max(q_lens))
+        results.append(args['out'].cpu().float())
+    for actual in results:
+        assert actual.isfinite().all()
+        torch.testing.assert_close(actual,torch.cat(references[True]),atol=.02,rtol=.02)
+        torch.testing.assert_close(actual,torch.cat(references[False]),atol=.08,rtol=.08)
+        for seq,(qlen,klen) in enumerate(zip(q_lens,kv_lens)):
+            if qlen>klen:
+                assert (actual[cu[seq]:cu[seq]+qlen-klen]==0).all()
 
 _SMALL_UA_SHAPE_SCORES = 2 * 10**8
 _HUGE_UA_SHAPE_BYTES = 96 * 1024**3

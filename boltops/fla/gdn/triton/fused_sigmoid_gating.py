@@ -184,7 +184,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
                 i_t = accepted - 1
             else:
                 i_t = 0
-            state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t).to(
+            state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t * stride_indices_tok).to(
                 tl.int64
             )
             if state_idx <= NULL_STATE_INDEX:
@@ -203,7 +203,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         if not IS_KDA:
             x = tl.load(p_a).to(tl.float32) + b_dt_bias
         else:
-            x = tl.load(p_a).to(tl.float32) + tl.load(p_dt_bias).to(tl.float32)
+            x = tl.load(p_a, mask=mask_k, other=0).to(tl.float32) + tl.load(p_dt_bias, mask=mask_k, other=0).to(tl.float32)
         softplus_x = tl.where(
             beta * x <= threshold, (1 / beta) * tl.log(1 + tl.exp(beta * x)), x
         )
@@ -227,7 +227,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
 
         if INPLACE_FINAL_STATE:
             final_state_idx = tl.load(
-                ssm_state_indices + i_n * stride_indices_seq + i_t
+                ssm_state_indices + i_n * stride_indices_seq + i_t * stride_indices_tok
             ).to(tl.int64)
             if final_state_idx > NULL_STATE_INDEX:
                 p_ht = ht + final_state_idx * stride_final_state_token
@@ -311,7 +311,7 @@ def fused_sigmoid_gating_delta_rule_update(
         )
 
     o = q.new_empty(NK, *v.shape)
-    final_state = initial_state if inplace_final_state else q.new_empty(T, HV, V, K, dtype=initial_state.dtype)
+    final_state = initial_state if inplace_final_state else q.new_empty(B * T, HV, V, K, dtype=initial_state.dtype)
 
     stride_init_state_token = initial_state.stride(0)
     stride_final_state_token = final_state.stride(0)

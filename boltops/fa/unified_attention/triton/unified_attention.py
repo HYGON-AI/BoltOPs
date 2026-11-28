@@ -347,7 +347,11 @@ def kernel_unified_attention_2d(
         tile_mask = seq_offset < max_seq_prefix_len
 
         physical_block_idx = tl.load(
-            block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
+            block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE,
+            # Mask the page-table access itself, before loading K/V. The last
+            # tile can extend past the final allocated page of the last row.
+            mask=tile_mask,
+            other=0,
         ).to(tl.int64)
 
         v_offset_1 = (
@@ -496,7 +500,7 @@ def kernel_unified_attention_2d(
             is_query_key = (key_rel_pos >= 0) & (key_rel_pos < qq_bias_stride_0)
             qq_bias = tl.load(
                 qq_bias_row_ptrs + key_rel_pos[None, :],
-                mask=is_query_key[None, :],  # avoid OOB for context keys
+                mask=is_query_key[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
                 other=0.0,
             )
             S += qq_bias
@@ -792,7 +796,11 @@ def kernel_unified_attention_3d(
         tile_mask = seq_offset < max_seq_prefix_len
 
         physical_block_idx = tl.load(
-            block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
+            block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE,
+            # Mask the page-table access itself, before loading K/V. The last
+            # tile can extend past the final allocated page of the last row.
+            mask=tile_mask,
+            other=0,
         ).to(tl.int64)
 
         v_offset_1 = (
@@ -943,7 +951,7 @@ def kernel_unified_attention_3d(
             is_query_key = (key_rel_pos >= 0) & (key_rel_pos < qq_bias_stride_0)
             qq_bias = tl.load(
                 qq_bias_row_ptrs + key_rel_pos[None, :],
-                mask=is_query_key[None, :],  # avoid OOB for context keys
+                mask=is_query_key[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
                 other=0.0,
             )
             S += qq_bias
@@ -1308,7 +1316,7 @@ def _gluon_wasp_device_supported(device):
     return device.type == "cuda" and get_arch(device) == "gfx946"
 
 
-def _try_unified_attention_wasp_gluon(
+def _try_unified_attention_decode_wasp_gluon(
     *,
     q,
     k,
@@ -1329,63 +1337,41 @@ def _try_unified_attention_wasp_gluon(
     sinks,
     mm_prefix_range,
 ):
-    """Launch the guarded Gluon WASP decode specialization when applicable."""
+    """Launch the generic Gluon WASP decode path when applicable."""
+    tensors = (q, k, v, out)
+    metadata = (cu_seqlens_q, seqused_k, block_table)
     if (
-        max_seqlen_q != 1
-        or q.ndim != 3
-        or k.ndim != 4
-        or v.ndim != 4
-        or out.shape != q.shape
-        or q.shape[0] == 0
+        max_seqlen_q != 1 or q.ndim != 3 or k.ndim != 4 or v.ndim != 4
+        or q.shape[0] == 0 or out.shape != q.shape
         or not _gluon_wasp_device_supported(q.device)
-        or any(tensor.device != q.device for tensor in (
-            k, v, out, cu_seqlens_q, seqused_k, block_table
-        ))
-        or any(tensor.stride(-1) != 1 for tensor in (q, k, v, out))
-        or cu_seqlens_q.ndim != 1
-        or seqused_k.shape != (q.shape[0],)
-        or cu_seqlens_q.dtype not in (torch.int32, torch.int64)
-        or seqused_k.dtype not in (torch.int32, torch.int64)
-        or not cu_seqlens_q.is_contiguous()
-        or not seqused_k.is_contiguous()
-        or q.shape[0] != cu_seqlens_q.numel() - 1
-        or q.dtype != torch.bfloat16
-        or out.dtype != torch.bfloat16
-        or (q.shape[1:], k.shape[1:], v.shape[1:]) != (
-            (32, 128), (16, 8, 128), (16, 8, 128)
+        or any(t.device != q.device for t in (*tensors, *metadata))
+        or any(t.stride(-1) != 1 for t in tensors)
+        or q.dtype != torch.bfloat16 or out.dtype != torch.bfloat16
+        or k.dtype != torch.float8_e4m3fn or v.dtype != k.dtype
+        # Kernel layout constraints; batch, sequence length and head counts
+        # remain generic (subject only to a valid GQA ratio).
+        or (q.shape[-1], k.shape[1:], v.shape[1:]) != (
+            128, (16, k.shape[2], 128), (16, k.shape[2], 128)
         )
-        or k.dtype != torch.float8_e4m3fn
-        or v.dtype != torch.float8_e4m3fn
-        or block_table.ndim != 2
-        or block_table.shape[0] != q.shape[0]
-        or block_table.dtype not in (torch.int32, torch.int64)
-        or not block_table.is_contiguous()
-        or softcap != 0
-        or output_scale is not None
-        or alibi_slopes is not None
-        or qq_bias is not None
-        or sinks is not None
-        or mm_prefix_range is not None
-        or window_size[0] >= 0
-        or window_size[1] >= 0
+        or k.shape[2] == 0 or q.shape[1] % k.shape[2] != 0
+        or cu_seqlens_q.ndim != 1 or seqused_k.shape != (q.shape[0],)
+        or q.shape[0] != cu_seqlens_q.numel() - 1
+        or any(t.dtype not in (torch.int32, torch.int64) for t in metadata)
+        or any(not t.is_contiguous() for t in metadata)
+        or softcap != 0 or window_size != (-1, -1)
+        or any(feature is not None for feature in (
+            output_scale, alibi_slopes, qq_bias, sinks, mm_prefix_range
+        ))
     ):
         return False
-    if not isinstance(k_descale, torch.Tensor) or not isinstance(v_descale, torch.Tensor):
+    scales = (k_descale, v_descale)
+    if any(not isinstance(t, torch.Tensor) or t.device != q.device
+           or t.numel() != 1 or t.dtype != torch.float32
+           or not t.is_contiguous() for t in scales):
         return False
-    if (
-        k_descale.numel() != 1
-        or v_descale.numel() != 1
-        or k_descale.dtype != torch.float32
-        or v_descale.dtype != torch.float32
-        or not k_descale.is_contiguous()
-        or not v_descale.is_contiguous()
-        or k_descale.device != q.device
-        or v_descale.device != q.device
-    ):
-        return False
-    from .unified_attention_wasp_gluon import launch_unified_attention_wasp_gluon
+    from .unified_attention_wasp_gluon import launch_unified_attention_decode_gluon
 
-    launch_unified_attention_wasp_gluon(
+    launch_unified_attention_decode_gluon(
         q,
         k,
         v,
@@ -1396,6 +1382,53 @@ def _try_unified_attention_wasp_gluon(
         k_descale,
         v_descale,
         softmax_scale,
+    )
+    return True
+
+
+def _try_unified_attention_prefill_wasp_gluon(
+    *, q, k, v, out, cu_seqlens_q, max_seqlen_q, seqused_k,
+    max_seqlen_k, softmax_scale, window_size, block_table, softcap,
+    k_descale, v_descale, alibi_slopes, output_scale, qq_bias, sinks,
+    mm_prefix_range,
+):
+    """Select the gfx946 prefill path for supported prefill layouts."""
+    if (
+        max_seqlen_q <= 1
+        or q.ndim != 3 or k.ndim != 4 or v.shape != k.shape
+        or out.shape != q.shape
+        or cu_seqlens_q.ndim != 1 or seqused_k.ndim != 1
+        or not _gluon_wasp_device_supported(q.device)
+        or not ((q.shape[1:] == (32, 128) and k.shape[1:] == (16, 8, 128))
+                or (q.shape[1:] == (16, 256) and k.shape[1:] == (16, 2, 256)))
+        or q.dtype != torch.bfloat16 or out.dtype != torch.bfloat16
+        or k.dtype != torch.float8_e4m3fn or v.dtype != k.dtype
+        or cu_seqlens_q.numel() != seqused_k.numel() + 1
+        or block_table.ndim != 2 or block_table.shape[0] != seqused_k.numel()
+        or block_table.shape[1] < triton.cdiv(max_seqlen_k, 16)
+        or any(t.dtype != torch.int32 for t in (cu_seqlens_q, seqused_k, block_table))
+        or any(t.device != q.device or not t.is_contiguous() for t in (
+            q, k, v, out, cu_seqlens_q, seqused_k, block_table
+        ))
+        or softcap != 0 or window_size[0] >= 0 or window_size[1] >= 0
+        or any(feature is not None for feature in (
+            output_scale, alibi_slopes, qq_bias, sinks, mm_prefix_range
+        ))
+        or not isinstance(softmax_scale, (float, int))
+    ):
+        return False
+    if any(not isinstance(t, torch.Tensor) for t in (k_descale, v_descale)):
+        return False
+    if any(t.device != q.device or t.dtype != torch.float32 or t.numel() != 1
+           or not t.is_contiguous() for t in (k_descale, v_descale)):
+        return False
+    if max(t.numel() for t in (q, k, v, out, block_table)) >= 2**31:
+        return False
+    from .unified_attention_wasp_gluon import launch_unified_attention_prefill_gluon
+
+    launch_unified_attention_prefill_gluon(
+        q, k, v, out, cu_seqlens_q, seqused_k, block_table,
+        k_descale, v_descale, softmax_scale, max_seqlen_q,
     )
     return True
 
@@ -1432,14 +1465,27 @@ def _unified_attention_core(
     assert causal, "Only causal attention is supported"
     assert q_descale is None, "Q scales not supported"
 
-    wasp_default = (
-        q.shape == (512, 32, 128)
-        and max_seqlen_q == 1 and max_seqlen_k == 376
-        and softmax_segm_output is None and softmax_segm_max is None
-        and softmax_segm_expsum is None
-    )
+    if (softmax_segm_output is None and softmax_segm_max is None
+            and softmax_segm_expsum is None):
+        if _try_unified_attention_prefill_wasp_gluon(
+            q=q, k=k, v=v, out=out, cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=max_seqlen_q, seqused_k=seqused_k,
+            max_seqlen_k=max_seqlen_k, softmax_scale=softmax_scale,
+            window_size=window_size, block_table=block_table, softcap=softcap,
+            k_descale=k_descale, v_descale=v_descale,
+            alibi_slopes=alibi_slopes, output_scale=output_scale,
+            qq_bias=qq_bias, sinks=sinks, mm_prefix_range=mm_prefix_range,
+        ):
+            return
+
+    # This is a generic decode route.  The kernel handles arbitrary batch and
+    # sequence lengths; shape-specific performance measurements must not gate
+    # correctness dispatch.
+    # Decode produces the final result in one pass, so caller-provided segment
+    # scratch is unnecessary and can be left untouched.
+    wasp_default = max_seqlen_q == 1
     if wasp_default:
-        if _try_unified_attention_wasp_gluon(
+        if _try_unified_attention_decode_wasp_gluon(
             q=q,
             k=k,
             v=v,

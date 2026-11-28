@@ -241,6 +241,20 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     if H <= 0 or HV % H != 0:
         raise ValueError(f"Invalid inferred heads: H={H}, HV={HV}.")
 
+    # The kernel supports a strided token axis, but uses dense offsets within
+    # each token/state row and for the output. Reject unsupported views before
+    # launching rather than silently reading or writing the wrong storage.
+    for name, tensor in (("mixed_qkv", mixed_qkv), ("a", a), ("b", b),
+                         ("A_log", A_log), ("dt_bias", dt_bias)):
+        if tensor.stride(-1) != 1:
+            raise ValueError(f"`{name}` must have unit last-dimension stride.")
+    if initial_state.stride()[-3:] != (V * K, K, 1):
+        raise ValueError("`initial_state` must have dense HV/V/K dimensions.")
+    if not out.is_contiguous():
+        raise ValueError("`out` must be contiguous.")
+    if ssm_state_indices.dtype not in (torch.int32, torch.int64):
+        raise ValueError("`ssm_state_indices` must be int32 or int64.")
+
     BK = triton.next_power_of_2(K)
     cfg = kernel_cfg if kernel_cfg is not None else _get_fused_recurrent_packed_decode_config(B, H, HV)
     BV = min(triton.next_power_of_2(V), int(cfg["BV"]))

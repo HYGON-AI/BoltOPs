@@ -61,7 +61,7 @@ def _reference_paged_attention_diffkv(q, k_cache, v_cache, q_lens, kv_lens, tabl
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires an HCU/CUDA Triton device")
 @pytest.mark.parametrize("batch, heads", [(1, 4), (4, 64)])
-@pytest.mark.parametrize("q_len, kv_len", [(12, 24), (20, 48)])
+@pytest.mark.parametrize("q_len, kv_len", [(12, 24), (20, 48), (17, 65)])
 def test_qk_value_head_diffkv_matches_reference(
     batch: int, heads: int, q_len: int, kv_len: int,
 ) -> None:
@@ -75,7 +75,10 @@ def test_qk_value_head_diffkv_matches_reference(
     k_cpu = torch.randn(pages, page, heads, qk_dim, dtype=torch.bfloat16)
     v_cpu = torch.randn(pages, page, heads, v_dim, dtype=torch.bfloat16)
     q, k, v = q_cpu.to(device), k_cpu.to(device), v_cpu.to(device)
-    out = torch.empty(total_q, heads, v_dim, device=device, dtype=torch.bfloat16)
+    # Guard both ends of the output allocation against unmasked tail stores.
+    guarded_out = torch.full((total_q + 2, heads, v_dim), 19.0,
+                             device=device, dtype=torch.bfloat16)
+    out = guarded_out[1:-1]
     table_cpu = torch.arange(pages, dtype=torch.int32).reshape(batch, pages_per_seq)
     table = table_cpu.to(device)
     unified_attention(
@@ -88,5 +91,7 @@ def test_qk_value_head_diffkv_matches_reference(
         q_cpu, k_cpu, v_cpu, [q_len] * batch, [kv_len] * batch,
         table_cpu, qk_dim ** -0.5, True,
     )
+    assert torch.all(guarded_out[0].cpu() == 19.0)
+    assert torch.all(guarded_out[-1].cpu() == 19.0)
     assert out.shape[-1] == v_dim
     torch.testing.assert_close(out.cpu(), reference, atol=3e-2, rtol=3e-2)
