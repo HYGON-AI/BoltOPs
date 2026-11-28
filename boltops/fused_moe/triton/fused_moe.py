@@ -37,7 +37,7 @@ from boltops.fused_moe.triton.moe_compat import (
     sgl_moe_align_block_size as sgl_moe_align_block_size_aiter,
 )
 from boltops.utility.torch_guard import torch_compile_guard
-from boltops.fused_moe.triton.moe_sorting_hipc import moe_sorting_fwd
+from boltops.fused_moe.triton.moe_sorting_gluon import moe_sorting_fwd
 from boltops.utility import dtypes
 
 
@@ -438,17 +438,15 @@ def moe_align_block_size(
 
     return sorted_ids, expert_ids, num_tokens_post_pad
 
-def moe_sorting_ck(
+def moe_sorting_gluon(
     topk_ids,
     topk_weights,
     num_experts,
-    model_dim,
-    moebuf_dtype,
     block_size=32,
     expert_mask=None,
 ):
+    """Build the packed routing metadata consumed by the MoE GEMMs."""
     device = topk_ids.device
-    M, topk = topk_ids.shape
     topk = topk_ids.shape[1]
     max_num_tokens_padded = topk_ids.numel() + num_experts * block_size - topk
     max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
@@ -463,7 +461,6 @@ def moe_sorting_ck(
         (num_experts*2,), dtype=dtypes.i32, device=device
     )
     num_valid_ids = torch.empty((1), dtype=dtypes.i32, device=device)
-    moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
 
     # for now, moe_sorting_fwd only support int32 topk_ids
     if topk_ids.dtype != dtypes.i32:
@@ -477,12 +474,11 @@ def moe_sorting_ck(
         sorted_expert_ids,
         tokens_positions_per_expert,
         num_valid_ids,
-        moe_buf,
         num_experts,
         block_size,
         expert_mask,
     )
-    return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, tokens_positions_per_expert, moe_buf
+    return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, tokens_positions_per_expert
 
 
 def inplace_fused_experts(hidden_states: torch.Tensor,
@@ -1109,8 +1105,8 @@ def fused_experts_mxfp_impl(
         ck_sorting = expert_map is None
         sorted_weights = None
         if ck_sorting:
-            sorted_ids, sorted_weights, experts, padded, _, _ = moe_sorting_ck(
-                ids, weights, global_num_experts, w2.shape[1], output_dtype,
+            sorted_ids, sorted_weights, experts, padded, _ = moe_sorting_gluon(
+                ids, weights, global_num_experts,
                 config['BLOCK_SIZE_M'])
         else:
             sorted_ids, experts, padded = moe_align_block_size(
@@ -1473,12 +1469,12 @@ def fused_experts_impl(hidden_states: torch.Tensor,
             ck_sorting = False
         else:
             # Convert expert_map (global->local mapping, -1 for inactive) to
-            # expert_mask (binary 0/1 mask) expected by moe_sorting_ck's C kernel.
+            # expert_mask (binary 0/1 mask) expected by moe_sorting_gluon.
             expert_mask = (expert_map >= 0).to(torch.int32) if expert_map is not None else None
             sorted_token_ids, sorted_weights, expert_ids, num_tokens_post_padded, \
-                _tokens_positions_per_expert, _moe_buf = (
-                    moe_sorting_ck(curr_topk_ids, curr_topk_weights, global_num_experts,
-                                w2.shape[1], output_dtype, config["BLOCK_SIZE_M"], expert_mask)
+                _tokens_positions_per_expert = (
+                    moe_sorting_gluon(curr_topk_ids, curr_topk_weights, global_num_experts,
+                                config["BLOCK_SIZE_M"], expert_mask)
             )
 
         if (use_int8_w8a8 or use_fp8_w8a8 or use_int4_w4a8) and per_channel_quant:

@@ -2,7 +2,7 @@
 
 融合 MoE experts 计算：对 `hidden_states` 按 `topk_ids` / `topk_weights` 路由，
 经专家 `w1`/`w2`（及可选量化与 bias）得到输出。内部可走 Triton GEMM 路径，
-并依赖私有 HIPC MoE sorting。
+路由排序使用 Gluon MoE sorting，不再编译私有 HIPC 扩展。
 
 相关文档：
 
@@ -116,9 +116,10 @@ def fused_experts(
 ### 2.3 前置条件
 
 - 张量在 GPU 上；`hidden_states` contiguous；`w1`/`w2` 最后一维 stride 为 1
+- MoE sorting 要求 Gluon 3.6 API，以及支持目标 HCU Wave64 架构的 Triton 后端
 - `topk_weights.shape == topk_ids.shape`
 - `hidden_states.shape[1]` 与 `w1` 的 K 维匹配（INT4 路径另有约定）
-- 量化路径须提供对应 scale（及必要时 zp）；需本机 `aicc` 以编译 HIPC sorter
+- 量化路径须提供对应 scale（及必要时 zp）；sorting 使用 Triton Gluon，无需编译 HIPC 扩展
 - 公开入口为 `fused_experts`；底层 `fused_experts_impl` 仅供内部 / 调参使用
 
 ## 3. 正确性测试与性能基准
@@ -219,11 +220,11 @@ NMZ 失败项中，除 M=1 外其余各点退化为 4.79%、1.07%、-0.81%、0.3
 
 ## 附录 B. 溯源
 
-由 ROCm **aiter** 的 Triton fused MoE 迁入（triton-only 路径）；HIPC sorting
-为独立 in-tree 实现，不依赖 aiter / CK 运行时。
+由 ROCm **aiter** 的 Triton fused MoE 迁入（triton-only 路径）；sorting
+由 Gluon 实现，不依赖 HIPC 扩展或 aiter / CK 运行时。
 
 ## 附录 C. 实现备注
 
 - 公开 `fused_experts` 转发至 `fused_experts_impl`（带 `torch_compile_guard`）。
-- Sorting 使用同目录下 `moe_sorting_hipc/` 的 `aicc` JIT；kernel 源码在 `csrc/`。
+- Sorting 使用 `boltops/fused_moe/triton/moe_sorting_gluon.py`；只返回路由元数据，不申请或清零未使用的 MoE 输出 buffer。
 - Launch 配置优先读当前 `configs/triton_<capability>`，再向低能力版本回退。
