@@ -20,7 +20,7 @@
         "BLOCK_SIZE_K": 256,
         "GROUP_SIZE_M": 1,
         "COMBINE_SCALE_LOAD": false,
-        "USE_MLS_LOAD": true,
+        "USE_MLS_LOAD": false,
         "schedule_hint": "none",
         "sched_latency": "none",
         "kpack": 2,

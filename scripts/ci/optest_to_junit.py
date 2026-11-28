@@ -30,7 +30,7 @@ _PYTEST_SECTION_RE = re.compile(r"=+ (?:FAILURES|ERRORS) =+$")
 _PYTEST_SUBSECTION_RE = re.compile(r"_+ .+ _+$")
 _RUNNER_LINE_RE = re.compile(r"\[(?:\d+/\d+\] backend=|summary\] )")
 _RUNNER_HEADER_RE = re.compile(r"\[\d+/\d+\] backend=")
-_RUNNER_VERDICT_RE = re.compile(r"\[summary\] \S+ file=(\S+): pytest rc=(-?\d+)")
+_RUNNER_VERDICT_RE = re.compile(r"\[summary\] \S+ file=(\S+): (?:pytest rc=(-?\d+)|launch FAILED)")
 _MAX_FULL_LINES = 2000
 _MAX_CONTEXT = 990
 _TAIL_LINES = 5
@@ -114,11 +114,11 @@ def _failure_sections(lines: list[str]) -> list[list[str]]:
 def _read_error_context(log_dir: Path, log_rel: str) -> str:
     """Extract where a run failed from a log, not just that it failed.
 
-    Logs up to _MAX_FULL_LINES lines are returned whole; larger logs are
-    assembled, bounded to _MAX_CONTEXT lines, from: the fatal-error
-    window and the failing-test sections, the pytest short summary (with
-    each file's non-zero ``pytest rc`` verdict), and the final tally.
-    ANSI escapes are stripped for GitLab's JUnit viewer.
+    Prioritize failed files/cases, compiler diagnostics and exception details
+    even in short logs. Success and skip summaries cannot displace a failure.
+    Output is bounded to _MAX_CONTEXT lines, with room for the final tally.
+    Logs without recognized failures are returned whole when short, otherwise
+    their tail is used. ANSI escapes are stripped for the JUnit viewer.
     """
     log_file = log_dir / log_rel
     if not log_file.is_file():
@@ -129,56 +129,74 @@ def _read_error_context(log_dir: Path, log_rel: str) -> str:
         return f"(failed to read log: {exc})"
 
     lines = [_ANSI_RE.sub("", line) for line in content.splitlines()]
-    if len(lines) <= _MAX_FULL_LINES:
-        return "\n".join(lines)
-
     verdicts = [(i, match) for i, line in enumerate(lines)
                 if (match := _RUNNER_VERDICT_RE.search(line))
                 and match[2] != "0"]
-
-    segments: list[list[str]] = []
+    failure_sections = _failure_sections(lines)
     fatal = next((i for i, line in enumerate(lines)
                   if _FATAL_RE.match(line)), None)
+    traceback_at = next((i for i, line in enumerate(lines)
+                         if line.rstrip() == _TRACEBACK), None)
+    if not verdicts and not failure_sections and fatal is None and traceback_at is None:
+        if len(lines) <= _MAX_FULL_LINES:
+            return "\n".join(lines)
+        return "\n".join(lines[-_MAX_CONTEXT:])
+
+    # Put failed files and case IDs first. Successful/skip summaries must not
+    # consume the budget before a failure later in a long performance run.
+    segments: list[list[str]] = []
+    if verdicts:
+        segments.append([lines[i] for i, _ in verdicts])
+    for i, line in enumerate(lines):
+        if _SUMMARY_RE.match(line):
+            summary = _bounded(
+                lines, i, _SUMMARY_WINDOW,
+                stop=lambda l: bool(_RUNNER_HEADER_RE.search(l)))
+            if any(re.match(r"(?:FAILED|ERROR) ", item) for item in summary):
+                segments.append(summary)
+
+    # Compiler assertions precede the pytest traceback and may be followed by
+    # hundreds of MLIR lines. Keep the cause without dumping the IR module.
+    diagnostics = [line for line in lines if re.search(
+        r"Assertion .+ failed\.|LLVM ERROR:|(?:^|\s)(?:fatal )?error:|note: Pipeline failed", line)]
+    if diagnostics:
+        segments.append(diagnostics[:40])
     if fatal is not None:
         segments.append(lines[max(0, fatal - _FATAL_CONTEXT):
                               fatal + _FATAL_WINDOW])
-    segments.extend(_failure_sections(lines))
-    if fatal is None and not segments:
-        traceback_at = next((i for i, line in enumerate(lines)
-                             if line.rstrip() == _TRACEBACK), None)
-        if traceback_at is not None:
-            segments.append(lines[max(0, traceback_at - _FATAL_CONTEXT):
-                                  traceback_at + _FAILURE_WINDOW])
-    for i, line in enumerate(lines):
-        if _SUMMARY_RE.match(line):
-            # Keep each file's summary through its rc verdict (the only
-            # place naming which pytest run failed); the runner emits one
-            # summary per file, so failures in later files are covered too.
-            segments.append(_bounded(
-                lines, i, _SUMMARY_WINDOW,
-                stop=lambda l: bool(_RUNNER_HEADER_RE.search(l))))
+    segments.extend(failure_sections)
+    if fatal is None and not failure_sections and traceback_at is not None:
+        segments.append(lines[max(0, traceback_at - _FATAL_CONTEXT):
+                              traceback_at + _FAILURE_WINDOW])
     for i, _ in verdicts:
         start = max((j for j in range(i, -1, -1)
                      if _RUNNER_HEADER_RE.search(lines[j])), default=max(0, i - 1))
         segment = lines[start:i + 1]
-        if any(_PYTEST_SECTION_RE.match(l) for l in segment):
-            continue  # the FAILURES/ERRORS regions above carry the detail
-        # A file that died before pytest reported (rc<0) has no sections:
-        # keep its output tail, where the crash reason lives.
+        if any(_PYTEST_SECTION_RE.match(item) for item in segment):
+            continue
         if len(segment) > _FILE_WINDOW:
             segment = [segment[0]] + segment[-(_FILE_WINDOW - 1):]
         segments.append(segment)
 
+    # Always reserve room for the final tally, including when many files fail.
+    tail = lines[-_TAIL_LINES:]
     parts: list[str] = []
-    used = 0
-    for segment in [*segments, lines[-_TAIL_LINES:]]:
-        take = segment[:max(0, _MAX_CONTEXT - used)]
+    budget = _MAX_CONTEXT - len(tail) - 1
+    for segment in segments:
+        room = budget - bool(parts)
+        if room <= 0:
+            break
+        take = segment[:room]
         if not take:
             continue
         if parts:
             parts.append("[...]")
+            budget -= 1
         parts.extend(take)
-        used += len(take)
+        budget -= len(take)
+    if parts:
+        parts.append("[...]")
+    parts.extend(tail)
     return "\n".join(parts)
 
 

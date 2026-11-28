@@ -47,6 +47,13 @@ implementation; all backends' rows merge into the single ``<op>.csv``,
 distinguished by the ``backend`` column.  Each row's ``version``
 column carries that backend's dist version, whose string embeds the
 toolchain's own build commit.
+
+GPU scheduling: --gpus 1,2,3,4 distributes file/backend processes across
+the selected cards, one process per card. Without --gpus, inherit the
+optest allocation or visibility mask; an unmasked local run stays serial.
+For stock optest on Linux, recover its explicit --gpus pool from the
+immediate parent process argv, since its child masks may name only one
+leased card. Additional cards are reserved using optest GPU leases.
 """
 
 from __future__ import annotations
@@ -55,11 +62,13 @@ import argparse
 import ast
 import csv
 import os
+import signal
 import shutil
 import subprocess
 import sys
 import time
 import traceback
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -232,27 +241,239 @@ def plan_runs(
     ], skipped
 
 
-def run_op_benches(files: list[str], raw_dir: Path, backend: str) -> int:
-    """Run one bench file's tests; they emit raw rows into ``raw_dir``.
+def optest_gpu_pool(
+    env: dict[str, str], proc_root: Path = Path("/proc"),
+) -> str | None:
+    """Recover explicit --gpus from our immediate optest parent on Linux.
 
-    ``$OPTEST_BACKEND`` tells the op dispatch layers (and the collection
-    hook's ``backend`` column) which backend this pass exercises.
-    Returns the pytest exit code; ``-s`` keeps the bench's progress lines
-    visible in the run log.
+    Stock optest overwrites its child's masks with one leased GPU. Read only
+    that parent's argv, only in an optest run; never walk unrelated ancestors
+    or infer a pool from the host's visible hardware.
     """
-    cmd = [
-        sys.executable, "-m", "pytest", *files,
+    if not env.get("OPTEST_OUTPUT_DIR") or not env.get("OPTEST_GPUS"):
+        return None
+    try:
+        argv = [os.fsdecode(arg) for arg in
+                (proc_root / str(os.getppid()) / "cmdline").read_bytes().split(b"\0") if arg]
+    except OSError:
+        return None
+    if not argv:
+        return None
+    names = {"optest", "optest.bak"}
+    if Path(argv[0]).name in names:
+        cli_args = argv[1:]
+    elif Path(argv[0]).name.startswith("python"):
+        if len(argv) > 1 and Path(argv[1]).name in names:
+            cli_args = argv[2:]
+        elif argv[1:3] == ["-m", "optest.cli"]:
+            cli_args = argv[3:]
+        else:
+            return None
+    else:
+        return None
+    parser = argparse.ArgumentParser(add_help=False, exit_on_error=False)
+    for option in ("--op_name", "--test_mode", "--gpus"):
+        parser.add_argument(option)
+    try:
+        args, _ = parser.parse_known_args(cli_args)
+    except (argparse.ArgumentError, SystemExit):
+        return None
+    if args.op_name == "boltops" and args.test_mode in ("per", "all"):
+        return args.gpus if args.gpus not in (None, "auto") else None
+    return None
+
+
+def resolve_gpu_pool(
+    requested: str | None, env: dict[str, str], parent_pool: str | None = None,
+) -> list[str | None]:
+    """Use only explicitly selected or inherited GPU IDs; never scan the host."""
+    def parse(value: str) -> list[str]:
+        ids = [part.strip() for part in value.split(",")]
+        if not all(part.isascii() and part.isdecimal() for part in ids):
+            raise ValueError(f"expected comma-separated nonnegative GPU IDs, got {value!r}")
+        ids = [str(int(part)) for part in ids]
+        if len(ids) != len(set(ids)):
+            raise ValueError(f"duplicate GPU IDs: {value!r}")
+        return ids
+
+    limits = []
+    allocation = env.get("OPTEST_GPUS", "auto")
+    if allocation != "auto":
+        limits.append(parse(allocation))
+    # HIP takes precedence over CUDA on ROCm, but neither mask may be widened.
+    for name in ("HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"):
+        if name in env:
+            limits.append(parse(env[name]))
+    if parent_pool is not None:
+        allowed = parse(parent_pool)
+        if any(not set(limit).issubset(allowed) for limit in limits):
+            raise ValueError("optest allocation/mask is outside its original --gpus pool")
+        limits = [allowed]
+    pool = parse(requested) if requested is not None else (limits[0] if limits else None)
+    if pool is None:
+        return [None]  # Legacy local invocation: inherit its device environment.
+    if any(not set(pool).issubset(limit) for limit in limits):
+        raise ValueError(f"GPU pool {pool} exceeds the inherited allocation/mask {limits}")
+    if "ROCR_VISIBLE_DEVICES" in env:
+        raise ValueError(
+            "GPU scheduling requires HIP_VISIBLE_DEVICES instead of "
+            "ROCR_VISIBLE_DEVICES (different ID namespaces)"
+        )
+    return pool
+
+
+@contextmanager
+def lease_gpu_pool(devices: list[str | None], parent_allocation: str | None):
+    """Borrow the parent's leased device(s), reserve additional ones ourselves."""
+    if parent_allocation is None:
+        yield devices
+        return
+    inherited = set(parent_allocation.split(","))
+    extra = [gpu for gpu in devices if gpu not in inherited]
+    if not extra:
+        yield devices
+        return
+    from optest.device import DeviceAllocator
+
+    allocator = DeviceAllocator(
+        requested=",".join(extra), usage_threshold=0,
+        wait_seconds=0, stable_samples=1, sample_interval=0,
+    )
+    owned = []
+    try:
+        for _ in extra:
+            selected = allocator.try_acquire(1)
+            if not selected:
+                break
+            owned.extend(selected)
+        available = inherited | {str(gpu) for gpu in owned}
+        assigned = [gpu for gpu in devices if gpu in available]
+        if not assigned:
+            raise RuntimeError("all requested GPUs are leased by other optest tasks")
+        skipped = [gpu for gpu in devices if gpu not in available]
+        if skipped:
+            print(f"[schedule] GPUs leased elsewhere, omitted: {skipped}", flush=True)
+        yield assigned
+    finally:
+        allocator.release(owned)
+
+
+def _pytest_command(file: str) -> list[str]:
+    return [
+        sys.executable, "-m", "pytest", file,
         "--bench", "-m", "bench",
         "--continue-on-collection-errors",
+        "--durations=10",
         "-q", "-s", "-ra", "--no-header", "-p", "no:cacheprovider",
     ]
-    env = dict(
-        os.environ,
-        OPTEST_BENCH_RAW_DIR=str(raw_dir),
-        **{BACKEND_ENV: backend},
-    )
-    completed = subprocess.run(cmd, cwd=REPO_ROOT, env=env)
-    return completed.returncode
+
+
+def run_benchmarks(
+    runs: list[tuple[str, list[str], list[str]]],
+    raw_dir: Path,
+    devices: list[str | None],
+) -> list[int]:
+    """One process per file/backend, at most one process on each assigned GPU.
+
+    Task-local raw files are merged in plan order after execution. Finished
+    logs are replayed as contiguous blocks, including failed/crashed tasks.
+    """
+    tasks = [(backend, file) for backend, files, _ in runs for file in files]
+    codes = [1] * len(tasks)
+    task_dirs = [raw_dir / "tasks" / f"{i + 1:04d}" for i in range(len(tasks))]
+    running = {}
+    available = list(devices)
+    next_task = 0
+    raw_dir.mkdir(parents=True, exist_ok=True)
+
+    def terminate(signum, _frame):
+        raise SystemExit(128 + signum)
+
+    previous_sigterm = signal.signal(signal.SIGTERM, terminate)
+    try:
+        while next_task < len(tasks) or running:
+            while available and next_task < len(tasks):
+                index = next_task
+                next_task += 1
+                gpu = available.pop(0)
+                backend, file = tasks[index]
+                directory = task_dirs[index]
+                directory.mkdir(parents=True, exist_ok=True)
+                env = dict(
+                    os.environ, OPTEST_BENCH_RAW_DIR=str(directory),
+                    **{BACKEND_ENV: backend},
+                )
+                if gpu is not None:
+                    env.update(
+                        HIP_VISIBLE_DEVICES=gpu, CUDA_VISIBLE_DEVICES=gpu,
+                        OPTEST_GPUS=gpu,
+                    )
+                log_path = directory / "pytest.log"
+                print(
+                    f"[{index + 1}/{len(tasks)}] backend={backend} file={file} "
+                    f"gpu={gpu or 'inherited'} log={log_path}", flush=True,
+                )
+                handle = log_path.open("wb")
+                try:
+                    process = subprocess.Popen(
+                        _pytest_command(file), cwd=REPO_ROOT, env=env,
+                        stdout=handle, stderr=subprocess.STDOUT, start_new_session=True,
+                    )
+                except Exception:
+                    handle.close()
+                    available.append(gpu)
+                    traceback.print_exc()
+                    print(f"[summary] backend={backend} file={file}: launch FAILED", flush=True)
+                    continue
+                running[index] = (process, handle, gpu)
+
+            for index, (process, handle, gpu) in list(running.items()):
+                rc = process.poll()
+                if rc is None:
+                    continue
+                handle.close()
+                codes[index] = rc
+                backend, file = tasks[index]
+                print(
+                    f"[{index + 1}/{len(tasks)}] backend={backend} file={file} "
+                    f"gpu={gpu or 'inherited'} completed", flush=True,
+                )
+                with (task_dirs[index] / "pytest.log").open(errors="replace") as log:
+                    shutil.copyfileobj(log, sys.stdout)
+                print(f"\n[summary] backend={backend} file={file}: pytest rc={rc}", flush=True)
+                del running[index]
+                available.append(gpu)
+            if running:
+                time.sleep(0.1)
+    finally:
+        try:
+            # Include compiler/profiler descendants on Ctrl-C or CI cancellation.
+            for process, _handle, _gpu in running.values():
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            for process, handle, _gpu in running.values():
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+                # The leader may already have exited while a compiler child
+                # ignored SIGTERM. Escalate for the group, not just its leader.
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait()
+                handle.close()
+        finally:
+            signal.signal(signal.SIGTERM, previous_sigterm)
+
+    for directory in task_dirs:
+        for path in sorted(directory.glob("*.raw.jsonl")):
+            with path.open("rb") as source, (raw_dir / path.name).open("ab") as target:
+                shutil.copyfileobj(source, target)
+    return codes
 
 
 def collect_op_rows(
@@ -274,6 +495,26 @@ def collect_op_rows(
             rows_by_file_op.get(auto_op_name_for_file(file, derived_counts), [])
         )
     return rows
+
+
+def print_benchmark_failures(
+    runs: list[tuple[str, list[str], list[str]]],
+    run_rcs: list[int],
+    raw_dir: Path,
+) -> None:
+    """Repeat failed case details at the end, after later successful tasks."""
+    from ci.optest_to_junit import _read_error_context
+
+    tasks = [(backend, file) for backend, files, _ in runs for file in files]
+    for index, ((backend, file), rc) in enumerate(zip(tasks, run_rcs), start=1):
+        if rc == 0:
+            continue
+        log_path = raw_dir / "tasks" / f"{index:04d}" / "pytest.log"
+        print(
+            f"[FAILED] backend={backend} file={file}: pytest rc={rc}; "
+            f"log={log_path}", flush=True,
+        )
+        print(_read_error_context(log_path.parent, log_path.name), flush=True)
 
 
 def format_op_csv(op: str, rows: list[dict], output_dir: Path) -> Path:
@@ -356,6 +597,7 @@ def format_op_csv(op: str, rows: list[dict], output_dir: Path) -> Path:
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
     try:
         registry, file_specs, skipped_files = discover_ops()
     except RuntimeError as exc:
@@ -363,6 +605,10 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--gpus", default=None,
+        help="comma-separated GPU IDs; default: parent optest --gpus, OPTEST_GPUS or visibility mask, else one inherited device",
+    )
     parser.add_argument(
         "-o", "--output-dir", type=Path, default=None,
         help="CSV output directory (default: <repo>/optest_results; must stay "
@@ -378,6 +624,11 @@ def main(argv: list[str] | None = None) -> int:
              "declares)",
     )
     args = parser.parse_args(argv)
+    parent_pool = optest_gpu_pool(dict(os.environ))
+    try:
+        devices = resolve_gpu_pool(args.gpus, dict(os.environ), parent_pool)
+    except ValueError as exc:
+        parser.error(str(exc))
     output_dir = (args.output_dir or RESULTS_DIR).resolve()
 
     op_names = args.ops if args.ops is not None else sorted(registry)
@@ -421,37 +672,14 @@ def main(argv: list[str] | None = None) -> int:
     # One pytest per file: a process-level crash (device VMFault abort,
     # segfault in a runtime handler) kills only that file's tests; the
     # remaining files still run and their ops still get CSVs.
-    run_rcs: list[int] = []
-    total_runs = sum(len(files) for _, files, _ in runs)
-    index = 0
-    for backend, files, _run_ops in runs:
-        for file in files:
-            index += 1
-            print(
-                f"[{index}/{total_runs}] backend={backend} file={file}",
-                flush=True,
-            )
-            try:
-                rc = run_op_benches([file], raw_dir, backend)
-            except Exception:
-                failures += 1
-                print(
-                    f"[{index}/{total_runs}] backend={backend} "
-                    f"file={file} FAILED",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                traceback.print_exc()
-                continue
-            run_rcs.append(rc)
-            if rc != 0:
-                failures += 1
-                print(
-                    f"[summary] backend={backend} file={file}: "
-                    f"pytest rc={rc}",
-                    file=sys.stderr,
-                    flush=True,
-                )
+    if parent_pool is not None:
+        print(f"[schedule] recovered parent optest --gpus={parent_pool}", flush=True)
+    with lease_gpu_pool(
+        devices, os.environ.get("OPTEST_GPUS") if parent_pool is not None else None,
+    ) as assigned:
+        print(f"[schedule] GPU pool={assigned}; one pytest process per GPU", flush=True)
+        run_rcs = run_benchmarks(runs, raw_dir, assigned)
+    failures = sum(rc != 0 for rc in run_rcs)
 
     if runs:
         rows_by_file_op = read_rows(raw_dir)
@@ -486,6 +714,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
 
     if failures:
+        print_benchmark_failures(runs, run_rcs, raw_dir)
         print(f"{failures} benchmark failure(s)", file=sys.stderr)
         return 1
     print(f"Wrote {csv_count} CSV file(s) to {output_dir}")

@@ -110,7 +110,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         "--runslow",
         action="store_true",
         default=False,
-        help="also run @pytest.mark.slow cases (large TileLang MQA GPU grids)",
+        help="also run @pytest.mark.slow cases (large GPU grids, including UA bench1102)",
     )
     group.addoption(
         "--bench",
@@ -147,7 +147,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line(
         "markers",
-        "slow: long GPU grids skipped unless --runslow (CI default omits these)",
+        "slow: long GPU grids skipped unless --runslow (including UA bench1102)",
     )
     config.addinivalue_line(
         "markers",

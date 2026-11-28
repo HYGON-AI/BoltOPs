@@ -1968,6 +1968,7 @@ def _prepare_bench_1102_runner(case):
 
 
 @pytest.mark.bench
+@pytest.mark.slow
 @pytest.mark.parametrize('case', _bench_1102_cases(), ids=_bench_1102_case_id)
 def test_bench_1102_unified_attention_triton(case, bench_warmup, bench_repeat, time_ms):
     if not torch.cuda.is_available():

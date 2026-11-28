@@ -23,6 +23,7 @@ from __future__ import annotations
 import dataclasses
 import importlib.metadata
 import json
+import math
 import os
 import re
 import sys
@@ -225,8 +226,9 @@ def _capture_and_time(
     stream,
     state: dict,
     share_pool: bool,
+    _force_legacy: bool = False,
 ) -> float:
-    """One graph capture + timed replay on ``stream``.
+    """Time graph replay, limiting repeated work for long-running kernels.
 
     ``share_pool=True`` reuses (and grows) ``state["pool"]``; ``False``
     captures into a throwaway pool, leaving ``state`` untouched.
@@ -240,13 +242,28 @@ def _capture_and_time(
         torch.cuda.synchronize()
         s0 = torch.cuda.Event(enable_timing=True)
         s1 = torch.cuda.Event(enable_timing=True)
-        s0.record()
-        for _ in range(5):
+        adaptive = False
+        if not _force_legacy:
+            s0.record()
             run()
-        s1.record()
-        torch.cuda.synchronize()
-        estimate_ms = s0.elapsed_time(s1) / 5
-        n_repeat = 1000 if estimate_ms == 0 else max(1, int(rep / estimate_ms))
+            s1.record()
+            torch.cuda.synchronize()
+            estimate_ms = s0.elapsed_time(s1)
+            adaptive = estimate_ms > rep / 10
+        if adaptive:
+            # The operator already fills a sample's share of the budget.
+            n_repeat = 1
+        else:
+            # Preserve the established short-kernel measurement: changing
+            # graph size / adding replay boundaries can shift us-level
+            # results. Re-estimate exactly as the original helper did.
+            s0.record()
+            for _ in range(5):
+                run()
+            s1.record()
+            torch.cuda.synchronize()
+            estimate_ms = s0.elapsed_time(s1) / 5
+            n_repeat = 1000 if estimate_ms <= 0 else max(1, int(rep / estimate_ms))
 
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, pool=pool):
@@ -257,15 +274,34 @@ def _capture_and_time(
             state["pool"] = graph.pool()
         torch.cuda.synchronize()
 
-        samples: list[float] = []
-        for _ in range(10):
-            e0 = torch.cuda.Event(enable_timing=True)
-            e1 = torch.cuda.Event(enable_timing=True)
-            e0.record()
+        def replay_ms() -> float:
+            s0.record()
             graph.replay()
-            e1.record()
+            s1.record()
             torch.cuda.synchronize()
-            samples.append(e0.elapsed_time(e1) / n_repeat)
+            return s0.elapsed_time(s1)
+
+        if adaptive:
+            # Re-check graph time: eager launch gaps may overestimate it.
+            # At least three samples keep the statistic meaningful even
+            # when a single execution already exceeds the entire budget.
+            graph_ms = replay_ms()
+            if graph_ms <= 0:
+                return 0.0
+            if graph_ms <= rep / 10:
+                # A host scheduling stall can make the eager probe look
+                # slow. Keep fast GPU kernels on the established method.
+                del graph
+                return _capture_and_time(
+                    run, rep, return_mode, stream, state, share_pool,
+                    _force_legacy=True,
+                )
+            n_samples = min(10, max(3, math.ceil(rep / graph_ms)))
+            samples: list[float] = [graph_ms]
+            for _ in range(n_samples - 1):
+                samples.append(replay_ms())
+        else:
+            samples = [replay_ms() / n_repeat for _ in range(10)]
         del graph
 
     ordered = sorted(samples)
@@ -296,6 +332,11 @@ def _pooled_graph_bench(
     DTK-PyTorch small-allocation ``use_count`` assert (reusing a pool for
     very small graphs is buggy in this torch fork), so ops with small
     intermediates keep working just like triton's fresh-pool path.
+
+    Kernels whose estimated latency exceeds ``rep / 10`` use ``rep`` as
+    their approximate total replay budget, with at least three samples.
+    Short kernels retain the original graph size and ten replay samples
+    so their measurements stay comparable with historical results.
     """
     import torch
 
@@ -329,6 +370,12 @@ def time_ms(
     ``return_mode`` picks the statistic over the timed iterations
     (default ``"median"``; ``"min"`` / ``"max"`` / ``"mean"`` are
     supported by both toolchains).
+
+    On the shared Triton graph path, kernels whose estimated latency
+    exceeds ``repeat_ms / 10`` get a total replay budget of ``repeat_ms``
+    across 3--10 samples. Short kernels retain their historical sampling
+    method. Warmup, calibration and capture are additional work. Other
+    profiler paths retain their own budget rules.
 
     ``use_graph`` (default ``True``) prefers CUDA-graph capture; ops
     that cannot be captured fall back to plain event timing.  Errors
