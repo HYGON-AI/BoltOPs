@@ -47,8 +47,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      pull-requests: read
-      issues: write
+      pull-requests: write
       statuses: write
     steps:
     - name: Require approval for this fork PR commit
