@@ -26,9 +26,8 @@ python -m pip install --upgrade --constraint "${CI_WORK_DIR}/constraints.txt" "t
 # and validate vendor tags below.
 python -m pip install --upgrade --constraint "${CI_WORK_DIR}/constraints.txt" --index-url "${PIP_INDEX_URL}" triton
 python -m pip show torch triton
-# Query only the HCU index, then resolve that exact vendor build's dependencies
-# using both indexes. No static TileLang/FFI version and no public TileLang fallback.
-tilelang_version=$(python - <<'PY'
+# Try matching HCU builds newest first under the existing Torch and NumPy constraints.
+python - <<'PY'
 import json
 import os
 import subprocess
@@ -40,14 +39,28 @@ result = subprocess.check_output([
 ], text=True)
 versions = json.loads(result)["versions"]  # pip sorts compatible versions newest first.
 tags = {f"dtk{os.environ['DTK_VER']}", "torch" + os.environ["TORCH_VERSION"].replace(".", "")}
-selected = next((v for v in versions if tags.issubset(set(v.partition("+")[2].split(".")))), None)
-if selected is None:
+candidates = [v for v in versions if tags.issubset(v.partition("+")[2].split("."))]
+if not candidates:
     raise SystemExit(f"ERROR: No HCU TileLang matching {sorted(tags)}; available versions: {versions}")
-print(selected)
+
+for version in candidates:
+    print(f"Trying HCU TileLang: {version}", flush=True)
+    install = subprocess.run([
+        sys.executable, "-m", "pip", "install", "--upgrade",
+        "--constraint", os.path.join(os.environ["CI_WORK_DIR"], "constraints.txt"),
+        "--index-url", os.environ["PIP_INDEX_URL"], f"tilelang=={version}",
+        "--extra-index-url", "https://mirrors.aliyun.com/pypi/simple/",
+        "--trusted-host", "mirrors.aliyun.com",
+    ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    print(install.stdout, end="", flush=True)
+    if install.returncode == 0:
+        print(f"Selected HCU TileLang: {version}")
+        break
+    if "ERROR: ResolutionImpossible:" not in install.stdout:
+        raise SystemExit(install.returncode)
+else:
+    raise SystemExit(f"ERROR: No HCU TileLang matching {sorted(tags)} satisfies the Torch and NumPy constraints")
 PY
-)
-echo "Selected HCU TileLang: ${tilelang_version}"
-python -m pip install --upgrade --constraint "${CI_WORK_DIR}/constraints.txt" --index-url "${PIP_INDEX_URL}" "tilelang==${tilelang_version}" --extra-index-url https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
 python -m pip check
 python -m pip show torch triton tilelang apache-tvm-ffi numpy
 python - <<'PY'
